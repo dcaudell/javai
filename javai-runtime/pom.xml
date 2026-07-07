@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.xtrafe.javai</groupId>
+    <artifactId>javai-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>javai-runtime</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    Vector Core: EmbeddingVector, back-edge propagation, query(), CPU similarity backend,
+    local embedding provider — plus JavAISortable/JavAIList/Set/Map (see the
+    module-placement note in doc/spec/vector-core.md). See doc/spec/vector-core.md.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-annotations</artifactId>
+    </dependency>
+  </dependencies>
+</project>

@@ -1,0 +1,14 @@
+# Maven
+target/
+
+# IntelliJ IDEA
+*.iml
+*.ipr
+*.iws
+out/
+
+# OS
+.DS_Store
+
+# Logs
+*.log

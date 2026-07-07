@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.xtrafe.javai</groupId>
+    <artifactId>javai-parent</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>javai-completion</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    Completion Fabric: PromptContext, CompletionRequest/Result, JavAICompletionProvider,
+    wrapping Spring AI ChatModel/ChatClient rather than writing new provider clients. See
+    doc/spec/completion-fabric.md.
+
+    Note: "spring-ai-core" (referenced here originally) doesn't exist as a GA artifact —
+    Spring AI split it into spring-ai-model (ChatModel/EmbeddingModel, the abstractions
+    this module wraps) and spring-ai-client-chat (the ChatClient fluent builder used in
+    doc/spec/completion-fabric.md's worked examples) before 1.0.0 GA. Both come in
+    transitively via spring-ai-bom, pinned in the root pom.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-collections</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-runtime</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-model</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-client-chat</artifactId>
+    </dependency>
+  </dependencies>
+</project>

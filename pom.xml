@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>dev.xtrafe.javai</groupId>
+  <artifactId>javai-parent</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <name>JavAI Extensions</name>
+  <description>
+    A set of extensions to Java that make semantic embedding vectors, knowledge-graph
+    structure, and LLM-codegen guidance first-class, automatically-maintained properties
+    of the object model. See SPEC.md.
+  </description>
+
+  <!--
+    All six Phase 0 modules are interdependent by design (see SPEC.md's dependency
+    graph) and are meant to build together, not independently — `mvn install` (or
+    `mvn verify`) from this root builds the whole reactor in dependency order.
+    Build order matches SPEC.md/CLAUDE.md: javai-annotations, javai-runtime,
+    javai-agent, javai-collections, javai-persistence, javai-completion.
+  -->
+  <modules>
+    <module>javai-annotations</module>
+    <module>javai-runtime</module>
+    <module>javai-agent</module>
+    <module>javai-collections</module>
+    <module>javai-persistence</module>
+    <module>javai-completion</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <junit.version>5.11.0</junit.version>
+    <!-- TODO: verify/pin current releases before real use — placeholders from scaffolding. -->
+    <byte-buddy.version>1.15.10</byte-buddy.version>
+    <hibernate.version>6.6.4.Final</hibernate.version>
+    <neo4j-driver.version>5.27.0</neo4j-driver.version>
+    <!--
+      1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
+      and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
+      then got split into spring-ai-model (ChatModel/EmbeddingModel) + spring-ai-client-chat
+      (ChatClient) before 1.0.0 GA shipped. Pinned here to 1.0.9, the last patch on the
+      original 1.0.x line (current stable lines as of mid-2026 are 1.0.x, 1.1.x, and 2.0.0
+      GA; staying off 2.0 for now since it pairs with a Spring Boot 4 migration this project
+      doesn't need yet). Revisit before Phase 0 sign-off.
+    -->
+    <spring-ai.version>1.0.9</spring-ai.version>
+  </properties>
+
+  <!--
+    Dependency versions are pinned once here; module POMs declare dependencies without
+    versions. Note this is not a perfect analogue of Gradle's api/implementation split —
+    Maven's default "compile" scope is transitive to consumers of a module, closer to
+    Gradle's "api" than "implementation". Not load-bearing for Phase 0; revisit if a
+    module's transitive-dependency surface ever becomes a real problem.
+  -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <dependency>
+        <groupId>dev.xtrafe.javai</groupId>
+        <artifactId>javai-annotations</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.xtrafe.javai</groupId>
+        <artifactId>javai-runtime</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.xtrafe.javai</groupId>
+        <artifactId>javai-collections</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.hibernate.orm</groupId>
+        <artifactId>hibernate-core</artifactId>
+        <version>${hibernate.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.neo4j.driver</groupId>
+        <artifactId>neo4j-java-driver</artifactId>
+        <version>${neo4j-driver.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <!-- Every module gets JUnit 5 in test scope without repeating this block. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.13.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.2</version>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

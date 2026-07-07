@@ -1,0 +1,29 @@
+/**
+ * The full JavAI Extensions annotation vocabulary, across three extension areas:
+ *
+ * <ul>
+ *   <li><b>Vector Core</b> (search-visibility hat): {@link dev.xtrafe.javai.annotations.JavAIVectorizable},
+ *       {@link dev.xtrafe.javai.annotations.Vectorize}, {@link dev.xtrafe.javai.annotations.VectorizeIgnore},
+ *       {@link dev.xtrafe.javai.annotations.SearchVisibility}, {@link dev.xtrafe.javai.annotations.Summary},
+ *       {@link dev.xtrafe.javai.annotations.EmbeddingModel}.
+ *   <li><b>Vector Collections</b>: {@link dev.xtrafe.javai.annotations.JavAIGraphNode},
+ *       {@link dev.xtrafe.javai.annotations.JavAIEdge}.
+ *   <li><b>Codegen Guidance</b> (LLM/codegen-guidance hat): {@link dev.xtrafe.javai.annotations.Requires},
+ *       {@link dev.xtrafe.javai.annotations.Ensures}, {@link dev.xtrafe.javai.annotations.Invariant},
+ *       {@link dev.xtrafe.javai.annotations.Intent}, {@link dev.xtrafe.javai.annotations.AgentWritable},
+ *       {@link dev.xtrafe.javai.annotations.Frozen}, {@link dev.xtrafe.javai.annotations.HumanOnly},
+ *       {@link dev.xtrafe.javai.annotations.Nondeterministic}, {@link dev.xtrafe.javai.annotations.Costly},
+ *       {@link dev.xtrafe.javai.annotations.Provenance}.
+ * </ul>
+ *
+ * These are plain annotation definitions with no processing logic -- the weaver in
+ * {@code javai-agent} is what gives them behavior. See {@code doc/spec/} for the full
+ * design of each area. Before generating or modifying code that carries the Codegen
+ * Guidance annotations, read {@code doc/JavAI_Codegen_Guidance.md} in full.
+ *
+ * <p>The proposed (not-yet-implemented) {@code @Summary} tuning parameters described in
+ * {@code doc/spec/vector-core.md} (decay, maxStack, maxDepth, aggregation, edgeKind) are
+ * deliberately NOT present on {@link dev.xtrafe.javai.annotations.Summary} below -- they
+ * are specification proposals, not Phase 0 scope.
+ */
+package dev.xtrafe.javai.annotations;
