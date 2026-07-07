@@ -67,7 +67,29 @@ public void setBody(String body) {
 
 ## What's actually implemented
 
-Nothing yet. `package-info.java` documents the module's purpose and Phase-0-spike-first ordering.
-`DependencyWiringTest` only proves the classpath wires up correctly (`javai-annotations`, `javai-runtime`,
-and ByteBuddy all resolve and a `new ByteBuddy()` instantiates) — it does not exercise any weaving logic,
-because none exists. The next concrete task in this repo is the spike described above.
+The minimal weaving spike described above, and nothing past it:
+
+- `JavAIWeaver` — installs a load-time ByteBuddy `AgentBuilder` transformer matching
+  `@JavAIVectorizable`-annotated classes. For the single `@Vectorize` field it finds, it adds three
+  bookkeeping fields, synthesizes `isDirty()`/`recomputeCount()`/`vector()`, and instruments the
+  field's conventional `setXxx` setter (via `Advice`) to call `markDirty()` on exit — the original
+  assignment is untouched, matching the worked example in doc/spec/acceleration-substrate.md.
+- `WeaverRuntimeSupport` — the static methods the woven bytecode calls into. Reads/writes the woven
+  fields via reflection (simplicity over performance; this is a correctness spike, not the Phase 2
+  acceleration path) and stands in a deterministic toy embedding function for a real embedding model.
+- `MarkDirtyAdvice` — the `Advice` class inlined into the tail of the woven setter.
+- `VectorizationWeavingSpikeTest` — loads a *fresh* copy of the `VectorizableWidget` fixture through an
+  isolated classloader after the transformer installs, proving the weaving is genuinely load-time (the
+  compiled fixture class on disk has none of these methods), and walks the full
+  `Clean → FieldDirty → EmbeddingRecomputing → Clean` cycle from doc/spec/vector-core.md: a mutation
+  alone never triggers recomputation, exactly one recomputation happens per dirty cycle, and a repeated
+  clean read returns the cached vector unchanged.
+
+Deliberately not attempted here: `dependents()`/back-edge `propagateDirty()` walk across multiple linked
+objects (`SummaryDirty`), non-conventional setters, and multiple `@Vectorize` fields per class. Those need
+`javai-runtime`'s real types and are scoped to the full build-out, not this spike.
+
+Byte Buddy was bumped from the `1.15.10` scaffolding placeholder to `1.18.11` while building this spike:
+`1.15.10` cannot parse class files compiled by this repo's JDK 26 toolchain ("Java 26 (70) is not
+supported"). `ByteBuddyAgent.install()` also needs `-Djdk.attach.allowAttachSelf=true` to self-attach on
+modern JDKs — wired into this module's `maven-surefire-plugin` configuration.

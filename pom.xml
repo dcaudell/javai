@@ -38,7 +38,12 @@
 
     <junit.version>5.11.0</junit.version>
     <!-- TODO: verify/pin current releases before real use — placeholders from scaffolding. -->
-    <byte-buddy.version>1.15.10</byte-buddy.version>
+    <!--
+      Bumped from the 1.15.10 placeholder while building the javai-agent weaving spike: 1.15.10 hard-fails
+      parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
+      repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
+    -->
+    <byte-buddy.version>1.18.11</byte-buddy.version>
     <hibernate.version>6.6.4.Final</hibernate.version>
     <neo4j-driver.version>5.27.0</neo4j-driver.version>
     <!--

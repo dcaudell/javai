@@ -1,0 +1,66 @@
+## Pre-work for the Embedding Generation deployment described in the whitepaper's §4.5 ("Embedding
+## Generation") and doc/spec/vector-core.md's JavAIEmbeddingProvider SPI. Nothing in javai-runtime talks
+## to this yet -- JavAIEmbeddingProvider's Phase 0 HTTP client hasn't been written. This compose file is
+## the deployment target that client will be built against: Hugging Face's text-embeddings-inference
+## (TEI) as a sidecar container, never a bespoke Python/PyTorch serving process (§4.5.2's "depend on,
+## don't build" posture), reachable at an identical REST API regardless of which profile is running
+## behind it (§4.5.2's "one model file, one SPI, three deployment shapes").
+##
+## Usage:
+##   cp .env.example .env   # fill in JAVAI_EMBEDDING_MODEL_REVISION -- see .env.example and README.md
+##   docker compose --profile cpu up    # Phase 0 baseline: CPU-only, no GPU required (whitepaper §9.1)
+##   docker compose --profile cuda up   # NVIDIA GPU acceleration -- same model, same API, just faster
+##
+## Apple Silicon/Metal has no profile here: Docker Desktop cannot pass a Metal GPU through to a
+## container, so TEI's metal image isn't usable this way. Run `text-embeddings-router` natively on macOS
+## instead for local dev acceleration -- see README.md.
+
+services:
+  javai-embeddings-cpu:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    profiles: ["cpu"]
+    command:
+      - "--model-id=${JAVAI_EMBEDDING_MODEL_ID:-Qwen/Qwen3-Embedding-0.6B}"
+      - "--revision=${JAVAI_EMBEDDING_MODEL_REVISION:?set JAVAI_EMBEDDING_MODEL_REVISION in .env -- pin a model revision, do not float on a branch}"
+    ports:
+      - "${JAVAI_EMBEDDING_PORT:-8080}:80"
+    volumes:
+      - ./data/embeddings-cache:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  javai-embeddings-cuda:
+    image: ghcr.io/huggingface/text-embeddings-inference:cuda-1.9
+    profiles: ["cuda"]
+    command:
+      - "--model-id=${JAVAI_EMBEDDING_MODEL_ID:-Qwen/Qwen3-Embedding-0.6B}"
+      - "--revision=${JAVAI_EMBEDDING_MODEL_REVISION:?set JAVAI_EMBEDDING_MODEL_REVISION in .env -- pin a model revision, do not float on a branch}"
+    ports:
+      - "${JAVAI_EMBEDDING_PORT:-8080}:80"
+    volumes:
+      - ./data/embeddings-cache:/data
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ## Uncomment once a javai-app image exists to build against this sidecar directly, per the whitepaper's
+  ## own compose example (§4.5.2, Example 14):
+  # javai-app:
+  #   build: ..
+  #   environment:
+  #     JAVAI_EMBEDDING_ENDPOINT: http://javai-embeddings-cpu:80
+  #     JAVAI_EMBEDDING_MODEL: qwen3-embedding-0.6b
+  #   depends_on:
+  #     - javai-embeddings-cpu
