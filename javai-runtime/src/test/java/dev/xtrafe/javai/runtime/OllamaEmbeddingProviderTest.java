@@ -58,6 +58,34 @@ class OllamaEmbeddingProviderTest {
         assertEquals(2, result.dims());
     }
 
+    /**
+     * Confirmed empirically against a real Ollama instance: {@code /api/embed} returns
+     * {@code "embeddings": []} (zero rows, not a placeholder vector) for a genuinely empty input string --
+     * breaking {@code CollectionVectorSupport.computeCentroid()}'s assumption that {@code embed("")}
+     * always yields a real, correctly-dimensioned vector for an empty collection. Substituting a single
+     * space keeps that contract true against real Ollama too.
+     */
+    @Test
+    void embedSubstitutesASingleSpaceForEmptyInput() throws IOException {
+        StringBuilder capturedRequestBody = new StringBuilder();
+        server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        server.createContext("/api/embed", exchange -> {
+            capturedRequestBody.append(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] body = "{\"model\":\"test-model\",\"embeddings\":[[0.1,0.2]]}".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        var provider = new OllamaEmbeddingProvider(
+                URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
+        provider.embed("");
+
+        assertEquals("{\"model\":\"test-model\",\"input\":\" \"}", capturedRequestBody.toString(),
+                "an empty input string must be substituted with a single space, never sent through as-is");
+    }
+
     @Test
     void embedThrowsOnNonOkStatus() throws IOException {
         server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);

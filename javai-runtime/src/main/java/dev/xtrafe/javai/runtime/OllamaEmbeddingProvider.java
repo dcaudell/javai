@@ -46,8 +46,16 @@ public final class OllamaEmbeddingProvider implements JavAIEmbeddingProvider {
 
     @Override
     public EmbeddingVector embed(String text) {
+        // Confirmed empirically: Ollama's /api/embed returns "embeddings": [] (zero rows, not a
+        // placeholder/zero vector) for a genuinely empty input string -- unlike the fake providers used
+        // elsewhere in this codebase's hermetic tests, which happily hash an empty string into a real-
+        // shaped vector. CollectionVectorSupport.computeCentroid() relies on embed("") producing a real,
+        // correctly-dimensioned vector for an empty collection (so it has *some* dimension to combine
+        // arithmetically with a parent's summaryVector()); substituting a single space keeps that
+        // contract true against real Ollama too, since Ollama embeds a lone space into a real vector.
+        String effectiveText = text.isEmpty() ? " " : text;
         String requestBody =
-                "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":\"" + JsonStrings.escape(text) + "\"}";
+                "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":\"" + JsonStrings.escape(effectiveText) + "\"}";
         HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(30))

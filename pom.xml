@@ -46,6 +46,11 @@
     <byte-buddy.version>1.18.11</byte-buddy.version>
     <hibernate.version>6.6.4.Final</hibernate.version>
     <neo4j-driver.version>5.27.0</neo4j-driver.version>
+    <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
+         hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
+    <postgresql-driver.version>42.7.7</postgresql-driver.version>
+    <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
+    <testcontainers.version>1.21.4</testcontainers.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
       and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
@@ -114,9 +119,26 @@
         <version>${hibernate.version}</version>
       </dependency>
       <dependency>
+        <groupId>org.hibernate.orm</groupId>
+        <artifactId>hibernate-vector</artifactId>
+        <version>${hibernate.version}</version>
+      </dependency>
+      <dependency>
         <groupId>org.neo4j.driver</groupId>
         <artifactId>neo4j-java-driver</artifactId>
         <version>${neo4j-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <version>${postgresql-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers-bom</artifactId>
+        <version>${testcontainers.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
       </dependency>
     </dependencies>
   </dependencyManagement>

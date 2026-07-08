@@ -6,6 +6,11 @@ import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.runtime.JavAIArrayList;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+import jakarta.persistence.Transient;
+
+import java.util.UUID;
 
 import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
 
@@ -26,9 +31,23 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * <p>{@code implements JavAIGraphNode} lets {@code Article} instances participate directly in a
  * {@code javai-collections} {@code KnowledgeGraph} -- a hand-declared, unwoven marker interface, per that
  * module's own README.
+ *
+ * <p>{@code @Entity} + {@link #id}, for {@code javai-persistence}: {@link #getId()} is what
+ * {@code ArticleRepository} (see {@code PersistenceE2ETest}) uses as the JavAI-fixed {@code UUID} identity
+ * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code comments}/
+ * {@code draftComment}/{@code attachment} are all {@code @Transient}: Hibernate has no JPA association
+ * annotation to map them by (that's real, separate scope -- teaching Hibernate to persist a
+ * {@code JavAIArrayList} as a relational collection -- not needed to prove the vector storage/query
+ * contract this test targets), so Hibernate simply ignores them; Neo4j's backend, by contrast, doesn't
+ * look at {@code @Transient} at all, so {@code featuredComment}/{@code comments} (both {@code @Summary})
+ * still become real relationships there, same as in-memory.
  */
+@Entity
 @JavAIVectorizable
 public class Article implements JavAIGraphNode {
+
+    @Id
+    private UUID id;
 
     @Vectorize
     private String title;
@@ -36,15 +55,19 @@ public class Article implements JavAIGraphNode {
     @Vectorize
     private String body;
 
+    @Transient
     @Summary
     private Comment featuredComment;
 
+    @Transient
     @Summary
     private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
 
+    @Transient
     @SearchVisibility(PRIVATE)
     private Comment draftComment;
 
+    @Transient
     private Attachment attachment;
 
     public Article() {
@@ -53,6 +76,10 @@ public class Article implements JavAIGraphNode {
     public Article(String title, String body) {
         this.title = title;
         this.body = body;
+    }
+
+    public UUID getId() {
+        return id;
     }
 
     public String getTitle() {

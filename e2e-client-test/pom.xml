@@ -62,6 +62,11 @@
       <artifactId>javai-collections</artifactId>
       <version>${javai.version}</version>
     </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-persistence</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -105,11 +110,12 @@
         <configuration>
           <!--
             ByteBuddyAgent.install() self-attaches to this JVM to weave the domain classes below;
-            disabled by default since JDK 9. Also give the first run generous room: TEI has to pull its
-            image and download the model before the container's health check passes.
+            disabled by default since JDK 9. Also give the first run generous room:
+            MonolithicInfrastructure builds a genuinely large custom image (Postgres+pgvector, Neo4j, and
+            Ollama with its embedding model baked in) from scratch on a cold Docker build cache.
           -->
           <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
-          <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+          <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
           <!--
             Surefire does not forward -D properties from the `mvn` command line into the forked test JVM
             on its own; this is what actually makes `-Djavai.embedding.provider=...` reach

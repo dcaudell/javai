@@ -14,6 +14,7 @@ import net.bytebuddy.agent.builder.ResettableClassFileTransformer;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
+import net.bytebuddy.description.modifier.FieldPersistence;
 import net.bytebuddy.description.modifier.Visibility;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
@@ -111,7 +112,12 @@ public final class JavAIWeaver {
         DynamicType.Builder<?> result = builder
                 .implement(dev.xtrafe.javai.runtime.JavAIVectorizable.class)
                 .implement(JavAIDirtyTracking.class)
-                .defineField(JavAIRuntime.STATE_FIELD, DirtyTrackingSupport.class, Visibility.PRIVATE)
+                // FieldPersistence.TRANSIENT (the JVM modifier, not just JPA's @Transient annotation) --
+                // so that a class that's both @Entity and @JavAIVectorizable doesn't need an annotation on
+                // a field it never sees in source: Hibernate's default field-access mapping already skips
+                // the `transient` keyword automatically. See javai-persistence's EntityReflection/backends,
+                // which independently also skip any "$javai$"-prefixed field by name for the same reason.
+                .defineField(JavAIRuntime.STATE_FIELD, DirtyTrackingSupport.class, Visibility.PRIVATE, FieldPersistence.TRANSIENT)
 
                 .defineMethod("markFieldDirty", void.class, Visibility.PUBLIC)
                 .intercept(MethodCall.invoke(MARK_FIELD_DIRTY).withThis())

@@ -3,6 +3,9 @@ package dev.xtrafe.javai.e2e.domain;
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.annotations.VectorizeIgnore;
+import jakarta.persistence.Id;
+
+import java.util.UUID;
 
 /**
  * Client code: an ordinary annotated class, no {@code implements JavAIVectorizable}, no hand-written
@@ -15,9 +18,17 @@ import dev.xtrafe.javai.annotations.VectorizeIgnore;
  * <p>{@code internalModerationNote} carries both {@code @Vectorize} and {@code @VectorizeIgnore} on the
  * same field -- the explicit exclude signal must win against real weaving and real embeddings, exactly as
  * {@code JavAIWeaver}'s hermetic test already proves in isolation.
+ *
+ * <p>{@link #id} exists purely for {@code javai-persistence}: a comment becomes a related Neo4j node when
+ * reached through {@link Article#getFeaturedComment()}/{@link Article#getComments()} (both
+ * {@code @Summary} fields), which requires its own {@code @Id}. Comment has no repository of its own --
+ * see {@code PersistenceE2ETest}.
  */
 @JavAIVectorizable
 public class Comment extends Attribution {
+
+    @Id
+    private UUID id;
 
     @Vectorize
     private String text;
@@ -32,6 +43,10 @@ public class Comment extends Attribution {
     public Comment(String author, String text) {
         setAuthor(author);
         this.text = text;
+    }
+
+    public UUID getId() {
+        return id;
     }
 
     public String getText() {

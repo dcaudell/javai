@@ -16,15 +16,7 @@ import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.GenericContainer;
-import org.testcontainers.containers.wait.strategy.Wait;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
-import org.testcontainers.utility.DockerImageName;
 
-import java.io.IOException;
-import java.net.URI;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -46,49 +38,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * like once {@code javaic} exists.
  *
  * <p>Domain mirrors doc/spec/end-to-end-example.md's own Article/Comment worked example. Requires Docker;
- * first run pulls an image and downloads the model (slow, one-time) -- see README.md.
+ * first run builds {@link MonolithicInfrastructure}'s image (slow, one-time) -- see README.md.
  *
- * <p><b>Which container and provider actually get used is decided once, by {@link LocalEmbeddingDefaults}</b>
- * -- Ollama on macOS, TEI (the whitepaper's Phase 0 default, §4.5.2) on Linux/Windows -- both against the
- * same reference model, {@code Qwen/Qwen3-Embedding-0.6B} (§4.5.1). See that class's javadoc and
- * doc/spec/vector-core.md's "Provider selection across platforms" section for why: TEI's Candle backend
- * has a confirmed, unresolved upstream bug running this model on CPU. This test itself has no
- * platform-specific logic at all -- it just asks {@code LocalEmbeddingDefaults} what to do.
+ * <p><b>The embedding provider/model this test runs against is fixed by {@link MonolithicInfrastructure}</b>,
+ * not chosen per-platform here: the monolithic container it starts bakes in Ollama specifically (with the
+ * reference model, {@code Qwen/Qwen3-Embedding-0.6B} / {@code qwen3-embedding:0.6b}, §4.5.1), and forces
+ * {@link LocalEmbeddingDefaults} to agree via its override property, so {@code modelLabel()}/
+ * {@code create(...)} below still resolve correctly without this test itself carrying any
+ * platform-specific logic. See {@code MonolithicInfrastructure}'s javadoc for why (TEI's Candle backend has
+ * a confirmed, unresolved upstream bug running this model on CPU -- doc/spec/vector-core.md's "Provider
+ * selection across platforms").
  *
  * <p>The weaver itself is installed by {@link JavAIWeavingLauncherSessionListener}, not here -- see that
  * class's javadoc for why {@code @BeforeAll} turned out not to be early enough.
  */
-@Testcontainers
 class ArticleGraphEmbeddingE2ETest {
 
-    private static final int EXPECTED_DIMS = 1024; // Qwen3-Embedding-0.6B's output dimensionality, either backend
-
-    @Container
-    static final GenericContainer<?> embeddings = createEmbeddingsContainer();
-
-    private static GenericContainer<?> createEmbeddingsContainer() {
-        GenericContainer<?> container = new GenericContainer<>(DockerImageName.parse(LocalEmbeddingDefaults.dockerImage()))
-                .withExposedPorts(LocalEmbeddingDefaults.containerPort())
-                .waitingFor(Wait.forHttp(LocalEmbeddingDefaults.healthCheckPath())
-                        .forStatusCode(200)
-                        .withStartupTimeout(Duration.ofMinutes(10)));
-        if (!LocalEmbeddingDefaults.preferOllama()) {
-            // TEI fetches the model as part of its own startup/health-check, via this CLI flag. Ollama's
-            // image has no startup-time-model-fetch equivalent -- see configureRealProvider() below.
-            container = container.withCommand("--model-id", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
-        }
-        return container;
-    }
+    private static final int EXPECTED_DIMS = 1024; // Qwen3-Embedding-0.6B's output dimensionality
 
     @BeforeAll
-    static void configureRealProvider() throws IOException, InterruptedException {
-        if (LocalEmbeddingDefaults.preferOllama()) {
-            embeddings.execInContainer("ollama", "pull", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
-        }
-
-        String endpoint = "http://" + embeddings.getHost() + ":"
-                + embeddings.getMappedPort(LocalEmbeddingDefaults.containerPort());
-        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(URI.create(endpoint)));
+    static void configureRealProvider() {
+        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
     }
 
     private Article article;
