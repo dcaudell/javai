@@ -1,9 +1,12 @@
 package dev.xtrafe.javai.runtime;
 
+import dev.xtrafe.javai.annotations.SearchVisibility;
+
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
@@ -18,11 +21,18 @@ import java.util.Set;
  * {@code markDirty()}-family methods, and every mutating setter, to call straight through to these static
  * methods. Application code never calls anything in this class directly.
  *
- * <p>Reflection appears in exactly one place -- {@link #stateOf}, the single field lookup that reaches a
- * woven class's one synthesized {@link DirtyTrackingSupport} field. Everything past that point is typed,
- * ordinary Java: recursing into a child's {@code summaryVector()} or checking {@code instanceof
- * JavAIDirtyTracking} needs no reflection, because real implementations of those interfaces exist now
- * (unlike the load-time weaving spike this replaces, which reflected on ad hoc fields throughout).
+ * <p>Reflection lives in two places, both read-side and both hierarchy-aware (a class's own declared
+ * fields plus every superclass's, stopping at {@code Object}): {@link #stateOf}/{@link #findField}, which
+ * reach a woven class's one synthesized {@link DirtyTrackingSupport} field or a named
+ * {@code @Vectorize}/{@code @Summary} field's current value, and {@link #walkGraph}/
+ * {@link #registerAllFieldDependencies}, which reflect over *every* declared field generically to find
+ * graph-shaped values, independent of any annotation. Nothing else needs reflection: recursing into a
+ * child's {@code summaryVector()} or checking {@code instanceof JavAIDirtyTracking} is typed, ordinary
+ * Java, because real implementations of those interfaces exist now (unlike the load-time weaving spike
+ * this replaces, which reflected on ad hoc fields throughout). Note the asymmetry with {@code javai-agent}'s
+ * weaver: setter-triggered dirty-marking only reaches a superclass if that superclass is itself woven (see
+ * {@code JavAIWeaver}'s javadoc) -- Advice can't instrument bytecode outside the class being transformed,
+ * a constraint plain reflection here doesn't share.
  */
 public final class JavAIRuntime {
 
@@ -124,7 +134,7 @@ public final class JavAIRuntime {
      * rather than needing the weaver to pass down which ones are annotated.
      */
     public static void registerAllFieldDependencies(Object self) {
-        for (Field field : self.getClass().getDeclaredFields()) {
+        for (Field field : allFields(self.getClass())) {
             if (field.getName().equals(STATE_FIELD)) {
                 continue;
             }
@@ -299,7 +309,14 @@ public final class JavAIRuntime {
         if (depth >= maxDepth) {
             return;
         }
-        for (Field field : node.getClass().getDeclaredFields()) {
+        for (Field field : allFields(node.getClass())) {
+            if (field.getName().equals(STATE_FIELD) || !isFieldSearchVisible(field)) {
+                // STATE_FIELD is internal bookkeeping, never part of the domain graph. A field marked
+                // @SearchVisibility(PRIVATE) is a hard stop -- doc/spec/vector-core.md's "search-semantic
+                // visibility... independent of Java access modifiers": don't traverse through it at all,
+                // so nothing reachable only via this field is discoverable through query().
+                continue;
+            }
             field.setAccessible(true);
             Object value;
             try {
@@ -321,7 +338,11 @@ public final class JavAIRuntime {
         if (unit == null || !visited.add(unit)) {
             return;
         }
-        if (type.isInstance(unit)) {
+        // Type-level @SearchVisibility(PRIVATE) gates *matching* only, not traversal: a node can be a
+        // deliberate pass-through (its own instances never surface as hits) while its descendants remain
+        // fully reachable. That's a different axis than the field-level check above, which gates whether
+        // we recurse through a specific edge at all.
+        if (type.isInstance(unit) && isTypeSearchVisible(unit.getClass())) {
             matches.add(type.cast(unit));
         }
         // Only descend into graph-shaped values (another vectorizable object, or a container of them).
@@ -332,6 +353,16 @@ public final class JavAIRuntime {
         if (unit instanceof JavAIVectorizable || unit instanceof Map<?, ?> || unit instanceof Iterable<?>) {
             walkGraph(unit, depth, maxDepth, type, visited, matches);
         }
+    }
+
+    private static boolean isFieldSearchVisible(Field field) {
+        SearchVisibility visibility = field.getAnnotation(SearchVisibility.class);
+        return visibility == null || visibility.value() != SearchVisibility.Visibility.PRIVATE;
+    }
+
+    private static boolean isTypeSearchVisible(Class<?> type) {
+        SearchVisibility visibility = type.getAnnotation(SearchVisibility.class);
+        return visibility == null || visibility.value() != SearchVisibility.Visibility.PRIVATE;
     }
 
     private static Iterable<?> expand(Object value) {
@@ -361,18 +392,18 @@ public final class JavAIRuntime {
     }
 
     private static Object readField(Object self, String fieldName) {
+        Field field = findField(self.getClass(), fieldName);
         try {
-            Field field = self.getClass().getDeclaredField(fieldName);
             field.setAccessible(true);
             return field.get(self);
-        } catch (ReflectiveOperationException e) {
-            throw new IllegalStateException("Expected field " + fieldName + " on " + self.getClass(), e);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot read field " + fieldName + " on " + self.getClass(), e);
         }
     }
 
     private static DirtyTrackingSupport stateOf(Object self) {
+        Field field = findField(self.getClass(), STATE_FIELD);
         try {
-            Field field = self.getClass().getDeclaredField(STATE_FIELD);
             field.setAccessible(true);
             DirtyTrackingSupport state = (DirtyTrackingSupport) field.get(self);
             if (state == null) {
@@ -380,9 +411,31 @@ public final class JavAIRuntime {
                 field.set(self, state);
             }
             return state;
-        } catch (ReflectiveOperationException e) {
+        } catch (IllegalAccessException e) {
             throw new IllegalStateException(
                     "Woven class is missing the expected " + STATE_FIELD + " field on " + self.getClass(), e);
         }
+    }
+
+    /** Every field declared anywhere in {@code type}'s class hierarchy, not just on {@code type} itself. */
+    private static List<Field> allFields(Class<?> type) {
+        List<Field> fields = new ArrayList<>();
+        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
+            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+        }
+        return fields;
+    }
+
+    /** Finds {@code fieldName} anywhere in {@code type}'s class hierarchy, not just declared on {@code type}. */
+    private static Field findField(Class<?> type, String fieldName) {
+        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
+            try {
+                return current.getDeclaredField(fieldName);
+            } catch (NoSuchFieldException ignored) {
+                // keep searching up the hierarchy
+            }
+        }
+        throw new IllegalStateException(
+                "Expected field " + fieldName + " on " + type + " or one of its superclasses");
     }
 }

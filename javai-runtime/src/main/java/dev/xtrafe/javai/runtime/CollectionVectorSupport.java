@@ -7,20 +7,24 @@ import java.util.List;
 
 /**
  * Shared {@code vector()}/{@code summaryVector()} arithmetic for every concrete JavAI collection
- * ({@link JavAIArrayList}, {@link JavAILinkedHashSet}, {@link JavAILinkedHashMap}) -- each holds one
+ * ({@link JavAIArrayList}, {@link JavAILinkedHashSet}, {@link JavAILinkedHashMap}, and
+ * {@code javai-collections}' {@code KnowledgeGraph}/{@code VectorIndex} implementations) -- each holds one
  * {@link DirtyTrackingSupport} directly (no reflection needed; unlike a woven user class, these are our
- * own code) and calls through to these statics rather than duplicating the same formula three times.
+ * own code) and calls through to these statics rather than duplicating the same formula repeatedly.
  *
  * <p>Every element in a JavAI collection is implicitly a summary contributor -- no per-element
  * {@code @Summary} annotation is needed, since the collection itself is what a containing object marks
  * {@code @Summary} to opt in.
+ *
+ * <p>Public because {@code javai-collections} depends on {@code javai-runtime} and reuses this directly
+ * rather than re-deriving the same centroid/decay-weighted-sum logic for {@code KnowledgeGraph}.
  */
-final class CollectionVectorSupport {
+public final class CollectionVectorSupport {
 
     private CollectionVectorSupport() {
     }
 
-    static EmbeddingVector vector(DirtyTrackingSupport state, Collection<?> elements) {
+    public static EmbeddingVector vector(DirtyTrackingSupport state, Collection<?> elements) {
         // Unlike a plain object, a collection's "own vector" (its centroid) has no @Vectorize fields of
         // its own -- it's entirely derived from elements' own vectors. So it must also recompute when
         // SummaryDirty (an element changed), not just when this collection's own membership changed
@@ -33,7 +37,7 @@ final class CollectionVectorSupport {
         return state.cachedVector();
     }
 
-    static EmbeddingVector summaryVector(DirtyTrackingSupport state, Collection<?> elements) {
+    public static EmbeddingVector summaryVector(DirtyTrackingSupport state, Collection<?> elements) {
         if (state.cachedSummaryVector() == null || state.isSummaryDirty()) {
             if (!JavAIRuntime.enterSummaryComputation(elements)) {
                 // Cycle: this collection is already being summarized further up this same call stack.
@@ -64,13 +68,13 @@ final class CollectionVectorSupport {
     }
 
     /** Call after any mutation: invalidates this collection's own caches and notifies its dependents. */
-    static void onMutated(DirtyTrackingSupport state, Object owner) {
+    public static void onMutated(DirtyTrackingSupport state, Object owner) {
         state.markFieldDirty();
         state.markSummaryDirty();
         JavAIRuntime.propagateDirty(owner);
     }
 
-    static double similarityOf(Object element, EmbeddingVector reference) {
+    public static double similarityOf(Object element, EmbeddingVector reference) {
         if (element instanceof JavAIVectorizable vectorizable) {
             return VectorMath.cosineSimilarity(vectorizable.vector(), reference);
         }

@@ -8,14 +8,17 @@ import java.util.List;
  * {@code centroid()}/{@code sortByCosineDistance()} are built from. Not part of the public
  * {@link JavAIVectorizable} contract -- a plain utility shared by {@link JavAIRuntime} and the
  * concrete collection types.
+ *
+ * <p>Public because {@code javai-collections} (e.g. {@code KnowledgeGraph}'s {@code similarityTo()})
+ * reuses {@link #cosineSimilarity} directly rather than re-deriving it.
  */
-final class VectorMath {
+public final class VectorMath {
 
     private VectorMath() {
     }
 
     /** L2-normalizes {@code values} in place; leaves an all-zero vector untouched (nothing to scale by). */
-    static float[] normalize(float[] values) {
+    public static float[] normalize(float[] values) {
         double sumSquares = 0;
         for (float v : values) {
             sumSquares += (double) v * v;
@@ -32,13 +35,13 @@ final class VectorMath {
     }
 
     /** {@code target += source * weight}, element-wise. Both arrays must be the same length. */
-    static void addWeighted(float[] target, float[] source, float weight) {
+    public static void addWeighted(float[] target, float[] source, float weight) {
         for (int i = 0; i < target.length; i++) {
             target[i] += source[i] * weight;
         }
     }
 
-    static double cosineSimilarity(EmbeddingVector a, EmbeddingVector b) {
+    public static double cosineSimilarity(EmbeddingVector a, EmbeddingVector b) {
         if (a.dims() != b.dims()) {
             throw new IllegalArgumentException(
                     "Cannot compare vectors of different dimensionality: " + a.dims() + " vs " + b.dims());
@@ -58,7 +61,7 @@ final class VectorMath {
     }
 
     /** Mean vector of {@code vectors}, treating the whole collection as one point. */
-    static EmbeddingVector centroid(List<EmbeddingVector> vectors) {
+    public static EmbeddingVector centroid(List<EmbeddingVector> vectors) {
         if (vectors.isEmpty()) {
             throw new IllegalStateException("Cannot compute a centroid of zero vectors");
         }

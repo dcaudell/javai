@@ -1,7 +1,12 @@
 package dev.xtrafe.javai.e2e;
 
+import dev.xtrafe.javai.collections.JavAIKnowledgeGraph;
+import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.e2e.domain.Article;
+import dev.xtrafe.javai.e2e.domain.Attachment;
+import dev.xtrafe.javai.e2e.domain.Attribution;
 import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.e2e.domain.RelatesTo;
 import dev.xtrafe.javai.runtime.EmbeddingVector;
 import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
 import dev.xtrafe.javai.runtime.JavAIList;
@@ -176,6 +181,110 @@ class ArticleGraphEmbeddingE2ETest {
     void similarityToItselfIsApproximatelyOne() {
         JavAIVectorizable articleV = vectorizable(article);
         assertEquals(1.0, articleV.similarityTo(articleV), 1e-4);
+    }
+
+    @Test
+    void inheritedVectorizeFieldSetterIsWovenAndWorksThroughAncestorTypedReference() {
+        JavAIVectorizable featuredV = vectorizable(featured);
+        JavAIDirtyTracking featuredD = dirtyTracking(featured);
+
+        EmbeddingVector before = featuredV.vector();
+        assertFalse(featuredD.isFieldDirty());
+
+        // Reference statically typed as the plain, unwoven ancestor -- Attribution -- not Comment. Java
+        // resolves instance method calls virtually against the runtime type, so this must still reach the
+        // weaver's synthesized override on Comment (author's setter is declared only on Attribution) and
+        // mark the object dirty, exactly as JavAIWeaver's own hermetic test proves in isolation.
+        Attribution featuredAsAttribution = featured;
+        featuredAsAttribution.setAuthor("alice, updated");
+        assertTrue(featuredD.isFieldDirty(),
+                "mutating an inherited @Vectorize field, even via an ancestor-typed reference, must mark FieldDirty");
+
+        EmbeddingVector after = featuredV.vector();
+        assertNotEquals(toList(before.values()), toList(after.values()),
+                "changing the inherited author field must change vector()");
+    }
+
+    @Test
+    void vectorizeIgnoredFieldNeverAffectsVectorEvenWithRealEmbeddings() {
+        JavAIVectorizable featuredV = vectorizable(featured);
+
+        featured.setInternalModerationNote("flagged: needs review");
+        EmbeddingVector first = featuredV.vector();
+
+        // Change only the ignored field, then force a recompute via the *other*, wired field -- mutating
+        // internalModerationNote alone never marks FieldDirty at all, so vector() would just return the
+        // same cached value regardless of whether the exclusion actually works, proving nothing.
+        featured.setInternalModerationNote("cleared after review");
+        featured.setText(featured.getText());
+        EmbeddingVector second = featuredV.vector();
+
+        assertEquals(toList(first.values()), toList(second.values()),
+                "an @VectorizeIgnore'd field's value must never affect vector()'s canonical text");
+    }
+
+    @Test
+    void searchVisibilityPrivateFieldBlocksTraversalIntoDraftComment() {
+        Comment draft = new Comment("dave", "unpublished draft note, should never be discoverable");
+        article.setDraftComment(draft);
+
+        JavAIVectorizable articleV = vectorizable(article);
+        JavAIList<Comment> found = articleV.query(articleV.fieldVector("body"), Comment.class);
+
+        assertEquals(3, found.size(), "draftComment must not be reachable via query() at all");
+        assertFalse(found.contains(draft),
+                "a field-level @SearchVisibility(PRIVATE) must block traversal entirely");
+    }
+
+    @Test
+    void searchVisibilityPrivateTypeBlocksMatchingButNotTraversal() {
+        Attachment attachment = new Attachment("incident-report.pdf");
+        Comment throughAttachment = new Comment("erin", "found via the attachment, not directly on the article");
+        attachment.setRelatedComment(throughAttachment);
+        article.setAttachment(attachment);
+
+        JavAIVectorizable articleV = vectorizable(article);
+        EmbeddingVector reference = articleV.fieldVector("body");
+
+        JavAIList<Attachment> attachmentMatches = articleV.query(reference, Attachment.class);
+        assertTrue(attachmentMatches.isEmpty(),
+                "a type-level @SearchVisibility(PRIVATE) class must never be returned as a query() match");
+
+        JavAIList<Comment> commentMatches = articleV.query(reference, Comment.class);
+        assertEquals(4, commentMatches.size(),
+                "featuredComment + the two listed comments + the one reachable through Attachment");
+        assertTrue(commentMatches.contains(throughAttachment),
+                "traversal must continue through a type-hidden node to reach its own descendants");
+    }
+
+    @Test
+    void knowledgeGraphNearestSubgraphRanksByRealEmbeddingSimilarity() {
+        Article cooking = new Article("Simple Weeknight Pasta Recipes",
+                "A collection of quick, easy pasta dishes you can make in under thirty minutes on a busy weeknight.");
+        Article sports = new Article("Local Team Advances to Championship Game",
+                "After a dramatic overtime victory, the local basketball team secured a spot in next week's championship.");
+
+        JavAIKnowledgeGraph<Article, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+        graph.addNode(article);
+        graph.addNode(cooking);
+        graph.addNode(sports);
+        graph.addEdge(article, cooking, new RelatesTo("published same day"));
+        graph.addEdge(article, sports, new RelatesTo("published same day"));
+
+        EmbeddingVector securityReference = vectorizable(article).vector();
+        SubgraphResult<Article, RelatesTo> nearest = graph.nearestSubgraph(securityReference, 1, 1);
+
+        assertEquals(1.0, nearest.scoreOf(article), 1e-4,
+                "the article must score ~1.0 against a reference vector taken from its own vector()");
+        assertTrue(nearest.nodes().contains(article));
+        assertEquals(0, nearest.hopsFrom(article, article));
+
+        // 1-hop expansion from the single nearest origin (the article) must pull in its structural
+        // neighbors -- graph structure, not similarity ranking, drives their inclusion here.
+        assertTrue(nearest.nodes().contains(cooking), "cooking must be reachable one hop from the article");
+        assertTrue(nearest.nodes().contains(sports), "sports must be reachable one hop from the article");
+        assertEquals(1, nearest.hopsFrom(cooking, article));
+        assertEquals(1, nearest.hopsFrom(sports, article));
     }
 
     /**

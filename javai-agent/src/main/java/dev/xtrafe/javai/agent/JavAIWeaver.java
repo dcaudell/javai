@@ -3,6 +3,7 @@ package dev.xtrafe.javai.agent;
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
+import dev.xtrafe.javai.annotations.VectorizeIgnore;
 import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
 import dev.xtrafe.javai.runtime.EmbeddingVector;
 import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
@@ -12,10 +13,12 @@ import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.agent.builder.ResettableClassFileTransformer;
 import net.bytebuddy.asm.Advice;
 import net.bytebuddy.description.field.FieldDescription;
+import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.Visibility;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.implementation.MethodCall;
+import net.bytebuddy.implementation.SuperMethodCall;
 
 import java.lang.annotation.Annotation;
 import java.lang.instrument.Instrumentation;
@@ -39,8 +42,30 @@ import static net.bytebuddy.matcher.ElementMatchers.named;
  * {@code setXxx} setter to instrument.
  *
  * <p>Supersedes the earlier spike (a single-field, fake-embedding proof that the mechanism works at all).
- * Scope still deliberately excludes: non-conventional setters, and multiple annotated fields sharing one
- * setter -- those aren't part of doc/spec/vector-core.md's contract either.
+ * Scope still deliberately excludes: non-conventional setters and multiple annotated fields sharing one
+ * setter.
+ *
+ * <p><b>{@code @Vectorize}/{@code @Summary} fields declared on a superclass</b> (the common shape: a plain,
+ * unannotated base class holding shared fields, with only the concrete leaf class carrying
+ * {@code @JavAIVectorizable}) are supported, but not by instrumenting the ancestor's setter directly --
+ * Advice can only instrument bytecode physically present in the class actually being transformed, and an
+ * inherited setter's bytecode lives in the ancestor's own class file, not this one. Instead, when the
+ * setter for such a field isn't declared on the woven class itself, this weaver synthesizes a real
+ * override -- {@code public void setXxx(T value) { super.setXxx(value); }} via {@link SuperMethodCall} --
+ * so the setter now has bytecode of its own in the transformed class, and the usual {@link Advice} wiring
+ * attaches to that exactly as it would to a genuinely-declared setter. This is ordinary Java override
+ * dispatch, not a workaround with a hole in it: because instance methods resolve virtually against the
+ * runtime type, calling {@code setXxx} on a leaf instance reaches the synthesized override even through a
+ * reference statically typed as the ancestor (an explicit cast does not defeat it). What genuinely can't be
+ * covered, and is skipped silently (same as an annotated field with no setter at all): a {@code final}
+ * ancestor setter (cannot be overridden -- a JVM-level rule, not this weaver's choice); a {@code private}
+ * ancestor setter (private methods aren't inherited in Java's model, so there is nothing to override); a
+ * package-private ancestor setter whose declaring class is in a different package than the woven class; and,
+ * regardless of any of the above, a field ever mutated by direct assignment rather than through its setter
+ * (e.g. from within the ancestor's own constructor) -- no setter call occurs there for Advice to observe,
+ * woven or not. {@link JavAIRuntime}'s read-side reflection (the {@code query()} graph walk, generic
+ * dependency wiring) has no bytecode-locality restriction to begin with and already walks the full class
+ * hierarchy directly.
  */
 public final class JavAIWeaver {
 
@@ -76,6 +101,9 @@ public final class JavAIWeaver {
 
     private static DynamicType.Builder<?> weave(DynamicType.Builder<?> builder, TypeDescription typeDescription) {
         Set<String> vectorizeFields = fieldNamesAnnotatedWith(typeDescription, Vectorize.class);
+        // @VectorizeIgnore wins over @Vectorize if a field somehow carries both -- an explicit "exclude"
+        // signal should never be silently overridden by an "include" one on the same field.
+        vectorizeFields.removeAll(fieldNamesAnnotatedWith(typeDescription, VectorizeIgnore.class));
         Set<String> summaryFields = fieldNamesAnnotatedWith(typeDescription, Summary.class);
         String vectorizeFieldsCsv = String.join(",", vectorizeFields);
         String summaryFieldsCsv = String.join(",", summaryFields);
@@ -136,11 +164,25 @@ public final class JavAIWeaver {
         for (String fieldName : annotatedFields) {
             String setterName = setterNameFor(fieldName);
             if (typeDescription.getDeclaredMethods().filter(named(setterName)).isEmpty()) {
-                // No conventional setter -- fine for a field that's only ever mutated through itself
-                // (e.g. a @Summary collection field initialized inline: elements are added via
-                // getItems().add(...), never through a setter). ConstructorExitAdvice plus the
-                // collection's own dependents-tracking already cover that case without one.
-                continue;
+                // Not declared directly on the woven class -- the field itself may still be inherited
+                // (allowed, see class javadoc) even though its setter isn't declared here. Look for a
+                // setter further up the hierarchy that this class can legally override.
+                MethodDescription.InDefinedShape inherited = findOverridableInheritedSetter(typeDescription, setterName);
+                if (inherited == null) {
+                    // Either no setter exists anywhere reachable (fine -- e.g. a @Summary collection field
+                    // mutated only via getItems().add(...), never a setter; ConstructorExitAdvice plus the
+                    // collection's own dependents-tracking already cover that case), or the nearest one
+                    // found can't legally be overridden (final/private/cross-package package-private -- see
+                    // class javadoc). Same permissive skip either way: no accessor fires for this setter,
+                    // but nothing else about the woven class is affected.
+                    continue;
+                }
+                // Synthesize `public <returnType> setXxx(<paramType> value) { super.setXxx(value); }` --
+                // ordinary override dispatch, so Advice attached below to *this* class's own copy of the
+                // method fires on every call, including through an ancestor-typed reference.
+                result = result.defineMethod(setterName, inherited.getReturnType(), Visibility.PUBLIC)
+                        .withParameters(inherited.getParameters().asTypeList())
+                        .intercept(SuperMethodCall.INSTANCE);
             }
             Class<?> advice = vectorizeFields.contains(fieldName)
                     ? VectorizeFieldSetterAdvice.class
@@ -153,10 +195,46 @@ public final class JavAIWeaver {
 
     private static Set<String> fieldNamesAnnotatedWith(TypeDescription typeDescription, Class<? extends Annotation> annotationType) {
         Set<String> names = new LinkedHashSet<>();
-        for (FieldDescription.InDefinedShape field : typeDescription.getDeclaredFields().filter(isAnnotatedWith(annotationType))) {
-            names.add(field.getName());
+        for (TypeDescription current = typeDescription; current != null && !current.represents(Object.class);
+                current = current.getSuperClass() == null ? null : current.getSuperClass().asErasure()) {
+            for (FieldDescription.InDefinedShape field : current.getDeclaredFields().filter(isAnnotatedWith(annotationType))) {
+                names.add(field.getName());
+            }
         }
         return names;
+    }
+
+    /**
+     * Walks from {@code typeDescription}'s superclass upward looking for a declared {@code setterName}
+     * method with exactly one parameter. Returns the nearest one found only if this class can legally
+     * override it (not {@code final}, not {@code private}, and not package-private in a different package);
+     * returns {@code null} if none is found, or if the nearest one found can't be overridden -- deliberately
+     * not continuing past it to search for some more distant, unrelated shadowed method.
+     */
+    private static MethodDescription.InDefinedShape findOverridableInheritedSetter(
+            TypeDescription typeDescription, String setterName) {
+        TypeDescription.Generic superClass = typeDescription.getSuperClass();
+        for (TypeDescription current = superClass == null ? null : superClass.asErasure();
+                current != null && !current.represents(Object.class);
+                current = current.getSuperClass() == null ? null : current.getSuperClass().asErasure()) {
+            for (MethodDescription.InDefinedShape candidate : current.getDeclaredMethods().filter(named(setterName))) {
+                if (candidate.isStatic() || candidate.getParameters().size() != 1) {
+                    continue;
+                }
+                return isOverridableFrom(candidate, typeDescription) ? candidate : null;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isOverridableFrom(MethodDescription.InDefinedShape method, TypeDescription subclass) {
+        if (method.isFinal() || method.isPrivate()) {
+            return false;
+        }
+        if (method.isPackagePrivate()) {
+            return method.getDeclaringType().getPackage().equals(subclass.getPackage());
+        }
+        return true;
     }
 
     private static String setterNameFor(String fieldName) {

@@ -57,6 +57,11 @@
       <artifactId>javai-agent</artifactId>
       <version>${javai.version}</version>
     </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-collections</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
 
     <dependency>
       <groupId>org.junit.jupiter</groupId>

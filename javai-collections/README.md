@@ -49,8 +49,9 @@ public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
     // they came from.
     SubgraphResult<N, E> nearestSubgraph(EmbeddingVector reference, int k, int hops);
 
-    // -- persistence-facing --
-    KnowledgeGraph<N, E> persisted(JavAIRepository<N> backing);
+    // -- persistence-facing: NOT part of the interface yet. The whitepaper's own signature is
+    // `persisted(JavAIRepository<N> backing)`, but JavAIRepository belongs to Persistence Bridge
+    // (javai-persistence), which depends on this module, not the reverse -- see package-info.
 }
 
 // What nearestSubgraph() actually returns. Because it extends
@@ -84,18 +85,42 @@ JavAIList<Article> ranked = narrowed.sortByCosineDistance(queryVector);
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `JavAIGraphNode` / `JavAIEdge` | Interfaces (this module) | Native graph node/edge contract for `KnowledgeGraph` participants |
-| `@JavAIGraphNode` / `@JavAIEdge` | Annotations (`javai-annotations`, class/record) | Declares knowledge-graph participation — same name as the interface it causes to be implemented |
+| `JavAIGraphNode` / `JavAIEdge` | Interfaces (this module) | Native graph node/edge contract for `KnowledgeGraph` participants -- **declare directly**, e.g. `class Article implements JavAIGraphNode`; see below |
+| `@JavAIGraphNode` / `@JavAIEdge` | Annotations (`javai-annotations`, class/record) | Documentation/intent-signaling only -- **not woven**, carries no runtime behavior |
+
+### Why `@JavAIGraphNode`/`@JavAIEdge` are never woven
+
+Two independent reasons, either one sufficient on its own:
+
+1. **Both interfaces are empty markers.** Weaving exists to save hand-writing method bodies
+   (`@JavAIVectorizable` implements a dozen-plus real methods this way); an interface with zero methods
+   has no bodies to save. `class Article implements JavAIGraphNode` costs exactly what
+   `@JavAIGraphNode class Article` would, with none of the ByteBuddy machinery behind it.
+2. **Weaving them would need `javai-agent` to depend on `javai-collections`**, to reference these
+   interfaces for `.implement(...)`. That's backwards from the documented build order (`javai-agent`
+   depends only on `javai-annotations` + `javai-runtime`; this module depends on `javai-runtime`, which in
+   turn assumes `javai-agent`'s weaving already works). The only way around it would be relocating
+   `JavAIGraphNode`/`JavAIEdge` into `javai-runtime`, mirroring `JavAIList`/`Set`/`Map`'s own placement
+   precedent above -- pure churn for annotations that don't need it.
 
 ## Which one do I reach for?
 
 See whitepaper §6.7 for the full comparison table (`JavAIList` vs. `VectorIndex` vs. `KnowledgeGraph` vs. a
-JPA-style repository query) — reproduce it here once the types below actually have implementations to
-document.
+JPA-style repository query).
 
 ## What's actually implemented
 
-`JavAIGraphNode` and `JavAIEdge` exist as real, empty marker interfaces. `KnowledgeGraph`, `SubgraphResult`,
-and `VectorIndex` are not written yet — only specified above and in `doc/spec/vector-collections.md`.
-`DependencyWiringTest` proves the classpath (this module + `javai-runtime`, including the `JavAIList`
-relocation) resolves correctly; it doesn't exercise any graph logic.
+`JavAIGraphNode`/`JavAIEdge` (empty marker interfaces, declared directly, never woven -- see above).
+`VectorIndex`/`JavAIVectorIndex` (hand-written, reuses `javai-runtime`'s `CollectionVectorSupport`).
+`KnowledgeGraph`/`SubgraphResult` via `JavAIKnowledgeGraph`/`JavAIKnowledgeSubgraphResult` (hand-written,
+not woven -- concrete, user-instantiated containers like `javai-runtime`'s `JavAIArrayList`): `addNode`/
+`addEdge`/`nodes`/`edges`/`neighbors`/`match` for construction and pattern-match traversal,
+`nearestSubgraph` for the hybrid similarity + hop-expansion query (BFS from each of the k nearest nodes,
+tracking per-origin hop counts for `hopsFrom`), `vector()`/`summaryVector()` over the graph's own nodes
+(reusing `CollectionVectorSupport`, same as `JavAIArrayList`), and dependents wiring so mutating a node
+propagates dirty up through the graph. `SubgraphResult` gets "narrow again" for free by extending
+`JavAIKnowledgeGraph` rather than reimplementing it. All covered by hermetic tests (`JavAIVectorIndexTest`,
+`JavAIKnowledgeGraphTest`) using a fake embedding provider, no Docker required.
+
+`persisted(JavAIRepository<N> backing)` is not part of the interface yet -- see the code excerpt above and
+package-info for why.

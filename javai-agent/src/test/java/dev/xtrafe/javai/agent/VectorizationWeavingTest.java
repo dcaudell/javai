@@ -3,7 +3,10 @@ package dev.xtrafe.javai.agent;
 import dev.xtrafe.javai.agent.fixtures.CyclicWidget;
 import dev.xtrafe.javai.agent.fixtures.GraphChild;
 import dev.xtrafe.javai.agent.fixtures.GraphContainer;
+import dev.xtrafe.javai.agent.fixtures.InheritedVectorizeBase;
+import dev.xtrafe.javai.agent.fixtures.InheritedVectorizeLeaf;
 import dev.xtrafe.javai.agent.fixtures.VectorizableWidget;
+import dev.xtrafe.javai.agent.fixtures.VectorizeIgnoreWidget;
 import dev.xtrafe.javai.runtime.EmbeddingVector;
 import dev.xtrafe.javai.runtime.JavAIRuntime;
 import net.bytebuddy.agent.ByteBuddyAgent;
@@ -22,9 +25,11 @@ import java.lang.reflect.Method;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -163,6 +168,69 @@ class VectorizationWeavingTest {
         // If propagateDirty() didn't stop at an already-dirty node, this call would already have hung.
         assertTrue((boolean) isSummaryDirty.invoke(a), "propagation must walk the cycle back around to a");
         assertTrue((boolean) isSummaryDirty.invoke(b), "propagation must reach b, a's direct dependent");
+    }
+
+    @Test
+    void vectorizeIgnoreWinsOverVectorizeOnTheSameField() throws Exception {
+        ClassLoader loader = loadFixtures(VectorizeIgnoreWidget.class);
+        Class<?> widgetClass = loader.loadClass(VectorizeIgnoreWidget.class.getName());
+        Object widget = widgetClass.getDeclaredConstructor().newInstance();
+
+        Method setIncluded = widgetClass.getMethod("setIncluded", String.class);
+        Method setExcluded = widgetClass.getMethod("setExcluded", String.class);
+        Method vector = widgetClass.getMethod("vector");
+
+        // No accessor is even synthesized for an ignored field -- the weaver never discovered it as
+        // @Vectorize in the first place.
+        assertThrows(NoSuchMethodException.class, () -> widgetClass.getMethod("excludedVector"));
+
+        setIncluded.invoke(widget, "included text");
+        setExcluded.invoke(widget, "excluded text, version one");
+        EmbeddingVector first = (EmbeddingVector) vector.invoke(widget);
+
+        // Change only the ignored field's value, then force a recompute via the *other*, wired setter
+        // (setExcluded alone wouldn't mark FieldDirty at all, so vector() would just return the same
+        // cached value regardless of whether exclusion actually works -- that would prove nothing).
+        setExcluded.invoke(widget, "excluded text, version two");
+        setIncluded.invoke(widget, "included text");
+        EmbeddingVector second = (EmbeddingVector) vector.invoke(widget);
+
+        assertArrayEquals(first.values(), second.values(),
+                "an @VectorizeIgnore'd field's value must never affect vector()'s canonical text");
+    }
+
+    @Test
+    void inheritedVectorizeFieldSetterIsWovenViaSynthesizedOverride() throws Exception {
+        ClassLoader loader = loadFixtures(InheritedVectorizeBase.class, InheritedVectorizeLeaf.class);
+        Class<?> baseClass = loader.loadClass(InheritedVectorizeBase.class.getName());
+        Class<?> leafClass = loader.loadClass(InheritedVectorizeLeaf.class.getName());
+        Object leaf = leafClass.getDeclaredConstructor().newInstance();
+
+        // Reflected off the *ancestor* class token, not the leaf's -- stands in for calling setLabel(...)
+        // through a reference statically typed as InheritedVectorizeBase (an explicit cast) in ordinary
+        // Java code. Method.invoke dispatches virtually on the receiver's runtime type just like invokevirtual
+        // does, so this must still land on the leaf's synthesized override.
+        Method setLabelViaBaseReference = baseClass.getMethod("setLabel", String.class);
+        Method setDetail = leafClass.getMethod("setDetail", String.class);
+        Method vector = leafClass.getMethod("vector");
+        Method isFieldDirty = leafClass.getMethod("isFieldDirty");
+
+        setLabelViaBaseReference.invoke(leaf, "first label");
+        setDetail.invoke(leaf, "first detail");
+        assertTrue((boolean) isFieldDirty.invoke(leaf),
+                "mutating an inherited @Vectorize field's setter must mark FieldDirty");
+
+        EmbeddingVector first = (EmbeddingVector) vector.invoke(leaf);
+        assertFalse((boolean) isFieldDirty.invoke(leaf), "reading vector() must clear FieldDirty");
+
+        // Mutate only the inherited field -- proves the synthesized override, not some coincidental effect
+        // of also touching the leaf's own field.
+        setLabelViaBaseReference.invoke(leaf, "second label");
+        assertTrue((boolean) isFieldDirty.invoke(leaf),
+                "mutating the inherited field via the ancestor's own Method token must still mark FieldDirty");
+
+        EmbeddingVector second = (EmbeddingVector) vector.invoke(leaf);
+        assertNotEquals(first, second, "changing the inherited field's value must change vector()");
     }
 
     private static ClassLoader loadFixtures(Class<?>... fixtureClasses) throws IOException {
