@@ -1,0 +1,2 @@
+- Executive oversight via AOP cutpoints
+- Add recursive MCP microservice fabric to the whitepaper. 

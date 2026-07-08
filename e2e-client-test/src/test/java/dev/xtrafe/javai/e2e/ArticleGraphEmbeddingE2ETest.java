@@ -1,0 +1,211 @@
+package dev.xtrafe.javai.e2e;
+
+import dev.xtrafe.javai.e2e.domain.Article;
+import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.runtime.EmbeddingVector;
+import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
+import dev.xtrafe.javai.runtime.JavAIList;
+import dev.xtrafe.javai.runtime.JavAIRuntime;
+import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import java.io.IOException;
+import java.net.URI;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Real end-to-end proof, not a hermetic one: a genuine object graph (a single {@code @Summary}
+ * reference plus a {@code @Summary} collection), real embeddings from a live container (not
+ * {@code javai-runtime}/{@code javai-agent}'s own fake providers), and client code that never writes
+ * {@code implements JavAIVectorizable} by hand -- {@code Article}/{@code Comment} are plain annotated
+ * classes, built with plain {@code new}. Phase 0 has no real compiler yet (that's {@code javaic},
+ * Phase 1+), so there's no compile-time-checked {@code article.vector()} call the way the whitepaper's own
+ * examples show -- this test calls through the woven-in {@code JavAIVectorizable}/{@code JavAIDirtyTracking}
+ * interfaces instead, which the weaver makes every annotated class genuinely implement at load time. That
+ * cast is the one honest concession to "no compiler yet"; everything else is exactly what it will look
+ * like once {@code javaic} exists.
+ *
+ * <p>Domain mirrors doc/spec/end-to-end-example.md's own Article/Comment worked example. Requires Docker;
+ * first run pulls an image and downloads the model (slow, one-time) -- see README.md.
+ *
+ * <p><b>Which container and provider actually get used is decided once, by {@link LocalEmbeddingDefaults}</b>
+ * -- Ollama on macOS, TEI (the whitepaper's Phase 0 default, §4.5.2) on Linux/Windows -- both against the
+ * same reference model, {@code Qwen/Qwen3-Embedding-0.6B} (§4.5.1). See that class's javadoc and
+ * doc/spec/vector-core.md's "Provider selection across platforms" section for why: TEI's Candle backend
+ * has a confirmed, unresolved upstream bug running this model on CPU. This test itself has no
+ * platform-specific logic at all -- it just asks {@code LocalEmbeddingDefaults} what to do.
+ *
+ * <p>The weaver itself is installed by {@link JavAIWeavingLauncherSessionListener}, not here -- see that
+ * class's javadoc for why {@code @BeforeAll} turned out not to be early enough.
+ */
+@Testcontainers
+class ArticleGraphEmbeddingE2ETest {
+
+    private static final int EXPECTED_DIMS = 1024; // Qwen3-Embedding-0.6B's output dimensionality, either backend
+
+    @Container
+    static final GenericContainer<?> embeddings = createEmbeddingsContainer();
+
+    private static GenericContainer<?> createEmbeddingsContainer() {
+        GenericContainer<?> container = new GenericContainer<>(DockerImageName.parse(LocalEmbeddingDefaults.dockerImage()))
+                .withExposedPorts(LocalEmbeddingDefaults.containerPort())
+                .waitingFor(Wait.forHttp(LocalEmbeddingDefaults.healthCheckPath())
+                        .forStatusCode(200)
+                        .withStartupTimeout(Duration.ofMinutes(10)));
+        if (!LocalEmbeddingDefaults.preferOllama()) {
+            // TEI fetches the model as part of its own startup/health-check, via this CLI flag. Ollama's
+            // image has no startup-time-model-fetch equivalent -- see configureRealProvider() below.
+            container = container.withCommand("--model-id", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
+        }
+        return container;
+    }
+
+    @BeforeAll
+    static void configureRealProvider() throws IOException, InterruptedException {
+        if (LocalEmbeddingDefaults.preferOllama()) {
+            embeddings.execInContainer("ollama", "pull", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
+        }
+
+        String endpoint = "http://" + embeddings.getHost() + ":"
+                + embeddings.getMappedPort(LocalEmbeddingDefaults.containerPort());
+        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(URI.create(endpoint)));
+    }
+
+    private Article article;
+    private Comment featured;
+    private Comment firstListedComment;
+    private Comment secondListedComment;
+
+    @BeforeEach
+    void buildGraph() {
+        article = new Article(
+                "Zero-day disclosed in widely used TLS library",
+                "Researchers today disclosed a critical vulnerability affecting a widely used open-source "
+                        + "TLS implementation, prompting an emergency patch cycle across the industry.");
+
+        featured = new Comment("alice", "This is going to be a nightmare for the supply chain.");
+        article.setFeaturedComment(featured);
+
+        firstListedComment = new Comment("bob", "Already seeing scanners probing for this in the wild.");
+        secondListedComment = new Comment("carol", "Our vendor still hasn't shipped a fix.");
+        article.getComments().add(firstListedComment);
+        article.getComments().add(secondListedComment);
+    }
+
+    @Test
+    void fieldVectorsAreRealAndDistinct() {
+        JavAIVectorizable articleV = vectorizable(article);
+        EmbeddingVector title = articleV.fieldVector("title");
+        EmbeddingVector body = articleV.fieldVector("body");
+
+        assertEquals(EXPECTED_DIMS, title.dims());
+        assertEquals(EXPECTED_DIMS, body.dims());
+        assertEquals(LocalEmbeddingDefaults.modelLabel(), title.modelId());
+        assertTrue(containsNonZero(title.values()), "a real embedding should not be all zeros");
+        assertNotEquals(toList(title.values()), toList(body.values()),
+                "title and body have different text, so must embed to different vectors");
+    }
+
+    @Test
+    void vectorLifecycleIsLazyAndReflectsMutation() {
+        JavAIVectorizable articleV = vectorizable(article);
+        JavAIDirtyTracking articleD = dirtyTracking(article);
+
+        assertTrue(articleD.isFieldDirty(), "never-read object starts dirty");
+        EmbeddingVector before = articleV.vector();
+        assertFalse(articleD.isFieldDirty(), "reading vector() must clear FieldDirty");
+
+        EmbeddingVector reread = articleV.vector();
+        assertEquals(before, reread, "a repeat clean read must return the cached vector, not recompute");
+
+        article.setTitle("Zero-day disclosed in widely used TLS library -- UPDATED");
+        assertTrue(articleD.isFieldDirty(), "mutating a @Vectorize field must mark FieldDirty");
+
+        EmbeddingVector after = articleV.vector();
+        assertNotEquals(toList(before.values()), toList(after.values()), "a changed field must change vector()");
+    }
+
+    @Test
+    void summaryVectorPropagatesThroughSingleReferenceAndCollection() {
+        JavAIVectorizable articleV = vectorizable(article);
+        JavAIDirtyTracking articleD = dirtyTracking(article);
+
+        EmbeddingVector initial = articleV.summaryVector();
+        assertFalse(articleD.isSummaryDirty());
+
+        featured.setText("Updated: this is worse than we first thought.");
+        assertTrue(articleD.isSummaryDirty(),
+                "mutating the single @Summary reference (featuredComment) must propagate to the article");
+        EmbeddingVector afterFeaturedMutation = articleV.summaryVector();
+        assertNotEquals(toList(initial.values()), toList(afterFeaturedMutation.values()));
+
+        secondListedComment.setText("Update: our vendor shipped a fix an hour ago.");
+        assertTrue(articleD.isSummaryDirty(),
+                "mutating a comment inside the @Summary collection must also propagate to the article");
+        EmbeddingVector afterCollectionMutation = articleV.summaryVector();
+        assertNotEquals(toList(afterFeaturedMutation.values()), toList(afterCollectionMutation.values()));
+    }
+
+    @Test
+    void queryFindsAllCommentsReachableFromTheArticle() {
+        JavAIVectorizable articleV = vectorizable(article);
+        JavAIList<Comment> found = articleV.query(articleV.fieldVector("body"), Comment.class);
+
+        assertEquals(3, found.size(), "featuredComment + the two comments in the list");
+        assertTrue(found.contains(featured));
+        assertTrue(found.contains(firstListedComment));
+        assertTrue(found.contains(secondListedComment));
+    }
+
+    @Test
+    void similarityToItselfIsApproximatelyOne() {
+        JavAIVectorizable articleV = vectorizable(article);
+        assertEquals(1.0, articleV.similarityTo(articleV), 1e-4);
+    }
+
+    /**
+     * Every {@code @JavAIVectorizable} class genuinely implements this interface once woven -- this cast
+     * always succeeds at runtime. Only needed because Phase 0 has no real compiler to make the call sites
+     * above type-check without it; see the class javadoc.
+     */
+    private static JavAIVectorizable vectorizable(Object woven) {
+        return (JavAIVectorizable) woven;
+    }
+
+    private static JavAIDirtyTracking dirtyTracking(Object woven) {
+        return (JavAIDirtyTracking) woven;
+    }
+
+    private static boolean containsNonZero(float[] values) {
+        for (float value : values) {
+            if (value != 0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Compares by value, not by reference/timestamp -- {@code EmbeddingVector} carries a computedAt. */
+    private static List<Float> toList(float[] values) {
+        List<Float> list = new ArrayList<>(values.length);
+        for (float value : values) {
+            list.add(value);
+        }
+        return list;
+    }
+}

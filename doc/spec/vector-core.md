@@ -178,3 +178,49 @@ Object vector vs. summary vector vs. field vector, and subgraph querying, are de
 the whitepaper §6.1–§6.4 and Appendix A. Reproduce those as integration tests once `javai-runtime` and
 `javai-collections` both exist — they're written as a coherent story (an `Article`/`Comment` domain) and
 translate directly into test fixtures.
+
+## Provider selection across platforms (discovered building the E2E test, not in the whitepaper)
+
+`javai-runtime` ships two real `JavAIEmbeddingProvider` implementations, not one:
+
+| Implementation | Backend | Status |
+|---|---|---|
+| `TextEmbeddingsInferenceProvider` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
+| `OllamaEmbeddingProvider` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+
+The reason a second implementation exists at all: TEI's Candle backend has a confirmed, unresolved upstream
+bug running the reference model, `Qwen/Qwen3-Embedding-0.6B` (§4.5.1), on CPU — "Intel MKL ERROR: Parameter
+8 was incorrect on entry to SGEMM" — reported on native x86_64/AMD hardware, not only under emulation (see
+[huggingface/text-embeddings-inference#667](https://github.com/huggingface/text-embeddings-inference/issues/667)
+and [#636](https://github.com/huggingface/text-embeddings-inference/issues/636); no upstream fix as of this
+writing). It reproduces reliably on macOS, where Apple Silicon additionally needs x86_64 emulation to run
+TEI's `cpu-1.9` image at all (it has no arm64 build). A separately-suggested fix,
+`attn_implementation="eager"`, does **not** apply: that addresses a different bug (NaN output from
+PyTorch's SDPA kernel on macOS) in a different stack (loading the model directly via
+`transformers`/`sentence-transformers` in Python) — TEI is an independent Rust reimplementation that never
+touches PyTorch's attention-kernel selection.
+
+Ollama runs the same reference model through a genuinely different stack, unaffected by TEI's bug, on an
+image that's natively arm64 (confirmed via `docker image inspect` — no x86_64 emulation on Apple Silicon at
+all). This is exactly the "swapping the embedding provider entirely... is a configuration key, not a code
+change" flexibility this SPI is designed for (§4.5.4) — applied one level down, to work around a specific
+backend's bug rather than to change models or vendors.
+
+**`dev.xtrafe.javai.runtime.LocalEmbeddingDefaults`** is the one place this decision is made, so it can't
+drift between "which provider class gets constructed" and "which container actually gets started":
+
+- Defaults to Ollama on macOS, TEI everywhere else (Linux, Windows, unrecognized) — matching the
+  whitepaper on every platform except the one with a confirmed bug.
+- Overridable via the `javai.embedding.provider` system property (`ollama` or `tei`) — e.g. an Intel Mac
+  that wants to try TEI, or a Linux box that wants Ollama for consistency with a Mac dev fleet.
+- Exposes everything a caller needs to both start the right container (`dockerImage()`, `containerPort()`,
+  `healthCheckPath()`, `modelIdentifierForContainerStartup()`) and construct the matching provider against
+  it (`create(URI)`, `modelLabel()` for the `EmbeddingVector.modelId()` it will produce).
+
+`e2e-client-test`'s `ArticleGraphEmbeddingE2ETest` is built entirely on top of this — it has no
+platform-specific logic of its own, just asks `LocalEmbeddingDefaults` what to do. Verified end to end on
+macOS (Ollama path, all 5 assertions passing against real 1024-dim embeddings); the TEI/Linux/Windows path
+is exercised by the same test code but has not been separately run on those platforms yet — it reuses the
+TEI wiring already proven correct in an earlier version of this test (against a different model, before the
+Qwen3/Candle bug was tracked down), so nothing about the container startup or HTTP contract is new or
+unverified, only the specific model being requested.

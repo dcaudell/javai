@@ -1,8 +1,10 @@
 /**
- * Vector Core: {@link EmbeddingVector}, {@link JavAIVectorizable}, the dirty-state
- * propagation engine (not yet implemented -- see the object lifecycle state machine in
- * doc/spec/vector-core.md), {@code query()}, a CPU reference similarity backend, and a
- * default embedding provider.
+ * Vector Core: {@link EmbeddingVector}, {@link JavAIVectorizable}, the dirty-state propagation engine
+ * ({@link JavAIRuntime}, {@link JavAIDirtyTracking}, {@link DirtyTrackingSupport} -- see the object
+ * lifecycle state machine in doc/spec/vector-core.md), the reflection-based {@code query()} graph walk,
+ * a CPU cosine-similarity backend ({@link VectorMath}), and a real embedding provider
+ * ({@link JavAIEmbeddingProvider}, {@link TextEmbeddingsInferenceProvider} against the {@code docker/}
+ * TEI sidecar).
  *
  * <p><b>Module-placement note:</b> {@link JavAISortable}, {@link JavAIList},
  * {@link JavAISet}, and {@link JavAIMap} live here rather than in javai-collections,

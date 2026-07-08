@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    Deliberately standalone: no parent POM, and not listed in the root pom.xml's modules. This is
+    downstream client code exercising JavAI Extensions as a published dependency, not one of the six
+    Phase 0 reactor components SPEC.md describes. Run `mvn install` from the repo root first so
+    dev.xtrafe.javai:javai-{annotations,runtime,agent}:0.1.0-SNAPSHOT are in the local repository;
+    see README.md.
+  -->
+  <groupId>dev.xtrafe.javai.e2e</groupId>
+  <artifactId>e2e-client-test</artifactId>
+  <version>0.1.0-SNAPSHOT</version>
+  <packaging>jar</packaging>
+
+  <name>JavAI Extensions -- End-to-End Client Test</name>
+  <description>
+    Standalone client project proving JavAI Extensions end to end: a real object graph (references and
+    collections), real per-field/local/summary vectors, real embeddings from the Docker text-embeddings-
+    inference container -- not a fake/hermetic provider. See README.md.
+  </description>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <javai.version>0.1.0-SNAPSHOT</javai.version>
+    <junit.version>5.11.0</junit.version>
+    <testcontainers.version>1.21.4</testcontainers.version>
+
+    <!--
+      Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
+      unset (falls back to host-OS detection), but an *absent* Maven property would make
+      ${javai.embedding.provider} below resolve to the literal string "${javai.embedding.provider}"
+      instead of interpolating to nothing. Override with `mvn test -Djavai.embedding.provider=ollama`
+      (or `tei`) to force a choice regardless of host OS.
+    -->
+    <javai.embedding.provider></javai.embedding.provider>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-annotations</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-runtime</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-agent</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- For JavAIWeavingLauncherSessionListener: needs to install the weaver before JUnit's own
+           test discovery reflectively touches (and thereby unwovenly loads) the domain classes. -->
+      <groupId>org.junit.platform</groupId>
+      <artifactId>junit-platform-launcher</artifactId>
+      <version>1.11.0</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <version>${testcontainers.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${testcontainers.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <!--
+            ByteBuddyAgent.install() self-attaches to this JVM to weave the domain classes below;
+            disabled by default since JDK 9. Also give the first run generous room: TEI has to pull its
+            image and download the model before the container's health check passes.
+          -->
+          <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+          <forkedProcessTimeoutInSeconds>600</forkedProcessTimeoutInSeconds>
+          <!--
+            Surefire does not forward -D properties from the `mvn` command line into the forked test JVM
+            on its own; this is what actually makes `-Djavai.embedding.provider=...` reach
+            LocalEmbeddingDefaults.
+          -->
+          <systemPropertyVariables>
+            <javai.embedding.provider>${javai.embedding.provider}</javai.embedding.provider>
+          </systemPropertyVariables>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
