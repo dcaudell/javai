@@ -177,11 +177,7 @@ class PersistenceE2ETest {
     /**
      * {@code relatedComments} (a {@code JavAILinkedHashMap<String, Comment>}, not {@code @Summary} -- see
      * {@code Article}'s own javadoc) round-trips through the same {@code javai_collection_members} table as
-     * {@code comments}, this time with {@code member_key} populated. Deliberately Postgres-only: Neo4j's
-     * relationship hydration doesn't yet handle {@code Map}-typed fields correctly (a real, separate gap --
-     * see this project's own tracked follow-up), so no Neo4j test ever populates this field, keeping
-     * {@code neo4jFullObjectGraphRoundTrips} etc. safely unaffected (Neo4j's hydration short-circuits
-     * cleanly when there are zero relationships of a given type).
+     * {@code comments}, this time with {@code member_key} populated.
      */
     @Test
     void postgresJavAILinkedHashMapFieldRoundTrips() {
@@ -191,6 +187,27 @@ class PersistenceE2ETest {
 
         Article saved = postgresRepository.save(article);
         Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getRelatedComments().size());
+        assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
+        assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+    }
+
+    /**
+     * Same as {@link #postgresJavAILinkedHashMapFieldRoundTrips()}, against Neo4j: each map entry becomes a
+     * relationship with the original key stored as a {@code mapKey} relationship property, read back on
+     * hydration to reconstruct {@code relatedComments} with both keys and values intact -- proves the fix
+     * for a real, confirmed gap (Neo4j's relationship hydration used to only handle {@code Collection}-typed
+     * fields, and never persisted map keys at all; see {@code Neo4jRepositoryBackend}'s own javadoc).
+     */
+    @Test
+    void neo4jJavAILinkedHashMapFieldRoundTrips() {
+        Article article = newArticle("Map field test (Neo4j)", "Body text for the map field test.");
+        article.getRelatedComments().put("first", new Comment("erin", "first related comment"));
+        article.getRelatedComments().put("second", new Comment("frank", "second related comment"));
+
+        Article saved = neo4jRepository.save(article);
+        Article reloaded = neo4jRepository.findById(saved.getId()).orElseThrow();
 
         assertEquals(2, reloaded.getRelatedComments().size());
         assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());

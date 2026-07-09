@@ -134,10 +134,14 @@ for any other key type -- silently storing a stringified key that could never co
 its original type would be a much worse outcome than an immediate, explicit error.
 
 **Neo4j doesn't need any of this ceremony removal** -- its own reflective relationship mapping has no
-`PersistentBag`-equivalent substitution problem to begin with. It does, however, have a real, separate,
-currently-tracked gap of its own: relationship hydration only handles `Collection`-typed fields correctly
-today, not `Map`-typed ones, and map keys aren't persisted as relationship properties at all yet -- so a
-`JavAILinkedHashMap` field works on Postgres but not yet on Neo4j.
+`PersistentBag`-equivalent substitution problem to begin with, so there was never an `@Transient`/proxy
+conflict to automate away there. It does have the same `Map`-key limitation as Postgres, for an analogous
+reason: a `Map`-typed relationship field creates one relationship per entry, with the original key stored as
+a `mapKey` property on the relationship itself (not the target node, which may be reachable through more
+than one owner/key) -- `K` must be `String`, validated eagerly at `registerEntityType` time, for the same
+"don't silently store a key that can never round-trip back" reason as the Postgres side. A `JavAILinkedHashMap`
+field works on both backends as of this pass -- `Neo4jRepositoryBackendTest.mapFieldRoundTripsWithKeysPreserved`
+and `HibernatePostgresRepositoryBackendTest`/e2e's own Postgres map test both prove it.
 
 **Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
 Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
@@ -218,8 +222,12 @@ never sees in source.
 - Arbitrary Spring-Data-style derived queries (`findByTitle` and friends) -- only the `findNearestBy*`
   family above is supported, and anything else fails fast, with a clear message, at repository-creation
   time.
-- `JavAILinkedHashMap` fields with a non-`String` key type (Postgres) or any populated `Map`-typed field at
-  all (Neo4j) -- see "Collections" above.
+- `JavAILinkedHashMap`/any `Map` relationship field with a non-`String` key type, on either backend -- see
+  "Collections" above.
+- Neo4j's `registerEntityType` doesn't (yet) recursively auto-register related entity types reachable
+  through a field the way the Postgres backend now does -- a related type still needs its own
+  `JavAIPI.repository(...)` call made first (see `Neo4jRepositoryBackendTest`'s own test fixtures for the
+  pattern this implies today).
 - The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
   not started.
 

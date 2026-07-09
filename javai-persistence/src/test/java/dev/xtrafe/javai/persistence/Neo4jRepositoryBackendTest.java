@@ -192,4 +192,31 @@ class Neo4jRepositoryBackendTest {
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
     }
+
+    /**
+     * Proves the fix for a real, previously-confirmed gap: {@code hydrateRelationshipField} used to only
+     * handle {@code Collection}-typed relationship fields, and {@code saveNode} never persisted a
+     * {@code Map} field's keys at all -- so a {@code Map}-typed field couldn't correctly round-trip through
+     * Neo4j (it would either throw trying to assign a related node directly into a {@code Map}-typed field
+     * slot, or -- before that fix -- have no way to know what key to reconstruct it under even if hydration
+     * were fixed in isolation). {@code TestArticleWithTags.tagsByCode} is a real
+     * {@code Map<String, TestTag>}, not a {@code Collection}; both entries' keys must survive the round trip
+     * exactly, not just their values.
+     */
+    @Test
+    void mapFieldRoundTripsWithKeysPreserved() {
+        JavAIPI.repository(TestTagRepository.class);
+        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class);
+
+        TestArticleWithTags article = new TestArticleWithTags("Map field test");
+        article.getTagsByCode().put("first", new TestTag("alpha"));
+        article.getTagsByCode().put("second", new TestTag("beta"));
+
+        TestArticleWithTags saved = repository.save(article);
+        TestArticleWithTags reloaded = repository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getTagsByCode().size());
+        assertEquals("alpha", reloaded.getTagsByCode().get("first").getLabel());
+        assertEquals("beta", reloaded.getTagsByCode().get("second").getLabel());
+    }
 }

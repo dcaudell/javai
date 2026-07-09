@@ -14,6 +14,8 @@ import org.neo4j.driver.Values;
 import org.neo4j.driver.types.Node;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -52,6 +54,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * contributing) and still needs a real relationship to round-trip through Neo4j at all -- conflating the
  * two would mean choosing between correct persistence and correct in-memory summary-vector semantics.
  *
+ * <p><b>{@code Map} fields round-trip their keys too, via a relationship property.</b> A {@code Map<K, V>}
+ * relationship field creates one relationship per entry, with the map key (stringified) stored as a
+ * {@code mapKey} property on the relationship itself -- not on the target node, which may be reachable
+ * through more than one owner/key. Hydration reads that property back and reconstructs the original map
+ * ({@link #hydrateRelationshipField}), rather than only being able to correctly hydrate {@code Collection}
+ * fields. {@code K} must be {@code String}; {@link #registerEntityType} validates this eagerly and throws a
+ * clear {@code IllegalArgumentException} for any other key type, rather than silently storing a stringified
+ * key that could never correctly round-trip back to its original type.
+ *
  * <p><b>One property (and one vector index) per model, not one shared property.</b> {@code <model>} is
  * {@link ModelIds#sanitize} applied to {@code EmbeddingVector.modelId()} -- the same scheme
  * {@code HibernatePostgresRepositoryBackend} uses for its per-model tables, and for the same reason: two
@@ -83,7 +94,39 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         // traversal, where the target's Java type isn't otherwise known. Same "register everything you
         // need before using it" rule as the Postgres backend: a related entity type has to have its own
         // repository() call made at some point before traversal-hydration needs to resolve its label.
+        validateMapKeyTypesAreSupported(entityType);
         typesByLabel.put(label(entityType), entityType);
+    }
+
+    /** Fails fast, at registration time, for a {@code Map} relationship field keyed by anything other than
+     *  {@code String} -- the relationship's {@code mapKey} property is a plain string (see
+     *  {@link #saveRelationship}), so a stringified non-{@code String} key could never correctly round-trip
+     *  back to its original type on hydration. Mirrors {@code HibernatePostgresRepositoryBackend}'s own
+     *  identical limitation/validation for the same reason. */
+    private static void validateMapKeyTypesAreSupported(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (!Map.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            Class<?> keyType = genericTypeArgument(field, 0);
+            if (keyType != String.class) {
+                throw new IllegalArgumentException("Neo4j persistence only supports String-keyed map fields -- "
+                        + entityType.getName() + "." + field.getName() + " is keyed by "
+                        + (keyType == null ? "an unresolvable type" : keyType.getName()));
+            }
+        }
+    }
+
+    /** {@code field}'s {@code index}-th generic type argument as a raw {@code Class}, or {@code null} if
+     *  the field isn't parameterized or that argument isn't a simple class. */
+    private static Class<?> genericTypeArgument(Field field, int index) {
+        if (field.getGenericType() instanceof ParameterizedType parameterized) {
+            Type[] args = parameterized.getActualTypeArguments();
+            if (index < args.length && args[index] instanceof Class<?> clazz) {
+                return clazz;
+            }
+        }
+        return null;
     }
 
     @Override
@@ -264,27 +307,32 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
             Object value = EntityReflection.readField(entity, fieldName);
             String relationshipType = relationshipType(fieldName);
             if (value instanceof Map<?, ?> map) {
-                for (Object element : map.values()) {
-                    saveRelationship(tx, label, id, element, relationshipType, alreadySaved);
+                for (Map.Entry<?, ?> mapEntry : map.entrySet()) {
+                    saveRelationship(tx, label, id, mapEntry.getValue(), relationshipType, alreadySaved,
+                            String.valueOf(mapEntry.getKey()));
                 }
             } else if (value instanceof Iterable<?> iterable) {
                 for (Object element : iterable) {
-                    saveRelationship(tx, label, id, element, relationshipType, alreadySaved);
+                    saveRelationship(tx, label, id, element, relationshipType, alreadySaved, null);
                 }
             } else if (value != null) {
-                saveRelationship(tx, label, id, value, relationshipType, alreadySaved);
+                saveRelationship(tx, label, id, value, relationshipType, alreadySaved, null);
             }
         }
     }
 
+    /** {@code mapKey} is {@code null} for a singular reference or a {@code Collection} element, or the
+     *  original {@code Map} key ({@code String}-typed -- see {@link #validateMapKeyTypesAreSupported}) for
+     *  a {@code Map} value -- stored as a property on the relationship itself (not the target node, which
+     *  may be reachable through more than one owner/key) so hydration can reconstruct the original map. */
     private void saveRelationship(SimpleQueryRunner tx, String ownerLabel, UUID ownerId, Object target,
-            String relationshipType, Map<Object, UUID> alreadySaved) {
+            String relationshipType, Map<Object, UUID> alreadySaved, String mapKey) {
         saveNode(tx, target, alreadySaved); // ensures the target node exists; no-ops if already visited
         UUID targetId = EntityReflection.readId(target);
         String targetLabel = label(target.getClass());
         tx.run("MATCH (a:`" + ownerLabel + "` {id: $ownerId}), (b:`" + targetLabel + "` {id: $targetId}) "
-                + "MERGE (a)-[:`" + relationshipType + "`]->(b)",
-                Values.parameters("ownerId", ownerId.toString(), "targetId", targetId.toString()));
+                + "MERGE (a)-[r:`" + relationshipType + "`]->(b) SET r.mapKey = $mapKey",
+                Values.parameters("ownerId", ownerId.toString(), "targetId", targetId.toString(), "mapKey", mapKey));
     }
 
     // ---- read: reflective hydration back into a plain Java object graph ------------------------
@@ -321,18 +369,24 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         return entity;
     }
 
+    /** One related node reached via a relationship, plus that relationship's {@code mapKey} property
+     *  ({@code null} unless the owning field is a {@code Map}) -- see {@link #saveRelationship}. */
+    private record RelatedNode(Node node, String mapKey) {
+    }
+
     private void hydrateRelationshipField(Session session, Object owner, String fieldName, Map<UUID, Object> hydrated) {
         Field field = EntityReflection.findField(owner.getClass(), fieldName);
         UUID ownerId = EntityReflection.readId(owner);
         String ownerLabel = label(owner.getClass());
         String relationshipType = relationshipType(fieldName);
 
-        List<Node> relatedNodes = session.executeRead(tx -> {
-            var result = tx.run("MATCH (a:`" + ownerLabel + "` {id: $id})-[:`" + relationshipType + "`]->(b) RETURN b",
-                    Values.parameters("id", ownerId.toString()));
-            List<Node> found = new ArrayList<>();
+        List<RelatedNode> relatedNodes = session.executeRead(tx -> {
+            var result = tx.run("MATCH (a:`" + ownerLabel + "` {id: $id})-[r:`" + relationshipType + "`]->(b) "
+                    + "RETURN b, r.mapKey AS mapKey", Values.parameters("id", ownerId.toString()));
+            List<RelatedNode> found = new ArrayList<>();
             for (Record record : result.list()) {
-                found.add(record.get("b").asNode());
+                Value mapKeyValue = record.get("mapKey");
+                found.add(new RelatedNode(record.get("b").asNode(), mapKeyValue.isNull() ? null : mapKeyValue.asString()));
             }
             return found;
         });
@@ -341,14 +395,20 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         }
 
         Object currentValue = EntityReflection.readField(owner, fieldName);
-        if (currentValue instanceof Collection<?> existingCollection) {
+        if (currentValue instanceof Map<?, ?> existingMap) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> map = (Map<String, Object>) existingMap;
+            for (RelatedNode related : relatedNodes) {
+                map.put(related.mapKey(), hydrateRelated(session, related.node(), hydrated));
+            }
+        } else if (currentValue instanceof Collection<?> existingCollection) {
             @SuppressWarnings("unchecked")
             Collection<Object> collection = (Collection<Object>) existingCollection;
-            for (Node relatedNode : relatedNodes) {
-                collection.add(hydrateRelated(session, relatedNode, hydrated));
+            for (RelatedNode related : relatedNodes) {
+                collection.add(hydrateRelated(session, related.node(), hydrated));
             }
         } else {
-            Object related = hydrateRelated(session, relatedNodes.get(0), hydrated);
+            Object related = hydrateRelated(session, relatedNodes.get(0).node(), hydrated);
             try {
                 field.setAccessible(true);
                 field.set(owner, related);
