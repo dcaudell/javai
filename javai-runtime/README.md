@@ -127,8 +127,21 @@ specification proposals only; do not implement until there's a demonstrated need
 - `EmbeddingVector` — real record with a compact constructor validating `dims == values.length` and a
   non-blank `modelId`. Tested (`EmbeddingVectorTest`): stores values/modelId, rejects mismatched dims,
   requires a modelId.
-- `JavAIVectorizable`, `JavAISortable`, `JavAIList`, `JavAISet`, `JavAIMap` — interfaces only, no
-  implementation. Nothing implements them yet; that's `javai-agent`'s weaving job, not started.
-- The lifecycle state machine and summary-vector formula above are specified precisely enough to be written
-  as tests directly (state-transition tests, cycle-safety tests, duplicate-reference-stacking tests) — do
-  that alongside implementing the weaving spike in `javai-agent`, not as an afterthought.
+- `JavAIVectorizable`/`JavAIDirtyTracking`/`JavAISortable`/`JavAIList`/`JavAISet`/`JavAIMap` — real
+  contracts, implemented for real. `javai-agent`'s weaver implements `JavAIVectorizable`/
+  `JavAIDirtyTracking` on any `@JavAIVectorizable`-annotated class at load time (see that module's README);
+  this module itself owns three concrete, hand-written (not woven) collection types implementing
+  `JavAIList`/`JavAISet`/`JavAIMap` directly — `JavAIArrayList`, `JavAILinkedHashSet`, `JavAILinkedHashMap`
+  — each with real `vector()`/`summaryVector()` (centroid/decay-weighted sum via `CollectionVectorSupport`,
+  shared with `javai-collections`' `KnowledgeGraph`) and dirty-tracking wired through their mutators.
+- `JavAIRuntime` — the back-edge propagation/lazy-recompute engine every woven `vector()`/`summaryVector()`/
+  `query()` call delegates to: `propagateDirty`, `registerDependency`, cycle-safe `summaryVector`
+  computation, and the reflective, hierarchy-aware (walks superclasses) `query()` graph walk, gated by
+  `@SearchVisibility` at both the field (traversal) and type (matching) level.
+- `JavAIEmbeddingProvider` has two real implementations, not just the interface: `OllamaEmbeddingProvider`
+  and `TextEmbeddingsInferenceProvider` (Hugging Face's TEI) — both plain `java.net.http.HttpClient`
+  clients, no JSON library dependency. `LocalEmbeddingDefaults` picks between them per host OS (see its own
+  javadoc for why: a confirmed TEI/Candle CPU bug on this project's reference model).
+- The lifecycle state machine and summary-vector formula above are exactly what's implemented and tested:
+  state-transition tests, cycle-safety tests, and duplicate-reference-stacking tests all exist and pass,
+  both hermetically (a fake embedding provider) and against real embeddings in `e2e-client-test`.

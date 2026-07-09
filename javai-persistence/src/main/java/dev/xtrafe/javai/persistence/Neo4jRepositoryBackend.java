@@ -32,16 +32,25 @@ import java.util.concurrent.ConcurrentHashMap;
  * and native-vector-index-backed {@code findNearestBy*} queries.
  *
  * <p><b>Mapping rules</b> (the same "is this graph-shaped" boundary {@code JavAIRuntime.query()} already
- * draws): the entity's simple class name is its node label (a Phase 0 assumption -- two distinct entity
+ * draws -- and deliberately keyed off a field's *declared type*, not a {@code @Summary} annotation; see
+ * below): the entity's simple class name is its node label (a Phase 0 assumption -- two distinct entity
  * types sharing a simple name across packages isn't supported); every {@code @Vectorize} field becomes a
  * {@code <field>Vector__<model>} property (plus a {@code <field>VectorComputedAt__<model>} sibling), the
  * object's own combined {@code vector()}/{@code summaryVector()} become {@code vector__<model>}/
  * {@code summaryVector__<model>} properties directly on the node (required -- Neo4j's native vector index
- * needs a direct node property, not a related node's); every {@code @Summary} field becomes a relationship
- * (type name upper-snake-cased from the field name) to a recursively-saved related node, which therefore
- * needs its own {@code @Id}; every other simple-typed field (String/primitive/UUID/enum/Instant) becomes a
- * plain, unqualified property. Anything else -- a non-simple, non-{@code @Summary} field -- is silently
- * skipped, a documented Phase 0 boundary.
+ * needs a direct node property, not a related node's); every field whose *declared type* is
+ * {@code JavAIVectorizable}, a {@code Collection}, or a {@code Map} becomes a relationship (type name
+ * upper-snake-cased from the field name) to a recursively-saved related node (or one per element), which
+ * therefore needs its own {@code @Id}; every other simple-typed field (String/primitive/UUID/enum/Instant)
+ * becomes a plain, unqualified property. Anything else is silently skipped, a documented Phase 0 boundary.
+ *
+ * <p><b>Relationship classification is by declared type, not the {@code @Summary} annotation</b> --
+ * deliberately decoupled: {@code @Summary} means "contributes to {@code summaryVector()}'s decay-weighted
+ * sum" (an in-memory, {@code javai-runtime} concern) and has nothing to do with whether a field should
+ * persist as a relationship. A field can be graph-shaped without being {@code @Summary} (e.g.
+ * {@code Article.draftComment}/{@code attachment}, {@code @SearchVisibility}-relevant but not summary-
+ * contributing) and still needs a real relationship to round-trip through Neo4j at all -- conflating the
+ * two would mean choosing between correct persistence and correct in-memory summary-vector semantics.
  *
  * <p><b>One property (and one vector index) per model, not one shared property.</b> {@code <model>} is
  * {@link ModelIds#sanitize} applied to {@code EmbeddingVector.modelId()} -- the same scheme
@@ -215,19 +224,18 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         String label = label(entityType);
         JavAIVectorizable vectorizable = (JavAIVectorizable) entity;
         Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
-        Set<String> summaryFields = EntityReflection.summaryFieldNames(entityType);
 
         Map<String, Object> properties = new HashMap<>();
         for (Field field : EntityReflection.allFields(entityType)) {
             String fieldName = field.getName();
-            if (isIdField(field) || summaryFields.contains(fieldName)) {
-                continue; // id is the MERGE key, handled separately; @Summary fields become relationships
+            if (isIdField(field) || isRelationshipField(field)) {
+                continue; // id is the MERGE key, handled separately; relationships handled in the pass below
             }
             Object value = EntityReflection.readField(entity, fieldName);
             if (isSimpleValue(value)) {
                 properties.put(fieldName, toNeo4jValue(value));
             }
-            // else: not @Summary but also not a simple type -- documented Phase 0 boundary, skipped.
+            // else: not graph-shaped but also not a simple type -- documented Phase 0 boundary, skipped.
         }
         for (String fieldName : vectorizeFields) {
             EmbeddingVector vector = vectorizable.fieldVector(fieldName);
@@ -248,7 +256,11 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
                 Values.parameters("id", id.toString(), "props", properties));
 
-        for (String fieldName : summaryFields) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (!isRelationshipField(field)) {
+                continue;
+            }
+            String fieldName = field.getName();
             Object value = EntityReflection.readField(entity, fieldName);
             String relationshipType = relationshipType(fieldName);
             if (value instanceof Map<?, ?> map) {
@@ -293,22 +305,23 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
         EntityReflection.writeId(entity, id);
         hydrated.put(id, entity);
 
-        Set<String> summaryFields = EntityReflection.summaryFieldNames(entityType);
         for (Field field : EntityReflection.allFields(entityType)) {
             String fieldName = field.getName();
-            if (isIdField(field) || summaryFields.contains(fieldName) || !node.containsKey(fieldName)) {
+            if (isIdField(field) || isRelationshipField(field) || !node.containsKey(fieldName)) {
                 continue;
             }
             setFieldFromNeo4jValue(entity, field, node.get(fieldName));
         }
 
-        for (String fieldName : summaryFields) {
-            hydrateSummaryField(session, entity, fieldName, hydrated);
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (isRelationshipField(field)) {
+                hydrateRelationshipField(session, entity, field.getName(), hydrated);
+            }
         }
         return entity;
     }
 
-    private void hydrateSummaryField(Session session, Object owner, String fieldName, Map<UUID, Object> hydrated) {
+    private void hydrateRelationshipField(Session session, Object owner, String fieldName, Map<UUID, Object> hydrated) {
         Field field = EntityReflection.findField(owner.getClass(), fieldName);
         UUID ownerId = EntityReflection.readId(owner);
         String ownerLabel = label(owner.getClass());
@@ -365,6 +378,16 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
 
     private static boolean isIdField(Field field) {
         return field.isAnnotationPresent(jakarta.persistence.Id.class);
+    }
+
+    /** By declared type, not the runtime value -- so a currently-null singular reference (e.g. an unset
+     *  {@code Article.draftComment}) is still correctly routed to the relationship pass, not silently
+     *  treated as a plain (null-valued) property. See the class javadoc for why this is declared-type-
+     *  driven rather than keyed off {@code @Summary}. */
+    private static boolean isRelationshipField(Field field) {
+        Class<?> type = field.getType();
+        return Map.class.isAssignableFrom(type) || Collection.class.isAssignableFrom(type)
+                || JavAIVectorizable.class.isAssignableFrom(type);
     }
 
     private static boolean isSimpleValue(Object value) {

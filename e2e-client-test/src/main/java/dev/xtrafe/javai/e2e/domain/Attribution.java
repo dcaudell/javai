@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.e2e.domain;
 
 import dev.xtrafe.javai.annotations.Vectorize;
+import jakarta.persistence.MappedSuperclass;
 
 /**
  * Deliberately plain -- no {@code @JavAIVectorizable} of its own. {@link Comment} is the concrete,
@@ -9,7 +10,12 @@ import dev.xtrafe.javai.annotations.Vectorize;
  * just the hermetic fixture in javai-agent's own test suite: the weaver synthesizes
  * {@code public void setAuthor(String value) { super.setAuthor(value); } } on {@code Comment} at
  * class-load time so mutating an inherited field still marks the leaf object dirty.
+ *
+ * <p>{@code @MappedSuperclass}: without it, Hibernate would silently ignore {@link #author} on any
+ * {@code @Entity} subclass (a plain, un-annotated superclass's fields aren't mapped by default) --
+ * needed so {@code Comment.getAuthor()} actually round-trips through Postgres, not just Neo4j.
  */
+@MappedSuperclass
 public class Attribution {
 
     @Vectorize

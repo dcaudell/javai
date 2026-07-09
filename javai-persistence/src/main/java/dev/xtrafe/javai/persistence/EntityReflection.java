@@ -1,6 +1,5 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 import jakarta.persistence.Id;
 
@@ -37,11 +36,6 @@ final class EntityReflection {
     /** Every {@code @Vectorize} field name -- what {@code findNearestBy<Field>Vector} validates against. */
     static Set<String> vectorizeFieldNames(Class<?> type) {
         return fieldNamesAnnotatedWith(type, Vectorize.class);
-    }
-
-    /** Every {@code @Vectorize}/{@code @Summary} field name -- used for the Neo4j property/relationship split. */
-    static Set<String> summaryFieldNames(Class<?> type) {
-        return fieldNamesAnnotatedWith(type, Summary.class);
     }
 
     static Field idField(Class<?> type) {

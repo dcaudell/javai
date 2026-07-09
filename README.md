@@ -89,11 +89,27 @@ IntelliJ detects the root `pom.xml`.
 
 ## Current status
 
-Phase 0, pre-implementation. Repository structure and build scaffolding are in place; the annotation
-vocabulary is fully defined and each module resolves and compiles against its dependencies, but none of the
-six areas' real logic (weaving, the lifecycle state machine, `KnowledgeGraph`, persistence shims, the
-completion layer) is implemented yet beyond placeholder smoke tests. The next concrete step is a minimal
-ByteBuddy weaving spike in `javai-agent` — see that module's README and `CLAUDE.md`'s build-order section.
+Phase 0, five of six areas real and verified against real embeddings and real backing stores, not just
+placeholder smoke tests:
+
+- **`javai-annotations`** — the full annotation vocabulary across all six areas.
+- **`javai-runtime`** (Vector Core) — the full object lifecycle (`FieldDirty`/`SummaryDirty`, lazy
+  recompute), `query()`, real embedding providers (Ollama and Hugging Face's text-embeddings-inference),
+  and the concrete `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` collections.
+- **`javai-agent`** (Acceleration Substrate) — a full ByteBuddy weaver: multi-field `vector()`,
+  `summaryVector()` propagation through both single references and collections, `query()`, cycle safety,
+  `@SearchVisibility`/`@VectorizeIgnore`, and inherited-field support via synthesized setter overrides.
+- **`javai-collections`** (Vector Collections) — `VectorIndex` and `KnowledgeGraph`/`SubgraphResult`
+  (hybrid similarity + structural queries), both hand-written and reflection-based, not woven.
+- **`javai-persistence`** (Persistence Bridge) — both backends real: Postgres+pgvector (one table per
+  embedding model, so a provider swap needs no schema migration) and Neo4j (native vector index, one
+  model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
+  for re-embedding an existing store after a provider swap, reverting non-destructively.
+- **`javai-completion`** (Completion Fabric) — not started; `package-info.java` is a placeholder.
+
+`e2e-client-test` (a standalone downstream consumer, not one of the six modules) proves the above against a
+single monolithic Docker container bundling Postgres+pgvector, Neo4j, and a real embedding provider, not
+fakes or mocks.
 
 ## License
 

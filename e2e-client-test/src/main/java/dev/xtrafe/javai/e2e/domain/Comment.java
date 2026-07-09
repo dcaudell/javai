@@ -3,6 +3,7 @@ package dev.xtrafe.javai.e2e.domain;
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.annotations.VectorizeIgnore;
+import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 
 import java.util.UUID;
@@ -19,11 +20,14 @@ import java.util.UUID;
  * same field -- the explicit exclude signal must win against real weaving and real embeddings, exactly as
  * {@code JavAIWeaver}'s hermetic test already proves in isolation.
  *
- * <p>{@link #id} exists purely for {@code javai-persistence}: a comment becomes a related Neo4j node when
- * reached through {@link Article#getFeaturedComment()}/{@link Article#getComments()} (both
- * {@code @Summary} fields), which requires its own {@code @Id}. Comment has no repository of its own --
- * see {@code PersistenceE2ETest}.
+ * <p>{@code @Entity} + {@link #id}: a real, independently-persistable entity on both backends --
+ * {@link Article#getFeaturedComment()}/{@link Article#getDraftComment()} are real Postgres
+ * {@code @OneToOne}s, and {@link Article#getComments()} round-trips through
+ * {@code javai-persistence}'s own collection-membership mechanism (Postgres) or a real graph relationship
+ * (Neo4j) -- see {@code PersistenceE2ETest}. Comment has no derived queries of its own; see
+ * {@code CommentRepository}'s javadoc for why it's still realized as a repository once, regardless.
  */
+@Entity
 @JavAIVectorizable
 public class Comment extends Attribution {
 

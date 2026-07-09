@@ -1,6 +1,7 @@
-- Add test-data fixtures to the e2e project to create realistic data volume. 
-- Add both unit and e2e tests for all collection types declared in javai-runtime
-- Make sure in e2e that objects can fully utilize both JPA and Neo4j, and can simultaneously be persisted in both.
+- (Done) Update README.md files to reflect the current state of the project. 
+- (Done) Add test-data fixtures to the e2e project to create realistic data volume. 
+- (Done) Add both unit and e2e tests for all collection types declared in javai-runtime
+- (Done) Make sure in e2e that objects can fully utilize both JPA and Neo4j, and can simultaneously be persisted in both.
 - Executive oversight via AOP cutpoints
 - Add recursive MCP microservice fabric to the whitepaper. 
 - Export transcripts and rank ability

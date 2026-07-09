@@ -6,9 +6,11 @@ import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.runtime.JavAIArrayList;
+import dev.xtrafe.javai.runtime.JavAILinkedHashMap;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
-import jakarta.persistence.Transient;
+import jakarta.persistence.OneToOne;
 
 import java.util.UUID;
 
@@ -34,13 +36,21 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  *
  * <p>{@code @Entity} + {@link #id}, for {@code javai-persistence}: {@link #getId()} is what
  * {@code ArticleRepository} (see {@code PersistenceE2ETest}) uses as the JavAI-fixed {@code UUID} identity
- * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code comments}/
- * {@code draftComment}/{@code attachment} are all {@code @Transient}: Hibernate has no JPA association
- * annotation to map them by (that's real, separate scope -- teaching Hibernate to persist a
- * {@code JavAIArrayList} as a relational collection -- not needed to prove the vector storage/query
- * contract this test targets), so Hibernate simply ignores them; Neo4j's backend, by contrast, doesn't
- * look at {@code @Transient} at all, so {@code featuredComment}/{@code comments} (both {@code @Summary})
- * still become real relationships there, same as in-memory.
+ * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code draftComment}/
+ * {@code attachment} are real {@code @OneToOne(cascade = CascadeType.ALL)} associations -- ordinary
+ * Hibernate relational mapping, since a *singular* reference field never collides with Hibernate's own
+ * collection-proxy substitution. {@code comments}/{@code relatedComments} are the fields that would: a
+ * concrete JavAI collection class ({@code JavAIArrayList}/{@code JavAILinkedHashMap}) can never be a native
+ * Hibernate-mapped collection field (confirmed empirically -- a {@code ClassCastException} the moment
+ * Hibernate tries to substitute its own {@code PersistentBag}/{@code PersistentMap} into a field statically
+ * typed as the concrete JavAI class). Note there's no {@code @Transient} here, though, and no manual
+ * repository pre-registration for {@code Comment} either: {@code HibernatePostgresRepositoryBackend}
+ * auto-detects both of these fields reflectively and excludes them from Hibernate's own mapping itself, and
+ * auto-registers {@code Comment} as reachable through them -- see that class's javadoc ("No manual
+ * {@code @Transient} required" / "Related entity types are auto-registered too"). Both fields instead
+ * round-trip through {@code javai-persistence}'s own {@code javai_collection_members} side table, which,
+ * being reflective rather than proxy-based, hydrates a real {@code JavAIArrayList}/{@code JavAILinkedHashMap}
+ * back (full dirty-tracking intact) exactly like Neo4j's own reflective relationship mapping already does.
  */
 @Entity
 @JavAIVectorizable
@@ -55,19 +65,23 @@ public class Article implements JavAIGraphNode {
     @Vectorize
     private String body;
 
-    @Transient
+    @OneToOne(cascade = CascadeType.ALL)
     @Summary
     private Comment featuredComment;
 
-    @Transient
     @Summary
     private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
 
-    @Transient
+    // Not @Summary -- purely exercises JavAILinkedHashMap persistence (String-keyed, per
+    // HibernatePostgresRepositoryBackend's own documented Phase 0 limitation) alongside comments'
+    // JavAIArrayList, without changing what already-passing tests assert about summaryVector().
+    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+
+    @OneToOne(cascade = CascadeType.ALL)
     @SearchVisibility(PRIVATE)
     private Comment draftComment;
 
-    @Transient
+    @OneToOne(cascade = CascadeType.ALL)
     private Attachment attachment;
 
     public Article() {
@@ -108,6 +122,10 @@ public class Article implements JavAIGraphNode {
 
     public JavAIArrayList<Comment> getComments() {
         return comments;
+    }
+
+    public JavAILinkedHashMap<String, Comment> getRelatedComments() {
+        return relatedComments;
     }
 
     public Comment getDraftComment() {

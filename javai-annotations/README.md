@@ -76,5 +76,14 @@ All 17 annotations exist as real, compilable definitions (`AgentWritable`, `Cost
 `JavAIVectorizable`, `Nondeterministic`, `Provenance`, `Requires`, `SearchVisibility`, `Summary`,
 `Vectorize`, `VectorizeIgnore`), each with correct `@Retention`/`@Target`. `Requires`/`Ensures`/`Invariant`
 are repeatable, each via a nested `List` container annotation. `AnnotationsSmokeTest` reflectively proves
-every annotation is present, retained, and applicable to the right element kind. No processing/weaving logic
-exists here or anywhere yet — that's `javai-agent`'s job, not started.
+every annotation is present, retained, and applicable to the right element kind.
+
+This module itself carries no processing/weaving logic by design (see this README's own architecture
+section above) — that's `javai-agent`'s job, and it's real: a full ByteBuddy weaver reads `@Vectorize`,
+`@Summary`, `@SearchVisibility`, and `@VectorizeIgnore` off classes annotated with this module's
+`@JavAIVectorizable` and synthesizes the entire `JavAIVectorizable`/`JavAIDirtyTracking` contract at
+class-load time. See `javai-agent/README.md` for what's actually implemented there. `EmbeddingModel` is the
+one annotation defined here that nothing downstream reads yet (deliberately deferred, not forgotten — see
+`javai-runtime`/`javai-persistence` for why). The Codegen Guidance annotations
+(`Requires`/`Ensures`/`Invariant`/`Intent`/`AgentWritable`/`Frozen`/`HumanOnly`/`Nondeterministic`/`Costly`/
+`Provenance`) remain definitions only, with no runtime or agent-facing enforcement built yet.

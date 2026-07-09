@@ -2,6 +2,8 @@ package dev.xtrafe.javai.e2e;
 
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
+import dev.xtrafe.javai.e2e.domain.Attachment;
+import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
 import dev.xtrafe.javai.persistence.JavAIPI;
@@ -21,6 +23,7 @@ import java.util.List;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -44,6 +47,10 @@ class PersistenceE2ETest {
     static void configureProviderAndRepositories() {
         JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
 
+        // No CommentRepository/AttachmentRepository pre-registration here: HibernatePostgresRepositoryBackend
+        // auto-registers both, recursively, as soon as ArticleRepository is realized -- reachable through
+        // Article's own featuredComment/draftComment/attachment/comments/relatedComments fields. See that
+        // class's javadoc ("Related entity types are auto-registered too").
         JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.POSTGRES)
                 .postgresUrl(MonolithicInfrastructure.postgresUrl())
@@ -52,17 +59,16 @@ class PersistenceE2ETest {
                 .build());
         postgresRepository = JavAIPI.repository(ArticleRepository.class);
 
+        // Neo4j still needs this today -- only the Postgres backend's ceremony has been automated so far.
         JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.NEO4J)
                 .neo4jUri(MonolithicInfrastructure.neo4jUri())
                 .neo4jUsername("neo4j")
                 .neo4jPassword("javai12345")
                 .build());
-        neo4jRepository = JavAIPI.repository(ArticleRepository.class);
-        // Comment is never queried independently in this project -- only reached via Article's @Summary
-        // fields -- but the Neo4j backend still needs its node label registered to hydrate a related
-        // Comment node back into a real Comment object. See CommentRepository's own javadoc.
         JavAIPI.repository(CommentRepository.class);
+        JavAIPI.repository(AttachmentRepository.class);
+        neo4jRepository = JavAIPI.repository(ArticleRepository.class);
     }
 
     private static Article newArticle(String title, String body) {
@@ -142,6 +148,103 @@ class PersistenceE2ETest {
         assertEquals(1, nearest.size());
         assertEquals(security.getId(), nearest.get(0).getId(),
                 "the article whose own title produced the reference vector must rank nearest to itself");
+    }
+
+    /**
+     * The full object graph -- {@code featuredComment}, the {@code comments} list, {@code draftComment},
+     * {@code attachment} -- round-trips through Postgres, not just {@code title}/{@code body}.
+     * {@code featuredComment}/{@code draftComment}/{@code attachment} are real {@code @OneToOne}s;
+     * {@code comments} goes through {@code javai-persistence}'s own collection-membership mechanism (see
+     * {@code HibernatePostgresRepositoryBackend}'s javadoc) since {@code JavAIArrayList} can't be a native
+     * Hibernate collection field.
+     */
+    @Test
+    void postgresFullObjectGraphRoundTrips() {
+        Article article = fullArticle("Full graph test (Postgres)");
+        Article saved = postgresRepository.save(article);
+
+        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+        assertEquals("first take: Full graph test (Postgres)", reloaded.getFeaturedComment().getText());
+        assertEquals(2, reloaded.getComments().size());
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("first listed comment")));
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("second listed comment")));
+        assertNotNull(reloaded.getDraftComment(), "draftComment must round-trip as a real @OneToOne");
+        assertEquals("an unpublished draft", reloaded.getDraftComment().getText());
+        assertNotNull(reloaded.getAttachment(), "attachment must round-trip as a real @OneToOne");
+        assertEquals("report.pdf", reloaded.getAttachment().getFilename());
+    }
+
+    /**
+     * {@code relatedComments} (a {@code JavAILinkedHashMap<String, Comment>}, not {@code @Summary} -- see
+     * {@code Article}'s own javadoc) round-trips through the same {@code javai_collection_members} table as
+     * {@code comments}, this time with {@code member_key} populated. Deliberately Postgres-only: Neo4j's
+     * relationship hydration doesn't yet handle {@code Map}-typed fields correctly (a real, separate gap --
+     * see this project's own tracked follow-up), so no Neo4j test ever populates this field, keeping
+     * {@code neo4jFullObjectGraphRoundTrips} etc. safely unaffected (Neo4j's hydration short-circuits
+     * cleanly when there are zero relationships of a given type).
+     */
+    @Test
+    void postgresJavAILinkedHashMapFieldRoundTrips() {
+        Article article = newArticle("Map field test (Postgres)", "Body text for the map field test.");
+        article.getRelatedComments().put("first", new Comment("erin", "first related comment"));
+        article.getRelatedComments().put("second", new Comment("frank", "second related comment"));
+
+        Article saved = postgresRepository.save(article);
+        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getRelatedComments().size());
+        assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
+        assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+    }
+
+    /** Same as {@link #postgresFullObjectGraphRoundTrips()}, against Neo4j's reflective relationship
+     *  mapping instead of Postgres's collection-membership table. */
+    @Test
+    void neo4jFullObjectGraphRoundTrips() {
+        Article article = fullArticle("Full graph test (Neo4j)");
+        Article saved = neo4jRepository.save(article);
+
+        Article reloaded = neo4jRepository.findById(saved.getId()).orElseThrow();
+        assertEquals("first take: Full graph test (Neo4j)", reloaded.getFeaturedComment().getText());
+        assertEquals(2, reloaded.getComments().size());
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("first listed comment")));
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("second listed comment")));
+        assertNotNull(reloaded.getDraftComment(), "draftComment must round-trip as a real relationship");
+        assertEquals("an unpublished draft", reloaded.getDraftComment().getText());
+        assertNotNull(reloaded.getAttachment(), "attachment must round-trip as a real relationship");
+        assertEquals("report.pdf", reloaded.getAttachment().getFilename());
+    }
+
+    /**
+     * The same Article instance, saved to *both* backends -- proves an object isn't backend-exclusive:
+     * whichever repository proxy you saved it through, the other backend's own copy is independently
+     * correct and independently queryable, sharing only the {@code UUID} identity.
+     */
+    @Test
+    void sameArticleCanBePersistedSimultaneouslyToBothBackends() {
+        Article article = fullArticle("Dual-persisted article");
+
+        Article postgresManaged = postgresRepository.save(article);
+        Article neo4jManaged = neo4jRepository.save(article);
+        assertEquals(postgresManaged.getId(), neo4jManaged.getId(), "both saves share the same identity");
+
+        Article fromPostgres = postgresRepository.findById(article.getId()).orElseThrow();
+        Article fromNeo4j = neo4jRepository.findById(article.getId()).orElseThrow();
+
+        assertEquals("Dual-persisted article", fromPostgres.getTitle());
+        assertEquals("Dual-persisted article", fromNeo4j.getTitle());
+        assertEquals(2, fromPostgres.getComments().size());
+        assertEquals(2, fromNeo4j.getComments().size());
+        assertEquals(fromPostgres.getFeaturedComment().getText(), fromNeo4j.getFeaturedComment().getText());
+    }
+
+    private static Article fullArticle(String title) {
+        Article article = newArticle(title, "Body text for " + title + ".");
+        article.getComments().add(new Comment("bob", "first listed comment"));
+        article.getComments().add(new Comment("carol", "second listed comment"));
+        article.setDraftComment(new Comment("dave", "an unpublished draft"));
+        article.setAttachment(new Attachment("report.pdf"));
+        return article;
     }
 
     /**

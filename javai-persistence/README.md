@@ -96,7 +96,59 @@ are the whole-object variants, for the object's own combined `vector()`/`summary
 **Register every repository before using any of them.** `JavAIPI.repository(...)` accumulates entity types
 under the hood; the Postgres backend's internal `SessionFactory` is built, once, lazily, on the *first*
 actual method call across any repository -- Hibernate's boot-time metadata is immutable afterward, so an
-entity type registered later would never be mapped.
+entity type registered later would never be mapped. On Postgres, this is narrower than it sounds in
+practice: `JavAIPI.repository(ArticleRepository.class)` alone is enough even if `Article` references
+`Comment`/`Attachment` (singly or through a collection) -- related entity types reachable through an
+already-registered type's own fields are discovered and registered automatically, recursively. You only need
+to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and independently*.
+
+## Collections: `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` fields
+
+A field typed as one of `javai-runtime`'s concrete vector-aware collections can never be a *native*
+Hibernate-mapped collection association -- Hibernate always substitutes its own `PersistentBag`/
+`PersistentSet`/`PersistentMap` wrapper into a mapped collection field the instant it's persisted (confirmed
+empirically: a `ClassCastException` the moment that wrapper can't be assigned back to a field statically
+typed as the concrete JavAI class). Declaring the field by interface type instead wouldn't help either --
+Hibernate would then silently install its own wrapper in place of the real `JavAIArrayList`, permanently and
+silently discarding its vector/dirty-tracking behavior with no error at all, which is worse than a loud
+failure.
+
+**No manual `@Transient` needed, on Postgres, as of this pass.** `HibernatePostgresRepositoryBackend`
+reflectively detects, for every registered entity type, which fields are shaped like a JavAI collection (a
+`Collection`/`Map` that also implements `JavAIDirtyTracking` -- true of all three concrete types today, and
+of any future one following the same pattern, with no code change needed) and generates an in-memory JPA
+`orm.xml`-equivalent mapping document marking exactly those fields `<transient>`, fed to Hibernate via
+`MetadataSources.addInputStream` alongside the ordinary annotation scanning. This is a real, spec-defined JPA
+override mechanism (XML mappings logically override annotations for whatever they explicitly mention), not a
+hack -- confirmed with a real container before being relied on. Such fields instead round-trip through
+`javai_collection_members`, a single, shared (not per-model) table this backend owns (owner/field/member
+identity, an optional string key for `Map` fields, an ordinal for order). Hydration is reflective, not
+proxy-based: it adds members into whatever collection/map instance the entity's own no-arg constructor
+already created (a real `JavAIArrayList`, full dirty-tracking intact) rather than replacing the field's
+value, so a `final` collection field works fine.
+
+**Known limitation: `Map` fields must be keyed by `String`, on Postgres, in this phase.** The membership
+table's key column is a plain `varchar`; a `JavAILinkedHashMap<K, V>` field is only supported when `K` is
+`String`. This is validated eagerly, at repository-registration time, with a clear `IllegalArgumentException`
+for any other key type -- silently storing a stringified key that could never correctly round-trip back to
+its original type would be a much worse outcome than an immediate, explicit error.
+
+**Neo4j doesn't need any of this ceremony removal** -- its own reflective relationship mapping has no
+`PersistentBag`-equivalent substitution problem to begin with. It does, however, have a real, separate,
+currently-tracked gap of its own: relationship hydration only handles `Collection`-typed fields correctly
+today, not `Map`-typed ones, and map keys aren't persisted as relationship properties at all yet -- so a
+`JavAILinkedHashMap` field works on Postgres but not yet on Neo4j.
+
+**Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
+Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
+implementation stand in for `PersistentBag`/`PersistentSet`/`PersistentMap` and could in principle preserve
+JavAI's vector/dirty-tracking behavior *while* being a real, natively Hibernate-managed association -- is
+deliberately not pursued yet. It's Postgres/Hibernate-only (Neo4j has no equivalent concept and would remain
+on its own reflective mechanism regardless, breaking the symmetry the two backends otherwise share), and
+correctly implementing a custom `PersistentCollection` is a substantial, easy-to-get-subtly-wrong undertaking
+(dirty-checking snapshot semantics, session attachment/detachment, lazy-initialization) disproportionate to
+a Phase 0 module whose job is proving the design space, not hardening a production ORM integration. Worth
+revisiting if this module graduates past Phase 0.
 
 ## Where vectors actually live
 
@@ -166,5 +218,13 @@ never sees in source.
 - Arbitrary Spring-Data-style derived queries (`findByTitle` and friends) -- only the `findNearestBy*`
   family above is supported, and anything else fails fast, with a clear message, at repository-creation
   time.
-- `e2e-client-test` doesn't exercise this module yet -- deferred to a later pass by design; this module's
-  own Testcontainers-based suite is the real-backend proof for now.
+- `JavAILinkedHashMap` fields with a non-`String` key type (Postgres) or any populated `Map`-typed field at
+  all (Neo4j) -- see "Collections" above.
+- The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
+  not started.
+
+`e2e-client-test` now exercises this module directly: `PersistenceE2ETest`/`ArticleFixtureVolumeE2ETest`
+save/query this project's own real `Article`/`Comment`/`Attachment` domain (not this module's own flat test
+fixture) against both real backends running in the same monolithic container as the rest of the e2e suite,
+including the full object graph (singular references, the `JavAIArrayList`/`JavAILinkedHashMap` collection
+fields above, real embeddings) and realistic-volume/semantic-similarity checks.
