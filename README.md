@@ -20,21 +20,22 @@ with the JavAI runtime as an ordinary classpath dependency. Any custom JVM, GPU 
 bytecode may exist only as an optional accelerated path with a required correct fallback, never as a
 requirement for correctness.
 
-## The six extension areas
+## The seven extension areas
 
 | # | Directory | Extension area | Purpose |
 |---|---|---|---|
-| 1 | [`javai-annotations`](javai-annotations/README.md) | Codegen Guidance (+ shared annotation vocabulary) | Every annotation used across all six areas — plain definitions, no processing logic |
+| 1 | [`javai-annotations`](javai-annotations/README.md) | Codegen Guidance (+ shared annotation vocabulary) | Every annotation used across all seven areas — plain definitions, no processing logic |
 | 2 | [`javai-runtime`](javai-runtime/README.md) | Vector Core | Embedding calculation, dirty-state propagation, object-graph `query()` |
 | 3 | [`javai-agent`](javai-agent/README.md) | Acceleration Substrate | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
-| 4 | [`javai-collections`](javai-collections/README.md) | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
-| 5 | [`javai-persistence`](javai-persistence/README.md) | Persistence Bridge | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
-| 6 | [`javai-completion`](javai-completion/README.md) | Completion Fabric | Provider-agnostic RAG completions, wrapping Spring AI |
+| 4 | [`javai-supervision`](javai-supervision/README.md) | Agentic Supervision | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
+| 5 | [`javai-collections`](javai-collections/README.md) | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
+| 6 | [`javai-persistence`](javai-persistence/README.md) | Persistence Bridge | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
+| 7 | [`javai-completion`](javai-completion/README.md) | Completion Fabric | Provider-agnostic RAG completions, wrapping Spring AI |
 
 `javai-annotations` is the one module every other module depends on, directly or transitively — it also
 carries Vector Core's and Vector Collections' vectorization/search-visibility annotation vocabulary
-(`@Vectorize`, `@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`), not just the Codegen
-Guidance ones.
+(`@Vectorize`, `@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`) and Agentic Supervision's
+(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`), not just the Codegen Guidance ones.
 
 ### Dependency graph
 
@@ -50,10 +51,18 @@ Guidance ones.
                     v    v               v
           javai-persistence      javai-completion
           (Persistence Bridge)   (Completion Fabric)
+
+          javai-supervision (Agentic Supervision) — standalone, depends only
+          on javai-annotations, its own independent weaver. Not fed by
+          javai-agent and doesn't feed anything else at the module level;
+          an LLM-backed listener composes with javai-completion/javai-runtime/
+          javai-collections at the application level instead. See
+          doc/spec/agentic-supervision.md.
 ```
 
-Build order matches this graph: `javai-annotations` → `javai-runtime` → `javai-agent` → `javai-collections`
-→ (`javai-persistence`, `javai-completion` — order between these two doesn't matter).
+Build order matches this graph: `javai-annotations` → (`javai-runtime`, `javai-agent`, `javai-supervision`
+in parallel — the latter two each depend only on annotations, not on each other) → `javai-collections` →
+(`javai-persistence`, `javai-completion` — order between these two doesn't matter).
 
 **A note on where things physically live vs. the conceptual area they belong to:** `JavAIVectorizable.query()`
 returns `JavAIList<T>`, and `javai-collections` depends on `javai-runtime`, not the reverse — so
@@ -63,14 +72,14 @@ whitepaper discusses them as part of Vector Collections. See `javai-runtime/READ
 
 ## Building
 
-All six modules live under one Maven reactor and build together — they're interdependent by design, not
+All seven modules live under one Maven reactor and build together — they're interdependent by design, not
 meant to be built independently:
 
 ```
 mvn install
 ```
 
-Opening this repository root in IntelliJ IDEA imports all six modules as one project automatically, since
+Opening this repository root in IntelliJ IDEA imports all seven modules as one project automatically, since
 IntelliJ detects the root `pom.xml`.
 
 ## Where things are
@@ -89,10 +98,10 @@ IntelliJ detects the root `pom.xml`.
 
 ## Current status
 
-Phase 0, five of six areas real and verified against real embeddings and real backing stores, not just
+Phase 0, five of seven areas real and verified against real embeddings and real backing stores, not just
 placeholder smoke tests:
 
-- **`javai-annotations`** — the full annotation vocabulary across all six areas.
+- **`javai-annotations`** — the full annotation vocabulary across all seven areas.
 - **`javai-runtime`** (Vector Core) — the full object lifecycle (`FieldDirty`/`SummaryDirty`, lazy
   recompute), `query()`, real embedding providers (Ollama and Hugging Face's text-embeddings-inference),
   and the concrete `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` collections.
@@ -106,8 +115,12 @@ placeholder smoke tests:
   model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
   for re-embedding an existing store after a provider swap, reverting non-destructively.
 - **`javai-completion`** (Completion Fabric) — not started; `package-info.java` is a placeholder.
+- **`javai-supervision`** (Agentic Supervision) — new. Its public contract (`SupervisionEvent`,
+  `SyncSupervisionListener`, `AsyncSupervisionListener`, plus the `@SyncSupervision`/`@AsyncSupervision`
+  annotations in `javai-annotations`) is defined and compiles; the weaver and dispatch runtime that make it
+  real are not written yet. See that module's README.
 
-`e2e-client-test` (a standalone downstream consumer, not one of the six modules) proves the above against a
+`e2e-client-test` (a standalone downstream consumer, not one of the seven modules) proves the above against a
 single monolithic Docker container bundling Postgres+pgvector, Neo4j, and a real embedding provider, not
 fakes or mocks.
 

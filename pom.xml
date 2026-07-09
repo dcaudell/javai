@@ -17,16 +17,20 @@
   </description>
 
   <!--
-    All six Phase 0 modules are interdependent by design (see SPEC.md's dependency
+    All seven Phase 0 modules are interdependent by design (see SPEC.md's dependency
     graph) and are meant to build together, not independently — `mvn install` (or
     `mvn verify`) from this root builds the whole reactor in dependency order.
-    Build order matches SPEC.md/CLAUDE.md: javai-annotations, javai-runtime,
-    javai-agent, javai-collections, javai-persistence, javai-completion.
+    Build order matches SPEC.md/CLAUDE.md: javai-annotations, then javai-runtime and
+    javai-agent and javai-supervision in parallel (javai-agent and javai-supervision
+    each depend only on javai-annotations, not on each other or on javai-runtime —
+    two independent weavers, two independent risk spikes), then javai-collections,
+    then javai-persistence and javai-completion.
   -->
   <modules>
     <module>javai-annotations</module>
     <module>javai-runtime</module>
     <module>javai-agent</module>
+    <module>javai-supervision</module>
     <module>javai-collections</module>
     <module>javai-persistence</module>
     <module>javai-completion</module>

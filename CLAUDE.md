@@ -31,7 +31,7 @@ fallback. Individual extensions that prove valuable are candidates for proposal 
 extensions that don't earn adoption remain a useful, self-contained library. See `SPEC.md` for what that
 means concretely.
 
-## The six extension areas, and where their code lives
+## The seven extension areas, and where their code lives
 
 | Area | Module | One-line purpose |
 |---|---|---|
@@ -41,23 +41,31 @@ means concretely.
 | Vector Collections | `javai-collections` | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` |
 | Codegen Guidance | `javai-annotations` (definitions only — see `doc/JavAI_Codegen_Guidance.md`) | Annotations governing what an LLM agent may read/write/trust |
 | Acceleration Substrate | `javai-agent` | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
+| Agentic Supervision | `javai-supervision` | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
 
 `javai-annotations` also carries Vector Core's and Vector Collections' annotation vocabulary (`@Vectorize`,
-`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.) — it is the one module every other
-module depends on, directly or transitively.
+`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.) plus Agentic Supervision's
+(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`) — it is the one module every other module
+depends on, directly or transitively.
 
 ## Build order (matches the dependency graph in `SPEC.md`)
 
 1. `javai-annotations` — no internal dependencies, unblocks everything else.
-2. `javai-runtime` — depends on `javai-annotations`.
-3. `javai-agent` — depends on `javai-annotations` + `javai-runtime` (it weaves calls into runtime hooks).
-4. `javai-collections` — depends on `javai-runtime`.
-5. `javai-persistence` and `javai-completion` — both depend on `javai-collections` (+ `javai-runtime`
+2. `javai-runtime` and `javai-agent` and `javai-supervision` — `javai-runtime` depends only on
+   `javai-annotations`; `javai-agent` depends on `javai-annotations` + `javai-runtime` (it weaves calls into
+   runtime hooks); `javai-supervision` depends only on `javai-annotations` (its own independent weaver — see
+   `doc/spec/agentic-supervision.md` for why it doesn't extend `javai-agent`). These three can proceed in
+   parallel once `javai-annotations` exists.
+3. `javai-collections` — depends on `javai-runtime`.
+4. `javai-persistence` and `javai-completion` — both depend on `javai-collections` (+ `javai-runtime`
    transitively); order between these two doesn't matter.
 
 Prove the weaving mechanism itself (a toy `@Vectorize` class, a woven setter, `markDirty()`/`propagateDirty()`
 firing correctly, lazy recomputation on next read) before building out `javai-runtime` and `javai-collections`
 in full — it's the highest-novelty, highest-risk piece, and everything downstream assumes it works.
+`javai-supervision`'s own weaving spike (a toy `@SyncSupervision` method, a listener registered and actually
+firing, PRE-stage argument rewrite proven end to end) is a second, independent risk spike — worth proving
+early too, but it doesn't block or get blocked by Vector Core's.
 
 ## Formal specs are test specs
 
@@ -65,11 +73,14 @@ in full — it's the highest-novelty, highest-risk piece, and everything downstr
 EmbeddingRecomputing → Clean`, and separately `→ SummaryDirty → SummaryRecomputing → Clean`) and a
 decay-weighted recursive formula for `summaryVector()`. Both are specified precisely enough to be written
 as tests directly — state-transition tests, cycle-safety tests, duplicate-reference-stacking tests — before
-or alongside the implementation they check, not as an afterthought.
+or alongside the implementation they check, not as an afterthought. `doc/spec/agentic-supervision.md`
+similarly specifies the sync/async dispatch ordering (sync tier commits fully before the async tier
+observes) precisely enough to test directly, and states a hard rule worth a test of its own: this project's
+own supervision-runtime classes must never carry `@SyncSupervision`/`@AsyncSupervision`.
 
 ## Single multi-module build
 
-All six modules live under this one Maven reactor and are expected to build together (`mvn install` or
+All seven modules live under this one Maven reactor and are expected to build together (`mvn install` or
 `mvn verify` from the repo root), not independently — they're interdependent by design, per the dependency
 graph above. Opening this repository root in IntelliJ IDEA imports all modules as one project automatically,
 since IntelliJ detects the root `pom.xml`.

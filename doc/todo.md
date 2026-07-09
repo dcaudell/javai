@@ -2,6 +2,7 @@
 - (Done) Add test-data fixtures to the e2e project to create realistic data volume. 
 - (Done) Add both unit and e2e tests for all collection types declared in javai-runtime
 - (Done) Make sure in e2e that objects can fully utilize both JPA and Neo4j, and can simultaneously be persisted in both.
-- Executive oversight via AOP cutpoints
+- (Done — whitepaper §5.7 "Agentic Supervision", javai-supervision module scaffolded, doc/spec/agentic-supervision.md) 
+- Executive oversight via AOP cutpoints. Weaver + dispatch runtime (JavAISupervisionRuntime/SupervisionWeaver) still needs real implementation.
 - Add recursive MCP microservice fabric to the whitepaper. 
 - Export transcripts and rank ability

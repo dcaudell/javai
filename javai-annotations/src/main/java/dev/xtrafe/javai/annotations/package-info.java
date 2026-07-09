@@ -1,5 +1,5 @@
 /**
- * The full JavAI Extensions annotation vocabulary, across three extension areas:
+ * The full JavAI Extensions annotation vocabulary, across four extension areas:
  *
  * <ul>
  *   <li><b>Vector Core</b> (search-visibility hat): {@link dev.xtrafe.javai.annotations.JavAIVectorizable},
@@ -14,12 +14,19 @@
  *       {@link dev.xtrafe.javai.annotations.Frozen}, {@link dev.xtrafe.javai.annotations.HumanOnly},
  *       {@link dev.xtrafe.javai.annotations.Nondeterministic}, {@link dev.xtrafe.javai.annotations.Costly},
  *       {@link dev.xtrafe.javai.annotations.Provenance}.
+ *   <li><b>Agentic Supervision</b>: {@link dev.xtrafe.javai.annotations.SyncSupervision},
+ *       {@link dev.xtrafe.javai.annotations.AsyncSupervision}, {@link dev.xtrafe.javai.annotations.SupervisionPointcut}.
+ *       Run-time execution control (an LLM-backed listener may observe or intervene on a call), a distinct
+ *       axis from Codegen Guidance's design-time edit permissions above -- see doc/spec/agentic-supervision.md
+ *       for why the two aren't the same thing despite both governing "what may an agent do here."
  * </ul>
  *
  * These are plain annotation definitions with no processing logic -- the weaver in
- * {@code javai-agent} is what gives them behavior. See {@code doc/spec/} for the full
- * design of each area. Before generating or modifying code that carries the Codegen
- * Guidance annotations, read {@code doc/JavAI_Codegen_Guidance.md} in full.
+ * {@code javai-agent} (Vector Core/Collections) or {@code javai-supervision} (Agentic Supervision -- its
+ * own, independent weaver; see that module's package-info for why it doesn't reuse javai-agent's) is what
+ * gives them behavior. See {@code doc/spec/} for the full design of each area. Before generating or
+ * modifying code that carries the Codegen Guidance annotations, read {@code doc/JavAI_Codegen_Guidance.md}
+ * in full.
  *
  * <p>The proposed (not-yet-implemented) {@code @Summary} tuning parameters described in
  * {@code doc/spec/vector-core.md} (decay, maxStack, maxDepth, aggregation, edgeKind) are

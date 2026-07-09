@@ -28,7 +28,7 @@ accelerated execution path with a required correct fallback — never as a requi
 work at all. If you're ever tempted to make correctness depend on something only a custom runtime provides,
 stop — that breaks the one constraint everything else is built around.
 
-## The six extension areas
+## The seven extension areas
 
 | # | Area | Purpose | Detail |
 |---|---|---|---|
@@ -37,7 +37,8 @@ stop — that breaks the one constraint everything else is built around.
 | 3 | **Completion Fabric** | Provider-agnostic RAG completions, wrapping Spring AI rather than competing with it | `doc/spec/completion-fabric.md` |
 | 4 | **Vector Collections** | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` — vector-aware, parallel to `java.util` | `doc/spec/vector-collections.md` |
 | 5 | **Codegen Guidance** | Annotations governing what an LLM coding agent may read, generate, or modify | `doc/spec/codegen-guidance.md` |
-| 6 | **Acceleration Substrate** | The compiler/weaver/dispatch mechanism beneath everything else — never part of any area's public surface | `doc/spec/acceleration-substrate.md` |
+| 6 | **Acceleration Substrate** | The compiler/weaver/dispatch mechanism beneath Vector Core, Vector Collections, and Codegen Guidance | `doc/spec/acceleration-substrate.md` |
+| 7 | **Agentic Supervision** | AoP-style method/constructor interception (sync, read-write + async, observation-only) enabling an LLM-backed listener to observe or intervene on execution | `doc/spec/agentic-supervision.md` |
 
 ## Dependency graph between the areas
 
@@ -51,32 +52,50 @@ stop — that breaks the one constraint everything else is built around.
                     |    +-------+-------+
                     v    v               v
           2. Persistence Bridge   3. Completion Fabric
+
+          7. Agentic Supervision   (standalone — its own independent weaver,
+                                     depending only on javai-annotations; not
+                                     fed by, and does not feed, any area above
+                                     at the module level — see below)
 ```
 
-Read arrows as "required by." Acceleration Substrate is the foundation — it's the compiler/weaver that
-actually implements Vector Core's interface and Vector Collections' graph types, and the mechanism that
-turns Codegen Guidance's annotations into enforced behavior. Vector Core feeds Vector Collections
-(`EmbeddingVector`/`similarityTo()` back cosine-distance sorting and graph-node similarity) and Persistence
-Bridge (nothing to persist without it). Vector Collections feeds Persistence Bridge (a `KnowledgeGraph` or
-`JavAIList` is what a repository query actually returns) and Completion Fabric (`toContext()` is defined on
-Vector Collections' result types). Codegen Guidance is mostly a leaf, consumed by the Substrate.
+Read arrows as "required by." Acceleration Substrate is the foundation for areas 1, 4, and 5 — it's the
+compiler/weaver that actually implements Vector Core's interface and Vector Collections' graph types, and
+the mechanism that turns Codegen Guidance's annotations into enforced behavior. Vector Core feeds Vector
+Collections (`EmbeddingVector`/`similarityTo()` back cosine-distance sorting and graph-node similarity) and
+Persistence Bridge (nothing to persist without it). Vector Collections feeds Persistence Bridge (a
+`KnowledgeGraph` or `JavAIList` is what a repository query actually returns) and Completion Fabric
+(`toContext()` is defined on Vector Collections' result types). Codegen Guidance is mostly a leaf, consumed
+by the Substrate.
+
+Agentic Supervision is deliberately *not* wired into this graph the way areas 1–6 are. It has its own
+independent weaver rather than extending Acceleration Substrate's, so that its module (`javai-supervision`)
+stays at the same early, cheap-to-prove tier as `javai-agent` instead of pulling Acceleration Substrate
+downstream of Completion Fabric/Vector Collections. An "Agentic Listener" — a supervision listener whose
+decision is LLM-backed and grounded in RAG over the object graph — is documented as an application-level
+composition of Agentic Supervision's generic listener interfaces with Completion Fabric and Vector
+Core/Collections, not a hard dependency any of those modules take on each other. See
+`doc/spec/agentic-supervision.md`'s "Relationship to the rest of JavAI Extensions" section for the full
+reasoning.
 
 Practical implication: Acceleration Substrate and Vector Core are where a design mistake is most expensive
 to unwind, since three or four other areas build on them. Persistence Bridge and Completion Fabric are the
-safest place to experiment.
+safest place to experiment. Agentic Supervision, being structurally isolated, is a similarly safe, low-blast-radius
+place to experiment — a mistake there doesn't ripple into the other six areas.
 
 ## Phase 0: the Golden Contract
 
 Phase 0 targets full functional completeness — every annotation, every collection, every auto-generated
 method, both persistence backends, and the entire Completion/RAG API — delivered via runtime bytecode
 weaving instead of a real compiler, because nothing in the functional surface actually requires a compiler
-or a GPU to work correctly, only to work fast. Six components, each a plain library, each independently
+or a GPU to work correctly, only to work fast. Seven components, each a plain library, each independently
 buildable in the order below:
 
 | Component | Mechanism | Delivers |
 |---|---|---|
-| `javai-annotations` | Plain annotation definitions, no processing logic | Full annotation vocabulary across all six areas |
+| `javai-annotations` | Plain annotation definitions, no processing logic | Full annotation vocabulary across all seven areas |
 | `javai-agent` (Acceleration Substrate) | ByteBuddy weaving, load-time agent or build-time Maven/Gradle plugin | Implements `JavAIVectorizable`/`JavAIGraphNode` on any annotated class |
+| `javai-supervision` (Agentic Supervision) | ByteBuddy weaving, its own independent installer | Sync (blocking, read-write) + async (fire-and-forget, observation-only) method/constructor interception |
 | `javai-runtime` (Vector Core) | Pure Java library | `EmbeddingVector`, back-edge propagation, `query()`, CPU similarity, local embedding provider |
 | `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-runtime` | `JavAIList`/`Set`/`Map`, `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
 | `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim | Both persistence backends real in Phase 0, not aspirational |
@@ -118,7 +137,13 @@ Phase 0) `@Summary` tuning parameters: `doc/spec/vector-core.md`.
 
 ## Current status
 
-Phase 0, pre-implementation. Repository structure and build scaffolding are in place; the ByteBuddy
-weaving spike described in `CLAUDE.md`'s build order has not yet been written. Don't assume anything beyond
-what's in this repo's actual source and tests reflects working code — the whitepaper describes the design,
-not a shipped implementation.
+Phase 0, actively underway. `javai-annotations`, `javai-runtime` (Vector Core), `javai-agent`
+(Acceleration Substrate's weaving, including the full lifecycle state machine and summary-vector
+propagation), `javai-collections` (Vector Collections), and `javai-persistence` (Persistence Bridge, both
+backends, including model-versioning/reindex/revert) all have real, tested implementations — see each
+module's own README for exactly what's covered and what's still deliberately out of scope. `javai-completion`
+(Completion Fabric) and `javai-supervision` (Agentic Supervision) are still scaffolding only — annotations
+and/or interfaces defined, no weaving or dispatch logic written yet. Don't assume anything beyond what's in
+a given module's actual source and tests reflects working code; check that module's README before relying
+on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design and may
+be ahead of or behind any one module's real implementation state at a given moment.
