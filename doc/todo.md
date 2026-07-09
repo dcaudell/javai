@@ -5,4 +5,5 @@
 - (Done — whitepaper §5.7 "Agentic Supervision", javai-supervision module scaffolded, doc/spec/agentic-supervision.md) 
 - Executive oversight via AOP cutpoints. Weaver + dispatch runtime (JavAISupervisionRuntime/SupervisionWeaver) still needs real implementation.
 - Add recursive MCP microservice fabric to the whitepaper. 
+- Although I have seen properly named Docker images be created, when you start fresh with the e2e image you are still producing images that have <none> for Name and <none> for Tag and appear not to correct this until subsequent runs. Could you work on ensuring your images are always correctly named from the get-go? 
 - Export transcripts and rank ability

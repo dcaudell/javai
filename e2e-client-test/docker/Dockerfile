@@ -54,17 +54,23 @@ RUN neo4j-admin dbms set-initial-password javai12345 \
     # line, Postgres and Ollama are reachable from outside the container and Neo4j silently is not.
     && echo "server.default_listen_address=0.0.0.0" >> /etc/neo4j/neo4j.conf
 
-# ---- Ollama, with the embedding model baked into the image layer (not pulled at container-start time) ----
-# Matches doc/spec/vector-core.md's reference model (Qwen/Qwen3-Embedding-0.6B) and
-# LocalEmbeddingDefaults' Ollama tag for it. Baking the model in means `mvn test` never depends on network
-# access at run time, only at image-build time -- consistent with this image itself needing to be built
-# before the first test run, same as any other Testcontainers image pull.
+# ---- Ollama, with both the embedding model and a chat/completion model baked into the image layer (not
+# pulled at container-start time) ----
+# Embedding model matches doc/spec/vector-core.md's reference model (Qwen/Qwen3-Embedding-0.6B) and
+# LocalEmbeddingDefaults' Ollama tag for it. Chat model matches LocalCompletionDefaults (javai-completion) --
+# qwen3:8b, deliberately more powerful than the smallest workable option (see that class's own javadoc for
+# the reasoning). Baking both in means `mvn test` never depends on network access at run time, only at
+# image-build time -- consistent with this image itself needing to be built before the first test run, same
+# as any other Testcontainers image pull. Both models pulled in the same temporary `ollama serve` session
+# rather than starting/stopping it twice.
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
 ARG JAVAI_EMBEDDING_MODEL=qwen3-embedding:0.6b
+ARG JAVAI_COMPLETION_MODEL=qwen3:8b
 RUN (/usr/local/bin/ollama serve &) \
     && sleep 5 \
     && /usr/local/bin/ollama pull ${JAVAI_EMBEDDING_MODEL} \
+    && /usr/local/bin/ollama pull ${JAVAI_COMPLETION_MODEL} \
     && pkill ollama \
     && sleep 2
 

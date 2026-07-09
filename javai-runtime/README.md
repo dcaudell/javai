@@ -15,6 +15,12 @@ module dependency. The extension-area taxonomy is conceptual; this is the compil
 split. `javai-collections` holds `KnowledgeGraph`, `SubgraphResult`, and `VectorIndex` — the types that
 depend on what's here, not the reverse.
 
+**Same reasoning, one more pair of types:** `Contextable` and `PromptContext` — Completion Fabric's
+RAG-integration primitives — also live here rather than in `javai-completion`. `Contextable.toContext(...)`
+references `PromptContext`, and `JavAIList`/`JavAISet`/`JavAIMap` all implement `Contextable`, so both types
+have to live wherever those three collection interfaces do, or this module would need an illegal reverse
+dependency on `javai-completion`. See "`Contextable`/`PromptContext`" below.
+
 ## The `JavAIVectorizable` contract
 
 `javaic`/the weaver (`javai-agent`) implements every method below on any class annotated
@@ -56,6 +62,47 @@ public interface JavAIVectorizable {
 | `similarityTo(...): double` | Method | Cosine similarity; CPU or accelerated backend chosen via `invokedynamic` (Acceleration Substrate) |
 | `query(EmbeddingVector, Class<T>[, int maxDepth]): JavAIList<T>` | Method | Search reachable graph for instances of `T`, ranked by similarity |
 | `JavAISimilarityBackend` / `JavAIEmbeddingProvider` | SPI interfaces | Pluggable similarity engine and embedding-model provider |
+| `Contextable` | Interface | `toContext(PromptContext): String` — anything that can render itself as prompt material; `JavAIList`/`Set`/`Map` implement it, delegating per-element |
+| `PromptContext` | Record | An ordered bag of `Contextable` entries, assembled into one String on demand — see below |
+| `ContextableObject<T>` | Record | Wraps an arbitrary object as a `Contextable` via GSON's default marshalling |
+
+## `Contextable`/`PromptContext`
+
+`PromptContext` is Completion Fabric's informing-material primitive — `javai-completion`'s `CompletionRequest`
+carries one — but it lives here because `JavAIList`/`JavAISet`/`JavAIMap` implement `Contextable`, whose
+method signature references `PromptContext` (see the module-placement note above).
+
+- **Assembly is entry-by-entry, not a flat string.** `PromptContext.toString()`/`toContext(...)` renders
+  each entry via `entry.toContext(this)`, joined with `"\n\n"`.
+- **`sourceLabel`**, if set, prints once as a `"[Source: ...]\n"` header before all entries; unset (the
+  default) means no header at all. Never per-entry.
+- **`maxLength` is opt-in** (`null` = unbounded, the default). This is what lets a caller partition a
+  context window across several named regions, each its own budgeted `PromptContext` — the budget is
+  honored identically whether that context is handed straight to a completion or nested as one `Contextable`
+  entry inside a larger, outer `PromptContext` (a nested `PromptContext` ignores the outer context's own
+  config and renders using its own entries/label/budget — see its class javadoc for why).
+- **No partial entries.** Assembly stops at the first entry whose rendered text would overflow the
+  remaining budget (preserving list order — entries are typically already relevance-sorted, e.g. via
+  `nearestN`); nothing is emitted to signal that omission happened.
+- **`defaultMarshall(Object)` uses GSON**, not Jackson — this module takes no Jackson dependency of its own
+  (only `javai-completion` sees Jackson at all, transitively via Spring AI). GSON's default reflective
+  serialization has no cycle guard equivalent to this module's own `enterSummaryComputation`/
+  `exitSummaryComputation` (used by `summaryVector()`'s recursive walk) — a self-referential or graph-shaped
+  object passed into `ContextableObject` risks a stack overflow. This is why `KnowledgeGraph`/
+  `SubgraphResult`/`VectorIndex` (`javai-collections`) do not implement `Contextable` yet — deferred pending
+  a cycle-aware design, not silently dropped.
+- **`defaultMarshall`'s default `Gson` only serializes fields annotated
+  `@`[`dev.xtrafe.javai.annotations.PromptContext`](../javai-annotations/src/main/java/dev/xtrafe/javai/annotations/PromptContext.java)**
+  — an allowlist, not a blocklist. Every other field is excluded, including a woven `@JavAIVectorizable`
+  class's internal bookkeeping (a cached `EmbeddingVector`, dirty-tracking state) — those must never leak
+  into a prompt just because an object got wrapped in `ContextableObject`, and an allowlist is the only way
+  to guarantee that without hand-maintaining a blocklist of "things that look internal." A caller that wants
+  GSON's ordinary, unfiltered reflection can still get it via `PromptContext.Builder.gson(Gson)` with a
+  plain `new Gson()` (or one with its own `ExclusionStrategy`) — the annotation-filtered default is an
+  opinionated starting point, not the only option. Note this annotation shares its simple name with
+  `PromptContext` the record itself — different packages, so it compiles, but code inside this very class
+  can't `import` it (its own type name is already in scope) and references it fully-qualified instead; not
+  an oversight, documented on both types.
 
 ## Object lifecycle state machine
 
@@ -145,3 +192,14 @@ specification proposals only; do not implement until there's a demonstrated need
 - The lifecycle state machine and summary-vector formula above are exactly what's implemented and tested:
   state-transition tests, cycle-safety tests, and duplicate-reference-stacking tests all exist and pass,
   both hermetically (a fake embedding provider) and against real embeddings in `e2e-client-test`.
+- `Contextable`/`ContextableObject`/`PromptContext` — real and tested (`PromptContextTest`,
+  `ContextableCollectionsTest`, plus delegation tests in `JavAIArrayListTest`/`JavAILinkedHashSetTest`/
+  `JavAILinkedHashMapTest`): stop-at-first-overflow budgeted assembly, silent omission, unbounded-by-default,
+  `sourceLabel` print-once-if-set, nested `PromptContext` ignoring the outer context's config, `merge()`,
+  `withMaxLength()`, GSON-backed `defaultMarshall()`, the `@PromptContext` field-allowlist filter (including
+  a real check that an `EmbeddingVector`-typed field is excluded unless explicitly annotated), and the
+  custom-`Gson` escape hatch restoring unfiltered serialization. `e2e-client-test`'s own `CompletionE2ETest`
+  additionally proves this against a real, woven `@JavAIVectorizable` class, not just hand-written test
+  POJOs. Not yet implemented: `Contextable` on `KnowledgeGraph`/`SubgraphResult`/`VectorIndex`
+  (`javai-collections`) — see the
+  "`Contextable`/`PromptContext`" section above for why.

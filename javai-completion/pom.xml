@@ -14,9 +14,13 @@
   <packaging>jar</packaging>
 
   <!--
-    Completion Fabric: PromptContext, CompletionRequest/Result, JavAICompletionProvider,
-    wrapping Spring AI ChatModel/ChatClient rather than writing new provider clients. See
-    doc/spec/completion-fabric.md.
+    Completion Fabric: PromptContext, CompletionRequest/Result, Cortex (the connector interface;
+    see doc/spec/completion-fabric.md's JavAICompletionProvider, renamed per the user's own naming
+    request), wrapping Spring AI ChatModel implementations rather than writing new provider clients
+    for OpenAI/Anthropic/Ollama. Groq and vLLM are OpenAI-wire-compatible (repointed spring-ai-openai,
+    different base-url), so they need no separate Spring AI module. Replicate has no Spring AI
+    ChatModel at all; its own Cortex is a hand-rolled HTTP client, the one deliberate deviation from
+    "wrap Spring AI, never write a provider client" (see this module's own README for why).
 
     Note: "spring-ai-core" (referenced here originally) doesn't exist as a GA artifact —
     Spring AI split it into spring-ai-model (ChatModel/EmbeddingModel, the abstractions
@@ -41,6 +45,46 @@
     <dependency>
       <groupId>org.springframework.ai</groupId>
       <artifactId>spring-ai-client-chat</artifactId>
+    </dependency>
+    <!-- Real ChatModel implementations, not just the abstractions above. spring-ai-openai backs
+         OpenAICortex directly, and GroqCortex/VLlmCortex too (both OpenAI-wire-compatible, just a
+         repointed base-url/api-key/model, no separate Spring AI module needed for either). -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-openai</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-anthropic</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-ollama</artifactId>
+    </dependency>
+    <!-- OllamaCortex's own hand-rolled NDJSON line parsing (see its own class javadoc); comes in
+         transitively via javai-runtime too, declared directly here since this module's own code
+         imports it. -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+    </dependency>
+    <!-- Mustache-compatible templating for CompletionRequest.render() (see its own javadoc for the
+         %%...%% delimiter + EscapingStrategy.NOOP choices). -->
+    <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+    </dependency>
+    <!-- OllamaCortexRealContainerTest's own real backend; see javai-persistence/pom.xml for the same
+         pattern (testcontainers-bom already imported at the root). -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
     </dependency>
   </dependencies>
 </project>

@@ -8,7 +8,15 @@ import java.util.Map;
  * own, so ranking and {@code centroid()} operate over values. See
  * doc/spec/vector-collections.md.
  */
-public interface JavAIMap<K, V> extends Map<K, V>, JavAISortable<V>, JavAIVectorizable {
+public interface JavAIMap<K, V> extends Map<K, V>, JavAISortable<V>, JavAIVectorizable, Contextable {
 
     EmbeddingVector centroid();
+
+    /** Renders each value (not key -- see this interface's own javadoc on why ranking/centroid() are
+     *  value-based) via its own {@link Contextable} override where it has one, falling back to
+     *  {@link PromptContext#defaultMarshall(Object)} otherwise -- see {@link CollectionVectorSupport#contextOf}. */
+    @Override
+    default String toContext(PromptContext prompt) {
+        return CollectionVectorSupport.contextOf(values(), prompt);
+    }
 }

@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.e2e.domain;
 
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
+import dev.xtrafe.javai.annotations.PromptContext;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.annotations.VectorizeIgnore;
 import jakarta.persistence.Entity;
@@ -18,7 +19,9 @@ import java.util.UUID;
  *
  * <p>{@code internalModerationNote} carries both {@code @Vectorize} and {@code @VectorizeIgnore} on the
  * same field -- the explicit exclude signal must win against real weaving and real embeddings, exactly as
- * {@code JavAIWeaver}'s hermetic test already proves in isolation.
+ * {@code JavAIWeaver}'s hermetic test already proves in isolation. Deliberately not {@code @PromptContext}
+ * either, for the same reason its name suggests: internal, never meant to surface -- not in an embedding,
+ * not in a prompt.
  *
  * <p>{@code @Entity} + {@link #id}: a real, independently-persistable entity on both backends --
  * {@link Article#getFeaturedComment()}/{@link Article#getDraftComment()} are real Postgres
@@ -35,6 +38,7 @@ public class Comment extends Attribution {
     private UUID id;
 
     @Vectorize
+    @PromptContext
     private String text;
 
     @Vectorize

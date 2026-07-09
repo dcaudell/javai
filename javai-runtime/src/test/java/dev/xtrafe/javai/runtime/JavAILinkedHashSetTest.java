@@ -70,4 +70,33 @@ class JavAILinkedHashSetTest {
 
         assertTrue(set.isSummaryDirty(), "mutating a member must dirty the set that holds it");
     }
+
+    @Test
+    void toContextDelegatesToAnElementsOwnContextableOverride() {
+        record CustomEntry(String label) implements Contextable {
+            @Override
+            public String toContext(PromptContext prompt) {
+                return "custom:" + label;
+            }
+        }
+        JavAILinkedHashSet<Contextable> set = new JavAILinkedHashSet<>();
+        set.add(new CustomEntry("one"));
+        set.add(new CustomEntry("two"));
+
+        String rendered = set.toContext(PromptContext.builder().build());
+
+        assertEquals("custom:one\n\ncustom:two", rendered);
+    }
+
+    @Test
+    void toContextFallsBackToDefaultMarshallRespectingThePromptContextFieldFilter() {
+        record PlainValue(@dev.xtrafe.javai.annotations.PromptContext String name, int count) {
+        }
+        JavAILinkedHashSet<Contextable> set = new JavAILinkedHashSet<>();
+        set.add(new ContextableObject<>(new PlainValue("widgets", 3)));
+
+        String rendered = set.toContext(PromptContext.builder().build());
+
+        assertEquals("{\"name\":\"widgets\"}", rendered);
+    }
 }

@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.e2e.domain;
 
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
+import dev.xtrafe.javai.annotations.PromptContext;
 import dev.xtrafe.javai.annotations.SearchVisibility;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
@@ -22,6 +23,11 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * {@code @Summary} collection ({@link #comments}, initialized inline and never reassigned -- elements
  * are added through the collection itself, exercising {@code javai-agent}'s constructor-exit wiring for
  * that case).
+ *
+ * <p>{@link #title}/{@link #body} also carry {@code @PromptContext} -- Completion Fabric's field-level
+ * allowlist for {@code PromptContext.defaultMarshall(Object)} -- so an {@code Article} wrapped in
+ * {@code ContextableObject} renders as just those two fields, never {@link #id} or any woven internal
+ * state; see {@code CompletionE2ETest}.
  *
  * <p>{@link #draftComment} is field-level {@code @SearchVisibility(PRIVATE)}: reachable in the object
  * graph exactly like {@link #featuredComment}, but {@code query()} must never traverse through it, so
@@ -60,9 +66,11 @@ public class Article implements JavAIGraphNode {
     private UUID id;
 
     @Vectorize
+    @PromptContext
     private String title;
 
     @Vectorize
+    @PromptContext
     private String body;
 
     @OneToOne(cascade = CascadeType.ALL)

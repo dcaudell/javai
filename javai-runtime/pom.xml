@@ -24,5 +24,11 @@
       <groupId>dev.xtrafe.javai</groupId>
       <artifactId>javai-annotations</artifactId>
     </dependency>
+    <!-- Backs PromptContext.defaultMarshall(); GSON, not Jackson (Spring AI's own transitive
+         dependency, pulled in only by javai-completion); see PromptContext's own javadoc. -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+    </dependency>
   </dependencies>
 </project>

@@ -20,6 +20,7 @@ class AnnotationsSmokeTest {
 
         @Vectorize
         @SearchVisibility(SearchVisibility.Visibility.PUBLIC)
+        @PromptContext
         String title;
 
         @VectorizeIgnore
@@ -59,6 +60,7 @@ class AnnotationsSmokeTest {
         Field title = Sample.class.getDeclaredField("title");
         assertTrue(title.isAnnotationPresent(Vectorize.class));
         assertTrue(title.isAnnotationPresent(SearchVisibility.class));
+        assertTrue(title.isAnnotationPresent(PromptContext.class));
 
         Field internalId = Sample.class.getDeclaredField("internalId");
         assertTrue(internalId.isAnnotationPresent(VectorizeIgnore.class));

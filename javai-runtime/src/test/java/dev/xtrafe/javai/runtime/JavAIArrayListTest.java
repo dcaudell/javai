@@ -69,4 +69,35 @@ class JavAIArrayListTest {
 
         assertTrue(list.isSummaryDirty(), "mutating a member must dirty the list that holds it");
     }
+
+    @Test
+    void toContextDelegatesToAnElementsOwnContextableOverride() {
+        record CustomEntry(String label) implements Contextable {
+            @Override
+            public String toContext(PromptContext prompt) {
+                return "custom:" + label;
+            }
+        }
+        JavAIArrayList<Contextable> list = new JavAIArrayList<>();
+        list.add(new CustomEntry("one"));
+        list.add(new CustomEntry("two"));
+
+        String rendered = list.toContext(PromptContext.builder().build());
+
+        assertEquals("custom:one\n\ncustom:two", rendered);
+    }
+
+    @Test
+    void toContextFallsBackToDefaultMarshallForNonContextableElements() {
+        record PlainValue(@dev.xtrafe.javai.annotations.PromptContext String name, int count) {
+        }
+        JavAIArrayList<Contextable> list = new JavAIArrayList<>();
+        list.add(new ContextableObject<>(new PlainValue("widgets", 3)));
+
+        PromptContext prompt = PromptContext.builder().build();
+        String rendered = list.toContext(prompt);
+
+        assertEquals("{\"name\":\"widgets\"}", rendered,
+                "delegation must apply the same @PromptContext field filter as a direct defaultMarshall call");
+    }
 }

@@ -62,4 +62,34 @@ class JavAILinkedHashMapTest {
 
         assertTrue(map.isSummaryDirty(), "mutating a value must dirty the map that holds it");
     }
+
+    @Test
+    void toContextRendersValuesNotKeysDelegatingToEachValuesOwnContextableOverride() {
+        record CustomEntry(String label) implements Contextable {
+            @Override
+            public String toContext(PromptContext prompt) {
+                return "custom:" + label;
+            }
+        }
+        JavAILinkedHashMap<String, Contextable> map = new JavAILinkedHashMap<>();
+        map.put("key-one", new CustomEntry("one"));
+        map.put("key-two", new CustomEntry("two"));
+
+        String rendered = map.toContext(PromptContext.builder().build());
+
+        assertEquals("custom:one\n\ncustom:two", rendered);
+        assertFalse(rendered.contains("key-one"), "keys must not appear -- only values are rendered");
+    }
+
+    @Test
+    void toContextFallsBackToDefaultMarshallRespectingThePromptContextFieldFilter() {
+        record PlainValue(@dev.xtrafe.javai.annotations.PromptContext String name, int count) {
+        }
+        JavAILinkedHashMap<String, Contextable> map = new JavAILinkedHashMap<>();
+        map.put("key", new ContextableObject<>(new PlainValue("widgets", 3)));
+
+        String rendered = map.toContext(PromptContext.builder().build());
+
+        assertEquals("{\"name\":\"widgets\"}", rendered);
+    }
 }

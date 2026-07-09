@@ -15,5 +15,15 @@
  * dependency. javai-collections holds KnowledgeGraph/SubgraphResult/VectorIndex, which
  * depend on the types here. The area taxonomy in the whitepaper is conceptual; this is
  * the compile-order-correct physical split.
+ *
+ * <p>{@link Contextable} and {@link PromptContext} (Completion Fabric's own RAG-integration primitives)
+ * live here for the identical reason: {@code Contextable.toContext(PromptContext)} references
+ * {@code PromptContext}, and {@link JavAIList}/{@link JavAISet}/{@link JavAIMap} all implement
+ * {@code Contextable} -- so both types must live wherever those three collection interfaces do, or
+ * javai-runtime would need an illegal reverse dependency on javai-completion. javai-collections'
+ * KnowledgeGraph/SubgraphResult/VectorIndex do not yet implement {@code Contextable} -- deferred
+ * pending a cycle-safe design, since GSON's default reflection (unlike this package's own
+ * {@code enterSummaryComputation}/{@code exitSummaryComputation} guard) has no protection against the
+ * cycles a graph-shaped type can legitimately contain. See {@code PromptContext}'s own javadoc.
  */
 package dev.xtrafe.javai.runtime;

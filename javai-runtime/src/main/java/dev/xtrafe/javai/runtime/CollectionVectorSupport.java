@@ -81,6 +81,27 @@ public final class CollectionVectorSupport {
         return Double.NEGATIVE_INFINITY;
     }
 
+    /**
+     * Shared {@code toContext()} body for {@link JavAIList}/{@link JavAISet}/{@link JavAIMap} -- delegates
+     * per-element rather than letting GSON reflect the whole collection as one opaque JSON array, so an
+     * element's own {@link Contextable} override (if it has one) is respected.
+     */
+    public static String contextOf(Collection<?> elements, PromptContext prompt) {
+        StringBuilder buffer = new StringBuilder();
+        boolean first = true;
+        for (Object element : elements) {
+            String rendered = element instanceof Contextable contextable
+                    ? contextable.toContext(prompt)
+                    : prompt.defaultMarshall(element);
+            if (!first) {
+                buffer.append("\n\n");
+            }
+            buffer.append(rendered);
+            first = false;
+        }
+        return buffer.toString();
+    }
+
     private static EmbeddingVector computeCentroid(Collection<?> elements) {
         List<EmbeddingVector> vectors = new ArrayList<>(elements.size());
         for (Object element : elements) {

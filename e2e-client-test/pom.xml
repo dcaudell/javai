@@ -30,6 +30,17 @@
     <javai.version>0.1.0-SNAPSHOT</javai.version>
     <junit.version>5.11.0</junit.version>
     <testcontainers.version>1.21.4</testcontainers.version>
+    <!--
+      Confirmed via `mvn dependency:tree -Dverbose`: without this, Maven's nearest-wins mediation picks
+      jackson-annotations:2.10.3 (a hard-pinned transitive dependency of Testcontainers' own
+      com.github.docker-java:docker-java-api, at a shallower tree depth) over the much newer
+      jackson-databind/jackson-core/jackson-datatype-jsr310 versions javai-completion pulls in
+      transitively via Spring AI; a real, severe cross-version mismatch (2.10.3 paired with 2.21.4)
+      that breaks Hibernate's own optional Jackson JSON format mapper at SessionFactory build time
+      (NoClassDefFoundError: com/fasterxml/jackson/annotation/JsonSerializeAs). Importing the BOM forces
+      every jackson-* artifact to one consistent version regardless of transitive depth.
+    -->
+    <jackson.version>2.21.4</jackson.version>
 
     <!--
       Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
@@ -40,6 +51,18 @@
     -->
     <javai.embedding.provider></javai.embedding.provider>
   </properties>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson</groupId>
+        <artifactId>jackson-bom</artifactId>
+        <version>${jackson.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
 
   <dependencies>
     <dependency>
@@ -66,6 +89,24 @@
       <groupId>dev.xtrafe.javai</groupId>
       <artifactId>javai-persistence</artifactId>
       <version>${javai.version}</version>
+    </dependency>
+    <!-- Brings Spring AI + GSON in transitively (Maven's default compile scope is transitive to
+         consumers); no separate BOM/version management needed here, same as javai-persistence already
+         bringing in Hibernate/the Postgres driver above without re-declaring versions. -->
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-completion</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
+
+    <!-- Realistic-sounding (not random-noise) sample data for SampleDataSeeder; chosen over Instancio
+         specifically because semantic-similarity tests need real embeddable text signal, not
+         type-correct-but-meaningless generated values. -->
+    <dependency>
+      <groupId>net.datafaker</groupId>
+      <artifactId>datafaker</artifactId>
+      <version>2.7.0</version>
+      <scope>test</scope>
     </dependency>
 
     <dependency>

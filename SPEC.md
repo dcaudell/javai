@@ -137,13 +137,22 @@ Phase 0) `@Summary` tuning parameters: `doc/spec/vector-core.md`.
 
 ## Current status
 
-Phase 0, actively underway. `javai-annotations`, `javai-runtime` (Vector Core), `javai-agent`
-(Acceleration Substrate's weaving, including the full lifecycle state machine and summary-vector
-propagation), `javai-collections` (Vector Collections), and `javai-persistence` (Persistence Bridge, both
-backends, including model-versioning/reindex/revert) all have real, tested implementations — see each
-module's own README for exactly what's covered and what's still deliberately out of scope. `javai-completion`
-(Completion Fabric) and `javai-supervision` (Agentic Supervision) are still scaffolding only — annotations
-and/or interfaces defined, no weaving or dispatch logic written yet. Don't assume anything beyond what's in
-a given module's actual source and tests reflects working code; check that module's README before relying
+Phase 0, actively underway. `javai-annotations`, `javai-runtime` (Vector Core, now including the
+`Contextable`/`PromptContext` RAG-integration primitives — see below), `javai-agent` (Acceleration
+Substrate's weaving, including the full lifecycle state machine and summary-vector propagation),
+`javai-collections` (Vector Collections), and `javai-persistence` (Persistence Bridge, both backends,
+including model-versioning/reindex/revert) all have real, tested implementations — see each module's own
+README for exactly what's covered and what's still deliberately out of scope. `javai-completion` (Completion
+Fabric) has both its connector layer (`Cortex`, six providers: OpenAI, Anthropic, Groq, vLLM, Ollama,
+Replicate; `CompletionRequest`/`CompletionResult`, provider-specific tuning parameters) and its
+RAG-integration half real and tested: grounding a completion in a `JavAIList`/`Set`/`Map` via `PromptContext`
+(`Contextable`, `ContextableObject`) — these two primitives live in `javai-runtime`, not `javai-completion`,
+for a real dependency-direction reason documented in both modules' own READMEs. `KnowledgeGraph`/
+`SubgraphResult` (`javai-collections`) don't implement `Contextable` yet — deferred pending a cycle-safe
+design, since GSON's default marshalling has no cycle guard and those types are graph-shaped by design; see
+`javai-completion`'s own README for exactly what's covered. `javai-supervision` (Agentic Supervision) is
+still scaffolding only — annotations and/or interfaces defined,
+no weaving or dispatch logic written yet. Don't assume anything beyond what's in a given module's actual
+source and tests reflects working code; check that module's README before relying
 on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design and may
 be ahead of or behind any one module's real implementation state at a given moment.
