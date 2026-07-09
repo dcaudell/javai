@@ -13,6 +13,8 @@
     <file url="file://$PROJECT_DIR$/javai-persistence/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-runtime/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-runtime/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-supervision/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-supervision/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/src/main/resources" charset="UTF-8" />
   </component>

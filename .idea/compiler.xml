@@ -8,10 +8,11 @@
         <outputRelativeToContentRoot value="true" />
         <module name="javai-collections" />
         <module name="javai-annotations" />
-        <module name="javai-persistence" />
         <module name="javai-runtime" />
-        <module name="javai-agent" />
         <module name="javai-completion" />
+        <module name="javai-persistence" />
+        <module name="javai-agent" />
+        <module name="javai-supervision" />
       </profile>
     </annotationProcessing>
   </component>
