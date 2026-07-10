@@ -15,11 +15,14 @@ this module consumes from `javai-model` rather than owning — see "RAG integrat
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `Cortex` | Interface | The connector to one LLM backend — `complete()`, `completeStreaming()`, `providerId()`, `modelId()`. Renames the spec's `JavAICompletionProvider`. |
-| `OpenAICortex` / `AnthropicCortex` / `OllamaCortex` / `GroqCortex` / `VLlmCortex` / `ReplicateCortex` | `Cortex` implementations | One per provider, each with its own builder — see "Provider coverage" below |
+| `Cortex` | Interface | The connector to one LLM backend — `complete()`, `completeStreaming()`, `providerId()`, `modelId()`, `contextWindowTokens()`. Renames the spec's `JavAICompletionProvider`. |
+| `CortexOpenAI` / `CortexAnthropic` / `CortexOllama` / `CortexGroq` / `CortexVLlm` / `CortexReplicate` | `Cortex` implementations | One per provider, each with its own builder — see "Provider coverage" below |
 | `CompletionRequest` | Value type + builder | A `List<String>` of prompt strings + optional `PromptContext` + `promptParams` (a Handlebars template model) + generation parameters + an open-ended `providerOptions` bag for tuning parameters specific to one provider/model |
+| `CompletionRequest.render(int)` | Method | Sizes `context` to fit the calling Cortex's `contextWindowTokens()` before rendering — see "Context-window budgeting" below |
 | `CompletionResult` | Value type | Text result + `providerId`/`modelId`/`completedAt` |
-| `LocalCompletionDefaults` | Static utility | The one place this repo decides which local chat model `OllamaCortex` defaults to (`qwen3:8b`) |
+| `LocalCompletionDefaults` | Static utility | The one place this repo decides which local chat model `CortexOllama` defaults to (`qwen3:8b`) |
+| `ContextWindows` | Static lookup | Best-effort, overridable-per-Cortex token-count table backing `contextWindowTokens()` — see "Context-window budgeting" below |
+| `EndpointRateLimiter` / `RetrySupport` / `TooManyRequestsException` / `RetryAfterParser` | `javai-vector` types, reused here | Shared 429/backoff coordination — see "Rate limiting" below |
 
 `PromptContext`/`Contextable`/`ContextableObject` — the RAG-integration primitives `CompletionRequest`
 carries a `PromptContext` of — live in `javai-model`, not here; see "RAG integration" below.
@@ -33,9 +36,9 @@ Hibernate's `SessionFactory` metadata is immutable once built; nothing here has 
 boot-once resource):
 
 ```java
-Cortex gpt    = OpenAICortex.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
-Cortex claude = AnthropicCortex.builder().apiKey(System.getenv("ANTHROPIC_API_KEY")).model("claude-sonnet-5").build();
-Cortex local  = OllamaCortex.builder().endpoint(URI.create("http://localhost:11434")).model("qwen3:8b").build();
+Cortex gpt    = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
+Cortex claude = CortexAnthropic.builder().apiKey(System.getenv("ANTHROPIC_API_KEY")).model("claude-sonnet-5").build();
+Cortex local  = CortexOllama.builder().endpoint(URI.create("http://localhost:11434")).model("qwen3:8b").build();
 
 // All three are used the same way, right away, side by side -- local and remote both look identical:
 CompletionResult fromGpt = gpt.complete(request);
@@ -54,7 +57,7 @@ CompletionResult fromLocal = local.complete(request);
 | Ollama | Spring AI's low-level `OllamaApi` directly (not `OllamaChatModel`) | native — see below for why the lower-level client |
 | Replicate | hand-rolled HTTP client | job-submission + poll, not chat-completions-shaped at all |
 
-OpenAI/Groq/vLLM share one real implementation (`OpenAiCompatibleCortexSupport`, package-private) behind
+OpenAI/Groq/vLLM share one real implementation (`CortexOpenAiCompatibleSupport`, package-private) behind
 three distinct public classes — three separate connector types were asked for, and that's the vocabulary
 that should show up in code, even though underneath all three just configure a repointed `OpenAiChatModel`.
 
@@ -71,12 +74,12 @@ from "wrap Spring AI," found empirically, not assumed.** Against this project's 
 no `onNext`, no `onError`, no `onComplete` — while decoding the identical NDJSON response as plain text
 lines completes in under a second. This is a known class of async-parser limitation with custom
 deserializers (here, `java.time.Instant`) that an ordinary, fully buffered synchronous parser doesn't hit.
-`OllamaCortex` sidesteps it: read raw NDJSON lines via `WebClient.bodyToFlux(String.class)` (proven fast and
+`CortexOllama` sidesteps it: read raw NDJSON lines via `WebClient.bodyToFlux(String.class)` (proven fast and
 reliable), then parse each already-complete line synchronously with a plain `Gson` — GSON, not Jackson,
 matching this project's `javai-vector`/`javai-model` (which take no Jackson dependency of their own; see `PromptContext`'s
 own javadoc). `ChatResponse`'s snake_case wire fields need `FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES`,
 and its `createdAt` field needs a custom `Instant` adapter, since GSON has no built-in `java.time` support
-either. `OllamaCortexRealContainerTest` is what caught the original hang, and re-confirmed the GSON-based
+either. `CortexOllamaRealContainerTest` is what caught the original hang, and re-confirmed the GSON-based
 fix against a real container afterward — a hermetic (fake-server) test could not have caught either, since
 the bug is specific to how a reactive decoder's async tokenizer behaves against a real chunked HTTP response.
 
@@ -84,8 +87,8 @@ the bug is specific to how a reactive decoder's async tokenizer behaves against 
 Justified, not a shortcut: no Spring AI `ChatModel` exists for Replicate, and its API is structurally
 different from every other provider here — a call creates a *prediction* (a job), resolved either
 synchronously (via the `Prefer: wait` header, used here) or by polling the prediction's own status URL
-until it reaches a terminal state. `ReplicateCortex` hand-rolls this the same way `javai-vector`'s
-`OllamaEmbeddingProvider` hand-rolls its own small, fixed-shape JSON rather than pulling in a library.
+until it reaches a terminal state. `CortexReplicate` hand-rolls this the same way `javai-vector`'s
+`EmbeddingProviderOllama` hand-rolls its own small, fixed-shape JSON rather than pulling in a library.
 `completeStreaming()` on this one Cortex is a first-pass simplification: it computes the full result via
 `complete()` and delivers it as a single chunk, rather than parsing Replicate's real SSE token stream —
 correct per the `Cortex` contract, just coarser-grained than the other five providers' real per-token
@@ -103,10 +106,67 @@ concrete, real, tested examples backing this requirement, not just a claim:
 - **Ollama**: `"enable_thinking"` (a `Boolean`) sets Ollama's own `think` request field — the one this
   module's real (Testcontainers-backed) test proves actually changes the model's real response (a non-empty
   reasoning trace appears in `message.thinking()`), not just gets accepted and ignored. Any other
-  `providerOptions` key on `OllamaCortex` passes straight through as an Ollama request option unmodified
+  `providerOptions` key on `CortexOllama` passes straight through as an Ollama request option unmodified
   (e.g. `"num_ctx"`, `"repeat_penalty"`).
 - **OpenAI/Groq/vLLM**: `"reasoning_effort"` (a `String`: `"low"`/`"medium"`/`"high"`) maps onto
   `OpenAiChatOptions.reasoningEffort(...)`.
+
+## Concurrency: every Cortex supports concurrent callers
+
+Each Cortex instance is effectively immutable once built, delegating to clients that are all documented
+thread-safe once constructed (JDK `HttpClient`, Spring `WebClient`, Spring AI's `ChatModel` implementations)
+— no locking or per-call mutable state was needed to make this true, and every Cortex's own hermetic test
+class has a `concurrentCallsAllSucceed()` test proving it directly (N calls submitted at once via an
+`ExecutorService`, all returning correctly with no exception).
+
+## Rate limiting: 429s, exponential backoff, coordinated across instances and modules
+
+Every Cortex, and both of `javai-vector`'s over-the-wire `JavAIEmbeddingProvider`s, shares one coordination
+point: `EndpointRateLimiter` (`javai-vector`, public) — a static registry keyed by normalized endpoint URL
+(scheme + authority, not path). Two independently-constructed instances pointed at the same base URL — even
+a `Cortex` and an `EmbeddingProvider`, even across the `javai-vector`/`javai-completion` module boundary —
+share the same limiter, so a 429 seen by one backs off the other too (`EndpointRateLimiterCrossInstanceTest`,
+in both modules, proves this with a hermetic `HttpServer` and a timing assertion). `RetrySupport.withRetry`
+(also `javai-vector`) drives the actual loop: up to five attempts, preferring the server's own `Retry-After`
+header (parsed by `RetryAfterParser`, seconds or HTTP-date form), falling back to exponential backoff
+(doubling, capped at 60s) otherwise.
+
+This lives in `javai-vector`, not here, specifically so both modules can share one registry —
+`javai-completion` depends on `javai-vector` transitively, never the reverse. Each provider's own 429
+*detection* is the only per-provider piece, since each uses a different HTTP client:
+
+- **OpenAI/Groq/vLLM, Anthropic, Ollama (non-streaming)**: a shared `TooManyRequestsResponseErrorHandler`
+  (`javai-completion`, implements Spring's `ResponseErrorHandler`) plugged into each provider's
+  `.responseErrorHandler(...)` builder call.
+- **Ollama (streaming), and Spring AI's own internal reactive client**: `TooManyRequestsExchangeFilterFunction`
+  (`javai-completion`), plugged in via `.webClientBuilder(WebClient.builder().filter(...))`. The streaming
+  path additionally needs its own reactor-aware retry wrapper, `CortexStreamingRetry` — a 429 there surfaces
+  as a reactive `onError` once the `Flux` is subscribed, not a thrown exception when it's built, so
+  `RetrySupport`'s synchronous loop doesn't fit; `CortexStreamingRetry` uses `Flux.retryWhen(...)` against
+  the same shared `EndpointRateLimiter` instead.
+- **`CortexReplicate`, `EmbeddingProviderOllama`, `EmbeddingProviderTextEmbeddingsInference`**: already have
+  the raw `HttpResponse` in hand (all three hand-roll `java.net.http.HttpClient`), so detection is just a
+  `statusCode() == 429` check.
+
+## Context-window budgeting
+
+`Cortex.contextWindowTokens()` reports this Cortex's configured model's context window, in tokens —
+best-effort (`ContextWindows`, a small lookup table keyed by model id with a conservative fallback for an
+unrecognized model), always overridable per-Cortex via `Builder.contextWindowTokens(int)` (strongly
+recommended for `CortexVLlm`/`CortexReplicate`, whose models `ContextWindows` can't realistically track).
+`CompletionRequest.render(int)` — what every Cortex actually calls, not the plain `render()` — converts that
+into an approximate character budget (`tokens * 4`, matching `PromptContext.maxLength()`'s own existing
+character-count semantics, not real tokenization) and, if the top-level `context` doesn't already have an
+explicit `maxLength`, sizes it to fit before rendering.
+
+Nested `PromptContext` entries (already legal before this feature — `PromptContext` implements `Contextable`,
+so nesting was always structurally supported) participate via a new `targetPercentage` field: when the outer
+context has a `maxLength` and reaches a nested entry lacking its own explicit `maxLength`, that entry gets
+`remainingBudget * (its targetPercentage / sum of all eligible siblings' targetPercentage)` before being
+rendered — a qualifying nested entry with no `targetPercentage` throws `IllegalStateException` at assembly
+time rather than silently claiming a 0% share, and an explicit `maxLength` on a nested entry always wins over
+the percentage split. See `PromptContext`'s own class javadoc ("Assembly rules") in `javai-model` for the
+exact algorithm, and `PromptContextTargetPercentageTest` there for the tests that lock it in.
 
 ## RAG integration: `PromptContext` lives in `javai-model`
 
@@ -204,7 +264,7 @@ A genuinely malformed/unterminated `%%` (not a real placeholder, just a stray to
 
 ## Local Docker model
 
-`LocalCompletionDefaults` defaults `OllamaCortex` to **`qwen3:8b`** (5.2 GB, 40K context) — deliberately
+`LocalCompletionDefaults` defaults `CortexOllama` to **`qwen3:8b`** (5.2 GB, 40K context) — deliberately
 more powerful than the smallest workable option, per explicit direction to prioritize capability over
 minimal footprint: current (2026) local-LLM benchmarking consistently ranks it the strongest dense model
 under 8B parameters, and it runs acceptably under Ollama's Metal acceleration on Apple Silicon.
@@ -218,7 +278,7 @@ other:
   already serves both embeddings and chat completions from one running instance), now also pulling
   `qwen3:8b` at image-build time.
 - `javai-completion/docker/Dockerfile` — this module's own, smaller, Ollama-only image (no
-  Postgres/Neo4j needed for a completions-only test), used by `OllamaCortexRealContainerTest`.
+  Postgres/Neo4j needed for a completions-only test), used by `CortexOllamaRealContainerTest`.
 
 Both bake the model in at image-build time rather than pulling it at container-start time, matching this
 project's established pattern (`javai-vector`'s own embedding-provider images do the same) — `mvn test`
@@ -227,13 +287,16 @@ never depends on network access at run time, only at (one-time) image-build time
 ## What's actually implemented
 
 `Cortex`, `CompletionRequest`/`CompletionResult`, and all six connector classes described above, plus
-`LocalCompletionDefaults`. `PromptContext`/`Contextable`/`ContextableObject` (consumed from `javai-model`)
+`LocalCompletionDefaults`, `ContextWindows`, and the shared rate-limiting/retry infrastructure (concurrency
+proof, 429 handling/backoff, `contextWindowTokens()`/`render(int)`, `PromptContext.targetPercentage` — see
+their own sections above). `PromptContext`/`Contextable`/`ContextableObject` (consumed from `javai-model`)
 are real and tested there — see that module's own README. Every Cortex is covered by hermetic tests
 (request/option-mapping against a fake HTTP server, `com.sun.net.httpserver.HttpServer` — the same pattern
-`OllamaEmbeddingProviderTest` already established). `OllamaCortexRealContainerTest` is this module's one
-real-backend proof (Testcontainers, this module's own Dockerfile baking in `qwen3:8b`) — there's no
+`EmbeddingProviderOllamaTest` already established), plus its own `concurrentCallsAllSucceed()` test.
+`CortexOllamaRealContainerTest` is this module's one real-backend proof (Testcontainers, this module's own
+Dockerfile baking in `qwen3:8b`) — there's no
 meaningful way to fake whether a real completion, real streaming, or a real tuning parameter's effect
-actually works. `e2e-client-test` now wires a real `OllamaCortex` into its own `Article`/`Comment` domain
+actually works. `e2e-client-test` now wires a real `CortexOllama` into its own `Article`/`Comment` domain
 too (`CompletionE2ETest`), grounding a completion in real, woven objects via `PromptContext`/
 `ContextableObject` against the same shared container that project already runs for embeddings/persistence.
 
@@ -249,6 +312,6 @@ implemented against their documented APIs and covered by hermetic tests, but tha
   graph-shaped by design).
 - Structured/schema-typed `CompletionResult` (a second, schema-bound variant, mentioned in the spec's
   primitives table).
-- Real per-token streaming for `ReplicateCortex` (see "Provider coverage" above).
+- Real per-token streaming for `CortexReplicate` (see "Provider coverage" above).
 - Real-endpoint verification for OpenAI/Anthropic/Groq/Replicate (pending API keys) and vLLM (pending a
   GPU-capable host).

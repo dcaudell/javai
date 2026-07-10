@@ -13,7 +13,7 @@ import java.util.function.Consumer;
  * specifically because Hibernate's {@code SessionFactory} metadata is immutable once built, so every
  * entity type has to be known up front. Nothing here has an equivalent shared, boot-once resource: each
  * Cortex is an independent object, constructed directly via its own builder
- * ({@code OpenAICortex.builder()...build()}, etc.), with no registration step and no bootstrap ordering
+ * ({@code CortexOpenAI.builder()...build()}, etc.), with no registration step and no bootstrap ordering
  * requirement. Constructing several Cortices -- local and remote, side by side -- is just constructing
  * several plain objects; see this module's README for a worked example.
  */
@@ -61,4 +61,9 @@ public interface Cortex {
 
     /** The specific model this Cortex is configured to call, e.g. {@code "gpt-4.1"}, {@code "qwen3:8b"}. */
     String modelId();
+
+    /** This Cortex's configured model's context window, in tokens -- best-effort (see {@link ContextWindows}),
+     *  overridable per-Cortex at construction time. {@link CompletionRequest#render(int)} uses this to size
+     *  the character budget it hands down to a {@code PromptContext}. */
+    int contextWindowTokens();
 }

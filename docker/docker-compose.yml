@@ -17,8 +17,8 @@
 ##
 ## `--profile ollama` is not one of the whitepaper's three deployment shapes -- it's a workaround for a
 ## confirmed, unresolved bug in TEI's Candle backend running Qwen3-Embedding-0.6B on CPU at all (see
-## README.md). Needs javai-vector's OllamaEmbeddingProvider on the client side, not
-## TextEmbeddingsInferenceProvider -- the REST contract is different.
+## README.md). Needs javai-vector's EmbeddingProviderOllama on the client side, not
+## EmbeddingProviderTextEmbeddingsInference -- the REST contract is different.
 ##
 ## `--profile postgres` / `--profile neo4j` are javai-persistence's (Persistence Bridge) two backends --
 ## see doc/spec/persistence-bridge.md and javai-persistence/README.md. Additive, not alternatives like the

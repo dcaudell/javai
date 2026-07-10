@@ -13,7 +13,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-class TextEmbeddingsInferenceProviderTest {
+class EmbeddingProviderTextEmbeddingsInferenceTest {
 
     private HttpServer server;
 
@@ -26,14 +26,14 @@ class TextEmbeddingsInferenceProviderTest {
 
     @Test
     void parseSingleRowReadsTheFirstEmbeddingRow() {
-        float[] values = TextEmbeddingsInferenceProvider.parseSingleRow("[[0.1,-0.2,0.3]]");
+        float[] values = EmbeddingProviderTextEmbeddingsInference.parseSingleRow("[[0.1,-0.2,0.3]]");
         assertArrayEquals(new float[] {0.1f, -0.2f, 0.3f}, values, 1e-6f);
     }
 
     @Test
     void parseSingleRowRejectsUnexpectedShape() {
-        assertThrows(TextEmbeddingsInferenceProvider.EmbeddingProviderException.class,
-                () -> TextEmbeddingsInferenceProvider.parseSingleRow("{\"not\":\"an array\"}"));
+        assertThrows(EmbeddingProviderTextEmbeddingsInference.EmbeddingProviderException.class,
+                () -> EmbeddingProviderTextEmbeddingsInference.parseSingleRow("{\"not\":\"an array\"}"));
     }
 
     @Test
@@ -47,7 +47,7 @@ class TextEmbeddingsInferenceProviderTest {
         });
         server.start();
 
-        var provider = new TextEmbeddingsInferenceProvider(
+        var provider = new EmbeddingProviderTextEmbeddingsInference(
                 URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
         EmbeddingVector result = provider.embed("hello");
 
@@ -67,9 +67,9 @@ class TextEmbeddingsInferenceProviderTest {
         });
         server.start();
 
-        var provider = new TextEmbeddingsInferenceProvider(
+        var provider = new EmbeddingProviderTextEmbeddingsInference(
                 URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
 
-        assertThrows(TextEmbeddingsInferenceProvider.EmbeddingProviderException.class, () -> provider.embed("hello"));
+        assertThrows(EmbeddingProviderTextEmbeddingsInference.EmbeddingProviderException.class, () -> provider.embed("hello"));
     }
 }

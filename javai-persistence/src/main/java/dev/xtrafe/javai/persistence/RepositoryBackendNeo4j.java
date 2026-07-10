@@ -65,7 +65,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p><b>One property (and one vector index) per model, not one shared property.</b> {@code <model>} is
  * {@link ModelIds#sanitize} applied to {@code EmbeddingVector.modelId()} -- the same scheme
- * {@code HibernatePostgresRepositoryBackend} uses for its per-model tables, and for the same reason: two
+ * {@code RepositoryBackendHibernatePostgres} uses for its per-model tables, and for the same reason: two
  * different models' vectors are never comparable, so keeping them under physically separate names is the
  * correct model regardless of whether their dimensions happen to match. A useful side effect specific to
  * Neo4j: since a node's properties are schemaless, an older model's {@code <field>Vector__<oldModel>}
@@ -76,14 +76,14 @@ import java.util.concurrent.ConcurrentHashMap;
  * index to query from the reference vector's own {@code modelId()}, so switching back immediately queries
  * whatever that model's property/index already holds.
  */
-final class Neo4jRepositoryBackend implements RepositoryBackend {
+final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     private final JavAIPersistenceConfig config;
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Map<String, Class<?>> typesByLabel = new ConcurrentHashMap<>();
     private volatile Driver driver;
 
-    Neo4jRepositoryBackend(JavAIPersistenceConfig config) {
+    RepositoryBackendNeo4j(JavAIPersistenceConfig config) {
         this.config = config;
     }
 
@@ -101,7 +101,7 @@ final class Neo4jRepositoryBackend implements RepositoryBackend {
     /** Fails fast, at registration time, for a {@code Map} relationship field keyed by anything other than
      *  {@code String} -- the relationship's {@code mapKey} property is a plain string (see
      *  {@link #saveRelationship}), so a stringified non-{@code String} key could never correctly round-trip
-     *  back to its original type on hydration. Mirrors {@code HibernatePostgresRepositoryBackend}'s own
+     *  back to its original type on hydration. Mirrors {@code RepositoryBackendHibernatePostgres}'s own
      *  identical limitation/validation for the same reason. */
     private static void validateMapKeyTypesAreSupported(Class<?> entityType) {
         for (Field field : EntityReflection.allFields(entityType)) {

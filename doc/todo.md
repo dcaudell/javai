@@ -10,7 +10,12 @@
 - CompletionRequest should use Cortex to determine the context window limits
 - Cortex should be able to handle multiple concurrent requests
 - Cortex should respond and respect "too many requests" errors and resend at specified intervals and also implement exponential backoff.
-- PromptContext should support a "target percentage" parameter of the context window size. Behavior should be that when the PropmptContext renders, it inspects its contained Contextable objects; if the object is an instanceof PromptContext, it gathers it's target percentage. The sum of target percentages is then used against the desired percentage and the context window limit to set a max-length value on the PromptContext. 
+- PromptContext should support a "target percentage" parameter of the context window size. Behavior should be that when the PropmptContext renders, it inspects its contained Contextable objects; if the object is an instanceof PromptContext, it gathers it's target percentage. The sum of target percentages is then used against the desired percentage and the context window limit to set a max-length value on the PromptContext.
+- Embeddings providers need to have the same rate limit protections as Cortex. 
+
+- Double check that a method or constructor can have both synchronous and asynchronous advice simultaneously.
+- Should be only one SupervisionListener interface; not different contract for synchronous and asynchronous advice.
+- See if we can use reflection at runtime to fill in the instance variables in pointcut events. 
 
 - Add recursive MCP microservice fabric to the whitepaper.
 - Export transcripts and rank ability

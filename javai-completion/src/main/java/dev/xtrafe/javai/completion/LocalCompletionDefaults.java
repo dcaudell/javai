@@ -3,7 +3,7 @@ package dev.xtrafe.javai.completion;
 import java.net.URI;
 
 /**
- * The one place this repo decides which local chat model {@link OllamaCortex} defaults to for
+ * The one place this repo decides which local chat model {@link CortexOllama} defaults to for
  * development and testing -- mirrors {@code javai-vector}'s {@code LocalEmbeddingDefaults} in spirit
  * (both {@code e2e-client-test}'s Docker image and any local-dev caller read this one class, so the model
  * baked into the container and the model this code asks for can't drift apart), but simpler: unlike the
@@ -42,9 +42,9 @@ public final class LocalCompletionDefaults {
         return FALLBACK_MODEL;
     }
 
-    /** Builds an {@link OllamaCortex} against the given (already-running) Ollama endpoint, using
+    /** Builds an {@link CortexOllama} against the given (already-running) Ollama endpoint, using
      *  {@link #model()}. */
-    public static OllamaCortex create(URI endpoint) {
-        return OllamaCortex.builder().endpoint(endpoint).model(model()).build();
+    public static CortexOllama create(URI endpoint) {
+        return CortexOllama.builder().endpoint(endpoint).model(model()).build();
     }
 }

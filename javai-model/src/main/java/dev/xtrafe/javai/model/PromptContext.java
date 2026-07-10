@@ -33,6 +33,15 @@ import java.util.ListIterator;
  *   <li>No partial entries: assembly stops at the first entry whose rendered text would overflow the
  *       remaining budget (preserving order, since entries are typically already relevance-sorted --
  *       e.g. via {@code JavAIList.nearestN}), and nothing is emitted to signal that omission happened.</li>
+ *   <li>{@link #targetPercentage()} sizes a <em>nested</em> {@code PromptContext} entry against however
+ *       much of this context's own {@link #maxLength()} remains at that point in assembly -- but only when
+ *       this context has a {@code maxLength} at all, and only for a nested entry that doesn't already carry
+ *       its own explicit {@code maxLength} (that always wins, same "manual override" rule as everywhere
+ *       else here). The percentage is normalized against the sum of every sibling nested entry's own
+ *       percentage that's likewise eligible (unbounded, no explicit {@code maxLength}) -- not against 1.0
+ *       directly -- so a handful of regions sharing "the rest of the budget" split it proportionally
+ *       between themselves. A qualifying nested entry with no {@code targetPercentage} set throws
+ *       {@link IllegalStateException} at assembly time rather than silently claiming a 0% share.</li>
  * </ul>
  *
  * <p><b>{@link #defaultMarshall(Object)} uses GSON, not Jackson</b> -- deliberately: neither {@code javai-vector}
@@ -68,7 +77,8 @@ import java.util.ListIterator;
  * concrete type) -- otherwise two contexts with identical entries but a different {@code sourceLabel} would
  * never compare equal as lists, which would violate the contract this class now advertises.
  */
-public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, Integer maxLength, Gson gson)
+public record PromptContext(
+        JavAIList<Contextable> entries, String sourceLabel, Integer maxLength, Gson gson, Double targetPercentage)
         implements List<Contextable>, Contextable {
 
     private static final Gson DEFAULT_GSON = new GsonBuilder()
@@ -91,6 +101,9 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
         gson = gson == null ? DEFAULT_GSON : gson;
         if (maxLength != null && maxLength < 0) {
             throw new IllegalArgumentException("maxLength must be >= 0, got " + maxLength);
+        }
+        if (targetPercentage != null && (targetPercentage <= 0.0 || targetPercentage > 1.0)) {
+            throw new IllegalArgumentException("targetPercentage must be in (0.0, 1.0], got " + targetPercentage);
         }
     }
 
@@ -120,17 +133,17 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
     }
 
     /** Concatenates this context's entries with {@code other}'s, keeping this context's sourceLabel/
-     *  maxLength/gson. */
+     *  maxLength/gson/targetPercentage. */
     public PromptContext merge(PromptContext other) {
         JavAIList<Contextable> combined = new JavAIArrayList<>(entries);
         combined.addAll(other.entries());
-        return new PromptContext(combined, sourceLabel, maxLength, gson);
+        return new PromptContext(combined, sourceLabel, maxLength, gson, targetPercentage);
     }
 
     /** A copy of this context with a different {@link #maxLength()}, re-triggering assembly under the new
      *  budget rather than slicing an already-assembled string. */
     public PromptContext withMaxLength(int maxLength) {
-        return new PromptContext(entries, sourceLabel, maxLength, gson);
+        return new PromptContext(entries, sourceLabel, maxLength, gson, targetPercentage);
     }
 
     /**
@@ -153,9 +166,19 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
         if (sourceLabel != null && !sourceLabel.isBlank()) {
             buffer.append("[Source: ").append(sourceLabel).append("]\n");
         }
+        // Only meaningful when this context itself has a budget -- an unbounded PromptContext has nothing
+        // to divide among nested entries, so they render unbounded too, same as before this feature existed.
+        Double percentageSum = maxLength == null ? null : sumOfEligibleTargetPercentages();
         boolean first = true;
         for (Contextable entry : entries) {
-            String rendered = entry.toContext(this);
+            Contextable effectiveEntry = entry;
+            if (percentageSum != null && entry instanceof PromptContext nested && nested.maxLength() == null) {
+                int remaining = maxLength - buffer.length();
+                double share = nested.targetPercentage() / percentageSum;
+                int allocated = Math.max(0, (int) (remaining * share));
+                effectiveEntry = nested.withMaxLength(allocated);
+            }
+            String rendered = effectiveEntry.toContext(this);
             String candidate = first ? rendered : ENTRY_SEPARATOR + rendered;
             if (maxLength != null && buffer.length() + candidate.length() > maxLength) {
                 break;
@@ -164,6 +187,28 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
             first = false;
         }
         return buffer.toString();
+    }
+
+    /**
+     * Sums {@link #targetPercentage()} across nested {@code PromptContext} entries that lack their own
+     * explicit {@link #maxLength()} (an explicit {@code maxLength} opts an entry out of the proportional
+     * split entirely -- "manual override always wins", same rule as everywhere else in this class). Throws
+     * if any such entry is missing {@code targetPercentage} -- there'd be no way to compute its share of
+     * this context's budget otherwise, and silently defaulting to a 0% share would be a confusing, silent
+     * failure to debug later.
+     */
+    private double sumOfEligibleTargetPercentages() {
+        double sum = 0;
+        for (Contextable entry : entries) {
+            if (entry instanceof PromptContext nested && nested.maxLength() == null) {
+                if (nested.targetPercentage() == null) {
+                    throw new IllegalStateException("A nested PromptContext with no explicit maxLength must set "
+                            + "targetPercentage, so its share of the parent's budget can be computed");
+                }
+                sum += nested.targetPercentage();
+            }
+        }
+        return sum;
     }
 
     // -- List<Contextable> contract: every method below delegates to `entries` (see class javadoc). --
@@ -300,6 +345,7 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
         private String sourceLabel;
         private Integer maxLength;
         private Gson gson;
+        private Double targetPercentage;
 
         private Builder() {
         }
@@ -331,8 +377,20 @@ public record PromptContext(JavAIList<Contextable> entries, String sourceLabel, 
             return this;
         }
 
+        /**
+         * This context's desired share, in {@code (0.0, 1.0]}, of whatever budget remains when it's nested
+         * inside an outer {@code PromptContext} that has its own {@link #maxLength()} set. Only consulted
+         * when this context is nested <em>and</em> doesn't already have its own explicit {@code maxLength}
+         * (an explicit one always wins); ignored entirely for a top-level context. See the class javadoc's
+         * assembly rules for exactly how the share is computed.
+         */
+        public Builder targetPercentage(double targetPercentage) {
+            this.targetPercentage = targetPercentage;
+            return this;
+        }
+
         public PromptContext build() {
-            return new PromptContext(entries, sourceLabel, maxLength, gson);
+            return new PromptContext(entries, sourceLabel, maxLength, gson, targetPercentage);
         }
     }
 }

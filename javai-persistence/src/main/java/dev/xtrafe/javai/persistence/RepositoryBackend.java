@@ -8,7 +8,7 @@ import java.util.UUID;
 
 /**
  * The backend-agnostic contract {@link RepositoryInvocationHandler} dispatches to --
- * {@code HibernatePostgresRepositoryBackend} and {@code Neo4jRepositoryBackend} are its two
+ * {@code RepositoryBackendHibernatePostgres} and {@code RepositoryBackendNeo4j} are its two
  * implementations, selected once via {@link JavAIPersistenceConfig.Backend}. Every method operates in
  * terms of the entity's already-woven {@code JavAIVectorizable} vectors (already computed and cached
  * in-memory by the time {@code save} is called) -- this interface only ever moves them into/out of a real
@@ -23,7 +23,7 @@ interface RepositoryBackend {
     /**
      * Registers {@code entityType} as one this backend must be able to persist. Called for every
      * repository interface {@link JavAIPI#repository(Class)} creates, before any method is actually
-     * invoked -- see {@code HibernatePostgresRepositoryBackend}'s javadoc for why registration and first
+     * invoked -- see {@code RepositoryBackendHibernatePostgres}'s javadoc for why registration and first
      * use are different moments (Hibernate's {@code SessionFactory} metadata is immutable once built).
      */
     void registerEntityType(Class<?> entityType);

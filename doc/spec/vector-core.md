@@ -194,8 +194,14 @@ translate directly into test fixtures.
 
 | Implementation | Backend | Status |
 |---|---|---|
-| `TextEmbeddingsInferenceProvider` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
-| `OllamaEmbeddingProvider` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+| `EmbeddingProviderTextEmbeddingsInference` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
+| `EmbeddingProviderOllama` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+
+Both hand-roll `java.net.http.HttpClient` calls (see each class's own javadoc for why no JSON library),
+and both retry a `429` response via `RetrySupport`/`EndpointRateLimiter` (also `javai-vector` — see
+`doc/spec/completion-fabric.md`'s "Rate limiting" section): endpoint-keyed, cross-instance backoff state
+shared with `javai-completion`'s `Cortex` implementations too, since `javai-completion` depends on
+`javai-vector` and can reuse the same registry.
 
 The reason a second implementation exists at all: TEI's Candle backend has a confirmed, unresolved upstream
 bug running the reference model, `Qwen/Qwen3-Embedding-0.6B` (§4.5.1), on CPU — "Intel MKL ERROR: Parameter

@@ -91,7 +91,7 @@ public final class SampleDataSeeder {
     private static final long READINESS_RETRY_DELAY_MILLIS = 1000;
 
     /** Discovers every table in the {@code public} schema (rather than hardcoding names) so this doesn't
-     *  quietly break if the per-model vector table names change (see {@code HibernatePostgresRepositoryBackend}'s
+     *  quietly break if the per-model vector table names change (see {@code RepositoryBackendHibernatePostgres}'s
      *  own table-per-model scheme). */
     private static void resetPostgres(String postgresUrl) {
         try (Connection connection = connectToPostgresWithRetry(postgresUrl)) {

@@ -15,10 +15,10 @@ import java.util.UUID;
 
 /**
  * Neo4j-only fixture proving a {@code Map<String, TestTag>} relationship field round-trips correctly --
- * see {@link Neo4jRepositoryBackendTest#mapFieldRoundTripsWithKeysPreserved()}. Deliberately a separate
+ * see {@link RepositoryBackendNeo4jTest#mapFieldRoundTripsWithKeysPreserved()}. Deliberately a separate
  * entity from {@link TestArticle} (not a map field added to it): {@code TestArticle} is shared with
- * {@link HibernatePostgresRepositoryBackendTest}, and this class exists purely to exercise
- * {@code Neo4jRepositoryBackend}'s own map-key persistence, which has no Postgres equivalent to keep in
+ * {@link RepositoryBackendHibernatePostgresTest}, and this class exists purely to exercise
+ * {@code RepositoryBackendNeo4j}'s own map-key persistence, which has no Postgres equivalent to keep in
  * sync with here.
  */
 @Entity

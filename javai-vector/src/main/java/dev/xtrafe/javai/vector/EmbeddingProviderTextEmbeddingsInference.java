@@ -19,17 +19,17 @@ import java.time.Instant;
  * {@code [[float, float, ...]]} back for a single-string request -- so a general-purpose parser would be
  * more machinery than the problem needs.
  */
-public final class TextEmbeddingsInferenceProvider implements JavAIEmbeddingProvider {
+public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbeddingProvider {
 
     private final HttpClient httpClient;
     private final URI embedEndpoint;
     private final String modelId;
 
-    public TextEmbeddingsInferenceProvider(URI baseUri, String modelId) {
+    public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId) {
         this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId);
     }
 
-    TextEmbeddingsInferenceProvider(HttpClient httpClient, URI baseUri, String modelId) {
+    EmbeddingProviderTextEmbeddingsInference(HttpClient httpClient, URI baseUri, String modelId) {
         this.httpClient = httpClient;
         this.embedEndpoint = baseUri.resolve("/embed");
         this.modelId = modelId;
@@ -44,6 +44,19 @@ public final class TextEmbeddingsInferenceProvider implements JavAIEmbeddingProv
                 .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                 .build();
 
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        float[] values = parseSingleRow(responseBody);
+        return new EmbeddingVector(values, modelId, values.length, Instant.now());
+    }
+
+    private String send(HttpRequest request) {
         HttpResponse<String> response;
         try {
             response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
@@ -55,13 +68,16 @@ public final class TextEmbeddingsInferenceProvider implements JavAIEmbeddingProv
                     "Interrupted while calling embedding endpoint " + embedEndpoint, e);
         }
 
+        if (response.statusCode() == 429) {
+            Duration retryAfter = RetryAfterParser.parse(response.headers().firstValue("Retry-After").orElse(null));
+            throw new TooManyRequestsException(
+                    "Embedding endpoint " + embedEndpoint + " returned HTTP 429: " + response.body(), retryAfter);
+        }
         if (response.statusCode() != 200) {
             throw new EmbeddingProviderException("Embedding endpoint " + embedEndpoint + " returned HTTP "
                     + response.statusCode() + ": " + response.body());
         }
-
-        float[] values = parseSingleRow(response.body());
-        return new EmbeddingVector(values, modelId, values.length, Instant.now());
+        return response.body();
     }
 
     /** TEI's response to a single-string {@code /embed} request: one row, {@code [[float, ...]]}. */

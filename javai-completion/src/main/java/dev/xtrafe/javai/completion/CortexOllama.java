@@ -5,6 +5,8 @@ import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import com.google.gson.JsonDeserializer;
 import com.google.gson.JsonSyntaxException;
+import dev.xtrafe.javai.vector.RetrySupport;
+import dev.xtrafe.javai.vector.TooManyRequestsException;
 import org.springframework.ai.ollama.api.OllamaApi;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -33,7 +35,7 @@ import java.util.concurrent.Flow;
  *
  * <p><b>Streaming is hand-rolled, not {@code OllamaApi.streamingChat()}</b> -- the second deliberate
  * deviation from "wrap Spring AI, never write provider client code" (the first being {@link
- * ReplicateCortex}). Confirmed empirically against a real container, not assumed: {@code
+ * CortexReplicate}). Confirmed empirically against a real container, not assumed: {@code
  * OllamaApi.streamingChat()}'s reactive decode straight into the {@code ChatResponse} record hangs
  * indefinitely (no {@code onNext}, no {@code onError}, no {@code onComplete}) against this project's real
  * Ollama backend, while decoding the identical NDJSON response as plain text lines completes in under a
@@ -48,20 +50,30 @@ import java.util.concurrent.Flow;
  * and its {@code createdAt} field needs a custom {@code Instant} adapter, since GSON has no built-in
  * {@code java.time} support either.
  */
-public final class OllamaCortex implements Cortex {
+public final class CortexOllama implements Cortex {
 
     private static final String DEFAULT_BASE_URL = "http://localhost:11434";
     private static final String ENABLE_THINKING_KEY = "enable_thinking";
 
     private final String model;
+    private final String baseUrl;
+    private final Integer contextWindowTokensOverride;
     private final OllamaApi ollamaApi;
     private final WebClient webClient;
     private final Gson gson;
 
-    private OllamaCortex(String baseUrl, String model) {
+    private CortexOllama(String baseUrl, String model, Integer contextWindowTokensOverride) {
         this.model = model;
-        this.ollamaApi = OllamaApi.builder().baseUrl(baseUrl).build();
-        this.webClient = WebClient.builder().baseUrl(baseUrl).build();
+        this.baseUrl = baseUrl;
+        this.contextWindowTokensOverride = contextWindowTokensOverride;
+        this.ollamaApi = OllamaApi.builder()
+                .baseUrl(baseUrl)
+                .responseErrorHandler(new TooManyRequestsResponseErrorHandler())
+                .build();
+        this.webClient = WebClient.builder()
+                .baseUrl(baseUrl)
+                .filter(TooManyRequestsExchangeFilterFunction.create())
+                .build();
         this.gson = new GsonBuilder()
                 .setFieldNamingPolicy(FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES)
                 .registerTypeAdapter(Instant.class,
@@ -75,7 +87,12 @@ public final class OllamaCortex implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
-        OllamaApi.ChatResponse response = ollamaApi.chat(chatRequest(request, false));
+        OllamaApi.ChatResponse response;
+        try {
+            response = RetrySupport.withRetry(baseUrl, () -> ollamaApi.chat(chatRequest(request, false)));
+        } catch (TooManyRequestsException e) {
+            throw new CompletionException("ollama rate-limited too many times", e);
+        }
         String text = response.message() == null ? "" : response.message().content();
         return new CompletionResult(text, "ollama", model, Instant.now());
     }
@@ -83,7 +100,7 @@ public final class OllamaCortex implements Cortex {
     @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
         CortexStreaming.bridge(
-                streamChatResponses(chatRequest(request, true)),
+                CortexStreamingRetry.withRetry(baseUrl, streamChatResponses(chatRequest(request, true))),
                 subscriber,
                 chatResponse -> chatResponse.message() == null ? null : chatResponse.message().content());
     }
@@ -115,8 +132,13 @@ public final class OllamaCortex implements Cortex {
         return model;
     }
 
+    @Override
+    public int contextWindowTokens() {
+        return contextWindowTokensOverride != null ? contextWindowTokensOverride : ContextWindows.lookup(model);
+    }
+
     private OllamaApi.ChatRequest chatRequest(CompletionRequest request, boolean stream) {
-        String promptText = request.render();
+        String promptText = request.render(contextWindowTokens());
 
         Map<String, Object> options = new LinkedHashMap<>(request.providerOptions());
         options.remove(ENABLE_THINKING_KEY);
@@ -143,6 +165,7 @@ public final class OllamaCortex implements Cortex {
     public static final class Builder {
         private String baseUrl = DEFAULT_BASE_URL;
         private String model;
+        private Integer contextWindowTokens;
 
         private Builder() {
         }
@@ -163,11 +186,17 @@ public final class OllamaCortex implements Cortex {
             return this;
         }
 
-        public OllamaCortex build() {
+        /** Overrides {@link ContextWindows}'s best-effort lookup for this model. */
+        public Builder contextWindowTokens(int contextWindowTokens) {
+            this.contextWindowTokens = contextWindowTokens;
+            return this;
+        }
+
+        public CortexOllama build() {
             if (model == null) {
-                throw new IllegalStateException("OllamaCortex requires a model -- e.g. \"qwen3:8b\"");
+                throw new IllegalStateException("CortexOllama requires a model -- e.g. \"qwen3:8b\"");
             }
-            return new OllamaCortex(baseUrl, model);
+            return new CortexOllama(baseUrl, model, contextWindowTokens);
         }
     }
 }

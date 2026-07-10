@@ -10,13 +10,13 @@ import java.util.Locale;
  * other local-dev caller (which provider class to construct) read this one class, so the two decisions
  * can't drift apart.
  *
- * <p>Short version: the whitepaper's Phase 0 default -- {@link TextEmbeddingsInferenceProvider} against
+ * <p>Short version: the whitepaper's Phase 0 default -- {@link EmbeddingProviderTextEmbeddingsInference} against
  * TEI's {@code cpu-1.9} image -- has a confirmed, unresolved upstream bug running
  * {@code Qwen/Qwen3-Embedding-0.6B} on CPU (TEI's Candle backend, "Intel MKL ERROR: Parameter 8 was
  * incorrect on entry to SGEMM"). It's reported on native x86_64/AMD hardware, not just under emulation, but
  * it reliably reproduces on macOS specifically (Apple Silicon needs x86_64 emulation for TEI's image at
  * all, which multiplies the same underlying failure). On macOS, this class defaults to
- * {@link OllamaEmbeddingProvider} instead -- a different stack (GGUF via llama.cpp) unaffected by the bug,
+ * {@link EmbeddingProviderOllama} instead -- a different stack (GGUF via llama.cpp) unaffected by the bug,
  * on an image that's natively arm64. Linux and Windows default to TEI, matching the whitepaper -- both
  * typically run on genuine x86_64 hardware, where TEI's own reports of this bug don't apply (not verified
  * by this repo; see the class javadoc caveat below).
@@ -98,8 +98,8 @@ public final class LocalEmbeddingDefaults {
     /** Builds the provider matching {@link #preferOllama()}, against the given (already-running) endpoint. */
     public static JavAIEmbeddingProvider create(URI endpoint) {
         return preferOllama()
-                ? new OllamaEmbeddingProvider(endpoint, OLLAMA_MODEL)
-                : new TextEmbeddingsInferenceProvider(endpoint, FRIENDLY_MODEL_LABEL);
+                ? new EmbeddingProviderOllama(endpoint, OLLAMA_MODEL)
+                : new EmbeddingProviderTextEmbeddingsInference(endpoint, FRIENDLY_MODEL_LABEL);
     }
 
     /** The {@code EmbeddingVector.modelId()} label whatever {@link #create} returns will produce. */

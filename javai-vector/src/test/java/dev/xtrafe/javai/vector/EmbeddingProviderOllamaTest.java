@@ -8,12 +8,13 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
-class OllamaEmbeddingProviderTest {
+class EmbeddingProviderOllamaTest {
 
     private HttpServer server;
 
@@ -28,14 +29,14 @@ class OllamaEmbeddingProviderTest {
     void parseEmbeddingsFieldIgnoresSurroundingFields() {
         String body = "{\"model\":\"qwen3-embedding:0.6b\",\"embeddings\":[[0.1,-0.2,0.3]],"
                 + "\"total_duration\":14143917,\"load_duration\":1019500}";
-        float[] values = OllamaEmbeddingProvider.parseEmbeddingsField(body);
+        float[] values = EmbeddingProviderOllama.parseEmbeddingsField(body);
         assertArrayEquals(new float[] {0.1f, -0.2f, 0.3f}, values, 1e-6f);
     }
 
     @Test
     void parseEmbeddingsFieldRejectsAMissingKey() {
-        assertThrows(OllamaEmbeddingProvider.EmbeddingProviderException.class,
-                () -> OllamaEmbeddingProvider.parseEmbeddingsField("{\"model\":\"x\"}"));
+        assertThrows(EmbeddingProviderOllama.EmbeddingProviderException.class,
+                () -> EmbeddingProviderOllama.parseEmbeddingsField("{\"model\":\"x\"}"));
     }
 
     @Test
@@ -49,7 +50,7 @@ class OllamaEmbeddingProviderTest {
         });
         server.start();
 
-        var provider = new OllamaEmbeddingProvider(
+        var provider = new EmbeddingProviderOllama(
                 URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
         EmbeddingVector result = provider.embed("hello");
 
@@ -78,7 +79,7 @@ class OllamaEmbeddingProviderTest {
         });
         server.start();
 
-        var provider = new OllamaEmbeddingProvider(
+        var provider = new EmbeddingProviderOllama(
                 URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
         provider.embed("");
 
@@ -97,9 +98,36 @@ class OllamaEmbeddingProviderTest {
         });
         server.start();
 
-        var provider = new OllamaEmbeddingProvider(
+        var provider = new EmbeddingProviderOllama(
                 URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
 
-        assertThrows(OllamaEmbeddingProvider.EmbeddingProviderException.class, () -> provider.embed("hello"));
+        assertThrows(EmbeddingProviderOllama.EmbeddingProviderException.class, () -> provider.embed("hello"));
+    }
+
+    @Test
+    void embedRetriesAfterA429AndSucceeds() throws IOException {
+        AtomicInteger requestCount = new AtomicInteger();
+        server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        server.createContext("/api/embed", exchange -> {
+            if (requestCount.getAndIncrement() == 0) {
+                exchange.getResponseHeaders().add("Retry-After", "1");
+                byte[] body = "rate limited".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(429, body.length);
+                exchange.getResponseBody().write(body);
+            } else {
+                byte[] body = "{\"model\":\"test-model\",\"embeddings\":[[0.5,0.25]]}".getBytes(StandardCharsets.UTF_8);
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+            }
+            exchange.close();
+        });
+        server.start();
+
+        var provider = new EmbeddingProviderOllama(
+                URI.create("http://localhost:" + server.getAddress().getPort()), "test-model");
+        EmbeddingVector result = provider.embed("hello");
+
+        assertArrayEquals(new float[] {0.5f, 0.25f}, result.values(), 1e-6f);
+        assertEquals(2, requestCount.get(), "must have retried exactly once after the 429");
     }
 }

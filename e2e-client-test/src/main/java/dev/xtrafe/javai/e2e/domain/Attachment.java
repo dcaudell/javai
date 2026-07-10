@@ -25,7 +25,7 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * Hibernate specifically -- it exists purely to test in-memory {@code query()} traversal depth, one level
  * further than this project's persistence fidelity needs to reach for Postgres. Neo4j's reflective
  * mapper has no equivalent "must annotate every hop" constraint, so it picks this field up as a real
- * relationship anyway (see {@code Neo4jRepositoryBackend}'s javadoc) -- an asymmetry that's inherent to
+ * relationship anyway (see {@code RepositoryBackendNeo4j}'s javadoc) -- an asymmetry that's inherent to
  * the two technologies, not a gap.
  */
 @Entity

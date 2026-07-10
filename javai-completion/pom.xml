@@ -51,7 +51,7 @@
       <artifactId>spring-ai-client-chat</artifactId>
     </dependency>
     <!-- Real ChatModel implementations, not just the abstractions above. spring-ai-openai backs
-         OpenAICortex directly, and GroqCortex/VLlmCortex too (both OpenAI-wire-compatible, just a
+         CortexOpenAI directly, and CortexGroq/CortexVLlm too (both OpenAI-wire-compatible, just a
          repointed base-url/api-key/model, no separate Spring AI module needed for either). -->
     <dependency>
       <groupId>org.springframework.ai</groupId>
@@ -65,7 +65,7 @@
       <groupId>org.springframework.ai</groupId>
       <artifactId>spring-ai-ollama</artifactId>
     </dependency>
-    <!-- OllamaCortex's own hand-rolled NDJSON line parsing (see its own class javadoc); comes in
+    <!-- CortexOllama's own hand-rolled NDJSON line parsing (see its own class javadoc); comes in
          transitively via javai-model too, declared directly here since this module's own code
          imports it. -->
     <dependency>
@@ -78,7 +78,7 @@
       <groupId>com.github.jknack</groupId>
       <artifactId>handlebars</artifactId>
     </dependency>
-    <!-- OllamaCortexRealContainerTest's own real backend; see javai-persistence/pom.xml for the same
+    <!-- CortexOllamaRealContainerTest's own real backend; see javai-persistence/pom.xml for the same
          pattern (testcontainers-bom already imported at the root). -->
     <dependency>
       <groupId>org.testcontainers</groupId>

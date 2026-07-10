@@ -131,7 +131,7 @@ class PersistenceE2ETest {
      * {@code attachment} -- round-trips through Postgres, not just {@code title}/{@code body}.
      * {@code featuredComment}/{@code draftComment}/{@code attachment} are real {@code @OneToOne}s;
      * {@code comments} goes through {@code javai-persistence}'s own collection-membership mechanism (see
-     * {@code HibernatePostgresRepositoryBackend}'s javadoc) since {@code JavAIArrayList} can't be a native
+     * {@code RepositoryBackendHibernatePostgres}'s javadoc) since {@code JavAIArrayList} can't be a native
      * Hibernate collection field.
      */
     @Test
@@ -174,7 +174,7 @@ class PersistenceE2ETest {
      * relationship with the original key stored as a {@code mapKey} relationship property, read back on
      * hydration to reconstruct {@code relatedComments} with both keys and values intact -- proves the fix
      * for a real, confirmed gap (Neo4j's relationship hydration used to only handle {@code Collection}-typed
-     * fields, and never persisted map keys at all; see {@code Neo4jRepositoryBackend}'s own javadoc).
+     * fields, and never persisted map keys at all; see {@code RepositoryBackendNeo4j}'s own javadoc).
      */
     @Test
     void neo4jJavAILinkedHashMapFieldRoundTrips() {

@@ -1,5 +1,9 @@
 package dev.xtrafe.javai.completion;
 
+import dev.xtrafe.javai.vector.RetryAfterParser;
+import dev.xtrafe.javai.vector.RetrySupport;
+import dev.xtrafe.javai.vector.TooManyRequestsException;
+
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -16,7 +20,7 @@ import java.util.concurrent.Flow;
  * <em>prediction</em> (a job), which is either already finished by the time the create call returns (using
  * the {@code Prefer: wait} header, requested here) or still running, in which case this client polls the
  * prediction's own status URL until it reaches a terminal state. Hand-rolls request/response JSON rather
- * than pulling in a library, same rationale as {@code OllamaEmbeddingProvider}: the fields this client
+ * than pulling in a library, same rationale as {@code EmbeddingProviderOllama}: the fields this client
  * actually needs (`status`, `output`, `error`, the polling URL) are a small, fixed set worth locating
  * directly rather than justifying a general parser.
  *
@@ -32,7 +36,7 @@ import java.util.concurrent.Flow;
  * Covered by hermetic tests (request/option-mapping, wait-then-poll behavior against a fake HTTP server)
  * only; see this module's README.
  */
-public final class ReplicateCortex implements Cortex {
+public final class CortexReplicate implements Cortex {
 
     private static final String DEFAULT_BASE_URL = "https://api.replicate.com";
     private static final Duration POLL_INTERVAL = Duration.ofSeconds(1);
@@ -42,14 +46,17 @@ public final class ReplicateCortex implements Cortex {
     private final URI predictionsEndpoint;
     private final String apiToken;
     private final String model;
+    private final Integer contextWindowTokensOverride;
 
-    private ReplicateCortex(HttpClient httpClient, String baseUrl, String apiToken, String model) {
+    private CortexReplicate(HttpClient httpClient, String baseUrl, String apiToken, String model,
+            Integer contextWindowTokensOverride) {
         this.httpClient = httpClient;
         // Replicate's "call an official model by owner/name directly" route -- no version hash needed,
         // matching how this project prefers the simplest correct call shape over a more ceremonial one.
         this.predictionsEndpoint = URI.create(baseUrl).resolve("/v1/models/" + model + "/predictions");
         this.apiToken = apiToken;
         this.model = model;
+        this.contextWindowTokensOverride = contextWindowTokensOverride;
     }
 
     public static Builder builder() {
@@ -58,7 +65,7 @@ public final class ReplicateCortex implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
-        String promptText = request.render();
+        String promptText = request.render(contextWindowTokens());
 
         String responseBody = createPrediction(promptText, request);
         String status = extractStringField(responseBody, "status");
@@ -113,6 +120,11 @@ public final class ReplicateCortex implements Cortex {
         return model;
     }
 
+    @Override
+    public int contextWindowTokens() {
+        return contextWindowTokensOverride != null ? contextWindowTokensOverride : ContextWindows.lookup(model);
+    }
+
     private String createPrediction(String promptText, CompletionRequest request) {
         StringBuilder input = new StringBuilder();
         input.append("{\"prompt\":\"").append(JsonStrings.escape(promptText)).append('"');
@@ -149,6 +161,14 @@ public final class ReplicateCortex implements Cortex {
     }
 
     private String send(HttpRequest httpRequest) {
+        try {
+            return RetrySupport.withRetry(predictionsEndpoint.toString(), () -> doSend(httpRequest));
+        } catch (TooManyRequestsException e) {
+            throw new CompletionException("Replicate rate-limited too many times calling " + httpRequest.uri(), e);
+        }
+    }
+
+    private String doSend(HttpRequest httpRequest) {
         HttpResponse<String> response;
         try {
             response = httpClient.send(httpRequest, HttpResponse.BodyHandlers.ofString());
@@ -157,6 +177,11 @@ public final class ReplicateCortex implements Cortex {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new CompletionException("Interrupted while calling Replicate at " + httpRequest.uri(), e);
+        }
+        if (response.statusCode() == 429) {
+            Duration retryAfter = RetryAfterParser.parse(response.headers().firstValue("Retry-After").orElse(null));
+            throw new TooManyRequestsException(
+                    "Replicate returned HTTP 429: " + response.body(), retryAfter);
         }
         if (response.statusCode() >= 300) {
             throw new CompletionException("Replicate returned HTTP " + response.statusCode() + ": " + response.body());
@@ -276,6 +301,7 @@ public final class ReplicateCortex implements Cortex {
         private String baseUrl = DEFAULT_BASE_URL;
         private String apiToken;
         private String model;
+        private Integer contextWindowTokens;
         private HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         private Builder() {
@@ -298,17 +324,25 @@ public final class ReplicateCortex implements Cortex {
             return this;
         }
 
+        /** Overrides {@link ContextWindows}'s best-effort lookup for this model -- Replicate hosts an
+         *  enormous, ever-changing model catalog this table can't hope to track, so this is worth setting
+         *  explicitly whenever it's known. */
+        public Builder contextWindowTokens(int contextWindowTokens) {
+            this.contextWindowTokens = contextWindowTokens;
+            return this;
+        }
+
         Builder httpClient(HttpClient httpClient) {
             this.httpClient = httpClient;
             return this;
         }
 
-        public ReplicateCortex build() {
+        public CortexReplicate build() {
             if (model == null) {
                 throw new IllegalStateException(
-                        "ReplicateCortex requires a model -- e.g. \"meta/meta-llama-3-70b-instruct\"");
+                        "CortexReplicate requires a model -- e.g. \"meta/meta-llama-3-70b-instruct\"");
             }
-            return new ReplicateCortex(httpClient, baseUrl, apiToken, model);
+            return new CortexReplicate(httpClient, baseUrl, apiToken, model, contextWindowTokens);
         }
     }
 }

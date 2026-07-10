@@ -41,7 +41,7 @@ public final class JavAIEnvironment {
         MonolithicContainer.ensureRunning();
         JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicContainer.embeddingEndpoint()));
 
-        // No CommentRepository/AttachmentRepository pre-registration here: HibernatePostgresRepositoryBackend
+        // No CommentRepository/AttachmentRepository pre-registration here: RepositoryBackendHibernatePostgres
         // auto-registers both, recursively, as soon as ArticleRepository is realized -- reachable through
         // Article's own featuredComment/draftComment/attachment/comments/relatedComments fields.
         JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()

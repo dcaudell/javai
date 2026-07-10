@@ -5,7 +5,7 @@ import java.util.concurrent.Flow;
 /**
  * Connector to a self-hosted vLLM server -- vLLM implements an OpenAI-compatible {@code /v1/chat/completions}
  * endpoint specifically to be a drop-in replacement for OpenAI clients, so this reuses
- * {@link OpenAiCompatibleCortexSupport} rather than a separate client, exactly like {@link GroqCortex}.
+ * {@link CortexOpenAiCompatibleSupport} rather than a separate client, exactly like {@link CortexGroq}.
  * Unlike OpenAI/Groq, there's no fixed default {@code base-url} -- a vLLM server is always self-hosted, so
  * {@link Builder#baseUrl} is required, not optional.
  *
@@ -14,12 +14,12 @@ import java.util.concurrent.Flow;
  * this pass's test environment. Covered by hermetic tests (request/option-mapping against a fake HTTP
  * server) only; see this module's README.
  */
-public final class VLlmCortex implements Cortex {
+public final class CortexVLlm implements Cortex {
 
     private final Cortex delegate;
 
-    private VLlmCortex(String baseUrl, String apiKey, String model) {
-        this.delegate = new OpenAiCompatibleCortexSupport("vllm", baseUrl, apiKey, model);
+    private CortexVLlm(String baseUrl, String apiKey, String model, Integer contextWindowTokens) {
+        this.delegate = new CortexOpenAiCompatibleSupport("vllm", baseUrl, apiKey, model, contextWindowTokens);
     }
 
     public static Builder builder() {
@@ -46,10 +46,16 @@ public final class VLlmCortex implements Cortex {
         return delegate.modelId();
     }
 
+    @Override
+    public int contextWindowTokens() {
+        return delegate.contextWindowTokens();
+    }
+
     public static final class Builder {
         private String baseUrl;
         private String apiKey = "";
         private String model;
+        private Integer contextWindowTokens;
 
         private Builder() {
         }
@@ -71,15 +77,22 @@ public final class VLlmCortex implements Cortex {
             return this;
         }
 
-        public VLlmCortex build() {
+        /** Strongly recommended for vLLM: {@link ContextWindows}'s table almost certainly doesn't know a
+         *  self-hosted, arbitrary model, so it'll otherwise fall back to a conservative default. */
+        public Builder contextWindowTokens(int contextWindowTokens) {
+            this.contextWindowTokens = contextWindowTokens;
+            return this;
+        }
+
+        public CortexVLlm build() {
             if (baseUrl == null) {
-                throw new IllegalStateException("VLlmCortex requires baseUrl -- vLLM is always self-hosted, "
+                throw new IllegalStateException("CortexVLlm requires baseUrl -- vLLM is always self-hosted, "
                         + "e.g. \"http://localhost:8000/v1\"");
             }
             if (model == null) {
-                throw new IllegalStateException("VLlmCortex requires a model -- whatever \"vllm serve\" was started with");
+                throw new IllegalStateException("CortexVLlm requires a model -- whatever \"vllm serve\" was started with");
             }
-            return new VLlmCortex(baseUrl, apiKey, model);
+            return new CortexVLlm(baseUrl, apiKey, model, contextWindowTokens);
         }
     }
 }

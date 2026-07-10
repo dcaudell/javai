@@ -50,7 +50,7 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * Hibernate-mapped collection field (confirmed empirically -- a {@code ClassCastException} the moment
  * Hibernate tries to substitute its own {@code PersistentBag}/{@code PersistentMap} into a field statically
  * typed as the concrete JavAI class). Note there's no {@code @Transient} here, though, and no manual
- * repository pre-registration for {@code Comment} either: {@code HibernatePostgresRepositoryBackend}
+ * repository pre-registration for {@code Comment} either: {@code RepositoryBackendHibernatePostgres}
  * auto-detects both of these fields reflectively and excludes them from Hibernate's own mapping itself, and
  * auto-registers {@code Comment} as reachable through them -- see that class's javadoc ("No manual
  * {@code @Transient} required" / "Related entity types are auto-registered too"). Both fields instead
@@ -81,7 +81,7 @@ public class Article implements JavAIGraphNode {
     private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
 
     // Not @Summary -- purely exercises JavAILinkedHashMap persistence (String-keyed, per
-    // HibernatePostgresRepositoryBackend's own documented Phase 0 limitation) alongside comments'
+    // RepositoryBackendHibernatePostgres's own documented Phase 0 limitation) alongside comments'
     // JavAIArrayList, without changing what already-passing tests assert about summaryVector().
     private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 

@@ -39,9 +39,12 @@ generation, and semantic serialization — not another API client.
 | `CompletionRequest` | Value type (`javai-completion`) | `List<String>` of prompt strings + `PromptContext` + `promptParams` (a Handlebars template model, `Map<String, Object>`) + generation parameters (max tokens, temperature, optional output schema) |
 | `CompletionRequest.render()` | Method (`javai-completion`) | Joins the prompt strings, appends the assembled `PromptContext`, then renders the whole combined text as a Handlebars template against `promptParams` — see "Prompt templating" below |
 | `CompletionResult` | Value type (`javai-completion`) | Text result, or a schema-typed result when structured output was requested |
-| `Cortex` | Interface (`javai-completion`) | Same shape as `JavAIEmbeddingProvider`/`JavAISimilarityBackend` — pluggable, config-selected backend per provider. Named `JavAICompletionProvider` in earlier drafts of this spec; `Cortex` is the name actually implemented |
+| `Cortex` | Interface (`javai-completion`) | Same shape as `JavAIEmbeddingProvider`/`JavAISimilarityBackend` — pluggable, config-selected backend per provider. Named `JavAICompletionProvider` in earlier drafts of this spec; `Cortex` is the name actually implemented. Six implementations, one per provider, all named `Cortex<Provider>` (`CortexOpenAI`, `CortexAnthropic`, `CortexGroq`, `CortexVLlm`, `CortexOllama`, `CortexReplicate`) — this project's `[Type][SubType]` naming convention, applied globally (also `JavAIEmbeddingProvider`'s two implementations and `javai-persistence`'s two `RepositoryBackend`s) |
 | `complete(CompletionRequest): CompletionResult` | Method | Default call — blocking, virtual-thread-backed; sync-looking regardless of provider |
 | `completeStreaming(CompletionRequest, Flow.Subscriber)` | Method | Token-streaming variant, backed by `java.util.concurrent.Flow` — opt-in, not the default |
+| `Cortex.contextWindowTokens()` | Method | This Cortex's configured model's context window, in tokens — best-effort (a small lookup table keyed by model id, with a conservative fallback), always overridable per-Cortex at construction time via `Builder.contextWindowTokens(int)` |
+| `CompletionRequest.render(int)` | Method | Same as `render()`, but first sizes `context` to fit the calling Cortex's `contextWindowTokens()` (converted to an approximate character budget) — every `Cortex` implementation calls this overload, not the plain `render()` |
+| `PromptContext.targetPercentage()` | Record component | A nested `PromptContext`'s desired share, in `(0.0, 1.0]`, of whatever budget remains in its parent at that point in assembly — see "Context-window budgeting" below |
 
 **Revised from this spec's original vision:** `toContext(): PromptContext` was originally described as a
 method directly on `JavAIList<T>`/`SubgraphResult<N,E>`, returning a `javai-completion` type. Taken
@@ -74,6 +77,39 @@ confirmed empirically before landing on them:
 
 See `javai-completion`'s own README and `CompletionRequest`'s class javadoc for the full rationale and the
 collision tests (`CompletionRequestTest`) that lock in this behavior.
+
+## Rate limiting: 429s, exponential backoff, coordinated across instances and modules
+
+Every network-calling provider — all six `Cortex` implementations, and `javai-vector`'s two over-the-wire
+`JavAIEmbeddingProvider`s — shares one coordination point: `EndpointRateLimiter`, a static registry in
+`javai-vector` keyed by normalized endpoint URL (scheme + authority, not path). Two independently-constructed
+instances pointed at the same base URL — even a `Cortex` and an `EmbeddingProvider`, even across the
+`javai-vector`/`javai-completion` module boundary — share the same limiter, so a 429 seen by one backs off
+the other too. `RetrySupport.withRetry(endpointKey, action)` (also `javai-vector`) drives the actual retry
+loop: up to five attempts, preferring the server's own `Retry-After` header, falling back to exponential
+backoff otherwise. Lives in `javai-vector`, not `javai-completion`, specifically so both modules can share
+one registry — `javai-completion` depends on `javai-vector` transitively, never the reverse. Each provider's
+own 429-detection adapter is the only per-provider piece: Spring AI's `ResponseErrorHandler`/
+`ExchangeFilterFunction` hooks for the five Spring-AI-backed Cortices, a raw HTTP status check for
+`CortexReplicate` and both embedding providers (all three already hand-roll `java.net.http.HttpClient`
+calls).
+
+## Context-window budgeting
+
+`Cortex.contextWindowTokens()` reports (best-effort, overridable) the calling model's context window.
+`CompletionRequest.render(int)` converts that into an approximate character budget (character length, not
+real tokenization — matching `PromptContext.maxLength()`'s own existing semantics) and, if the top-level
+`context` doesn't already have an explicit `maxLength`, sizes it to fit. Every `Cortex` implementation calls
+this overload rather than the plain `render()`.
+
+Nested `PromptContext` entries (already legal today — `PromptContext` implements `Contextable`, so nesting
+one context inside another was always structurally supported) participate via `targetPercentage`: when the
+outer context has a `maxLength` and reaches a nested entry that doesn't already carry its own explicit
+`maxLength`, that entry is sized to `remainingBudget * (its targetPercentage / sum of all eligible siblings'
+targetPercentage)` before being rendered. A qualifying nested entry with no `targetPercentage` set throws
+`IllegalStateException` at assembly time — fail loud, not a silent 0% share. An explicit `maxLength` on a
+nested entry always wins over the percentage split, the same "manual override" rule used everywhere else in
+`PromptContext`. See `PromptContext`'s own class javadoc ("Assembly rules") for the precise algorithm.
 
 ## Worked examples
 

@@ -33,6 +33,9 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
 | `JavAIEmbeddingProvider` | SPI interface | Pluggable, versioned embedding-model provider |
 | `JavAIDirtyTracking` | Interface | `addDependent`/`dependents()`, `isFieldDirty`/`markFieldDirty`/`clearFieldDirty`, `isSummaryDirty`/`markSummaryDirty`/`clearSummaryDirty` |
 | `DirtyTrackingSupport` | Concrete implementation | The entire durable per-object dirty-tracking state, as one object — a woven class gets one synthesized field of this type; concrete collections in `javai-model` hold one directly |
+| `EndpointRateLimiter` | Public utility | Cross-instance, cross-module 429/backoff coordination, keyed by normalized endpoint URL — see "Rate limiting" below |
+| `RetrySupport` | Public utility | Synchronous retry loop built on `EndpointRateLimiter`; used by both this module's embedding providers and, via the module dependency, `javai-completion`'s `Cortex` implementations |
+| `TooManyRequestsException` / `RetryAfterParser` | Public types | The shared 429 signal and `Retry-After` header parser every provider's own detection code funnels into |
 
 ## What's actually implemented
 
@@ -44,10 +47,24 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
   concrete JavAI collection (in `javai-model`) uses; its cache accessors (`cachedVector()`/`cacheVector()`/
   etc.) are `public`, not package-private, specifically so `javai-model`'s `JavAIRuntime` and concrete
   collection types (a different module now) can reach them.
-- `JavAIEmbeddingProvider` has two real implementations, not just the interface: `OllamaEmbeddingProvider`
-  and `TextEmbeddingsInferenceProvider` (Hugging Face's TEI) — both plain `java.net.http.HttpClient`
+- `JavAIEmbeddingProvider` has two real implementations, not just the interface: `EmbeddingProviderOllama`
+  and `EmbeddingProviderTextEmbeddingsInference` (Hugging Face's TEI) — both plain `java.net.http.HttpClient`
   clients, no JSON library dependency. `LocalEmbeddingDefaults` picks between them per host OS (see its own
   javadoc for why: a confirmed TEI/Candle CPU bug on this project's reference model).
+- Both providers retry a `429` via `RetrySupport`/`EndpointRateLimiter` — see "Rate limiting" below.
+
+## Rate limiting: 429s, exponential backoff, coordinated across instances and modules
+
+`EndpointRateLimiter` is a static registry, keyed by normalized endpoint URL (scheme + authority, not path),
+shared by both embedding providers here **and** every `Cortex` in `javai-completion` — two independently
+constructed instances pointed at the same base URL, even across that module boundary, share the same
+limiter, so a 429 seen by one backs off the other too (`EndpointRateLimiterCrossInstanceTest`, in both
+modules, proves this with a hermetic `HttpServer` and a timing assertion). Lives here, not in
+`javai-completion`, specifically so both modules can share one registry — `javai-completion` depends on this
+module transitively, never the reverse. `RetrySupport.withRetry` drives the actual loop (up to five
+attempts, preferring the server's `Retry-After` header via `RetryAfterParser`, falling back to exponential
+backoff otherwise); each embedding provider's own `send()` method detects the 429 directly off its raw
+`HttpResponse` and throws `TooManyRequestsException`, which only `RetrySupport` catches.
 
 ## Provider selection across platforms (discovered building the E2E test, not in the whitepaper)
 
@@ -55,8 +72,8 @@ This module ships two real `JavAIEmbeddingProvider` implementations:
 
 | Implementation | Backend | Status |
 |---|---|---|
-| `TextEmbeddingsInferenceProvider` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
-| `OllamaEmbeddingProvider` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+| `EmbeddingProviderTextEmbeddingsInference` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
+| `EmbeddingProviderOllama` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
 
 The reason a second implementation exists at all: TEI's Candle backend has a confirmed, unresolved upstream
 bug running the reference model, `Qwen/Qwen3-Embedding-0.6B` (§4.5.1), on CPU — "Intel MKL ERROR: Parameter

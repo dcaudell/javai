@@ -1,10 +1,10 @@
 package dev.xtrafe.javai.vector;
 
 /**
- * The one piece of JSON handling shared by every {@link JavAIEmbeddingProvider} HTTP client in this
- * package ({@link TextEmbeddingsInferenceProvider}, {@link OllamaEmbeddingProvider}) -- escaping a string
- * for embedding in a request body. Each client still hand-parses its own response shape rather than using
- * a general JSON library; see those classes' javadoc for why.
+ * The one piece of JSON handling shared by every {@link JavAIEmbeddingProvider} HTTP client in this package
+ * ({@link EmbeddingProviderTextEmbeddingsInference}, {@link EmbeddingProviderOllama}) -- escaping a string for
+ * embedding in a request body. Each client still hand-parses its own response shape rather than using a
+ * general JSON library; see those classes' javadoc for why.
  */
 final class JsonStrings {
 

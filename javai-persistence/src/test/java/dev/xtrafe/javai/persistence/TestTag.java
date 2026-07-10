@@ -15,7 +15,7 @@ import java.util.UUID;
  * Minimal related-entity fixture for {@link TestArticleWithTags}' {@code Map<String, TestTag>} field --
  * same hand-written-stand-in-for-woven-code pattern as {@link TestArticle}, kept separate from it (rather
  * than adding a map field to {@code TestArticle} itself) so this Neo4j-specific map-key round-trip test
- * can't affect {@link HibernatePostgresRepositoryBackendTest}, which reuses {@code TestArticle} too.
+ * can't affect {@link RepositoryBackendHibernatePostgresTest}, which reuses {@code TestArticle} too.
  */
 @Entity
 final class TestTag implements JavAIVectorizable {

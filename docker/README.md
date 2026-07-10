@@ -2,8 +2,8 @@
 
 This stands up the embedding-generation sidecar the whitepaper's §4.5 and
 [`doc/spec/vector-core.md`](../doc/spec/vector-core.md)'s `JavAIEmbeddingProvider` SPI describe.
-`javai-vector`'s `TextEmbeddingsInferenceProvider` is the real HTTP client that talks to it. There's also
-`OllamaEmbeddingProvider`, a second real implementation for the Apple-Silicon-specific gap described below.
+`javai-vector`'s `EmbeddingProviderTextEmbeddingsInference` is the real HTTP client that talks to it. There's also
+`EmbeddingProviderOllama`, a second real implementation for the Apple-Silicon-specific gap described below.
 [`../e2e-client-test`](../e2e-client-test) exercises the whole thing end to end — real embeddings, not a
 fake provider — against the whitepaper's reference model, managed via Testcontainers rather than this
 compose file directly.
@@ -51,8 +51,8 @@ this file won't repeat them.
 
 **Workaround: `--profile ollama`**, added to this compose file specifically for this gap — runs the same
 reference model through Ollama's GGUF/llama.cpp stack instead, unaffected by TEI's bug, on an image that's
-natively arm64 (no emulation at all on Apple Silicon). Needs `OllamaEmbeddingProvider` on the client side,
-not `TextEmbeddingsInferenceProvider` — the REST contract is different.
+natively arm64 (no emulation at all on Apple Silicon). Needs `EmbeddingProviderOllama` on the client side,
+not `EmbeddingProviderTextEmbeddingsInference` — the REST contract is different.
 `dev.xtrafe.javai.vector.LocalEmbeddingDefaults` (in `javai-vector`) is the single place that picks
 between the two automatically based on host OS (macOS → Ollama, else → TEI, overridable via the
 `javai.embedding.provider` system property) — see [`../e2e-client-test`](../e2e-client-test), which is

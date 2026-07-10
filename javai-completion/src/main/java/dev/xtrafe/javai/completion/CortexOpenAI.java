@@ -3,23 +3,21 @@ package dev.xtrafe.javai.completion;
 import java.util.concurrent.Flow;
 
 /**
- * Connector to Groq's hosted inference API -- OpenAI-wire-compatible by Groq's own design (a request
- * shaped exactly like an OpenAI chat-completions call, just against Groq's own {@code base-url} and
- * models), so this reuses {@link OpenAiCompatibleCortexSupport} rather than a separate client. Spring AI
- * itself documents this same "point the OpenAI client at Groq" integration path.
+ * Connector to OpenAI's own chat-completions API. Wraps Spring AI's {@code OpenAiChatModel} directly
+ * (native wire format, no repointing needed) via {@link CortexOpenAiCompatibleSupport}.
  *
  * <p><b>Not yet verified against a live endpoint</b> -- no API key was available at implementation time.
  * Covered by hermetic tests (request/option-mapping against a fake HTTP server) only; see this module's
  * README.
  */
-public final class GroqCortex implements Cortex {
+public final class CortexOpenAI implements Cortex {
 
-    private static final String DEFAULT_BASE_URL = "https://api.groq.com/openai/v1";
+    private static final String DEFAULT_BASE_URL = "https://api.openai.com";
 
     private final Cortex delegate;
 
-    private GroqCortex(String baseUrl, String apiKey, String model) {
-        this.delegate = new OpenAiCompatibleCortexSupport("groq", baseUrl, apiKey, model);
+    private CortexOpenAI(String baseUrl, String apiKey, String model, Integer contextWindowTokens) {
+        this.delegate = new CortexOpenAiCompatibleSupport("openai", baseUrl, apiKey, model, contextWindowTokens);
     }
 
     public static Builder builder() {
@@ -46,10 +44,16 @@ public final class GroqCortex implements Cortex {
         return delegate.modelId();
     }
 
+    @Override
+    public int contextWindowTokens() {
+        return delegate.contextWindowTokens();
+    }
+
     public static final class Builder {
         private String baseUrl = DEFAULT_BASE_URL;
         private String apiKey;
         private String model;
+        private Integer contextWindowTokens;
 
         private Builder() {
         }
@@ -70,11 +74,18 @@ public final class GroqCortex implements Cortex {
             return this;
         }
 
-        public GroqCortex build() {
+        /** Overrides {@link ContextWindows}'s best-effort lookup for this model -- prefer this whenever
+         *  correctness matters more than the table's convenience. */
+        public Builder contextWindowTokens(int contextWindowTokens) {
+            this.contextWindowTokens = contextWindowTokens;
+            return this;
+        }
+
+        public CortexOpenAI build() {
             if (model == null) {
-                throw new IllegalStateException("GroqCortex requires a model -- e.g. \"llama-3.3-70b-versatile\"");
+                throw new IllegalStateException("CortexOpenAI requires a model -- e.g. \"gpt-4.1\"");
             }
-            return new GroqCortex(baseUrl, apiKey, model);
+            return new CortexOpenAI(baseUrl, apiKey, model, contextWindowTokens);
         }
     }
 }

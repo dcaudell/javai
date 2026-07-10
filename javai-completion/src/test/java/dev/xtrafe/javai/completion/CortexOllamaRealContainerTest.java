@@ -24,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Real container, not hermetic -- there's no meaningful way to fake whether a real completion actually
  * comes back, or whether a real tuning parameter ({@code enable_thinking}) actually changes observed
  * behavior, matching this project's established testing philosophy
- * ({@code HibernatePostgresRepositoryBackendTest}, {@code OllamaEmbeddingProviderTest}). Builds
+ * ({@code RepositoryBackendHibernatePostgresTest}, {@code EmbeddingProviderOllamaTest}). Builds
  * {@code javai-completion/docker/Dockerfile} (Ollama + {@link LocalCompletionDefaults#model()} baked in) --
  * first run is slow (image build + a multi-gigabyte model pull), subsequent runs reuse Docker's own layer
  * cache. Explicitly named {@code javai-completion-ollama-test} (rather than left to
@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * unlabelled {@code <none>:<none>} dangling image.
  */
 @Testcontainers
-class OllamaCortexRealContainerTest {
+class CortexOllamaRealContainerTest {
 
     @Container
     static final GenericContainer<?> ollama = new GenericContainer<>(
@@ -83,9 +83,9 @@ class OllamaCortexRealContainerTest {
      * deliberately not a timing comparison (two real network calls will almost always differ in latency
      * regardless of whether a tuning parameter did anything, so that would prove nothing). Instead, this
      * goes straight to Ollama's own wire-level response (via {@code OllamaApi} directly, the same class
-     * {@link OllamaCortex} itself uses internally): enabling the real {@code think} field on a
+     * {@link CortexOllama} itself uses internally): enabling the real {@code think} field on a
      * thinking-capable model must produce a non-empty reasoning trace in {@code message.thinking()} --
-     * structurally absent when not requested. {@link OllamaCortexTest} (hermetic) already proves the
+     * structurally absent when not requested. {@link CortexOllamaTest} (hermetic) already proves the
      * *request* correctly carries {@code think:true}; this proves the real backend actually *does*
      * something different in response, not just that the request looked right.
      */

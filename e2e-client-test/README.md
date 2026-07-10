@@ -28,7 +28,7 @@ reflection, no isolated classloaders, no `implements JavAIVectorizable` written 
 - `similarityTo(self)` is ~1.0.
 
 `CompletionE2ETest` additionally proves `javai-completion`'s connector layer end to end against this same
-project's domain: a real `OllamaCortex` (via `LocalCompletionDefaults`) grounds a completion in real
+project's domain: a real `CortexOllama` (via `LocalCompletionDefaults`) grounds a completion in real
 `Article`/`Comment` objects wrapped as `ContextableObject`s inside a `PromptContext`, and separately proves
 that marshalling one of those real, woven objects only surfaces its `@PromptContext`-annotated fields
 (`title`/`body`/`text`/`author`), never an entity `id` or any internal woven state (a cached embedding

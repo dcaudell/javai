@@ -118,7 +118,7 @@ class ArticleFixtureVolumeE2ETest {
      * (re)computed in-memory ranking of <em>other</em> articles -- two earlier versions tried exactly that
      * (first requiring exact top-4 set equality, then loosening to "at most one disagreement"), and both
      * still failed intermittently across repeated real runs. The reason turned out to be structural, not a
-     * ranking bug: {@code HibernatePostgresRepositoryBackend.save()} computes and
+     * ranking bug: {@code RepositoryBackendHibernatePostgres.save()} computes and
      * persists vectors from {@code session.merge()}'s returned managed copy, a distinct object instance from
      * the {@code entity} reference {@code save()} itself returns (see that method's own javadoc) -- so a test
      * that calls {@code .vector()}/{@code .fieldVector()} on the returned {@code entity} is necessarily

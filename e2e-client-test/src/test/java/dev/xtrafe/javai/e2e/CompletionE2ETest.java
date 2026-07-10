@@ -29,7 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Kept to two real completions/marshalling checks, not an exhaustive suite -- each real call against
  * {@code qwen3:8b} costs real wall-clock time (see {@code javai-completion}'s own
- * {@code OllamaCortexRealContainerTest} for the established pattern this mirrors: {@code enable_thinking}
+ * {@code CortexOllamaRealContainerTest} for the established pattern this mirrors: {@code enable_thinking}
  * explicitly disabled and token budgets bounded, since Qwen3 defaults to extended reasoning that can
  * otherwise exhaust a small budget before producing any real content).
  */

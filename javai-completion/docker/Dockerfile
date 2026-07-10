@@ -1,5 +1,5 @@
 # A single Ollama instance with the chat/completion model baked into the image layer, for
-# OllamaCortexRealContainerTest -- this module's one real-backend proof (Cortex is otherwise hermetically
+# CortexOllamaRealContainerTest -- this module's one real-backend proof (Cortex is otherwise hermetically
 # tested against a fake HTTP server, see this module's README). Mirrors e2e-client-test/docker/Dockerfile's
 # own "bake the model in at build time, not pull it at container-start time" pattern, but scoped down to
 # just this one service -- javai-completion's own tests don't need Postgres/Neo4j at all.

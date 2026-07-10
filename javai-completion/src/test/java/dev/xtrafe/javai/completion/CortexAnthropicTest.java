@@ -7,6 +7,12 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -15,7 +21,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Hermetic only -- no Anthropic API key was available at implementation time (see this module's README).
  * Proves request/response mapping against a fake HTTP server standing in for Anthropic's Messages API.
  */
-class AnthropicCortexTest {
+class CortexAnthropicTest {
 
     private HttpServer server;
     private String capturedRequestBody;
@@ -37,6 +43,7 @@ class AnthropicCortexTest {
             exchange.getResponseBody().write(body);
             exchange.close();
         });
+        server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
         return "http://localhost:" + server.getAddress().getPort();
     }
@@ -49,7 +56,7 @@ class AnthropicCortexTest {
                  "model":"claude-sonnet-5","stop_reason":"end_turn"}
                 """);
 
-        Cortex cortex = AnthropicCortex.builder().baseUrl(baseUrl).apiKey("test-key").model("claude-sonnet-5").build();
+        Cortex cortex = CortexAnthropic.builder().baseUrl(baseUrl).apiKey("test-key").model("claude-sonnet-5").build();
         CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("Say hi").build());
 
         assertEquals("Hello from Claude!", result.text());
@@ -64,7 +71,7 @@ class AnthropicCortexTest {
                 {"content":[{"type":"text","text":"ok"}]}
                 """);
 
-        Cortex cortex = AnthropicCortex.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+        Cortex cortex = CortexAnthropic.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
                 .apiKey("test-key").model("claude-sonnet-5").build();
         cortex.complete(CompletionRequest.builder().prompt("hi").build()); // no maxTokens set explicitly
 
@@ -78,7 +85,7 @@ class AnthropicCortexTest {
                 {"content":[{"type":"text","text":"ok"}]}
                 """);
 
-        Cortex cortex = AnthropicCortex.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+        Cortex cortex = CortexAnthropic.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
                 .apiKey("test-key").model("claude-sonnet-5").build();
         cortex.complete(CompletionRequest.builder()
                 .prompt("hard problem")
@@ -93,10 +100,39 @@ class AnthropicCortexTest {
     @Test
     void builderRequiresAModel() {
         try {
-            AnthropicCortex.builder().apiKey("k").build();
+            CortexAnthropic.builder().apiKey("k").build();
             throw new AssertionError("expected IllegalStateException for a missing model");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("model"));
+        }
+    }
+
+    /** Proves a single {@link Cortex} instance is safe under concurrent callers. */
+    @Test
+    void concurrentCallsAllSucceed() throws IOException, InterruptedException {
+        String baseUrl = startFakeServer("""
+                {"content":[{"type":"text","text":"concurrent ok"}]}
+                """);
+
+        Cortex cortex = CortexAnthropic.builder().baseUrl(baseUrl).apiKey("test-key").model("claude-sonnet-5").build();
+        List<Callable<CompletionResult>> calls = java.util.stream.Stream.generate(
+                        () -> (Callable<CompletionResult>) () -> cortex.complete(CompletionRequest.builder().prompt("hi").build()))
+                .limit(20)
+                .toList();
+
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<CompletionResult>> futures = executor.invokeAll(calls);
+            for (Future<CompletionResult> future : futures) {
+                try {
+                    assertEquals("concurrent ok", future.get().text());
+                } catch (Exception e) {
+                    throw new AssertionError("a concurrent complete() call failed", e);
+                }
+            }
+        } finally {
+            executor.shutdown();
+            executor.awaitTermination(10, TimeUnit.SECONDS);
         }
     }
 }

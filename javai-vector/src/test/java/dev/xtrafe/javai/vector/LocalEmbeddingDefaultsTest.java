@@ -30,7 +30,7 @@ class LocalEmbeddingDefaultsTest {
         assertEquals(11434, LocalEmbeddingDefaults.containerPort());
         assertEquals("/", LocalEmbeddingDefaults.healthCheckPath());
         assertEquals("qwen3-embedding:0.6b", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
-        assertInstanceOf(OllamaEmbeddingProvider.class, LocalEmbeddingDefaults.create(URI.create("http://localhost:11434")));
+        assertInstanceOf(EmbeddingProviderOllama.class, LocalEmbeddingDefaults.create(URI.create("http://localhost:11434")));
     }
 
     @Test
@@ -41,7 +41,7 @@ class LocalEmbeddingDefaultsTest {
         assertEquals(80, LocalEmbeddingDefaults.containerPort());
         assertEquals("/health", LocalEmbeddingDefaults.healthCheckPath());
         assertEquals("Qwen/Qwen3-Embedding-0.6B", LocalEmbeddingDefaults.modelIdentifierForContainerStartup());
-        assertInstanceOf(TextEmbeddingsInferenceProvider.class,
+        assertInstanceOf(EmbeddingProviderTextEmbeddingsInference.class,
                 LocalEmbeddingDefaults.create(URI.create("http://localhost:8080")));
     }
 

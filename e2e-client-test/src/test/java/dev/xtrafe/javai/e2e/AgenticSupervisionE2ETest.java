@@ -39,7 +39,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <p>Kept to the minimum call count each demo needs to prove its point (3 feedback calls, 2 search calls --
  * five real completions total): each real call against {@code qwen3:8b} costs real wall-clock time, and
  * {@code enable_thinking} is explicitly disabled with a small token budget on every call, same as {@code
- * CompletionE2ETest} and {@code javai-completion}'s own {@code OllamaCortexRealContainerTest} already
+ * CompletionE2ETest} and {@code javai-completion}'s own {@code CortexOllamaRealContainerTest} already
  * establish, specifically to keep this fast and to stop Qwen3's default extended reasoning from consuming
  * the whole token budget before producing the one-word answer each prompt asks for.
  */

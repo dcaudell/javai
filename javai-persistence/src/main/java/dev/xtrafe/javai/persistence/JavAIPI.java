@@ -106,8 +106,8 @@ public final class JavAIPI {
 
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {
         return BACKENDS.computeIfAbsent(config, cfg -> switch (cfg.backend()) {
-            case POSTGRES -> new HibernatePostgresRepositoryBackend(cfg);
-            case NEO4J -> new Neo4jRepositoryBackend(cfg);
+            case POSTGRES -> new RepositoryBackendHibernatePostgres(cfg);
+            case NEO4J -> new RepositoryBackendNeo4j(cfg);
         });
     }
 }

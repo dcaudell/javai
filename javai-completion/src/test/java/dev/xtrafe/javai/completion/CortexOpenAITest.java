@@ -8,6 +8,12 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -17,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Proves request/response mapping against a fake HTTP server standing in for OpenAI's own endpoint, not
  * that a real completion is semantically correct.
  */
-class OpenAICortexTest {
+class CortexOpenAITest {
 
     private HttpServer server;
     private String capturedRequestBody;
@@ -39,6 +45,7 @@ class OpenAICortexTest {
             exchange.getResponseBody().write(body);
             exchange.close();
         });
+        server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
         return "http://localhost:" + server.getAddress().getPort();
     }
@@ -50,7 +57,7 @@ class OpenAICortexTest {
                  "choices":[{"index":0,"message":{"role":"assistant","content":"Hello there!"},"finish_reason":"stop"}]}
                 """);
 
-        Cortex cortex = OpenAICortex.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
+        Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
         CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("Say hi").build());
 
         assertEquals("Hello there!", result.text());
@@ -66,7 +73,7 @@ class OpenAICortexTest {
                 {"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
                 """);
 
-        Cortex cortex = OpenAICortex.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
+        Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
         cortex.complete(CompletionRequest.builder()
                 .prompt("Summarize this:")
                 .context(PromptContext.of("the informing material"))
@@ -82,7 +89,7 @@ class OpenAICortexTest {
                 {"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
                 """);
 
-        Cortex cortex = OpenAICortex.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
+        Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
         cortex.complete(CompletionRequest.builder()
                 .prompt("hi")
                 .providerOption("reasoning_effort", "high")
@@ -95,10 +102,42 @@ class OpenAICortexTest {
     @Test
     void builderRequiresAModel() {
         try {
-            OpenAICortex.builder().apiKey("k").build();
+            CortexOpenAI.builder().apiKey("k").build();
             throw new AssertionError("expected IllegalStateException for a missing model");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("model"));
+        }
+    }
+
+    /** Proves a single {@link Cortex} instance is safe under concurrent callers -- required by this
+     *  module's own contract now that every provider shares state (an {@link
+     *  dev.xtrafe.javai.vector.EndpointRateLimiter}) keyed by endpoint. */
+    @Test
+    void concurrentCallsAllSucceed() throws IOException, InterruptedException {
+        String baseUrl = startFakeServer("""
+                {"choices":[{"index":0,"message":{"role":"assistant","content":"concurrent ok"},"finish_reason":"stop"}]}
+                """);
+
+        Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
+        int callCount = 20;
+        List<Callable<CompletionResult>> calls = java.util.stream.Stream.generate(
+                        () -> (Callable<CompletionResult>) () -> cortex.complete(CompletionRequest.builder().prompt("hi").build()))
+                .limit(callCount)
+                .toList();
+
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<CompletionResult>> futures = executor.invokeAll(calls);
+            for (Future<CompletionResult> future : futures) {
+                try {
+                    assertEquals("concurrent ok", future.get().text());
+                } catch (Exception e) {
+                    throw new AssertionError("a concurrent complete() call failed", e);
+                }
+            }
+        } finally {
+            executor.shutdown();
+            executor.awaitTermination(10, TimeUnit.SECONDS);
         }
     }
 }

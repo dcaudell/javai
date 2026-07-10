@@ -1,8 +1,8 @@
 /**
  * Pure vector/embedding functionality: {@link EmbeddingVector} (the versioned embedding value type), a CPU
  * cosine-similarity backend ({@link VectorMath}), the {@link JavAIEmbeddingProvider} SPI plus two real
- * HTTP-client implementations ({@link TextEmbeddingsInferenceProvider} against the {@code docker/} TEI
- * sidecar, {@link OllamaEmbeddingProvider} for the macOS/Candle-bug workaround -- see
+ * HTTP-client implementations ({@link EmbeddingProviderTextEmbeddingsInference} against the {@code docker/} TEI
+ * sidecar, {@link EmbeddingProviderOllama} for the macOS/Candle-bug workaround -- see
  * {@link LocalEmbeddingDefaults} for which one a given platform gets by default), and the dirty-state
  * bookkeeping primitives ({@link JavAIDirtyTracking}, {@link DirtyTrackingSupport}, the internal
  * {@code IdentityWeakReference} helper its {@code dependents()} set uses).

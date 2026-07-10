@@ -7,6 +7,12 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -18,7 +24,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Proves the create-then-poll-until-terminal contract against a fake HTTP server, since Replicate's own API
  * is fundamentally job-submission-shaped, not a single request/response like every other provider here.
  */
-class ReplicateCortexTest {
+class CortexReplicateTest {
 
     private HttpServer server;
 
@@ -47,7 +53,7 @@ class ReplicateCortexTest {
         server.start();
         String baseUrl = "http://localhost:" + server.getAddress().getPort();
 
-        Cortex cortex = ReplicateCortex.builder().baseUrl(baseUrl).apiToken("test-token")
+        Cortex cortex = CortexReplicate.builder().baseUrl(baseUrl).apiToken("test-token")
                 .model("meta/meta-llama-3-70b-instruct").build();
         CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("Say hi").build());
 
@@ -83,7 +89,7 @@ class ReplicateCortexTest {
         server.start();
         String baseUrl = "http://localhost:" + server.getAddress().getPort();
 
-        Cortex cortex = ReplicateCortex.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
+        Cortex cortex = CortexReplicate.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
         CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("slow question").build());
 
         assertEquals("done", result.text());
@@ -104,7 +110,7 @@ class ReplicateCortexTest {
         server.start();
         String baseUrl = "http://localhost:" + server.getAddress().getPort();
 
-        Cortex cortex = ReplicateCortex.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
+        Cortex cortex = CortexReplicate.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
         CompletionException exception = assertThrows(CompletionException.class,
                 () -> cortex.complete(CompletionRequest.builder().prompt("hi").build()));
         assertTrue(exception.getMessage().contains("model overloaded"));
@@ -124,7 +130,7 @@ class ReplicateCortexTest {
         server.start();
         String baseUrl = "http://localhost:" + server.getAddress().getPort();
 
-        Cortex cortex = ReplicateCortex.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
+        Cortex cortex = CortexReplicate.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
         StringBuilder received = new StringBuilder();
         cortex.completeStreaming(CompletionRequest.builder().prompt("hi").build(), received::append);
 
@@ -133,6 +139,44 @@ class ReplicateCortexTest {
 
     @Test
     void builderRequiresAModel() {
-        assertThrows(IllegalStateException.class, () -> ReplicateCortex.builder().apiToken("t").build());
+        assertThrows(IllegalStateException.class, () -> CortexReplicate.builder().apiToken("t").build());
+    }
+
+    /** Proves a single {@link Cortex} instance is safe under concurrent callers. */
+    @Test
+    void concurrentCallsAllSucceed() throws IOException, InterruptedException {
+        server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        server.createContext("/v1/models/test/model/predictions", exchange -> {
+            byte[] body = "{\"id\":\"pred-concurrent\",\"status\":\"succeeded\",\"output\":[\"concurrent ok\"]}"
+                    .getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.setExecutor(Executors.newFixedThreadPool(8));
+        server.start();
+        String baseUrl = "http://localhost:" + server.getAddress().getPort();
+
+        Cortex cortex = CortexReplicate.builder().baseUrl(baseUrl).apiToken("test-token").model("test/model").build();
+        List<Callable<CompletionResult>> calls = java.util.stream.Stream.generate(
+                        () -> (Callable<CompletionResult>) () -> cortex.complete(CompletionRequest.builder().prompt("hi").build()))
+                .limit(20)
+                .toList();
+
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<CompletionResult>> futures = executor.invokeAll(calls);
+            for (Future<CompletionResult> future : futures) {
+                try {
+                    assertEquals("concurrent ok", future.get().text());
+                } catch (Exception e) {
+                    throw new AssertionError("a concurrent complete() call failed", e);
+                }
+            }
+        } finally {
+            executor.shutdown();
+            executor.awaitTermination(10, TimeUnit.SECONDS);
+        }
     }
 }

@@ -8,6 +8,12 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -16,10 +22,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Hermetic tests against a fake HTTP server -- request/option-mapping only. The real, Testcontainers-backed
  * proof that a genuine {@code qwen3:8b} completion (and the {@code enable_thinking} tuning parameter)
- * actually works is {@code OllamaCortexRealContainerTest}, this module's one real-backend test (mirroring
+ * actually works is {@code CortexOllamaRealContainerTest}, this module's one real-backend test (mirroring
  * this project's established "no meaningful way to fake a real backend" testing philosophy).
  */
-class OllamaCortexTest {
+class CortexOllamaTest {
 
     private HttpServer server;
     private String capturedRequestBody;
@@ -41,6 +47,7 @@ class OllamaCortexTest {
             exchange.getResponseBody().write(body);
             exchange.close();
         });
+        server.setExecutor(Executors.newFixedThreadPool(8));
         server.start();
         return "http://localhost:" + server.getAddress().getPort();
     }
@@ -52,7 +59,7 @@ class OllamaCortexTest {
                  "message":{"role":"assistant","content":"Hello from Ollama!"},"done":true}
                 """);
 
-        Cortex cortex = OllamaCortex.builder().endpoint(URI.create(baseUrl)).model("qwen3:8b").build();
+        Cortex cortex = CortexOllama.builder().endpoint(URI.create(baseUrl)).model("qwen3:8b").build();
         CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("Say hi").build());
 
         assertEquals("Hello from Ollama!", result.text());
@@ -67,7 +74,7 @@ class OllamaCortexTest {
                 {"message":{"role":"assistant","content":"ok"},"done":true}
                 """);
 
-        Cortex cortex = OllamaCortex.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+        Cortex cortex = CortexOllama.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
                 .model("qwen3:8b").build();
         cortex.complete(CompletionRequest.builder()
                 .prompt("think hard")
@@ -84,7 +91,7 @@ class OllamaCortexTest {
                 {"message":{"role":"assistant","content":"ok"},"done":true}
                 """);
 
-        Cortex cortex = OllamaCortex.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+        Cortex cortex = CortexOllama.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
                 .model("qwen3:8b").build();
         cortex.complete(CompletionRequest.builder().prompt("plain question").build());
 
@@ -98,7 +105,7 @@ class OllamaCortexTest {
                 {"message":{"role":"assistant","content":"ok"},"done":true}
                 """);
 
-        Cortex cortex = OllamaCortex.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+        Cortex cortex = CortexOllama.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
                 .model("qwen3:8b").build();
         cortex.complete(CompletionRequest.builder()
                 .prompt("hi")
@@ -112,10 +119,39 @@ class OllamaCortexTest {
     @Test
     void builderRequiresAModel() {
         try {
-            OllamaCortex.builder().build();
+            CortexOllama.builder().build();
             throw new AssertionError("expected IllegalStateException for a missing model");
         } catch (IllegalStateException expected) {
             assertTrue(expected.getMessage().contains("model"));
+        }
+    }
+
+    /** Proves a single {@link Cortex} instance is safe under concurrent callers. */
+    @Test
+    void concurrentCallsAllSucceed() throws IOException, InterruptedException {
+        String baseUrl = startFakeServer("""
+                {"message":{"role":"assistant","content":"concurrent ok"},"done":true}
+                """);
+
+        Cortex cortex = CortexOllama.builder().endpoint(URI.create(baseUrl)).model("qwen3:8b").build();
+        List<Callable<CompletionResult>> calls = java.util.stream.Stream.generate(
+                        () -> (Callable<CompletionResult>) () -> cortex.complete(CompletionRequest.builder().prompt("hi").build()))
+                .limit(20)
+                .toList();
+
+        ExecutorService executor = Executors.newFixedThreadPool(8);
+        try {
+            List<Future<CompletionResult>> futures = executor.invokeAll(calls);
+            for (Future<CompletionResult> future : futures) {
+                try {
+                    assertEquals("concurrent ok", future.get().text());
+                } catch (Exception e) {
+                    throw new AssertionError("a concurrent complete() call failed", e);
+                }
+            }
+        } finally {
+            executor.shutdown();
+            executor.awaitTermination(10, TimeUnit.SECONDS);
         }
     }
 }

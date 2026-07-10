@@ -5,15 +5,14 @@ import dev.xtrafe.javai.model.JavAIRuntime;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.PostgreSQLContainer;
+import org.neo4j.driver.AuthTokens;
+import org.neo4j.driver.Driver;
+import org.neo4j.driver.GraphDatabase;
+import org.testcontainers.containers.Neo4jContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
@@ -24,17 +23,18 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Real container, not hermetic: there's no meaningful way to fake whether pgvector's {@code <=>} operator
- * actually ranks correctly. Uses {@link FakeEmbeddingProvider} for the embeddings themselves (only
- * genuinely-different-text-produces-genuinely-different-vectors matters here, not real semantic quality --
- * that's already proven against real embeddings in {@code e2e-client-test}).
+ * Real container, not hermetic: there's no meaningful way to fake whether Neo4j's native vector index
+ * actually ranks correctly. See {@link RepositoryBackendHibernatePostgresTest}'s javadoc for why
+ * {@link FakeEmbeddingProvider} is still fine for the embeddings themselves.
  */
 @Testcontainers
-class HibernatePostgresRepositoryBackendTest {
+class RepositoryBackendNeo4jTest {
+
+    private static final String NEO4J_PASSWORD = "javai-test-password";
 
     @Container
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
-            DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres"));
+    static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:5.26-community"))
+            .withAdminPassword(NEO4J_PASSWORD);
 
     private static TestArticleRepository repository;
 
@@ -42,10 +42,10 @@ class HibernatePostgresRepositoryBackendTest {
     static void configurePersistenceAndProvider() {
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
         JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
-                .postgresUrl(postgres.getJdbcUrl())
-                .postgresUsername(postgres.getUsername())
-                .postgresPassword(postgres.getPassword())
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
                 .build());
         repository = JavAIPI.repository(TestArticleRepository.class);
     }
@@ -71,9 +71,9 @@ class HibernatePostgresRepositoryBackendTest {
     void findNearestByFieldVectorRanksBySimilarity() {
         TestArticle security = repository.save(new TestArticle("Zero-day disclosed",
                 "A critical vulnerability affecting a widely used TLS library was patched today."));
-        TestArticle cooking = repository.save(new TestArticle("Weeknight pasta recipes",
+        repository.save(new TestArticle("Weeknight pasta recipes",
                 "Quick, easy pasta dishes you can make in under thirty minutes."));
-        TestArticle sports = repository.save(new TestArticle("Championship game recap",
+        repository.save(new TestArticle("Championship game recap",
                 "The local team secured a dramatic overtime victory last night."));
 
         EmbeddingVector reference = security.fieldVector("title");
@@ -98,11 +98,11 @@ class HibernatePostgresRepositoryBackendTest {
 
     /**
      * Structural proof, not just behavioral: two different models' vectors for the *same* field of the
-     * *same* entity land in two entirely separate tables (named from {@link ModelIds#sanitize}), each
-     * holding exactly that model's own row -- never a shared table filtered by a {@code model_id} column.
+     * *same* node land under two entirely separate, model-qualified property names (named from
+     * {@link ModelIds#sanitize}) -- the old model's property is never overwritten by a newer model's save.
      */
     @Test
-    void savingUnderADifferentModelUsesASeparateTablePerModel() throws Exception {
+    void savingUnderADifferentModelUsesASeparatePropertyPerModel() {
         TestArticle article = repository.save(new TestArticle("Model migration test", "Original text."));
         UUID id = article.getId();
         String originalModelId = article.fieldVector("title").modelId();
@@ -115,33 +115,27 @@ class HibernatePostgresRepositoryBackendTest {
         TestArticle reloaded = repository.findById(id).orElseThrow();
         repository.save(reloaded);
 
-        try (Connection connection = DriverManager.getConnection(
-                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
-            assertEquals(1, countRows(connection, "javai_vectors__" + ModelIds.sanitize(originalModelId), id, "title"),
-                    "the original model's table must still hold exactly this entity's row, untouched");
-            assertEquals(1, countRows(connection, "javai_vectors__" + ModelIds.sanitize("fake-test-model-v2"), id, "title"),
-                    "the new model must have its own, separate table");
-        }
-    }
-
-    private static int countRows(Connection connection, String table, UUID id, String fieldName) throws Exception {
-        try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT COUNT(*) FROM " + table + " WHERE owner_id = ? AND field_name = ?")) {
-            statement.setObject(1, id);
-            statement.setString(2, fieldName);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                resultSet.next();
-                return resultSet.getInt(1);
-            }
+        try (Driver driver = GraphDatabase.driver(neo4j.getBoltUrl(), AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+                var session = driver.session()) {
+            String originalProperty = "titleVector__" + ModelIds.sanitize(originalModelId);
+            String newProperty = "titleVector__" + ModelIds.sanitize("fake-test-model-v2");
+            boolean bothPropertiesPresent = session.run(
+                    "MATCH (n:TestArticle {id: $id}) RETURN n[$originalProperty] IS NOT NULL AS hasOriginal, "
+                            + "n[$newProperty] IS NOT NULL AS hasNew",
+                    org.neo4j.driver.Values.parameters("id", id.toString(),
+                            "originalProperty", originalProperty, "newProperty", newProperty))
+                    .single().get("hasOriginal").asBoolean();
+            assertTrue(bothPropertiesPresent,
+                    "the original model's property must still be present, untouched by the newer model's save");
         }
     }
 
     /**
      * A different-dimension model swap is now *exactly* the same operation as a same-dimension one: just
      * {@code configureEmbeddingProvider(...)}, nothing else. Each model gets its own, independently and
-     * correctly dimensioned table the first time it's needed, so there's no shared-column conflict to hit
-     * -- contrast with the earlier, since-replaced shared-table design, where this used to fail outright
-     * with a pgvector dimension-mismatch error.
+     * correctly dimensioned property + vector index the first time it's needed, so there's no shared-
+     * property conflict to hit -- contrast with the earlier, since-replaced shared-property design, where
+     * a different-dimension swap left a node silently inconsistent with its own vector index.
      */
     @Test
     void differentDimensionModelSwapWorksTheSameAsASameDimensionSwap() {
@@ -151,7 +145,7 @@ class HibernatePostgresRepositoryBackendTest {
         JavAIRuntime.configureEmbeddingProvider(text -> new EmbeddingVector(
                 new float[] {0.1f, 0.2f, 0.3f, 0.4f}, "fake-test-model-4dim", 4, Instant.now()));
         TestArticle reloaded = repository.findById(id).orElseThrow();
-        TestArticle resaved = repository.save(reloaded); // must NOT throw, unlike the old shared-table design
+        TestArticle resaved = repository.save(reloaded); // must NOT throw
 
         List<TestArticle> found = repository.findNearestByTitleVector(resaved.fieldVector("title"), 5);
         assertTrue(found.stream().anyMatch(a -> a.getId().equals(id)));
@@ -191,11 +185,38 @@ class HibernatePostgresRepositoryBackendTest {
 
         List<TestArticle> found = repository.findNearestByTitleVector(originalReference, 5);
         assertTrue(found.stream().anyMatch(a -> a.getId().equals(id)),
-                "the original model's table must still hold this entity's vector -- reverting must not need reindexing");
+                "the original model's property/index must still hold this entity -- reverting must not need reindexing");
     }
 
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+    }
+
+    /**
+     * Proves the fix for a real, previously-confirmed gap: {@code hydrateRelationshipField} used to only
+     * handle {@code Collection}-typed relationship fields, and {@code saveNode} never persisted a
+     * {@code Map} field's keys at all -- so a {@code Map}-typed field couldn't correctly round-trip through
+     * Neo4j (it would either throw trying to assign a related node directly into a {@code Map}-typed field
+     * slot, or -- before that fix -- have no way to know what key to reconstruct it under even if hydration
+     * were fixed in isolation). {@code TestArticleWithTags.tagsByCode} is a real
+     * {@code Map<String, TestTag>}, not a {@code Collection}; both entries' keys must survive the round trip
+     * exactly, not just their values.
+     */
+    @Test
+    void mapFieldRoundTripsWithKeysPreserved() {
+        JavAIPI.repository(TestTagRepository.class);
+        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class);
+
+        TestArticleWithTags article = new TestArticleWithTags("Map field test");
+        article.getTagsByCode().put("first", new TestTag("alpha"));
+        article.getTagsByCode().put("second", new TestTag("beta"));
+
+        TestArticleWithTags saved = repository.save(article);
+        TestArticleWithTags reloaded = repository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getTagsByCode().size());
+        assertEquals("alpha", reloaded.getTagsByCode().get("first").getLabel());
+        assertEquals("beta", reloaded.getTagsByCode().get("second").getLabel());
     }
 }

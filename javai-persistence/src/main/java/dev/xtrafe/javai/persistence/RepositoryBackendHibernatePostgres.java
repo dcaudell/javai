@@ -83,7 +83,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * populated by {@link #syncCollectionMembers} on save and read back by {@link #hydrateCollectionMembers} on
  * load. Being reflective rather than proxy-based, hydration adds members into whatever collection instance
  * the entity's own no-arg constructor already created (a real {@code JavAIArrayList}, full dirty-tracking
- * intact) instead of replacing it -- the same trick {@code Neo4jRepositoryBackend} already relies on for
+ * intact) instead of replacing it -- the same trick {@code RepositoryBackendNeo4j} already relies on for
  * its own relationship hydration, applied here for symmetry across both backends.
  *
  * <p><b>No manual {@code @Transient} required.</b> {@link #registerEntityType} reflectively detects, for
@@ -125,7 +125,7 @@ import java.util.concurrent.ConcurrentHashMap;
  * to a Phase 0 module whose job is proving the design space, not hardening a production ORM integration.
  * See {@code javai-persistence/README.md} for the same note in context.
  */
-final class HibernatePostgresRepositoryBackend implements RepositoryBackend {
+final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private static final String FIELD_VECTOR_TABLE_PREFIX = "javai_vectors__";
     private static final String SUMMARY_VECTOR_TABLE_PREFIX = "javai_summary_vectors__";
@@ -135,7 +135,7 @@ final class HibernatePostgresRepositoryBackend implements RepositoryBackend {
     private final Object bootstrapLock = new Object();
     private volatile SessionFactory sessionFactory;
 
-    HibernatePostgresRepositoryBackend(JavAIPersistenceConfig config) {
+    RepositoryBackendHibernatePostgres(JavAIPersistenceConfig config) {
         this.config = config;
     }
 
@@ -258,7 +258,7 @@ final class HibernatePostgresRepositoryBackend implements RepositoryBackend {
                 // @Transient collection fields are left empty by merge(), so returning it would hand the
                 // caller back an Article whose in-memory `comments` looks wrong immediately after save().
                 // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
-                // what Neo4jRepositoryBackend.save() returns too, so both backends behave consistently.
+                // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
                 return entity;
             } catch (RuntimeException e) {
                 tx.rollback();
@@ -843,7 +843,7 @@ final class HibernatePostgresRepositoryBackend implements RepositoryBackend {
         StringBuilder entities = new StringBuilder();
         for (Class<?> entityType : entityTypes) {
             List<Field> transientFields = EntityReflection.allFields(entityType).stream()
-                    .filter(HibernatePostgresRepositoryBackend::isJavAICollectionField)
+                    .filter(RepositoryBackendHibernatePostgres::isJavAICollectionField)
                     .toList();
             if (transientFields.isEmpty()) {
                 continue;

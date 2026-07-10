@@ -11,7 +11,7 @@ import java.time.Instant;
 /**
  * An alternate real {@link JavAIEmbeddingProvider}: a thin HTTP client against
  * <a href="https://ollama.com">Ollama</a>'s {@code /api/embed} endpoint. Not the whitepaper's Phase 0
- * default (that's {@link TextEmbeddingsInferenceProvider} against TEI, per §4.5.2) -- this exists because
+ * default (that's {@link EmbeddingProviderTextEmbeddingsInference} against TEI, per §4.5.2) -- this exists because
  * TEI's Candle backend has a confirmed, unresolved upstream bug running {@code Qwen/Qwen3-Embedding-0.6B}
  * on CPU ("Intel MKL ERROR: Parameter 8 was incorrect on entry to SGEMM", reported on native x86_64/AMD
  * hardware too, not just under emulation -- see
@@ -23,22 +23,22 @@ import java.time.Instant;
  * doc/spec/vector-core.md's {@code JavAIEmbeddingProvider} SPI is designed for.
  *
  * <p>Hand-rolls the response JSON rather than pulling in a JSON library, same rationale as
- * {@link TextEmbeddingsInferenceProvider}: Ollama's {@code /api/embed} response is a JSON object with an
+ * {@link EmbeddingProviderTextEmbeddingsInference}: Ollama's {@code /api/embed} response is a JSON object with an
  * {@code "embeddings"} key holding {@code [[float, ...]]}, plus a few fields (timing metrics, echoed
  * model name) this client doesn't need -- locating one key and reusing the same bracket-unwrapping is
  * simpler than a general parser.
  */
-public final class OllamaEmbeddingProvider implements JavAIEmbeddingProvider {
+public final class EmbeddingProviderOllama implements JavAIEmbeddingProvider {
 
     private final HttpClient httpClient;
     private final URI embedEndpoint;
     private final String model;
 
-    public OllamaEmbeddingProvider(URI baseUri, String model) {
+    public EmbeddingProviderOllama(URI baseUri, String model) {
         this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, model);
     }
 
-    OllamaEmbeddingProvider(HttpClient httpClient, URI baseUri, String model) {
+    EmbeddingProviderOllama(HttpClient httpClient, URI baseUri, String model) {
         this.httpClient = httpClient;
         this.embedEndpoint = baseUri.resolve("/api/embed");
         this.model = model;
@@ -62,6 +62,19 @@ public final class OllamaEmbeddingProvider implements JavAIEmbeddingProvider {
                 .POST(HttpRequest.BodyPublishers.ofString(requestBody))
                 .build();
 
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        float[] values = parseEmbeddingsField(responseBody);
+        return new EmbeddingVector(values, model, values.length, Instant.now());
+    }
+
+    private String send(HttpRequest request) {
         HttpResponse<String> response;
         try {
             response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
@@ -73,13 +86,16 @@ public final class OllamaEmbeddingProvider implements JavAIEmbeddingProvider {
                     "Interrupted while calling embedding endpoint " + embedEndpoint, e);
         }
 
+        if (response.statusCode() == 429) {
+            Duration retryAfter = RetryAfterParser.parse(response.headers().firstValue("Retry-After").orElse(null));
+            throw new TooManyRequestsException(
+                    "Embedding endpoint " + embedEndpoint + " returned HTTP 429: " + response.body(), retryAfter);
+        }
         if (response.statusCode() != 200) {
             throw new EmbeddingProviderException("Embedding endpoint " + embedEndpoint + " returned HTTP "
                     + response.statusCode() + ": " + response.body());
         }
-
-        float[] values = parseEmbeddingsField(response.body());
-        return new EmbeddingVector(values, model, values.length, Instant.now());
+        return response.body();
     }
 
     /**

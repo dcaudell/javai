@@ -189,4 +189,45 @@ class CompletionRequestTest {
 
         assertEquals("", request.render());
     }
+
+    @Test
+    void renderWithContextWindowTokensSizesAnUnboundedContextToFitTheBudget() {
+        CompletionRequest request = CompletionRequest.builder()
+                .prompt("Q:")
+                .context(PromptContext.of("A".repeat(1000)))
+                .build();
+
+        // 10 tokens * 4 chars/token = 40 total chars, minus "Q:"'s own 2 chars -- nowhere near enough for
+        // the 1000-char context entry, so it must be dropped entirely (the existing whole-entry-or-nothing
+        // rule), leaving an empty (but still present, per render()'s own existing behavior) context section.
+        assertEquals("Q:\n\n", request.render(10));
+    }
+
+    @Test
+    void renderWithContextWindowTokensLeavesAnAlreadyBoundedContextAlone() {
+        CompletionRequest request = CompletionRequest.builder()
+                .prompt("Q:")
+                .context(PromptContext.of("A".repeat(1000)).withMaxLength(3))
+                .build();
+
+        // context already has an explicit maxLength -- render(int) must not touch it (manual override wins).
+        assertEquals("Q:\n\n", request.render(1_000_000));
+    }
+
+    @Test
+    void renderWithContextWindowTokensMatchesRenderWhenThereIsNoContext() {
+        CompletionRequest request = CompletionRequest.builder().prompt("just a prompt").build();
+
+        assertEquals(request.render(), request.render(50));
+    }
+
+    @Test
+    void renderWithContextWindowTokensFitsAContextThatComfortablyFitsTheBudget() {
+        CompletionRequest request = CompletionRequest.builder()
+                .prompt("Q:")
+                .context(PromptContext.of("short answer"))
+                .build();
+
+        assertEquals("Q:\n\nshort answer", request.render(1000));
+    }
 }

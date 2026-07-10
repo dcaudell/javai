@@ -5,7 +5,7 @@ import dev.xtrafe.javai.vector.DirtyTrackingSupport;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
-import dev.xtrafe.javai.vector.TextEmbeddingsInferenceProvider;
+import dev.xtrafe.javai.vector.EmbeddingProviderTextEmbeddingsInference;
 import dev.xtrafe.javai.vector.VectorMath;
 
 import java.lang.reflect.Field;
@@ -85,7 +85,7 @@ public final class JavAIRuntime {
                     + "system property (and optionally javai.embedding.model).");
         }
         String modelId = System.getProperty("javai.embedding.model", "qwen3-embedding-0.6b");
-        return new TextEmbeddingsInferenceProvider(URI.create(endpoint), modelId);
+        return new EmbeddingProviderTextEmbeddingsInference(URI.create(endpoint), modelId);
     }
 
     // ---- dirty-flag / dependents passthroughs, wired onto every woven class -----------------

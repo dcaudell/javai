@@ -71,6 +71,12 @@ public record CompletionRequest(
             .startDelimiter(DELIMITER)
             .endDelimiter(DELIMITER);
 
+    /** Rough English-text average used by {@link #render(int)} to convert a {@link Cortex}'s token-based
+     *  context window into an approximate character budget -- deliberately not real tokenization (no
+     *  per-provider tokenizer dependency this way), matching {@link PromptContext#maxLength()}'s own
+     *  existing character-count semantics. */
+    private static final int CHARS_PER_TOKEN_ESTIMATE = 4;
+
     public CompletionRequest {
         prompt = prompt == null ? List.of() : List.copyOf(prompt);
         promptParams = promptParams == null ? Map.of() : Map.copyOf(promptParams);
@@ -94,6 +100,28 @@ public record CompletionRequest(
         } catch (IOException e) {
             throw new IllegalStateException("Failed to render CompletionRequest as a Handlebars template", e);
         }
+    }
+
+    /**
+     * Same as {@link #render()}, but first sizes {@link #context()} to fit {@code contextWindowTokens} --
+     * the calling {@link Cortex}'s own {@link Cortex#contextWindowTokens()} -- converted to an approximate
+     * character budget via {@link #CHARS_PER_TOKEN_ESTIMATE}, after reserving room for the prompt text
+     * itself and for {@link #maxTokens()} worth of output. Only applies when {@link #context()} is
+     * non-null and doesn't already have its own explicit {@link PromptContext#maxLength()} set -- a manual
+     * {@code maxLength} always wins, consistent with {@link PromptContext}'s own "manual override" rule
+     * elsewhere. Every {@link Cortex} implementation calls this overload rather than {@link #render()}.
+     */
+    public String render(int contextWindowTokens) {
+        if (context == null || context.maxLength() != null) {
+            return render();
+        }
+        String promptText = String.join("\n\n", prompt);
+        int totalBudgetChars = contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE;
+        int reservedForOutput = (maxTokens == null ? 0 : maxTokens) * CHARS_PER_TOKEN_ESTIMATE;
+        int contextBudget = Math.max(0, totalBudgetChars - promptText.length() - reservedForOutput);
+        return new CompletionRequest(prompt, context.withMaxLength(contextBudget), promptParams, maxTokens,
+                temperature, providerOptions)
+                .render();
     }
 
     public static final class Builder {

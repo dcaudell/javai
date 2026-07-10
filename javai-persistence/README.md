@@ -114,7 +114,7 @@ Hibernate would then silently install its own wrapper in place of the real `JavA
 silently discarding its vector/dirty-tracking behavior with no error at all, which is worse than a loud
 failure.
 
-**No manual `@Transient` needed, on Postgres, as of this pass.** `HibernatePostgresRepositoryBackend`
+**No manual `@Transient` needed, on Postgres, as of this pass.** `RepositoryBackendHibernatePostgres`
 reflectively detects, for every registered entity type, which fields are shaped like a JavAI collection (a
 `Collection`/`Map` that also implements `JavAIDirtyTracking` -- true of all three concrete types today, and
 of any future one following the same pattern, with no code change needed) and generates an in-memory JPA
@@ -141,8 +141,8 @@ reason: a `Map`-typed relationship field creates one relationship per entry, wit
 a `mapKey` property on the relationship itself (not the target node, which may be reachable through more
 than one owner/key) -- `K` must be `String`, validated eagerly at `registerEntityType` time, for the same
 "don't silently store a key that can never round-trip back" reason as the Postgres side. A `JavAILinkedHashMap`
-field works on both backends as of this pass -- `Neo4jRepositoryBackendTest.mapFieldRoundTripsWithKeysPreserved`
-and `HibernatePostgresRepositoryBackendTest`/e2e's own Postgres map test both prove it.
+field works on both backends as of this pass -- `RepositoryBackendNeo4jTest.mapFieldRoundTripsWithKeysPreserved`
+and `RepositoryBackendHibernatePostgresTest`/e2e's own Postgres map test both prove it.
 
 **Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
 Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
@@ -193,12 +193,12 @@ through Hibernate's layer.
 
 ## What's actually implemented
 
-`JavAIRepository`/`JavAIPI`/`JavAIPersistenceConfig` (`HibernatePostgresRepositoryBackend`/
-`Neo4jRepositoryBackend` behind a `java.lang.reflect.Proxy`), both backends' save/findById/findAll/
+`JavAIRepository`/`JavAIPI`/`JavAIPersistenceConfig` (`RepositoryBackendHibernatePostgres`/
+`RepositoryBackendNeo4j` behind a `java.lang.reflect.Proxy`), both backends' save/findById/findAll/
 deleteById/reindexAll plus the three `findNearestBy*` variants, described above. `reindexAll()` needed no
 backend-specific code at all -- it's dispatched in `RepositoryInvocationHandler` purely as a
 `findAll()` + `save(...)` loop over each backend's existing methods. Covered by
-`HibernatePostgresRepositoryBackendTest`/`Neo4jRepositoryBackendTest` against real
+`RepositoryBackendHibernatePostgresTest`/`RepositoryBackendNeo4jTest` against real
 `pgvector/pgvector:pg16`/`neo4j:5.26-community` containers (Testcontainers) -- there's no meaningful way to
 hermetically fake whether a real similarity search actually ranks correctly, or whether two models' data
 really stay physically separate.
@@ -227,7 +227,7 @@ never sees in source.
   "Collections" above.
 - Neo4j's `registerEntityType` doesn't (yet) recursively auto-register related entity types reachable
   through a field the way the Postgres backend now does -- a related type still needs its own
-  `JavAIPI.repository(...)` call made first (see `Neo4jRepositoryBackendTest`'s own test fixtures for the
+  `JavAIPI.repository(...)` call made first (see `RepositoryBackendNeo4jTest`'s own test fixtures for the
   pattern this implies today).
 - The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
   not started.
