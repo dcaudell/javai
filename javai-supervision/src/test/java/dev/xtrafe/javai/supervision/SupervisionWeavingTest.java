@@ -22,10 +22,12 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -45,8 +47,8 @@ class SupervisionWeavingTest {
 
     private static ResettableClassFileTransformer transformer;
 
-    private final List<SyncSupervisionListener> registeredSync = new ArrayList<>();
-    private final List<AsyncSupervisionListener> registeredAsync = new ArrayList<>();
+    private final List<SupervisionListener> registeredSync = new ArrayList<>();
+    private final List<SupervisionListener> registeredAsync = new ArrayList<>();
 
     @BeforeAll
     static void installWeaver() {
@@ -72,13 +74,13 @@ class SupervisionWeavingTest {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 event.setArguments(new Object[] {"rewritten"});
             }
         });
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPost(SupervisionEvent event) {
                 event.setReturnValue(event.returnValue() + "!");
@@ -94,13 +96,13 @@ class SupervisionWeavingTest {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 event.setArguments(new Object[] {event.arguments()[0] + "-A"});
             }
         });
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 event.setArguments(new Object[] {event.arguments()[0] + "-B"});
@@ -116,7 +118,7 @@ class SupervisionWeavingTest {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 throw new IllegalArgumentException("blocked");
@@ -135,7 +137,7 @@ class SupervisionWeavingTest {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onException(SupervisionEvent event) {
                 event.setThrown(null);
@@ -153,7 +155,7 @@ class SupervisionWeavingTest {
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
         AtomicReference<String> observedMessage = new AtomicReference<>();
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onException(SupervisionEvent event) {
                 observedMessage.set(event.thrown().getMessage());
@@ -177,7 +179,7 @@ class SupervisionWeavingTest {
         Thread callingThread = Thread.currentThread();
         AtomicReference<Thread> listenerThread = new AtomicReference<>();
         CountDownLatch latch = new CountDownLatch(1);
-        async(new AsyncSupervisionListener() {
+        async(new SupervisionListener() {
             @Override
             public void onPost(SupervisionEvent event) {
                 listenerThread.set(Thread.currentThread());
@@ -198,7 +200,7 @@ class SupervisionWeavingTest {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPost(SupervisionEvent event) {
                 event.setReturnValue(((Integer) event.returnValue()) + 100);
@@ -206,7 +208,7 @@ class SupervisionWeavingTest {
         });
         AtomicReference<Object> asyncObservedValue = new AtomicReference<>();
         CountDownLatch latch = new CountDownLatch(1);
-        async(new AsyncSupervisionListener() {
+        async(new SupervisionListener() {
             @Override
             public void onPost(SupervisionEvent event) {
                 asyncObservedValue.set(event.returnValue());
@@ -222,12 +224,117 @@ class SupervisionWeavingTest {
                 "async tier must observe the sync tier's already-committed value, not the pre-sync one");
     }
 
+    /**
+     * {@code mixedTier} carries both {@code @SyncSupervision(POST)} and {@code @AsyncSupervision(POST)} --
+     * this proves the same claim {@link #syncTierCommitsBeforeAsyncTierObserves} does, but with a single
+     * {@link SupervisionListener} <em>instance</em> registered via both {@code registerSyncListener} and
+     * {@code registerAsyncListener}, not two separate listener objects. This is exactly the capability
+     * unifying the sync/async contract into one interface unlocks (previously the two registries required
+     * incompatible types, so the same object could never be handed to both): it's perfectly legal, and both
+     * registrations fire independently for the one call -- once blocking on the calling thread, once
+     * fire-and-forget on a different one.
+     */
+    @Test
+    void theSameListenerInstanceCanBeRegisteredAsBothSyncAndAsync() throws Exception {
+        Class<?> widgetClass = loadWidget();
+        Object widget = widgetClass.getDeclaredConstructor().newInstance();
+
+        Thread callingThread = Thread.currentThread();
+        List<Thread> observedThreads = new CopyOnWriteArrayList<>();
+        CountDownLatch asyncRan = new CountDownLatch(1);
+        SupervisionListener dualRoleListener = new SupervisionListener() {
+            @Override
+            public void onPost(SupervisionEvent event) {
+                observedThreads.add(Thread.currentThread());
+                if (Thread.currentThread() != callingThread) {
+                    asyncRan.countDown();
+                }
+            }
+        };
+
+        sync(dualRoleListener);
+        async(dualRoleListener);
+
+        int result = (int) widgetClass.getMethod("mixedTier", int.class).invoke(widget, 5);
+        assertEquals(10, result, "this listener doesn't rewrite the return value, unlike the previous test");
+
+        assertTrue(asyncRan.await(5, TimeUnit.SECONDS), "the async registration must still fire");
+        assertEquals(2, observedThreads.size(),
+                "one listener registered both ways must be dispatched once per tier -- twice total");
+        assertTrue(observedThreads.contains(callingThread), "the sync dispatch must run on the calling thread");
+        assertTrue(observedThreads.stream().anyMatch(t -> t != callingThread),
+                "the async dispatch must run on a different thread, even for this same listener instance");
+    }
+
+    /**
+     * The full round trip on {@code fullyMixedTier}, which carries both tiers at both PRE and POST, with
+     * two <em>separate</em> listener instances (one registered sync-only, one async-only) rather than one
+     * dual-registered instance: PRE fires sync-then-async, with async observing the sync tier's already-
+     * rewritten arguments (not the originals); the method body then runs against that rewritten argument;
+     * POST fires sync-then-async again, with async observing the sync tier's already-rewritten return
+     * value; and the caller ultimately receives that same sync-rewritten return value. This is the hard
+     * rule this module guarantees: every sync pointcut for a given dispatch fully flushes -- including any
+     * mutation -- before the async tier for that same dispatch ever sees the event.
+     */
+    @Test
+    void syncListenerAltersPreAndPostWhileAsyncListenerObservesEachAlreadyCommittedValue() throws Exception {
+        Class<?> widgetClass = loadWidget();
+        Object widget = widgetClass.getDeclaredConstructor().newInstance();
+
+        AtomicReference<Object[]> asyncObservedPreArguments = new AtomicReference<>();
+        AtomicReference<Object> asyncObservedPostReturnValue = new AtomicReference<>();
+        CountDownLatch asyncPreRan = new CountDownLatch(1);
+        CountDownLatch asyncPostRan = new CountDownLatch(1);
+
+        SupervisionListener syncListener = new SupervisionListener() {
+            @Override
+            public void onPre(SupervisionEvent event) {
+                event.setArguments(new Object[] {"SYNC-PRE[" + event.arguments()[0] + "]"});
+            }
+
+            @Override
+            public void onPost(SupervisionEvent event) {
+                event.setReturnValue(event.returnValue() + ":SYNC-POST");
+            }
+        };
+        SupervisionListener asyncListener = new SupervisionListener() {
+            @Override
+            public void onPre(SupervisionEvent event) {
+                asyncObservedPreArguments.set(event.arguments());
+                asyncPreRan.countDown();
+            }
+
+            @Override
+            public void onPost(SupervisionEvent event) {
+                asyncObservedPostReturnValue.set(event.returnValue());
+                asyncPostRan.countDown();
+            }
+        };
+
+        sync(syncListener);
+        async(asyncListener);
+
+        String result = (String) widgetClass.getMethod("fullyMixedTier", String.class).invoke(widget, "original");
+
+        // The body ran against the sync tier's PRE-rewritten argument, then the sync tier's POST rewrite
+        // was applied on top -- this is what the caller actually gets back.
+        assertEquals("handled:SYNC-PRE[original]:SYNC-POST", result);
+
+        assertTrue(asyncPreRan.await(5, TimeUnit.SECONDS), "the async PRE dispatch must eventually fire");
+        assertArrayEquals(new Object[] {"SYNC-PRE[original]"}, asyncObservedPreArguments.get(),
+                "async PRE must observe the sync tier's already-rewritten arguments, never the pre-sync originals");
+
+        assertTrue(asyncPostRan.await(5, TimeUnit.SECONDS), "the async POST dispatch must eventually fire");
+        assertEquals("handled:SYNC-PRE[original]:SYNC-POST", asyncObservedPostReturnValue.get(),
+                "async POST must observe the sync tier's already-committed return value, never the pre-sync one");
+    }
+
     @Test
     void listenerScopedToADifferentClassNeverFires() throws Exception {
         Class<?> widgetClass = loadWidget();
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 fail("a listener scoped to an unrelated class must never be invoked");
@@ -257,7 +364,7 @@ class SupervisionWeavingTest {
         ClassLoader loader = loadFixtures(SupervisedConstructorWidget.class);
         Class<?> widgetClass = loader.loadClass(SupervisedConstructorWidget.class.getName());
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 event.setArguments(new Object[] {"rewritten-label"});
@@ -274,7 +381,7 @@ class SupervisionWeavingTest {
         ClassLoader loader = loadFixtures(SupervisedConstructorWithExceptionWidget.class);
         Class<?> widgetClass = loader.loadClass(SupervisedConstructorWithExceptionWidget.class.getName());
 
-        sync(new SyncSupervisionListener() {
+        sync(new SupervisionListener() {
             @Override
             public void onPre(SupervisionEvent event) {
                 fail("SupervisionWeaver must reject EXCEPTION on a constructor at weave time, "
@@ -288,12 +395,12 @@ class SupervisionWeavingTest {
         assertEquals(SupervisedConstructorWithExceptionWidget.class.getName(), widget.getClass().getName());
     }
 
-    private void sync(SyncSupervisionListener listener) {
+    private void sync(SupervisionListener listener) {
         registeredSync.add(listener);
         JavAISupervisionRuntime.registerSyncListener(listener);
     }
 
-    private void async(AsyncSupervisionListener listener) {
+    private void async(SupervisionListener listener) {
         registeredAsync.add(listener);
         JavAISupervisionRuntime.registerAsyncListener(listener);
     }

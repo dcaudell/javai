@@ -3,8 +3,8 @@ package dev.xtrafe.javai.e2e.supervision;
 import dev.xtrafe.javai.completion.CompletionRequest;
 import dev.xtrafe.javai.completion.CompletionResult;
 import dev.xtrafe.javai.completion.Cortex;
-import dev.xtrafe.javai.supervision.AsyncSupervisionListener;
 import dev.xtrafe.javai.supervision.SupervisionEvent;
+import dev.xtrafe.javai.supervision.SupervisionListener;
 
 import java.time.Duration;
 import java.util.EnumMap;
@@ -24,7 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * so it never holds up {@code submitFeedback}'s return to its caller -- the test has to {@link
  * #awaitCompletion} explicitly rather than assert immediately after the calls that triggered it.
  */
-public class SentimentAggregationSupervisor implements AsyncSupervisionListener {
+public class SentimentAggregationSupervisor implements SupervisionListener {
 
     public enum Sentiment {
         POSITIVE, NEGATIVE, NEUTRAL

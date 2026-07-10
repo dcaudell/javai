@@ -14,14 +14,14 @@
   <packaging>jar</packaging>
 
   <!--
-    Agentic Supervision: SupervisionEvent, Sync/AsyncSupervisionListener, JavAISupervision (the
+    Agentic Supervision: SupervisionEvent, SupervisionListener, JavAISupervision (the
     registration + dispatch facade), SupervisionWeaver (its own, independent ByteBuddy weaver — see
     package-info for why this doesn't reuse javai-substrate). See doc/spec/agentic-supervision.md.
 
     Depends only on javai-annotations + ByteBuddy, deliberately — same early, low-risk tier as
     javai-vector, not downstream of Vector Core/Collections/Completion Fabric. An "Agentic Listener" that
     grounds its decisions in RAG over the object graph is documented as an application-level worked
-    example built on top of this module's generic listener interfaces plus javai-completion/javai-vector/
+    example built on top of this module's generic listener interface plus javai-completion/javai-vector/
     javai-model/javai-collections — not a dependency this module itself takes on.
   -->
 

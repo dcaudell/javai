@@ -46,6 +46,16 @@ public class SupervisedWidget {
         return value * 2;
     }
 
+    /** Both tiers at both PRE and POST -- unlike {@link #mixedTier}, this exercises the full round trip:
+     *  a sync PRE argument rewrite feeding the method body, then a sync POST return-value rewrite, with an
+     *  async listener registered for both pointcuts alongside a separate sync listener, per
+     *  {@code SupervisionWeavingTest}. */
+    @SyncSupervision({SupervisionPointcut.PRE, SupervisionPointcut.POST})
+    @AsyncSupervision({SupervisionPointcut.PRE, SupervisionPointcut.POST})
+    public String fullyMixedTier(String value) {
+        return "handled:" + value;
+    }
+
     public String unsupervised(String value) {
         return "plain:" + value;
     }

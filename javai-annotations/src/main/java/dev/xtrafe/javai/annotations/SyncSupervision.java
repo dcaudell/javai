@@ -4,10 +4,10 @@ import java.lang.annotation.*;
 
 /**
  * Marks a method or constructor as woven for <b>synchronous</b> Agentic Supervision at the given {@link
- * SupervisionPointcut}s: the calling thread blocks while every registered {@code SyncSupervisionListener}
- * (javai-supervision) scoped to this call runs, in registration order, each getting real read-write access
- * -- rewrite arguments, rewrite the return value, replace or suppress the thrown exception. See
- * doc/spec/agentic-supervision.md.
+ * SupervisionPointcut}s: the calling thread blocks while every {@code SupervisionListener}
+ * (javai-supervision) registered via {@code registerSyncListener} and scoped to this call runs, in
+ * registration order, each getting real read-write access -- rewrite arguments, rewrite the return value,
+ * replace or suppress the thrown exception. See doc/spec/agentic-supervision.md.
  *
  * <p>Stackable with {@link AsyncSupervision} on the same element, independently: a method can be
  * sync-supervised at some pointcuts, async-observed at others, both at the same pointcut (sync runs first,

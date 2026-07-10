@@ -36,20 +36,22 @@ case is *why* this module exists, but it isn't part of the module's own dependen
 | `@SyncSupervision(SupervisionPointcut...)` | Annotation (`javai-annotations`), method/constructor | Blocking, read-write weaving at the given pointcuts |
 | `@AsyncSupervision(SupervisionPointcut...)` | Annotation (`javai-annotations`), method/constructor | Fire-and-forget, observation-only weaving at the given pointcuts |
 | `SupervisionEvent` | Value type (this module) | The "object bucket": pointcut, instance, `Executable`, mutable arguments/returnValue/thrown |
-| `SyncSupervisionListener` | Interface (this module) | `onPre`/`onPost`/`onException`, each free to mutate the `SupervisionEvent` it receives; default no-ops |
-| `AsyncSupervisionListener` | Interface (this module) | Same three methods, observation-only — mutations are discarded |
-| `JavAISupervisionRuntime` | Static facade (this module) | Listener registration + the dispatch logic the weaver's Advice calls into |
+| `SupervisionListener` | Interface (this module) | One shape — `onPre`/`onPost`/`onException`, default no-ops — for both tiers; whether a given registration is blocking/read-write or fire-and-forget/observation-only is a property of *which* `JavAISupervisionRuntime` registration method it's handed to, not the interface (see "The sync/async model" below) |
+| `JavAISupervisionRuntime` | Static facade (this module) | Listener registration (`registerSyncListener`/`registerAsyncListener`, either accepting any `SupervisionListener`) + the dispatch logic the weaver's Advice calls into |
 | `SupervisionWeaver` | ByteBuddy `AgentBuilder` installer (this module) | Weaves `@SyncSupervision`/`@AsyncSupervision`-annotated methods/constructors |
 
 ## The sync/async model
 
-At a given pointcut on a given call, if both a sync and an async listener are registered, **sync always
-resolves first**: every registered `SyncSupervisionListener` scoped to the call runs, on the calling
-thread, in registration order, each seeing (and able to further mutate) whatever the previous one left
-behind. Once the sync tier is done, the event — now reflecting whatever the sync tier committed to — is
-handed to every registered `AsyncSupervisionListener` scoped to the call, dispatched onto a
-virtual-thread-per-task executor, fire-and-forget. The calling thread never waits on the async tier,
-regardless of how long a listener takes.
+**One listener interface, `SupervisionListener` — the sync/async distinction lives entirely in how it's
+registered, not in what type it is.** At a given pointcut on a given call, if both a sync-registered and an
+async-registered listener are in play, **sync always resolves first**: every `SupervisionListener` scoped to
+the call and registered via `registerSyncListener` runs, on the calling thread, in registration order, each
+seeing (and able to further mutate) whatever the previous one left behind. Once the sync tier is done, the
+event — now reflecting whatever the sync tier committed to — is handed to every `SupervisionListener` scoped
+to the call and registered via `registerAsyncListener`, dispatched onto a virtual-thread-per-task executor,
+fire-and-forget. The calling thread never waits on the async tier, regardless of how long a listener takes.
+Registering the very same listener instance both ways is legal and independent of which annotation(s) the
+woven call itself carries — it simply receives both dispatches, once blocking and once fire-and-forget.
 
 This is a deliberate answer to a real problem: "the AoP allows an entire separate program to run" at a
 join point (an LLM agent loop, potentially with tool calls, could run for a long time) — blocking on that
@@ -69,7 +71,7 @@ class Article {
 }
 
 // A sync listener with real veto power:
-JavAISupervisionRuntime.registerSyncListener(new SyncSupervisionListener() {
+JavAISupervisionRuntime.registerSyncListener(new SupervisionListener() {
     @Override
     public void onPre(SupervisionEvent event) {
         if (!moderationPolicy.allows(event.instance())) {
@@ -79,7 +81,7 @@ JavAISupervisionRuntime.registerSyncListener(new SyncSupervisionListener() {
 });
 
 // An async listener that reacts without holding up the publish() call:
-JavAISupervisionRuntime.registerAsyncListener(new AsyncSupervisionListener() {
+JavAISupervisionRuntime.registerAsyncListener(new SupervisionListener() {
     @Override
     public void onPost(SupervisionEvent event) {
         agenticListener.reviewAndMaybeFlag(event.instance());   // may take a while; publish() has already returned
@@ -96,15 +98,16 @@ runtime's own code. Don't.
 
 ## What's actually implemented
 
-Real, tested, all of it: `SupervisionEvent`, `SyncSupervisionListener`, `AsyncSupervisionListener`,
+Real, tested, all of it: `SupervisionEvent`, `SupervisionListener`,
 `SupervisionPointcut`/`@SyncSupervision`/`@AsyncSupervision` (in `javai-annotations`),
 `JavAISupervisionRuntime` (listener registration + sync-then-async dispatch), and `SupervisionWeaver` (the
 ByteBuddy `AgentBuilder` installer wiring `SupervisionMethodAdvice`/`SupervisionConstructorAdvice` at each
 requested pointcut). `SupervisionWeavingTest` proves the full contract end to end: PRE argument rewrite,
 POST return-value rewrite, PRE veto by throwing, EXCEPTION-to-normal-return conversion, sync-before-async
 ordering, async dispatch running off-thread without blocking or mutating the call, `supportedClass()`
-scoping, and constructor PRE argument rewrite. `DependencyWiringTest` still covers the narrower classpath
-smoke-test it always did.
+scoping, constructor PRE argument rewrite, and the same `SupervisionListener` instance registered via both
+`registerSyncListener` and `registerAsyncListener` for one dual-annotated call. `DependencyWiringTest` still
+covers the narrower classpath smoke-test it always did.
 
 Two real, JVM-imposed asymmetries between methods and constructors, discovered empirically while building
 the weaver (not assumed from the design doc) — both fully documented in `SupervisionWeaver`'s and
@@ -134,9 +137,8 @@ Not designed at all yet, deliberately deferred past this spike: a depth/budget g
 chain of async reactions (an async listener's side effect triggering another supervised call, which
 triggers another async reaction, ...).
 
-An "Agentic Listener" — a `SyncSupervisionListener`/`AsyncSupervisionListener` implementation that grounds
-its decisions in RAG over the object graph and calls an LLM to decide what to do — is documented as an
-application-level worked example in `doc/spec/agentic-supervision.md`, built on this module's listener
-interfaces plus `javai-completion` (the actual LLM call) and `javai-vector`/`javai-model`/`javai-collections`
-(the RAG grounding). It is not a dependency this module takes on itself, and not part of this module's own
-Phase 0 deliverable.
+An "Agentic Listener" — a `SupervisionListener` implementation that grounds its decisions in RAG over the
+object graph and calls an LLM to decide what to do — is documented as an application-level worked example in
+`doc/spec/agentic-supervision.md`, built on this module's listener interface plus `javai-completion` (the
+actual LLM call) and `javai-vector`/`javai-model`/`javai-collections` (the RAG grounding). It is not a
+dependency this module takes on itself, and not part of this module's own Phase 0 deliverable.

@@ -36,12 +36,12 @@ vector, dirty-tracking bookkeeping). The completion model (`qwen3:8b`) is baked 
 image as the embedding model — no extra container, no extra model pull.
 
 `AgenticSupervisionE2ETest` proves `javai-supervision` end to end, both real Cortex-grounded and both
-matching doc/spec/agentic-supervision.md's own worked examples: an `AsyncSupervisionListener`
-(`SentimentAggregationSupervisor`) classifies each `submitFeedback` call's return value via a real
-completion, fire-and-forget, and aggregates a running count across three calls rather than reacting to just
-one; a `SyncSupervisionListener` (`SqlInjectionGuardSupervisor`) blocks on a real completion at PRE to
-decide whether a `searchAccounts` filter is a SQL injection attempt, vetoing the call by throwing when it
-is. Both listeners and the annotated `SupervisedTextOperations` methods they're scoped to live under
+matching doc/spec/agentic-supervision.md's own worked examples: a `SupervisionListener` registered
+asynchronously (`SentimentAggregationSupervisor`) classifies each `submitFeedback` call's return value via a
+real completion, fire-and-forget, and aggregates a running count across three calls rather than reacting to
+just one; a `SupervisionListener` registered synchronously (`SqlInjectionGuardSupervisor`) blocks on a real
+completion at PRE to decide whether a `searchAccounts` filter is a SQL injection attempt, vetoing the call
+by throwing when it is. Both listeners and the annotated `SupervisedTextOperations` methods they're scoped to live under
 `src/test/java/.../supervision/`, not `domain/` — deliberately plain, no `@Entity`/`@JavAIVectorizable`,
 since Agentic Supervision has no dependency on persistence or vectorization. `JavAIWeavingLauncherSessionListener`
 installs `SupervisionWeaver` alongside `javai-substrate`'s `JavAIWeaver`, for the identical

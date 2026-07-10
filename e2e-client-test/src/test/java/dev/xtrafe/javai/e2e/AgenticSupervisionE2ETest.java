@@ -26,14 +26,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Two demos, matching doc/spec/agentic-supervision.md's own worked examples almost exactly:
  * <ul>
- *   <li>{@link #asyncSentimentSupervisorAggregatesSentimentAcrossSeveralCalls()} -- an {@code
- *       AsyncSupervisionListener} classifies each {@code submitFeedback} call's return value via a real
- *       completion, fire-and-forget, and the test proves the aggregation accumulates across calls rather
- *       than only ever reacting to one in isolation.
+ *   <li>{@link #asyncSentimentSupervisorAggregatesSentimentAcrossSeveralCalls()} -- a {@code
+ *       SupervisionListener} registered asynchronously classifies each {@code submitFeedback} call's return
+ *       value via a real completion, fire-and-forget, and the test proves the aggregation accumulates
+ *       across calls rather than only ever reacting to one in isolation.
  *   <li>{@link #syncSecuritySupervisorBlocksSqlInjectionButAllowsBenignQueries()} -- a {@code
- *       SyncSupervisionListener} vetoes a {@code searchAccounts} call at PRE, blocking on a real completion
- *       to decide, exactly the shape doc/spec/agentic-supervision.md's own {@code AgenticReviewListener}
- *       sketches.
+ *       SupervisionListener} registered synchronously vetoes a {@code searchAccounts} call at PRE, blocking
+ *       on a real completion to decide, exactly the shape doc/spec/agentic-supervision.md's own
+ *       {@code AgenticReviewListener} sketches.
  * </ul>
  *
  * <p>Kept to the minimum call count each demo needs to prove its point (3 feedback calls, 2 search calls --

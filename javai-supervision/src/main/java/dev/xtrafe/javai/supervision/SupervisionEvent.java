@@ -5,16 +5,18 @@ import dev.xtrafe.javai.annotations.SupervisionPointcut;
 import java.lang.reflect.Executable;
 
 /**
- * The "object bucket" delivered to every listener at a supervised {@link SupervisionPointcut}: everything
- * a listener needs to decide what happened and, for a {@link SyncSupervisionListener}, what to change.
- * Deliberately data-only -- how far a listener reaches from {@link #instance()} or {@link #arguments()}
- * (a plain field read, a full {@code query()} walk of the object graph, an entirely separate system) is
- * the listener's decision, not this module's. See doc/spec/agentic-supervision.md.
+ * The "object bucket" delivered to every {@link SupervisionListener} at a supervised
+ * {@link SupervisionPointcut}: everything a listener needs to decide what happened and, if registered
+ * synchronously, what to change. Deliberately data-only -- how far a listener reaches from
+ * {@link #instance()} or {@link #arguments()} (a plain field read, a full {@code query()} walk of the
+ * object graph, an entirely separate system) is the listener's decision, not this module's. See
+ * doc/spec/agentic-supervision.md.
  *
  * <p>{@code arguments}/{@code returnValue}/{@code thrown} are mutable <em>on this event instance</em> --
- * a {@link SyncSupervisionListener} rewrites them by calling the corresponding setter, and the weaver reads
- * them back out after every listener scoped to this call has run. An {@link AsyncSupervisionListener}
- * receives the same event but its dispatch discards whatever it sets: see that interface's javadoc.
+ * a synchronously-dispatched {@link SupervisionListener} rewrites them by calling the corresponding setter,
+ * and the weaver reads them back out after every sync listener scoped to this call has run. An
+ * asynchronously-dispatched listener receives the same event but its dispatch discards whatever it sets:
+ * see {@link SupervisionListener}'s own javadoc for the full sync-vs-async registration distinction.
  *
  * @param pointcut     which of the three moments this is
  * @param instance     the receiver ({@code null} for a static method or before a constructor has run)

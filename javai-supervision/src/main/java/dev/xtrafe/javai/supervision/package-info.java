@@ -6,10 +6,11 @@
  * package specifically and why it's shaped the way it is.
  *
  * <p><b>Public contract:</b> {@link dev.xtrafe.javai.supervision.SupervisionEvent} (the event/"object
- * bucket" every listener receives), {@link dev.xtrafe.javai.supervision.SyncSupervisionListener} (blocking,
- * read-write), {@link dev.xtrafe.javai.supervision.AsyncSupervisionListener} (fire-and-forget,
- * observation-only). Annotations ({@code @SyncSupervision}, {@code @AsyncSupervision}, {@code
- * SupervisionPointcut}) live in {@code javai-annotations}, same as every other annotation in this project.
+ * bucket" every listener receives), {@link dev.xtrafe.javai.supervision.SupervisionListener} (one shape,
+ * registered either blocking/read-write via {@code registerSyncListener} or fire-and-forget/
+ * observation-only via {@code registerAsyncListener} -- see that interface's own javadoc). Annotations
+ * ({@code @SyncSupervision}, {@code @AsyncSupervision}, {@code SupervisionPointcut}) live in
+ * {@code javai-annotations}, same as every other annotation in this project.
  *
  * <p><b>The two pieces that make the contract real, both implemented:</b>
  * <ul>

@@ -29,32 +29,32 @@ public final class JavAISupervisionRuntime {
 
     private static final System.Logger LOG = System.getLogger(JavAISupervisionRuntime.class.getName());
 
-    private static final List<SyncSupervisionListener> SYNC_LISTENERS = new CopyOnWriteArrayList<>();
-    private static final List<AsyncSupervisionListener> ASYNC_LISTENERS = new CopyOnWriteArrayList<>();
+    private static final List<SupervisionListener> SYNC_LISTENERS = new CopyOnWriteArrayList<>();
+    private static final List<SupervisionListener> ASYNC_LISTENERS = new CopyOnWriteArrayList<>();
     private static final ExecutorService ASYNC_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
 
     private JavAISupervisionRuntime() {
     }
 
-    public static void registerSyncListener(SyncSupervisionListener listener) {
+    public static void registerSyncListener(SupervisionListener listener) {
         if (listener == null) {
             throw new IllegalArgumentException("null listener");
         }
         SYNC_LISTENERS.add(listener);
     }
 
-    public static void unregisterSyncListener(SyncSupervisionListener listener) {
+    public static void unregisterSyncListener(SupervisionListener listener) {
         SYNC_LISTENERS.remove(listener);
     }
 
-    public static void registerAsyncListener(AsyncSupervisionListener listener) {
+    public static void registerAsyncListener(SupervisionListener listener) {
         if (listener == null) {
             throw new IllegalArgumentException("null listener");
         }
         ASYNC_LISTENERS.add(listener);
     }
 
-    public static void unregisterAsyncListener(AsyncSupervisionListener listener) {
+    public static void unregisterAsyncListener(SupervisionListener listener) {
         ASYNC_LISTENERS.remove(listener);
     }
 
@@ -67,10 +67,10 @@ public final class JavAISupervisionRuntime {
         }
         SupervisionEvent event = new SupervisionEvent(SupervisionPointcut.PRE, instance, executable, arguments, null, null);
         if (syncRequested) {
-            runSync(instance, event, SyncSupervisionListener::onPre);
+            runSync(instance, event, SupervisionListener::onPre);
         }
         if (asyncRequested) {
-            runAsync(instance, event, AsyncSupervisionListener::onPre);
+            runAsync(instance, event, SupervisionListener::onPre);
         }
         return event.arguments();
     }
@@ -84,10 +84,10 @@ public final class JavAISupervisionRuntime {
         }
         SupervisionEvent event = new SupervisionEvent(SupervisionPointcut.POST, instance, executable, null, returnValue, null);
         if (syncRequested) {
-            runSync(instance, event, SyncSupervisionListener::onPost);
+            runSync(instance, event, SupervisionListener::onPost);
         }
         if (asyncRequested) {
-            runAsync(instance, event, AsyncSupervisionListener::onPost);
+            runAsync(instance, event, SupervisionListener::onPost);
         }
         return event.returnValue();
     }
@@ -105,29 +105,29 @@ public final class JavAISupervisionRuntime {
         boolean syncRequested = requestsSync(executable, SupervisionPointcut.EXCEPTION);
         boolean asyncRequested = requestsAsync(executable, SupervisionPointcut.EXCEPTION);
         if (syncRequested) {
-            runSync(instance, event, SyncSupervisionListener::onException);
+            runSync(instance, event, SupervisionListener::onException);
         }
         if (asyncRequested) {
-            runAsync(instance, event, AsyncSupervisionListener::onException);
+            runAsync(instance, event, SupervisionListener::onException);
         }
         return event;
     }
 
-    private static void runSync(Object instance, SupervisionEvent event, BiConsumer<SyncSupervisionListener, SupervisionEvent> dispatch) {
+    private static void runSync(Object instance, SupervisionEvent event, BiConsumer<SupervisionListener, SupervisionEvent> dispatch) {
         Class<?> subject = subjectClass(instance, event.executable());
-        for (SyncSupervisionListener listener : SYNC_LISTENERS) {
+        for (SupervisionListener listener : SYNC_LISTENERS) {
             if (listener.supportedClass().isAssignableFrom(subject)) {
                 // No try/catch here, deliberately -- a listener throwing IS the veto/rejection mechanism
-                // (see SyncSupervisionListener's javadoc), so it must propagate immediately, aborting any
+                // (see SupervisionListener's javadoc), so it must propagate immediately, aborting any
                 // remaining sync listeners and skipping the async tier for this same dispatch.
                 dispatch.accept(listener, event);
             }
         }
     }
 
-    private static void runAsync(Object instance, SupervisionEvent event, BiConsumer<AsyncSupervisionListener, SupervisionEvent> dispatch) {
+    private static void runAsync(Object instance, SupervisionEvent event, BiConsumer<SupervisionListener, SupervisionEvent> dispatch) {
         Class<?> subject = subjectClass(instance, event.executable());
-        for (AsyncSupervisionListener listener : ASYNC_LISTENERS) {
+        for (SupervisionListener listener : ASYNC_LISTENERS) {
             if (listener.supportedClass().isAssignableFrom(subject)) {
                 // Each listener gets its own snapshot -- multiple async listeners for the same call can run
                 // concurrently on separate virtual threads, and SupervisionEvent's fields aren't

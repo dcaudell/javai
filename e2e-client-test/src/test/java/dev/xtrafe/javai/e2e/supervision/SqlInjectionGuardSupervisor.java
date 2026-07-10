@@ -4,7 +4,7 @@ import dev.xtrafe.javai.completion.CompletionRequest;
 import dev.xtrafe.javai.completion.CompletionResult;
 import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.supervision.SupervisionEvent;
-import dev.xtrafe.javai.supervision.SyncSupervisionListener;
+import dev.xtrafe.javai.supervision.SupervisionListener;
 
 /**
  * A blocking, LLM-grounded veto at PRE -- the synchronous counterpart to {@link
@@ -14,7 +14,7 @@ import dev.xtrafe.javai.supervision.SyncSupervisionListener;
  * {@link SupervisedTextOperations#searchAccounts} blocking on a real model round-trip for every call --
  * exactly the trade-off doc/spec/agentic-supervision.md's "why opt-in, and why sparse" section describes.
  */
-public class SqlInjectionGuardSupervisor implements SyncSupervisionListener {
+public class SqlInjectionGuardSupervisor implements SupervisionListener {
 
     private final Cortex cortex;
 

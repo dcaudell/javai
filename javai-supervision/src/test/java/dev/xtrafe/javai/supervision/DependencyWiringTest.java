@@ -8,7 +8,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
  * Proves javai-supervision's dependencies (javai-annotations, ByteBuddy) resolve and compile, and that
- * this module's own public contract (SupervisionEvent, the listener interfaces) is usable. No real
+ * this module's own public contract (SupervisionEvent, SupervisionListener) is usable. No real
  * weaving/dispatch logic exists yet -- see package-info for what's still needed.
  */
 class DependencyWiringTest {
@@ -36,11 +36,8 @@ class DependencyWiringTest {
 
     @Test
     void listenerDefaultsAreNoOpsAndDoNotThrow() {
-        SyncSupervisionListener sync = new SyncSupervisionListener() {
+        SupervisionListener listener = new SupervisionListener() {
         };
-        AsyncSupervisionListener async = new AsyncSupervisionListener() {
-        };
-        assertNotNull(sync.supportedClass());
-        assertNotNull(async.supportedClass());
+        assertNotNull(listener.supportedClass());
     }
 }
