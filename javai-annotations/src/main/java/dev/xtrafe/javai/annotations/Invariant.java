@@ -4,7 +4,7 @@ import java.lang.annotation.*;
 
 /**
  * A compiler-checked class invariant, applying across every method of the class -- including
- * ones not directly touched by a given change. See doc/JavAI_Codegen_Guidance.md.
+ * ones not directly touched by a given change. See doc/ai-guidance/JavAI_Codegen_Guidance.md.
  */
 @Retention(RetentionPolicy.RUNTIME)
 @Target(ElementType.TYPE)

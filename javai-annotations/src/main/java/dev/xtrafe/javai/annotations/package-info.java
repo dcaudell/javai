@@ -32,7 +32,7 @@
  * most of them behavior; {@code PromptContext} (Completion Fabric) is the one exception, read directly by
  * {@code javai-model} rather than any weaver -- see that annotation's own javadoc. See {@code doc/spec/}
  * for the full design of each area. Before generating or modifying code that carries the Codegen Guidance
- * annotations, read {@code doc/JavAI_Codegen_Guidance.md} in full.
+ * annotations, read {@code doc/ai-guidance/JavAI_Codegen_Guidance.md} in full.
  *
  * <p>The proposed (not-yet-implemented) {@code @Summary} tuning parameters described in
  * {@code doc/spec/vector-core.md} (decay, maxStack, maxDepth, aggregation, edgeKind) are

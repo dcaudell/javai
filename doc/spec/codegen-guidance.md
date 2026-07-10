@@ -3,7 +3,7 @@
 Annotation definitions live in `javai-annotations`; there's no separate `javai-codegen` module. Whitepaper:
 §5.5, Appendix B.
 
-**Read `doc/JavAI_Codegen_Guidance.md` in full before generating or modifying any code that carries these
+**Read `doc/ai-guidance/JavAI_Codegen_Guidance.md` in full before generating or modifying any code that carries these
 annotations — it applies to work done *in this repository*, not only to JavAI's end users.** This file is
 a short pointer; that one is the operative instructions.
 
@@ -44,5 +44,5 @@ public class Article {
 ```
 
 An agent may rewrite `normalize()` freely so long as the contract and intent still hold; `regenerateEmbedding()`
-is off-limits regardless of how good the proposed fix looks. See `doc/JavAI_Codegen_Guidance.md` for the
+is off-limits regardless of how good the proposed fix looks. See `doc/ai-guidance/JavAI_Codegen_Guidance.md` for the
 full rule set and a pre-submission checklist.

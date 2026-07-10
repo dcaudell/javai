@@ -4,7 +4,7 @@ import java.lang.annotation.*;
 
 /**
  * A compiler-checked precondition -- a hard pass/fail oracle for agent-written code, not
- * documentation. Treat as load-bearing. See doc/JavAI_Codegen_Guidance.md before touching
+ * documentation. Treat as load-bearing. See doc/ai-guidance/JavAI_Codegen_Guidance.md before touching
  * a method that carries this.
  */
 @Retention(RetentionPolicy.RUNTIME)

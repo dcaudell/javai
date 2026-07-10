@@ -35,7 +35,7 @@ Controls what gets embedded and how it's searched. See `doc/spec/vector-core.md`
 ### 2. Codegen Guidance — governing what an LLM agent may read, generate, or modify
 
 A hard pass/fail oracle where one is practical, a natural-language hint where it isn't. **Read
-[`doc/JavAI_Codegen_Guidance.md`](../doc/JavAI_Codegen_Guidance.md) in full before generating or modifying
+[`doc/ai-guidance/JavAI_Codegen_Guidance.md`](../doc/ai-guidance/JavAI_Codegen_Guidance.md) in full before generating or modifying
 any code carrying these — it applies to work done *in this repository*, not only to JavAI's end users.**
 
 | Annotation | Target | Purpose |

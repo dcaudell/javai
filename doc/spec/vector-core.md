@@ -190,18 +190,26 @@ translate directly into test fixtures.
 
 ## Provider selection across platforms (discovered building the E2E test, not in the whitepaper)
 
-`javai-vector` ships two real `JavAIEmbeddingProvider` implementations, not one:
+`javai-vector` ships five real `JavAIEmbeddingProvider` implementations:
 
 | Implementation | Backend | Status |
 |---|---|---|
 | `EmbeddingProviderTextEmbeddingsInference` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
 | `EmbeddingProviderOllama` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+| `EmbeddingProviderOpenAI` | OpenAI's hosted `/v1/embeddings` | Mirrors `javai-completion`'s `CortexOpenAI` vendor; not yet verified against a live endpoint |
+| `EmbeddingProviderVLlm` | Self-hosted vLLM's OpenAI-compatible `/v1/embeddings` | Mirrors `CortexVLlm`; not yet verified against a live endpoint |
+| `EmbeddingProviderReplicate` | Replicate's create-prediction-then-poll API | Mirrors `CortexReplicate`; best-effort — Replicate has no vendor-wide embeddings contract, see `javai-vector/README.md`'s "Hosted-vendor providers" section |
 
-Both hand-roll `java.net.http.HttpClient` calls (see each class's own javadoc for why no JSON library),
-and both retry a `429` response via `RetrySupport`/`EndpointRateLimiter` (also `javai-vector` — see
+All five hand-roll `java.net.http.HttpClient` calls (see each class's own javadoc for why no JSON library),
+and all five retry a `429` response via `RetrySupport`/`EndpointRateLimiter` (also `javai-vector` — see
 `doc/spec/completion-fabric.md`'s "Rate limiting" section): endpoint-keyed, cross-instance backoff state
 shared with `javai-completion`'s `Cortex` implementations too, since `javai-completion` depends on
 `javai-vector` and can reuse the same registry.
+
+`javai-completion`'s `Cortex` vendor set also includes Anthropic and Groq, but neither has a native
+embeddings API to mirror — Anthropic has none at all (it officially recommends Voyage AI instead) and
+Groq's API reference lists no embeddings endpoint. No `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq`
+exist as a result; this is a deliberate gap, not an oversight.
 
 The reason a second implementation exists at all: TEI's Candle backend has a confirmed, unresolved upstream
 bug running the reference model, `Qwen/Qwen3-Embedding-0.6B` (§4.5.1), on CPU — "Intel MKL ERROR: Parameter

@@ -7,7 +7,10 @@ properties of the object model — not a new language, and not infrastructure bo
 Read `SPEC.md` before starting any work in this repository. It is short by design and gives complete
 orientation regardless of which module you're touching. It links out to `doc/spec/*.md` for
 area-specific depth, and to `doc/JAI_Whitepaper.docx` (the full design document, source of truth for
-rationale) and `doc/JavAI_Codegen_Guidance.md` (agent-facing rules, described further down).
+rationale) and `doc/ai-guidance/JavAI_Codegen_Guidance.md` (agent-facing rules, described further down).
+Note `doc/ai-guidance/` also has a sibling file, `JavAI_Usage_Guide.md`, aimed at a different audience —
+an AI helping someone *consume* JavAI Extensions as a dependency in their own project, not contribute to
+this repository — not usually relevant to work done here, but good to know it exists.
 
 ## Hard rule: never run `git commit`
 
@@ -39,7 +42,7 @@ means concretely.
 | Persistence Bridge | `javai-persistence` | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
 | Completion Fabric | `javai-completion` | Provider-agnostic RAG completions, wrapping Spring AI |
 | Vector Collections | `javai-collections` (interfaces in `javai-model` — see note below) | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` |
-| Codegen Guidance | `javai-annotations` (definitions only — see `doc/JavAI_Codegen_Guidance.md`) | Annotations governing what an LLM agent may read/write/trust |
+| Codegen Guidance | `javai-annotations` (definitions only — see `doc/ai-guidance/JavAI_Codegen_Guidance.md`) | Annotations governing what an LLM agent may read/write/trust |
 | Acceleration Substrate | `javai-substrate` | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
 | Agentic Supervision | `javai-supervision` | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
 
@@ -105,7 +108,11 @@ since IntelliJ detects the root `pom.xml`.
   Treat it as the source of truth for *rationale*; `SPEC.md`/`doc/spec/` are the source of truth for
   *current implementation-facing detail*, since they'll be kept current as the design evolves and the
   docx will not be re-exported for every small change.
-- `doc/JavAI_Codegen_Guidance.md` — read this before generating or modifying any code annotated with
-  `@Requires`/`@Ensures`/`@Invariant`, `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`,
+- `doc/ai-guidance/JavAI_Codegen_Guidance.md` — read this before generating or modifying any code annotated
+  with `@Requires`/`@Ensures`/`@Invariant`, `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`,
   `@Nondeterministic`/`@Costly`, or `@Provenance`. It defines what an LLM agent is and isn't allowed to do
   around each of them, and applies to work in this repository, not just to JavAI's own users.
+- `doc/ai-guidance/JavAI_Usage_Guide.md` — the sibling file in that same directory, aimed at an AI helping
+  someone *consume* JavAI Extensions as a Maven dependency in a separate project (capabilities, the full
+  annotation vocabulary, every auto-generated/woven method, installation/activation steps). Not usually
+  relevant to work done in this repository itself.

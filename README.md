@@ -87,6 +87,150 @@ mvn install
 Opening this repository root in IntelliJ IDEA imports all eight modules as one project automatically, since
 IntelliJ detects the root `pom.xml`.
 
+## How to install
+
+The above is for building *this* repository. To add JavAI Extensions to your own project instead, from
+standard public Maven repositories:
+
+These instructions install the **full module set** — all seven extension areas — rather than picking and
+choosing. You can technically get away with fewer modules if you only want one or two capabilities, but the
+whole set is small, every module is designed to interoperate with the others, and not having to reason
+about which subset you need is one less decision to make.
+
+### Automated install
+
+**Do not copy this repository's own `SPEC.md`** — that file orients a *contributor* to this repo's own
+8-module Phase 0 build, not a downstream consumer, and would just confuse an assistant reading it in your
+project. Copy only the [`doc/ai-guidance/`](doc/ai-guidance/README.md) directory into your project (e.g.
+`docs/javai-guidance/`) — it's the one piece written specifically for this, and is self-contained — then
+tell Claude Code (or another AI coding assistant) something like:
+
+> Read `docs/javai-guidance/README.md` and follow `JavAI_Usage_Guide.md` to install the full JavAI
+> Extensions module set in this project.
+
+`JavAI_Usage_Guide.md` has the actual dependency coordinates, the full annotation vocabulary, every method a
+woven class gains at runtime, and the exact steps to activate the weaver correctly. Following it, an
+assistant can add all the dependencies, wire up both weavers, and stand up the reference Docker environment
+(see below) that covers every module's runtime needs at once.
+
+### Manual install
+
+1. **Add all seven modules** as dependencies (`javai-annotations` comes along transitively — no need to
+   declare it directly):
+
+   ```xml
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-vector</artifactId>
+     <version>0.1.0</version> <!-- match the current release -->
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-model</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-substrate</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-supervision</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-collections</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-persistence</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   <dependency>
+     <groupId>dev.xtrafe.javai</groupId>
+     <artifactId>javai-completion</artifactId>
+     <version>0.1.0</version>
+   </dependency>
+   ```
+
+2. **Install both weavers** before any annotated class is loaded — as early as possible in `main()`, or,
+   for a JUnit 5 test suite, from a `LauncherSessionListener` (not `@BeforeAll`, which runs too late):
+
+   ```java
+   Instrumentation instrumentation = net.bytebuddy.agent.ByteBuddyAgent.install();
+   dev.xtrafe.javai.substrate.JavAIWeaver.install(instrumentation);         // Vector Core
+   dev.xtrafe.javai.supervision.SupervisionWeaver.install(instrumentation); // Agentic Supervision
+   ```
+
+   and add `-Djdk.attach.allowAttachSelf=true` to the JVM launching that process (self-attach is disabled by
+   default on JDK 9+).
+
+3. **Stand up the runtime backends** the full set needs: an embedding-model provider (Vector Core), Postgres
+   and/or Neo4j (Persistence Bridge), and a completion provider (Completion Fabric). Agentic Supervision and
+   the woven Vector Core mechanism itself need nothing beyond step 2.
+
+   The straightforward way to get all three at once: this repository ships a reference Dockerfile
+   (`e2e-client-test/docker/Dockerfile`) bundling Postgres+pgvector, Neo4j, and Ollama — with both a
+   reference embedding model and a chat-completion model already baked in — into one container. It's not
+   published to a registry; build it locally the first time (a genuinely large, slow, one-time image
+   build), then just restart the same container on every subsequent run:
+
+   ```sh
+   cd e2e-client-test
+   docker build -t javai-e2e-monolithic:latest -f docker/Dockerfile docker
+   docker run -d --name javai-e2e-monolithic \
+     -p 15432:5432 -p 17474:7474 -p 17687:7687 -p 21434:11434 \
+     javai-e2e-monolithic:latest
+   # next time: docker start javai-e2e-monolithic
+   ```
+
+   Postgres on `localhost:15432`, Neo4j on `17474` (HTTP)/`17687` (Bolt), Ollama on `21434`. See
+   `e2e-client-test/README.md`'s "Persistent container" section for the full lifecycle notes (including how
+   to force a rebuild after editing the Dockerfile) — this is the same container `e2e-client-test`'s own
+   tests reuse, not a separate quick-start-only artifact.
+
+4. **Or configure your own embedding and completion providers**, from whichever vendors you prefer, instead
+   of the bundled Ollama-in-a-container from step 3. The two are independent — neither has a single
+   "one setting for everything" switch:
+
+   - **Embedding provider** (Vector Core) is registered once, globally, before anything calls `vector()`:
+
+     ```java
+     JavAIRuntime.configureEmbeddingProvider(
+         new EmbeddingProviderOllama(URI.create("http://localhost:11434"), "qwen3-embedding:0.6b"));
+     // or: new EmbeddingProviderTextEmbeddingsInference(URI.create("http://localhost:8080"), "your-model-label")
+     // or: new EmbeddingProviderOpenAI(apiKey, "text-embedding-3-small")
+     // or: new EmbeddingProviderVLlm(URI.create("http://your-vllm-host:8000"), "your-model")
+     // or: EmbeddingProviderReplicate.builder().apiToken(apiToken).model("owner/model-name").build()
+     // or: implement JavAIEmbeddingProvider yourself against any other vendor's embedding API
+     ```
+
+     Note: unlike the `Cortex` family (below), there's no `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq`
+     — neither vendor exposes a native embeddings API (Anthropic recommends Voyage AI instead; Groq's API has
+     no embeddings endpoint at all). See `javai-vector/README.md`'s "Hosted-vendor providers" section.
+
+     Without an explicit call, `JavAIRuntime` falls back to the `javai.embedding.endpoint`/
+     `javai.embedding.model` system properties (constructing an `EmbeddingProviderTextEmbeddingsInference`);
+     with neither the call nor those properties set, the first `vector()` call throws.
+
+   - **Completion provider** (Completion Fabric) has no global registration — construct whichever `Cortex`
+     you want, wherever you use it:
+
+     ```java
+     Cortex cortex = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
+     // or CortexAnthropic / CortexGroq / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
+     ```
+
+     Constructing several `Cortex`es side by side, local and remote, is normal — each is a plain object, not
+     something you register.
+
+Full detail on every step above — the complete woven-method reference, the full annotation vocabulary, and
+the exact timing trap that silently leaves a class unwoven if the weaver installs too late — lives in
+[`doc/ai-guidance/JavAI_Usage_Guide.md`](doc/ai-guidance/JavAI_Usage_Guide.md).
+
 ## Where things are
 
 - [`SPEC.md`](SPEC.md) — read this first. Complete orientation regardless of which module you're touching.
@@ -97,9 +241,15 @@ IntelliJ detects the root `pom.xml`.
 - [`doc/JAI_Whitepaper.docx`](doc/JAI_Whitepaper.docx) — the full design whitepaper: vision, prior-art
   research, roadmap, go/no-go. Source of truth for *rationale*; `SPEC.md`/`doc/spec/` are the source of
   truth for *current implementation-facing detail*.
-- [`doc/JavAI_Codegen_Guidance.md`](doc/JavAI_Codegen_Guidance.md) — required reading before generating or
-  modifying any code annotated with `@Requires`/`@Ensures`/`@Invariant`, `@Intent`,
-  `@AgentWritable`/`@Frozen`/`@HumanOnly`, `@Nondeterministic`/`@Costly`, or `@Provenance`.
+- [`doc/ai-guidance/`](doc/ai-guidance/README.md) — the **AI Guidance Package**: self-contained
+  documentation meant to be dropped into, or referenced from, a *downstream* project that depends on JavAI
+  Extensions as an ordinary Maven library (as opposed to this file and `CLAUDE.md`, which are for
+  contributors working inside this repository). Covers capabilities, the full annotation vocabulary, every
+  auto-generated/woven method, and installation/activation steps
+  ([`JavAI_Usage_Guide.md`](doc/ai-guidance/JavAI_Usage_Guide.md)), plus the narrower Codegen Guidance
+  meta-annotation rules ([`JavAI_Codegen_Guidance.md`](doc/ai-guidance/JavAI_Codegen_Guidance.md)) — required
+  reading before generating or modifying any code annotated with `@Requires`/`@Ensures`/`@Invariant`,
+  `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`, `@Nondeterministic`/`@Costly`, or `@Provenance`.
 
 ## Current status
 

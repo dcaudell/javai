@@ -4,7 +4,7 @@ import java.lang.annotation.*;
 
 /**
  * A compiler-checked postcondition -- must still hold after any change to the annotated
- * method. See doc/JavAI_Codegen_Guidance.md.
+ * method. See doc/ai-guidance/JavAI_Codegen_Guidance.md.
  */
 @Retention(RetentionPolicy.RUNTIME)
 @Target({ElementType.METHOD, ElementType.TYPE})
