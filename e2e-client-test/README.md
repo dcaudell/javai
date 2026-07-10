@@ -52,6 +52,42 @@ time) can cost several minutes on the *first* real completion in a run; once war
 complete in a few seconds combined. `forkedProcessTimeoutInSeconds` is set generously (3600s) to absorb the
 cold case without a spurious fork-timeout failure.
 
+`LombokInteropE2ETest` proves Lombok and `javai-substrate`'s load-time weaver genuinely coexist on the same
+class -- see "Lombok interop" below.
+
+## Lombok interop
+
+This module also depends on [Lombok](https://projectlombok.org/) (`provided` scope), included specifically
+to prove that `javai-substrate`'s weaver interoperates with it, not as a general convenience dependency (this
+project's other domain classes stay hand-written on purpose, so their woven behavior is easy to read -- see
+`Attachment.java`'s own javadoc). `domain/Tag.java` carries `@Getter`/`@Setter`/`@NoArgsConstructor`/
+`@AllArgsConstructor`/`@ToString`/`@EqualsAndHashCode` alongside `@JavAIVectorizable`/`@Vectorize`;
+`LombokInteropE2ETest` (real container, same as `ArticleGraphEmbeddingE2ETest`) proves the specific mechanism
+`JavAIWeaver` depends on -- a conventionally-named `setXxx` method with real bytecode to attach `Advice` to,
+and a constructor `ConstructorExitAdvice` can instrument -- still holds when that bytecode is entirely
+Lombok-generated: `setLabel(String)` triggers dirty-tracking exactly as a hand-written setter would, and
+`vector()` recomputes a genuinely different embedding afterward.
+
+**The ordering the weaver needs (Lombok completely done before JavAI ever weaves) is guaranteed by
+construction, not by any explicit configuration.** Lombok's annotation processor runs during `javac`
+(Maven's `compile`/`test-compile` phases), rewriting a class's bytecode on disk before the JVM that runs
+tests ever starts; `JavAIWeaver` only attaches (via `ByteBuddyAgent` self-attach, from
+`JavAIWeavingLauncherSessionListener`) once that already-Lombok-processed bytecode is loaded inside the
+forked test JVM. Compile-time code generation and load-time bytecode weaving simply happen in two different
+JVM processes, in a fixed order Maven's own build lifecycle already enforces -- there is no code path in
+this build where the weaver could observe a class before Lombok has finished with it, and nothing had to be
+added to make that true.
+
+**What did need explicit configuration, and is easy to miss:** simply adding `lombok` as a `provided`-scope
+dependency was not, on its own, enough to make Lombok run at all in this module. With this module's full
+dependency set on the classpath, javac's implicit "discover annotation processors via `-classpath`" fallback
+silently skips Lombok -- confirmed by reproducing it with a raw `javac` invocation, independent of Maven,
+which compiled `Tag.java` down to a bare class with only its declared fields and a default constructor, no
+generated accessors at all, no error or warning either. The fix -- and Lombok's own documented recommendation
+for Maven, not a workaround specific to this project -- is an explicit `annotationProcessorPaths` entry on
+`maven-compiler-plugin` (see this module's `pom.xml`), which stops depending on javac's classpath-scanning
+fallback entirely.
+
 ## Persistent container + seeded sample data
 
 `JavAIEnvironment`/`MonolithicContainer` (`src/main/java/.../environment/`) own this container's whole

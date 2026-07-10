@@ -17,5 +17,7 @@
 - (Done) See if we can use reflection at runtime to fill in the instance variables in pointcut events. 
 
 - Add javai-tagging module to the whitepaper. (Taggable interface, tags are taggable - recursive tagging. Tags are mebmers of tagsets. Objects can be inspected for which tags of a tagset should be applied to the object. Tags have an English slug and display name. Tags are linked to objects by a tag-instance table that applies a tag to an entity. Fitler the instance table by target type, then tag set, then tag to get at all objects of a certain type with a certain tag. ... still more thought required )
+- Spring Data MongoDB support
+- MongoDB Extension for Hibernate ORM support (https://www.mongodb.com/docs/languages/java/mongodb-hibernate/current/)
 - Add recursive MCP microservice fabric to the whitepaper.
 - Export transcripts and rank ability
