@@ -2,13 +2,10 @@ package dev.xtrafe.javai.e2e;
 
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
+import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.fixtures.ArticleFixtures;
-import dev.xtrafe.javai.persistence.JavAIPI;
-import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.vector.EmbeddingVector;
-import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
-import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -24,9 +21,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * persisted rows -- and the same already-computed embeddings -- rather than re-embedding sixteen articles
  * per test method.
  *
- * <p>{@link MonolithicInfrastructure}'s Postgres database is a single container shared (and never wiped)
- * across every e2e test class that runs in the same suite invocation, so by the time this class's tests
- * run, {@code javai_article} may already contain rows from {@link PersistenceE2ETest}'s own saves too. Every
+ * <p>{@code JavAIEnvironment}'s Postgres database is a single container shared (and never wiped) across
+ * every e2e test class that runs in the same suite invocation, so by the time this class's tests run,
+ * {@code javai_article} may already contain rows from {@link PersistenceE2ETest}'s own saves too. Every
  * fixture title in {@link ArticleFixtures} is deliberately distinct from every title/body used by any other
  * e2e test class for exactly this reason -- an accidental exact-text collision with {@link PersistenceE2ETest}'s
  * own fixture data caused a real, confirmed test failure during development (a tied title-vector rank).
@@ -38,18 +35,8 @@ class ArticleFixtureVolumeE2ETest {
 
     @BeforeAll
     static void saveFixtures() {
-        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
-
-        // No CommentRepository/AttachmentRepository pre-registration -- auto-registered recursively as soon
-        // as ArticleRepository is realized. See HibernatePostgresRepositoryBackend's javadoc.
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
-                .postgresUrl(MonolithicInfrastructure.postgresUrl())
-                .postgresUsername("javai")
-                .postgresPassword("javai")
-                .build());
-        postgresRepository = JavAIPI.repository(ArticleRepository.class);
-
+        JavAIEnvironment.ensureRunning();
+        postgresRepository = JavAIEnvironment.postgresArticleRepository();
         saved = ArticleFixtures.newArticles().stream().map(postgresRepository::save).toList();
     }
 

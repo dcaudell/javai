@@ -6,9 +6,8 @@ import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.model.ContextableObject;
-import dev.xtrafe.javai.model.JavAIRuntime;
-import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import dev.xtrafe.javai.model.PromptContext;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -23,10 +22,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * backend -- not a hermetic one. {@code javai-completion} was previously never wired into this project
  * ("this pass stayed scoped to javai-completion itself"); this is that wiring's first real usage.
  *
- * <p>The completion model is already baked into {@link MonolithicInfrastructure}'s shared image
- * ({@code qwen3:8b}, alongside the embedding model) -- see {@code docker/Dockerfile} -- so no separate
- * container or model pull is needed here, only {@link MonolithicInfrastructure#completionEndpoint()}
- * (the same Ollama instance {@link MonolithicInfrastructure#embeddingEndpoint()} already points at).
+ * <p>The completion model is already baked into {@code JavAIEnvironment}/{@code MonolithicContainer}'s
+ * shared image ({@code qwen3:8b}, alongside the embedding model) -- see {@code docker/Dockerfile} -- so no
+ * separate container or model pull is needed here, only {@link JavAIEnvironment#cortex()} (already built
+ * against the same Ollama instance the embedding provider is configured against).
  *
  * <p>Kept to two real completions/marshalling checks, not an exhaustive suite -- each real call against
  * {@code qwen3:8b} costs real wall-clock time (see {@code javai-completion}'s own
@@ -38,8 +37,7 @@ class CompletionE2ETest {
 
     @BeforeAll
     static void configureRealProviders() {
-        JavAIRuntime.configureEmbeddingProvider(
-                LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
+        JavAIEnvironment.ensureRunning();
     }
 
     @Test
@@ -59,7 +57,7 @@ class CompletionE2ETest {
                 .entry(new ContextableObject<>(second))
                 .build();
 
-        Cortex cortex = LocalCompletionDefaults.create(MonolithicInfrastructure.completionEndpoint());
+        Cortex cortex = JavAIEnvironment.cortex();
         CompletionResult result = cortex.complete(CompletionRequest.builder()
                 .prompt("In one sentence, what are readers saying about this article?")
                 .context(context)

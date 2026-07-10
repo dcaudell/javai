@@ -7,10 +7,10 @@ import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Attribution;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.domain.RelatesTo;
+import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.model.JavAIList;
-import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
@@ -38,14 +38,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * like once {@code javaic} exists.
  *
  * <p>Domain mirrors doc/spec/end-to-end-example.md's own Article/Comment worked example. Requires Docker;
- * first run builds {@link MonolithicInfrastructure}'s image (slow, one-time) -- see README.md.
+ * first run builds {@code JavAIEnvironment}/{@code MonolithicContainer}'s image (slow, one-time) -- see
+ * README.md.
  *
- * <p><b>The embedding provider/model this test runs against is fixed by {@link MonolithicInfrastructure}</b>,
- * not chosen per-platform here: the monolithic container it starts bakes in Ollama specifically (with the
+ * <p><b>The embedding provider/model this test runs against is fixed by {@code JavAIEnvironment}</b>, not
+ * chosen per-platform here: the monolithic container it starts bakes in Ollama specifically (with the
  * reference model, {@code Qwen/Qwen3-Embedding-0.6B} / {@code qwen3-embedding:0.6b}, §4.5.1), and forces
  * {@link LocalEmbeddingDefaults} to agree via its override property, so {@code modelLabel()}/
  * {@code create(...)} below still resolve correctly without this test itself carrying any
- * platform-specific logic. See {@code MonolithicInfrastructure}'s javadoc for why (TEI's Candle backend has
+ * platform-specific logic. See {@code MonolithicContainer}'s javadoc for why (TEI's Candle backend has
  * a confirmed, unresolved upstream bug running this model on CPU -- doc/spec/vector-core.md's "Provider
  * selection across platforms").
  *
@@ -58,7 +59,7 @@ class ArticleGraphEmbeddingE2ETest {
 
     @BeforeAll
     static void configureRealProvider() {
-        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
+        JavAIEnvironment.ensureRunning();
     }
 
     private Article article;

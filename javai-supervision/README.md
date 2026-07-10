@@ -38,8 +38,8 @@ case is *why* this module exists, but it isn't part of the module's own dependen
 | `SupervisionEvent` | Value type (this module) | The "object bucket": pointcut, instance, `Executable`, mutable arguments/returnValue/thrown |
 | `SyncSupervisionListener` | Interface (this module) | `onPre`/`onPost`/`onException`, each free to mutate the `SupervisionEvent` it receives; default no-ops |
 | `AsyncSupervisionListener` | Interface (this module) | Same three methods, observation-only — mutations are discarded |
-| `JavAISupervisionRuntime` (planned) | Static facade | Listener registration + the dispatch logic the weaver's Advice calls into |
-| `SupervisionWeaver` (planned) | ByteBuddy `AgentBuilder` installer | Weaves `@SyncSupervision`/`@AsyncSupervision`-annotated methods/constructors |
+| `JavAISupervisionRuntime` | Static facade (this module) | Listener registration + the dispatch logic the weaver's Advice calls into |
+| `SupervisionWeaver` | ByteBuddy `AgentBuilder` installer (this module) | Weaves `@SyncSupervision`/`@AsyncSupervision`-annotated methods/constructors |
 
 ## The sync/async model
 
@@ -96,13 +96,39 @@ runtime's own code. Don't.
 
 ## What's actually implemented
 
-`SupervisionEvent`, `SyncSupervisionListener`, `AsyncSupervisionListener` — real, compilable, this module's
-public contract. `SupervisionPointcut`, `@SyncSupervision`, `@AsyncSupervision` — real, in
-`javai-annotations`. Not yet implemented: `JavAISupervisionRuntime` (registration + dispatch) and
-`SupervisionWeaver` (the actual ByteBuddy weaving) — see `package-info.java` for the shape both are
-expected to take, following `javai-substrate`'s `JavAIWeaver`/`JavAIRuntime` split as the established idiom.
-`DependencyWiringTest` proves the classpath resolves and the event/listener types are usable; it doesn't
-exercise any weaving, because none exists yet.
+Real, tested, all of it: `SupervisionEvent`, `SyncSupervisionListener`, `AsyncSupervisionListener`,
+`SupervisionPointcut`/`@SyncSupervision`/`@AsyncSupervision` (in `javai-annotations`),
+`JavAISupervisionRuntime` (listener registration + sync-then-async dispatch), and `SupervisionWeaver` (the
+ByteBuddy `AgentBuilder` installer wiring `SupervisionMethodAdvice`/`SupervisionConstructorAdvice` at each
+requested pointcut). `SupervisionWeavingTest` proves the full contract end to end: PRE argument rewrite,
+POST return-value rewrite, PRE veto by throwing, EXCEPTION-to-normal-return conversion, sync-before-async
+ordering, async dispatch running off-thread without blocking or mutating the call, `supportedClass()`
+scoping, and constructor PRE argument rewrite. `DependencyWiringTest` still covers the narrower classpath
+smoke-test it always did.
+
+Two real, JVM-imposed asymmetries between methods and constructors, discovered empirically while building
+the weaver (not assumed from the design doc) — both fully documented in `SupervisionWeaver`'s and
+`SupervisionConstructorAdvice`'s own javadoc:
+
+- **EXCEPTION is rejected on constructors at weave time.** The JVM verifier won't allow an exception
+  handler to span a constructor's mandatory `super()`/`this()` call, so Byte Buddy refuses to attach the
+  `onThrowable` exit advice EXCEPTION needs to any constructor. `SupervisionWeaver` throws a clear error
+  from its own transform step rather than silently leaving EXCEPTION a no-op — though note the actual
+  failure mode `AgentBuilder`'s default error handling produces: it logs (this module installs a listener
+  so that's never silent) and falls back to leaving the *entire type* unwoven, not just that one
+  constructor's EXCEPTION request. `SupervisionWeavingTest#exceptionOnAConstructorLeavesThatTypeEntirelyUnwoven`
+  proves this is the real, observed behavior.
+- **A constructor's PRE dispatch always observes `instance() == null`.** Byte Buddy's entry advice
+  categorically refuses to bind `this` on a constructor at all, the same restriction it applies to a static
+  method's entry advice — regardless of whether the super/this call has already completed by that point in
+  the bytecode. `JavAISupervisionRuntime`'s existing null-instance fallback (originally added for static
+  methods) already covers this: `supportedClass()` scoping falls back to the constructor's declaring class.
+
+One genuine, tested improvement over this project's AoP lineage: EXCEPTION on a *method* fires for any
+exception leaving it, including one propagated from a call it makes -- not just a literal `throw` in the
+method's own body, which is all the ASM-based predecessor could ever see (it hooked `ATHROW` opcodes
+directly rather than installing a real exception handler). See
+`SupervisionWeavingTest#exceptionPointcutFiresForExceptionPropagatedFromAHelperCall`.
 
 Not designed at all yet, deliberately deferred past this spike: a depth/budget guard against a cascading
 chain of async reactions (an async listener's side effect triggering another supervised call, which

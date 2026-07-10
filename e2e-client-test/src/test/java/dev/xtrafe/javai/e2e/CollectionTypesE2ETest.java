@@ -1,14 +1,13 @@
 package dev.xtrafe.javai.e2e;
 
 import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import dev.xtrafe.javai.model.JavAILinkedHashSet;
 import dev.xtrafe.javai.model.JavAIList;
-import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
-import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -20,14 +19,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link ArticleGraphEmbeddingE2ETest} already exercises {@code JavAIArrayList} exhaustively (via
  * {@code Article.comments}) against real embeddings. This covers the other two concrete
  * {@code javai-model} collection types the same way -- real, woven {@link Comment} objects, real
- * embeddings from {@link MonolithicInfrastructure}'s Ollama, not the fake providers
- * {@code javai-model}'s own hermetic collection tests use.
+ * embeddings from {@code JavAIEnvironment}'s Ollama, not the fake providers {@code javai-model}'s own
+ * hermetic collection tests use.
  */
 class CollectionTypesE2ETest {
 
     @BeforeAll
     static void configureRealProvider() {
-        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
+        JavAIEnvironment.ensureRunning();
     }
 
     @Test

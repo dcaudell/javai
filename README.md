@@ -124,10 +124,12 @@ smoke tests:
   Groq, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
   parameters, Handlebars-based prompt templating (`CompletionRequest.render()`), and the RAG-integration
   half grounding a completion in `PromptContext`.
-- **`javai-supervision`** (Agentic Supervision) — new. Its public contract (`SupervisionEvent`,
-  `SyncSupervisionListener`, `AsyncSupervisionListener`, plus the `@SyncSupervision`/`@AsyncSupervision`
-  annotations in `javai-annotations`) is defined and compiles; the weaver and dispatch runtime that make it
-  real are not written yet. See that module's README.
+- **`javai-supervision`** (Agentic Supervision) — a full, independent ByteBuddy weaver (`SupervisionWeaver`)
+  and dispatch runtime (`JavAISupervisionRuntime`): method/constructor-scoped PRE/POST/EXCEPTION, sync
+  listeners with real veto/rewrite rights running before fire-and-forget async listeners on a
+  virtual-thread-per-task executor, and an improvement over its AoP predecessor (EXCEPTION now catches an
+  exception propagated from a called method, not just a literal `throw`). See that module's README for two
+  JVM-imposed method/constructor asymmetries discovered while building it.
 
 `e2e-client-test` (a standalone downstream consumer, not one of the eight modules) proves the above against a
 single monolithic Docker container bundling Postgres+pgvector, Neo4j, and a real embedding provider, not

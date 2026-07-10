@@ -29,16 +29,15 @@
 
     <javai.version>0.1.0-SNAPSHOT</javai.version>
     <junit.version>5.11.0</junit.version>
-    <testcontainers.version>1.21.4</testcontainers.version>
     <!--
-      Confirmed via `mvn dependency:tree -Dverbose`: without this, Maven's nearest-wins mediation picks
-      jackson-annotations:2.10.3 (a hard-pinned transitive dependency of Testcontainers' own
-      com.github.docker-java:docker-java-api, at a shallower tree depth) over the much newer
-      jackson-databind/jackson-core/jackson-datatype-jsr310 versions javai-completion pulls in
-      transitively via Spring AI; a real, severe cross-version mismatch (2.10.3 paired with 2.21.4)
-      that breaks Hibernate's own optional Jackson JSON format mapper at SessionFactory build time
-      (NoClassDefFoundError: com/fasterxml/jackson/annotation/JsonSerializeAs). Importing the BOM forces
-      every jackson-* artifact to one consistent version regardless of transitive depth.
+      Originally confirmed via `mvn dependency:tree -Dverbose` to fix a real, severe cross-version jackson
+      mismatch caused by Testcontainers' own com.github.docker-java:docker-java-api hard-pinning
+      jackson-annotations:2.10.3 at a shallower tree depth than the much newer jackson-databind/
+      jackson-core/jackson-datatype-jsr310 versions javai-completion pulls in transitively via Spring AI
+      (NoClassDefFoundError: com/fasterxml/jackson/annotation/JsonSerializeAs, at Hibernate's optional
+      Jackson JSON format mapper). Testcontainers is gone from this module now, so that specific cause no
+      longer applies; kept anyway as cheap, defensive version pinning across whatever else transitively
+      touches Jackson (Spring AI, Hibernate).
     -->
     <jackson.version>2.21.4</jackson.version>
 
@@ -85,6 +84,14 @@
       <artifactId>javai-substrate</artifactId>
       <version>${javai.version}</version>
     </dependency>
+    <!-- Agentic Supervision e2e proof (AgenticSupervisionE2ETest): its own independent weaver, installed
+         alongside javai-substrate's in JavAIWeavingLauncherSessionListener for the same early-class-loading
+         reason. -->
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-supervision</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
     <dependency>
       <groupId>dev.xtrafe.javai</groupId>
       <artifactId>javai-collections</artifactId>
@@ -104,14 +111,17 @@
       <version>${javai.version}</version>
     </dependency>
 
-    <!-- Realistic-sounding (not random-noise) sample data for SampleDataSeeder; chosen over Instancio
-         specifically because semantic-similarity tests need real embeddable text signal, not
-         type-correct-but-meaningless generated values. -->
+    <!-- Realistic-sounding (not random-noise) sample data for SampleDataSeeder/ArticleFixtures; chosen over
+         Instancio specifically because semantic-similarity tests need real embeddable text signal, not
+         type-correct-but-meaningless generated values. Compile scope, not test: both classes moved to
+         src/main (dev.xtrafe.javai.e2e.fixtures) as part of centralizing mock-data seeding as a real
+         responsibility of this module's main environment-setup code; a real trade-off worth stating
+         plainly, since it means a "client" artifact now carries a fake-data-generation library as a real
+         dependency, not just a test-scoped one. -->
     <dependency>
       <groupId>net.datafaker</groupId>
       <artifactId>datafaker</artifactId>
       <version>2.7.0</version>
-      <scope>test</scope>
     </dependency>
 
     <dependency>
@@ -126,18 +136,6 @@
       <groupId>org.junit.platform</groupId>
       <artifactId>junit-platform-launcher</artifactId>
       <version>1.11.0</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.testcontainers</groupId>
-      <artifactId>testcontainers</artifactId>
-      <version>${testcontainers.version}</version>
-      <scope>test</scope>
-    </dependency>
-    <dependency>
-      <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
-      <version>${testcontainers.version}</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -156,12 +154,20 @@
         <configuration>
           <!--
             ByteBuddyAgent.install() self-attaches to this JVM to weave the domain classes below;
-            disabled by default since JDK 9. Also give the first run generous room:
-            MonolithicInfrastructure builds a genuinely large custom image (Postgres+pgvector, Neo4j, and
-            Ollama with its embedding model baked in) from scratch on a cold Docker build cache.
+            disabled by default since JDK 9. Also give the first run generous room: JavAIEnvironment/
+            MonolithicContainer builds a genuinely large custom image (Postgres+pgvector, Neo4j, and Ollama
+            with its embedding model baked in) from scratch on a cold Docker build cache, but only ever
+            once per machine now (see MonolithicContainer's own javadoc: it matches by container name, not
+            Testcontainers' old image-hash reuse-matching, so a routine cache-drift rebuild can no longer
+            silently duplicate the container the way it used to).
+
+            The remaining variable this timeout has to absorb is LLM cold-load latency, not container
+            rebuilds: five real qwen3:8b completions (CPU-bound inference inside the container, no GPU
+            passthrough) measured ~1822s in one real run where the model wasn't already warm in Ollama's
+            memory; once warm, the same five calls typically complete in a few seconds combined.
           -->
           <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
-          <forkedProcessTimeoutInSeconds>1800</forkedProcessTimeoutInSeconds>
+          <forkedProcessTimeoutInSeconds>3600</forkedProcessTimeoutInSeconds>
           <!--
             Surefire does not forward -D properties from the `mvn` command line into the forked test JVM
             on its own; this is what actually makes `-Djavai.embedding.provider=...` reach

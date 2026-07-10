@@ -5,42 +5,48 @@
  * doc/spec/agentic-supervision.md for the full design; this note covers what's Phase 0 scope in this
  * package specifically and why it's shaped the way it is.
  *
- * <p><b>Public contract, defined here:</b> {@link dev.xtrafe.javai.supervision.SupervisionEvent} (the
- * event/"object bucket" every listener receives), {@link dev.xtrafe.javai.supervision.SyncSupervisionListener}
- * (blocking, read-write), {@link dev.xtrafe.javai.supervision.AsyncSupervisionListener} (fire-and-forget,
+ * <p><b>Public contract:</b> {@link dev.xtrafe.javai.supervision.SupervisionEvent} (the event/"object
+ * bucket" every listener receives), {@link dev.xtrafe.javai.supervision.SyncSupervisionListener} (blocking,
+ * read-write), {@link dev.xtrafe.javai.supervision.AsyncSupervisionListener} (fire-and-forget,
  * observation-only). Annotations ({@code @SyncSupervision}, {@code @AsyncSupervision}, {@code
  * SupervisionPointcut}) live in {@code javai-annotations}, same as every other annotation in this project.
  *
- * <p><b>Not yet implemented -- the two pieces still needed to make the contract above real:</b>
+ * <p><b>The two pieces that make the contract real, both implemented:</b>
  * <ul>
- *   <li>{@code JavAISupervisionRuntime} (or similarly named static facade, matching {@code JavAIRuntime}'s
- *       shape in javai-model): {@code registerSyncListener}/{@code registerAsyncListener} plus the
- *       actual dispatch logic a weaver's Advice classes call into -- runs sync listeners on the calling
- *       thread in registration order, then dispatches async listeners onto a
- *       virtual-thread-per-task executor, fire-and-forget, per doc/spec/agentic-supervision.md.
- *   <li>{@code SupervisionWeaver}: a ByteBuddy {@code AgentBuilder} installer selecting methods/
- *       constructors annotated {@code @SyncSupervision}/{@code @AsyncSupervision} (method/constructor-level
- *       selection, not the type-level selection {@code javai-substrate}'s {@code JavAIWeaver} uses) and
- *       wiring {@code Advice} at each requested {@link dev.xtrafe.javai.annotations.SupervisionPointcut}
- *       to build a {@link dev.xtrafe.javai.supervision.SupervisionEvent} and forward it to the runtime
- *       facade above. Follow {@code JavAIWeaver}'s established discipline: the weaver and its Advice
- *       classes do no algorithmic logic of their own, they only capture the join point and delegate.
+ *   <li>{@link dev.xtrafe.javai.supervision.JavAISupervisionRuntime} -- the static facade Advice calls
+ *       into: {@code registerSyncListener}/{@code registerAsyncListener} (plus matching unregister
+ *       methods) and the dispatch logic itself. Runs sync listeners on the calling thread, in registration
+ *       order, before dispatching async listeners onto a virtual-thread-per-task executor, fire-and-forget,
+ *       each with its own defensive snapshot of the event (see that class's javadoc for why a shared
+ *       mutable event across concurrent async listeners would be a real data race, not just a documented
+ *       "mutations are discarded" abstraction).
+ *   <li>{@link dev.xtrafe.javai.supervision.SupervisionWeaver} -- the ByteBuddy {@code AgentBuilder}
+ *       installer, selecting methods/constructors annotated {@code @SyncSupervision}/{@code
+ *       @AsyncSupervision} (method/constructor-level selection, not the type-level selection {@code
+ *       javai-substrate}'s {@code JavAIWeaver} uses) and wiring {@link
+ *       dev.xtrafe.javai.supervision.SupervisionMethodAdvice}/{@link
+ *       dev.xtrafe.javai.supervision.SupervisionConstructorAdvice} at the join point. Follows {@code
+ *       JavAIWeaver}'s established discipline: the weaver and its Advice classes do no algorithmic logic of
+ *       their own, they only capture the join point and delegate.
  * </ul>
  *
- * <p><b>Why this module has its own weaver instead of extending {@code javai-substrate}'s:</b> {@code
- * javai-substrate} depends on {@code javai-annotations} + {@code javai-vector} + {@code javai-model} and is
- * deliberately the first thing proven in Phase 0 ("prove the weaving mechanism itself... before building
- * out javai-vector/javai-model and javai-collections in full" -- CLAUDE.md). If this module's weaving lived
- * in {@code javai-substrate} instead, and an Agentic Listener implementation eventually wants to depend on
- * {@code javai-completion} (to actually call an LLM) or {@code javai-collections}/{@code javai-vector}/
- * {@code javai-model} (to ground its decision in the object graph), {@code javai-substrate} would end up
- * needing those too -- pulling the one module meant to be provable earliest and cheapest all the way
- * downstream of the rest of the reactor. Keeping Agentic Supervision's weaver independent (depending only
- * on {@code javai-annotations}, same tier as {@code javai-vector}) means it's a second, parallel,
- * equally-early risk spike instead of a blocker on the first one. Nothing here needs to know about
- * vectorization at all -- see {@link
- * dev.xtrafe.javai.supervision.SupervisionEvent}'s javadoc: RAG scope over the object graph, if a listener
- * wants any at all, is entirely that listener implementation's business, not this module's.
+ * <p><b>A real improvement over this project's AoP lineage, confirmed by test:</b> EXCEPTION on a
+ * <em>method</em> fires for any exception leaving the method, including one propagated from a call it
+ * makes -- not just a literal {@code throw} statement in the method's own body, which is all the ASM-based
+ * predecessor could ever see (it hooked {@code ATHROW} opcodes directly rather than installing a real
+ * exception handler). See {@link dev.xtrafe.javai.supervision.SupervisionMethodAdvice}'s javadoc.
+ *
+ * <p><b>A real, JVM-imposed limitation on constructors, also confirmed by test, not assumed:</b> the JVM
+ * verifier will not allow an exception handler to span a constructor's mandatory {@code super()}/{@code
+ * this()} call, so Byte Buddy refuses to attach EXCEPTION's {@code onThrowable} exit advice to any
+ * constructor at all. {@link dev.xtrafe.javai.supervision.SupervisionWeaver} rejects {@code
+ * SupervisionPointcut#EXCEPTION} on a constructor at weave time rather than leaving it a silent no-op; see
+ * that class's and {@link dev.xtrafe.javai.supervision.SupervisionConstructorAdvice}'s javadoc for the full
+ * explanation, including the actual observed failure mode ({@code AgentBuilder} logs and leaves the whole
+ * type unwoven, rather than failing class loading). Separately, and also empirically confirmed: a
+ * constructor's PRE dispatch always observes {@code instance() == null} -- Byte Buddy's entry advice
+ * categorically refuses to bind {@code this} on a constructor, the same restriction it applies to a static
+ * method, regardless of where the super/this call actually completes in the bytecode.
  *
  * <p><b>Hard rule: this module's own classes must never carry {@code @SyncSupervision}/{@code
  * @AsyncSupervision}.</b> The weaving selection is opt-in (annotation-scoped, not blanket), so this is
@@ -51,9 +57,9 @@
  * doesn't exist here because it isn't needed -- opt-in selection means there is no denylist to maintain or
  * forget to update.)
  *
- * <p><b>Also not yet designed, deliberately deferred:</b> a depth/budget guard for cascading async
- * reactions (an async listener's side effect triggering another supervised call, which triggers another
- * async listener, ...). Worth a real answer before this goes past a Phase 0 spike; not blocking the spike
- * itself. See doc/spec/agentic-supervision.md's open-questions note.
+ * <p><b>Not yet designed, deliberately deferred:</b> a depth/budget guard for cascading async reactions (an
+ * async listener's side effect triggering another supervised call, which triggers another async listener,
+ * ...). Worth a real answer before this goes past a Phase 0 spike; not blocking the spike itself. See
+ * doc/spec/agentic-supervision.md's open-questions note.
  */
 package dev.xtrafe.javai.supervision;

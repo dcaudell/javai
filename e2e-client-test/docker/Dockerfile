@@ -1,19 +1,22 @@
 # A single, monolithic image bundling every platform dependency this e2e project needs -- Postgres +
 # pgvector, Neo4j, and an embedding provider (Ollama) -- as three supervised processes in one container,
-# rather than three separate Testcontainers. Built and run entirely by Testcontainers
-# (org.testcontainers.images.builder.ImageFromDockerfile) as part of `mvn test`; nothing here needs a
-# manual `docker build` step or a registry push.
+# rather than three separate sidecar containers. Built and run by this project's own
+# dev.xtrafe.javai.e2e.environment.MonolithicContainer (plain `docker` CLI calls -- see that class's own
+# javadoc for why this is deliberately not Testcontainers) as part of `mvn test`; nothing here needs a
+# manual `docker build` step or a registry push. Matched by fixed container name
+# (`javai-e2e-monolithic`), so a build only ever happens once per machine, the first time no container or
+# image by that name exists yet.
 #
-# Why one container instead of Testcontainers' usual "one container per service": explicitly requested,
-# to keep this project's whole e2e surface (in-memory vectorization, both persistence backends, real
-# embeddings) served by a single piece of test infrastructure rather than three independently-lifecycled
-# ones. The trade-off, stated plainly: this is a bigger, slower-to-build image than composing three
-# battle-tested official images would be, and a process going wrong in here is a bit more work to isolate
-# than a crashed container with its own name and logs. Postgres, Neo4j, and Ollama were each verified
-# working in isolation before being combined -- see the project history for how a couple of real, non-
-# obvious bugs surfaced only once real clients connected (Neo4j's Debian package ships every listen-address
-# config line commented out, but its *actual* compiled-in default is loopback-only despite its own startup
-# log claiming "0.0.0.0" -- fixed below, not assumed).
+# Why one container instead of one-container-per-service: explicitly requested, to keep this project's
+# whole e2e surface (in-memory vectorization, both persistence backends, real embeddings) served by a
+# single piece of test infrastructure rather than three independently-lifecycled ones. The trade-off,
+# stated plainly: this is a bigger, slower-to-build image than composing three battle-tested official
+# images would be, and a process going wrong in here is a bit more work to isolate than a crashed
+# container with its own name and logs. Postgres, Neo4j, and Ollama were each verified working in
+# isolation before being combined -- see the project history for how a couple of real, non-obvious bugs
+# surfaced only once real clients connected (Neo4j's Debian package ships every listen-address config line
+# commented out, but its *actual* compiled-in default is loopback-only despite its own startup log
+# claiming "0.0.0.0" -- fixed below, not assumed).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -60,9 +63,9 @@ RUN neo4j-admin dbms set-initial-password javai12345 \
 # LocalEmbeddingDefaults' Ollama tag for it. Chat model matches LocalCompletionDefaults (javai-completion) --
 # qwen3:8b, deliberately more powerful than the smallest workable option (see that class's own javadoc for
 # the reasoning). Baking both in means `mvn test` never depends on network access at run time, only at
-# image-build time -- consistent with this image itself needing to be built before the first test run, same
-# as any other Testcontainers image pull. Both models pulled in the same temporary `ollama serve` session
-# rather than starting/stopping it twice.
+# image-build time -- consistent with this image itself needing to be built before the first test run,
+# same as pulling any other base image the first time it's needed. Both models pulled in the same
+# temporary `ollama serve` session rather than starting/stopping it twice.
 RUN curl -fsSL https://ollama.com/install.sh | sh
 
 ARG JAVAI_EMBEDDING_MODEL=qwen3-embedding:0.6b

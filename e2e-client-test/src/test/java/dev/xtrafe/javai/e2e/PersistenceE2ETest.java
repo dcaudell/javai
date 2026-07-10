@@ -3,15 +3,12 @@ package dev.xtrafe.javai.e2e;
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.Attachment;
-import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.Comment;
-import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
+import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
 import dev.xtrafe.javai.persistence.JavAIPI;
-import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.vector.EmbeddingVector;
-import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
-import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.neo4j.driver.AuthTokens;
@@ -27,16 +24,16 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Persistence Bridge, end to end: real embeddings (via {@link MonolithicInfrastructure}'s Ollama, same as
+ * Persistence Bridge, end to end: real embeddings (via {@code JavAIEnvironment}'s Ollama, same as
  * {@link ArticleGraphEmbeddingE2ETest}), real weaving, and this project's own {@link Article}/
  * {@link Comment} domain -- not {@code javai-persistence}'s own flat, non-relational test fixture --
  * saved into and queried back out of both real backends the monolithic container provides.
  *
  * <p>A repository proxy is bound to whichever backend was configured at the moment
  * {@link JavAIPI#repository(Class)} created it -- switching {@link JavAIPI#configurePersistence} afterward
- * doesn't retroactively affect an already-created proxy. That's what lets this one test class hold both a
- * Postgres-backed and a Neo4j-backed {@code ArticleRepository} at once, each fully independent, rather
- * than needing two separate test classes.
+ * doesn't retroactively affect an already-created proxy. That's what lets {@code JavAIEnvironment} build
+ * both a Postgres-backed and a Neo4j-backed {@code ArticleRepository} once, up front, each fully
+ * independent, for this test class (and every other) to share.
  */
 class PersistenceE2ETest {
 
@@ -45,30 +42,9 @@ class PersistenceE2ETest {
 
     @BeforeAll
     static void configureProviderAndRepositories() {
-        JavAIRuntime.configureEmbeddingProvider(LocalEmbeddingDefaults.create(MonolithicInfrastructure.embeddingEndpoint()));
-
-        // No CommentRepository/AttachmentRepository pre-registration here: HibernatePostgresRepositoryBackend
-        // auto-registers both, recursively, as soon as ArticleRepository is realized -- reachable through
-        // Article's own featuredComment/draftComment/attachment/comments/relatedComments fields. See that
-        // class's javadoc ("Related entity types are auto-registered too").
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
-                .postgresUrl(MonolithicInfrastructure.postgresUrl())
-                .postgresUsername("javai")
-                .postgresPassword("javai")
-                .build());
-        postgresRepository = JavAIPI.repository(ArticleRepository.class);
-
-        // Neo4j still needs this today -- only the Postgres backend's ceremony has been automated so far.
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.NEO4J)
-                .neo4jUri(MonolithicInfrastructure.neo4jUri())
-                .neo4jUsername("neo4j")
-                .neo4jPassword("javai12345")
-                .build());
-        JavAIPI.repository(CommentRepository.class);
-        JavAIPI.repository(AttachmentRepository.class);
-        neo4jRepository = JavAIPI.repository(ArticleRepository.class);
+        JavAIEnvironment.ensureRunning();
+        postgresRepository = JavAIEnvironment.postgresArticleRepository();
+        neo4jRepository = JavAIEnvironment.neo4jArticleRepository();
     }
 
     private static Article newArticle(String title, String body) {
@@ -275,8 +251,8 @@ class PersistenceE2ETest {
         Comment featured = article.getFeaturedComment();
         neo4jRepository.save(article);
 
-        try (Driver driver = GraphDatabase.driver(MonolithicInfrastructure.neo4jUri(),
-                AuthTokens.basic("neo4j", "javai12345"));
+        try (Driver driver = GraphDatabase.driver(MonolithicContainer.neo4jUri(),
+                AuthTokens.basic(MonolithicContainer.NEO4J_USERNAME, MonolithicContainer.NEO4J_PASSWORD));
                 var session = driver.session()) {
             long relationshipCount = session.run(
                     "MATCH (a:Article {id: $articleId})-[:FEATURED_COMMENT]->(c:Comment {id: $commentId}) RETURN count(*) AS c",

@@ -164,8 +164,11 @@ and its RAG-integration half real and tested: grounding a completion in a `JavAI
 `KnowledgeGraph`/`SubgraphResult` (`javai-collections`) don't implement `Contextable` yet — deferred pending
 a cycle-safe design, since GSON's default marshalling has no cycle guard and those types are graph-shaped by
 design; see `javai-completion`'s own README for exactly what's covered. `javai-supervision` (Agentic
-Supervision) is still scaffolding only — annotations and/or interfaces defined,
-no weaving or dispatch logic written yet. Don't assume anything beyond what's in a given module's actual
-source and tests reflects working code; check that module's README before relying
+Supervision) also has a real, tested implementation now: `SupervisionWeaver` (its own independent ByteBuddy
+weaver) and `JavAISupervisionRuntime` (listener registration + sync-then-async dispatch), proven end to end
+by `SupervisionWeavingTest` — PRE/POST/EXCEPTION, sync veto and rewrite rights, async off-thread dispatch
+that can't block or mutate the call, and two JVM-imposed asymmetries between methods and constructors
+discovered (not assumed) while building it; see that module's own README for the full detail. Don't assume
+anything beyond what's in a given module's actual source and tests reflects working code; check that module's README before relying
 on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design and may
 be ahead of or behind any one module's real implementation state at a given moment.

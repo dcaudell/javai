@@ -43,10 +43,27 @@ read-write access rather than being passive notifications. What changes, and why
   class level (a whole class opts in, individual methods opt out). This module's weaving is opt-in at the
   method/constructor level directly (`@SyncSupervision`/`@AsyncSupervision`), and deliberately has no
   class-level "everything in this class is supervised" form — see "Why opt-in, and why sparse" below.
-- **EXCEPTION gets strictly more capable.** `SupervisionEvent.setThrown(null)` converts an exceptional
-  exit into a normal return of whatever `setReturnValue` was also called with — the one thing the original
-  couldn't do, and a natural consequence of `Advice.OnMethodExit(onThrowable = ...)` giving read-write
-  access to both the thrown value and the return value at the same join point.
+- **EXCEPTION gets strictly more capable, on methods.** `SupervisionEvent.setThrown(null)` converts an
+  exceptional exit into a normal return of whatever `setReturnValue` was also called with — the one thing
+  the original couldn't do, a natural consequence of `Advice.OnMethodExit(onThrowable = ...)` giving
+  read-write access to both the thrown value and the return value at the same join point. A second,
+  separate improvement falls out of the same mechanism: EXCEPTION fires for *any* exception leaving the
+  method, including one propagated from a call it makes, not just a literal `throw` textually inside it —
+  the original could only ever see the latter, since it hooked `ATHROW` opcodes directly rather than
+  installing a real exception handler.
+- **EXCEPTION does not extend to constructors, for a real JVM reason discovered while building this, not
+  assumed up front.** The JVM verifier will not allow an exception handler to span a constructor's
+  mandatory `super()`/`this()` call, so ByteBuddy refuses to attach `Advice.OnMethodExit(onThrowable = ...)`
+  to any constructor at all. `SupervisionWeaver` rejects `EXCEPTION` on a constructor at weave time rather
+  than leaving it a silent no-op — see `javai-supervision`'s own README/package-info for the exact,
+  empirically-confirmed failure mode. A related, narrower constraint: a constructor's PRE dispatch always
+  observes `instance() == null`, since ByteBuddy's entry advice categorically refuses to bind `this` on a
+  constructor regardless of where the super/this call completes in the bytecode — the same restriction it
+  applies to a static method's entry advice. Neither of these are regressions from the original: its
+  ASM-based mechanism never installed a real exception handler at all (see above), so it never hit the
+  first restriction, and it loaded `this` via a raw, low-level `ALOAD 0` rather than ByteBuddy's higher-level
+  `Advice` binding, so it never hit the second either — but reproducing the original's exact capability
+  here wasn't judged worth the added complexity for this spike.
 - **A second, orthogonal axis is new: synchronous vs. asynchronous delivery.** The original had no
   equivalent. See below — this is the actual answer to "an AoP join point can trigger arbitrarily long-running
   work; you cannot always afford to block on that."
@@ -77,8 +94,8 @@ had between "this class is `@Managed`" and "an `Advisor` is actually registered 
 | `SupervisionEvent` | Value type (`javai-supervision`) | Pointcut, instance, `Executable`, mutable arguments/returnValue/thrown |
 | `SyncSupervisionListener` | Interface (`javai-supervision`) | `onPre`/`onPost`/`onException`, real mutation rights, default no-ops |
 | `AsyncSupervisionListener` | Interface (`javai-supervision`) | Same three methods, observation-only, mutations discarded |
-| `JavAISupervisionRuntime` (planned) | Static facade | Listener registration + the dispatch logic Advice calls into |
-| `SupervisionWeaver` (planned) | ByteBuddy `AgentBuilder` installer | Weaves annotated methods/constructors; its own installer, independent of `javai-substrate`'s |
+| `JavAISupervisionRuntime` | Static facade (`javai-supervision`) | Listener registration + the dispatch logic Advice calls into |
+| `SupervisionWeaver` | ByteBuddy `AgentBuilder` installer (`javai-supervision`) | Weaves annotated methods/constructors; its own installer, independent of `javai-substrate`'s |
 
 ## The sync/async model, precisely
 

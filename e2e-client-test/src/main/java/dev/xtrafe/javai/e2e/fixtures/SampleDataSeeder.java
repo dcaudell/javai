@@ -3,8 +3,7 @@ package dev.xtrafe.javai.e2e.fixtures;
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.Comment;
-import dev.xtrafe.javai.persistence.JavAIPI;
-import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
+import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
 import net.datafaker.Faker;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
@@ -22,8 +21,11 @@ import java.util.Random;
 import java.util.function.Function;
 
 /**
- * Resets and re-seeds {@link MonolithicInfrastructure}'s persistent container with ample, real (not
- * random-noise) sample data on every run.
+ * Resets and re-seeds {@link MonolithicContainer}'s persistent container with ample, real (not
+ * random-noise) sample data on every run. Moved here (main code, {@link dev.xtrafe.javai.e2e.environment}'s
+ * sibling package) from test code, per the same reasoning as that package: mock-data seeding is a real
+ * responsibility of the e2e application's own environment setup, not test-owned scaffolding -- see {@code
+ * JavAIEnvironment}, the one caller.
  *
  * <p><b>Domain data does NOT persist across runs, even though the container/image now does.</b> An
  * earlier version of this class only seeded once (skipping if the Postgres table was non-empty), on the
@@ -65,27 +67,19 @@ public final class SampleDataSeeder {
     private SampleDataSeeder() {
     }
 
-    /** Truncates all Postgres tables and wipes the Neo4j graph, then seeds both fresh -- every run, not
-     *  just the first, since domain data is deliberately not persisted across runs (see class javadoc). */
-    public static void resetAndSeed(String postgresUrl, String neo4jUri) {
+    /**
+     * Truncates all Postgres tables and wipes the Neo4j graph, then seeds both fresh -- every run, not just
+     * the first, since domain data is deliberately not persisted across runs (see class javadoc).
+     *
+     * <p>Takes already-built repositories rather than constructing its own: {@code JavAIEnvironment} is now
+     * the single place that calls {@code JavAIPI.configurePersistence}/{@code JavAIPI.repository}, so this
+     * class only needs the raw JDBC/Bolt URLs for the truncate/wipe step (not part of the {@code
+     * JavAIRepository} contract) and the two already-realized repositories for the actual seeding.
+     */
+    public static void resetAndSeed(
+            String postgresUrl, String neo4jUri, ArticleRepository postgresRepository, ArticleRepository neo4jRepository) {
         resetPostgres(postgresUrl);
         resetNeo4j(neo4jUri);
-
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
-                .postgresUrl(postgresUrl)
-                .postgresUsername("javai")
-                .postgresPassword("javai")
-                .build());
-        ArticleRepository postgresRepository = JavAIPI.repository(ArticleRepository.class);
-
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
-                .backend(JavAIPersistenceConfig.Backend.NEO4J)
-                .neo4jUri(neo4jUri)
-                .neo4jUsername("neo4j")
-                .neo4jPassword("javai12345")
-                .build());
-        ArticleRepository neo4jRepository = JavAIPI.repository(ArticleRepository.class);
 
         for (Article article : generateArticles()) {
             postgresRepository.save(article);
@@ -93,11 +87,14 @@ public final class SampleDataSeeder {
         }
     }
 
+    private static final int READINESS_RETRY_ATTEMPTS = 20;
+    private static final long READINESS_RETRY_DELAY_MILLIS = 1000;
+
     /** Discovers every table in the {@code public} schema (rather than hardcoding names) so this doesn't
      *  quietly break if the per-model vector table names change (see {@code HibernatePostgresRepositoryBackend}'s
      *  own table-per-model scheme). */
     private static void resetPostgres(String postgresUrl) {
-        try (Connection connection = DriverManager.getConnection(postgresUrl, "javai", "javai")) {
+        try (Connection connection = connectToPostgresWithRetry(postgresUrl)) {
             List<String> tableNames = new ArrayList<>();
             try (Statement listTables = connection.createStatement();
                     ResultSet tables = listTables.executeQuery(
@@ -116,10 +113,54 @@ public final class SampleDataSeeder {
         }
     }
 
+    /**
+     * {@link MonolithicContainer#ensureRunning()}'s own readiness check only confirms Postgres's TCP port
+     * is accepting connections at all -- confirmed empirically to be not the same thing as Postgres being
+     * ready to actually complete the wire-protocol handshake for a real client on a just-created container:
+     * supervisord considers the process "RUNNING" the moment it's stayed alive for a second, well before
+     * Postgres has finished its own internal startup sequence, and a connection attempt in that window gets
+     * a raw {@code SQLException}/connection-reset rather than a clean refusal. Retrying the actual JDBC
+     * handshake here, not just the TCP port, is what's actually needed -- this is a real, observed race,
+     * not a defensive guess.
+     */
+    private static Connection connectToPostgresWithRetry(String postgresUrl) throws SQLException {
+        SQLException lastFailure = null;
+        for (int attempt = 1; attempt <= READINESS_RETRY_ATTEMPTS; attempt++) {
+            try {
+                return DriverManager.getConnection(
+                        postgresUrl, MonolithicContainer.POSTGRES_USERNAME, MonolithicContainer.POSTGRES_PASSWORD);
+            } catch (SQLException e) {
+                lastFailure = e;
+                sleep(READINESS_RETRY_DELAY_MILLIS);
+            }
+        }
+        throw lastFailure;
+    }
+
     private static void resetNeo4j(String neo4jUri) {
-        try (Driver driver = GraphDatabase.driver(neo4jUri, AuthTokens.basic("neo4j", "javai12345"));
-                Session session = driver.session()) {
-            session.run("MATCH (n) DETACH DELETE n").consume();
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; attempt <= READINESS_RETRY_ATTEMPTS; attempt++) {
+            try (Driver driver = GraphDatabase.driver(neo4jUri,
+                    AuthTokens.basic(MonolithicContainer.NEO4J_USERNAME, MonolithicContainer.NEO4J_PASSWORD))) {
+                driver.verifyConnectivity();
+                try (Session session = driver.session()) {
+                    session.run("MATCH (n) DETACH DELETE n").consume();
+                }
+                return;
+            } catch (RuntimeException e) {
+                lastFailure = e;
+                sleep(READINESS_RETRY_DELAY_MILLIS);
+            }
+        }
+        throw lastFailure;
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Interrupted while waiting for the database to become ready", e);
         }
     }
 
