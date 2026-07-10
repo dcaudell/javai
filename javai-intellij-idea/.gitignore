@@ -1,0 +1,8 @@
+.gradle/
+build/
+out/
+.idea/
+*.iml
+# IntelliJ Platform Gradle plugin's own cache (downloaded SDK/plugin artifact indexes, sandbox instance for
+# `./gradlew runIde`) -- regenerated on demand, not something to commit.
+.intellijPlatform/
