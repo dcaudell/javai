@@ -1,10 +1,10 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAISet;
-import dev.xtrafe.javai.runtime.JavAISortable;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAISet;
+import dev.xtrafe.javai.model.JavAISortable;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 
 import java.util.function.Predicate;
 

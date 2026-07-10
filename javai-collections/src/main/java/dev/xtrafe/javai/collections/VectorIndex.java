@@ -1,8 +1,8 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAISortable;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAISortable;
 
 /**
  * Bare similarity-search container "for cases that don't need full graph semantics" (doc/spec/
@@ -10,7 +10,7 @@ import dev.xtrafe.javai.runtime.JavAISortable;
  * {@code JavAIVectorizable} of its own (no {@code vector()}/{@code summaryVector()} -- it isn't meant to
  * be a node in the object graph itself, just a standalone lookup structure) and no dependents/dirty
  * tracking. If you need a collection that participates in {@code summaryVector()} propagation, reach for
- * {@code JavAIArrayList}/{@code JavAILinkedHashSet} in {@code javai-runtime} instead.
+ * {@code JavAIArrayList}/{@code JavAILinkedHashSet} in {@code javai-model} instead.
  */
 public interface VectorIndex<T> extends JavAISortable<T> {
 

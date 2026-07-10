@@ -1,16 +1,25 @@
 # Vector Core
 
-Module: `javai-runtime`. Whitepaper: §4.1–§4.3 (mechanism), §4.5 (embedding generation), §5.1 (primitives),
-§6.1–§6.3 (worked examples). No internal dependencies beyond `javai-annotations`.
+Modules: `javai-vector` (pure vector/embedding functionality: `EmbeddingVector`, the CPU similarity backend,
+embedding providers, dirty-tracking primitives — depends only on `javai-annotations`) and `javai-model`
+(`JavAIVectorizable`/`JavAIRuntime`, plus the Vector Collections interfaces and Completion Fabric's RAG
+primitives — depends on `javai-vector`; see below for why). Whitepaper: §4.1–§4.3 (mechanism), §4.5
+(embedding generation), §5.1 (primitives), §6.1–§6.3 (worked examples).
 
-**Module-placement note (discovered while scaffolding, not in the whitepaper):** `JavAISortable<T>`,
-`JavAIList<T>`, `JavAISet<T>`, and `JavAIMap<K,V>` physically live in this module, not in
-`javai-collections`, even though `doc/spec/vector-collections.md` discusses them as part of the Vector
-Collections extension area. Reason: `JavAIVectorizable.query()` returns `JavAIList<T>`, and
-`javai-collections` depends on `javai-runtime`, not the reverse — putting `JavAIList` in
+**Module-placement note (discovered while scaffolding, not in the whitepaper):** `JavAIVectorizable` (the
+contract) and `JavAIRuntime` (the engine implementing it) live in `javai-model`, not `javai-vector`, for the
+same reason `JavAISortable<T>`, `JavAIList<T>`, `JavAISet<T>`, and `JavAIMap<K,V>` do — all four physically
+live in `javai-model`, not in `javai-collections`, even though `doc/spec/vector-collections.md` discusses
+the latter three as part of the Vector Collections extension area. Reason: `JavAIVectorizable.query()`
+returns `JavAIList<T>`, and `JavAIList` in turn `extends JavAIVectorizable` right back — two types with a
+genuine mutual reference can't live in separate modules without an illegal cycle, so wherever `JavAIList`
+goes, `JavAIVectorizable`/`JavAIRuntime` (which constructs a `JavAIList` to implement `query()`) has to go
+too. `javai-collections` depends on `javai-model`, not the reverse — putting `JavAIList` in
 `javai-collections` would create a circular module dependency. The extension-area taxonomy is conceptual;
 this is the compile-order-correct physical split. `javai-collections` holds `KnowledgeGraph`,
-`SubgraphResult`, and `VectorIndex` — the types that depend on what's here, not the reverse.
+`SubgraphResult`, and `VectorIndex` — the types that depend on what's here, not the reverse. See
+`javai-model`'s own package-info.java for the full reasoning and `doc/module-dependency-graph.md` for the
+complete physical module graph.
 
 The area everything else is built on: computing an object's embedding, keeping it current, and searching
 an object graph by similarity.
@@ -175,13 +184,13 @@ commitments — do not build these until there's a concrete, demonstrated need:
 ## Worked examples
 
 Object vector vs. summary vector vs. field vector, and subgraph querying, are demonstrated end to end in
-the whitepaper §6.1–§6.4 and Appendix A. Reproduce those as integration tests once `javai-runtime` and
+the whitepaper §6.1–§6.4 and Appendix A. Reproduce those as integration tests once `javai-model` and
 `javai-collections` both exist — they're written as a coherent story (an `Article`/`Comment` domain) and
 translate directly into test fixtures.
 
 ## Provider selection across platforms (discovered building the E2E test, not in the whitepaper)
 
-`javai-runtime` ships two real `JavAIEmbeddingProvider` implementations, not one:
+`javai-vector` ships two real `JavAIEmbeddingProvider` implementations, not one:
 
 | Implementation | Backend | Status |
 |---|---|---|
@@ -206,7 +215,7 @@ all). This is exactly the "swapping the embedding provider entirely... is a conf
 change" flexibility this SPI is designed for (§4.5.4) — applied one level down, to work around a specific
 backend's bug rather than to change models or vendors.
 
-**`dev.xtrafe.javai.runtime.LocalEmbeddingDefaults`** is the one place this decision is made, so it can't
+**`dev.xtrafe.javai.vector.LocalEmbeddingDefaults`** is the one place this decision is made, so it can't
 drift between "which provider class gets constructed" and "which container actually gets started":
 
 - Defaults to Ollama on macOS, TEI everywhere else (Linux, Windows, unrecognized) — matching the

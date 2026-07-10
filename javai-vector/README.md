@@ -1,0 +1,81 @@
+# javai-vector
+
+Extension area: **Vector Core** (part 1 of 2 — see `javai-model` for the other half). Whitepaper:
+§4.1–§4.3 (mechanism), §4.5 (embedding generation), §5.1 (primitives). Full detail:
+[`doc/spec/vector-core.md`](../doc/spec/vector-core.md).
+
+Depends on `javai-annotations` only. Pure vector/embedding functionality, nothing else: computing an
+embedding, keeping it current, and the dirty-state bookkeeping primitives used to track staleness. No
+collection types, no RAG-integration primitives, no `JavAIVectorizable` contract or engine — those live in
+[`javai-model`](../javai-model/README.md), a deliberate physical split explained below.
+
+**Module-placement note (why this module is narrower than "Vector Core" the whitepaper describes):**
+`JavAIVectorizable` (the contract) and `JavAIRuntime` (the engine implementing it, including the `query()`
+graph walk) are dependency-direction hostages of `JavAIList`: `JavAIVectorizable.query()` returns
+`JavAIList<T>`, and `JavAIList` in turn `extends JavAIVectorizable` right back. Two types with a genuine
+mutual reference can never live in separate modules without an illegal cycle — confirmed this isn't
+avoidable by extracting `query()` into its own interface: `JavAIRuntime.summaryVector()`'s cycle-safe walk
+checks `value instanceof JavAIVectorizable` to decide whether a `@Summary`-annotated collection field
+should contribute its own `summaryVector()` (real, tested behavior), so `JavAIList` needs the *whole*
+`JavAIVectorizable` contract, not just `query()`. Since `JavAIList`/`Set`/`Map` have to live upstream of
+`javai-collections` for the same compile-order reason they always have, `JavAIVectorizable`/`JavAIRuntime`
+follow them into `javai-model` rather than staying here. What's left in this module is exactly the subset
+with zero reference to `JavAIList`/`Contextable` at all — confirmed by grepping every file here, not
+assumed. See `javai-model`'s own package-info.java for the full trace and
+[`doc/module-dependency-graph.md`](../doc/module-dependency-graph.md) for the complete physical module graph.
+
+## Public API
+
+| Element | Kind | Purpose |
+|---|---|---|
+| `EmbeddingVector` | Record | A versioned vector: `values`, `modelId`, `dims`, `computedAt` — not a bare `float[]` |
+| `VectorMath` | Static utility | `normalize`, `addWeighted`, `cosineSimilarity`, `centroid` — CPU similarity backend |
+| `JavAIEmbeddingProvider` | SPI interface | Pluggable, versioned embedding-model provider |
+| `JavAIDirtyTracking` | Interface | `addDependent`/`dependents()`, `isFieldDirty`/`markFieldDirty`/`clearFieldDirty`, `isSummaryDirty`/`markSummaryDirty`/`clearSummaryDirty` |
+| `DirtyTrackingSupport` | Concrete implementation | The entire durable per-object dirty-tracking state, as one object — a woven class gets one synthesized field of this type; concrete collections in `javai-model` hold one directly |
+
+## What's actually implemented
+
+- `EmbeddingVector` — real record with a compact constructor validating `dims == values.length` and a
+  non-blank `modelId`. Tested (`EmbeddingVectorTest`): stores values/modelId, rejects mismatched dims,
+  requires a modelId.
+- `VectorMath` — tested (`VectorMathTest`): normalization, weighted addition, cosine similarity, centroid.
+- `JavAIDirtyTracking`/`DirtyTrackingSupport` — the shared dirty-state primitive every woven class and every
+  concrete JavAI collection (in `javai-model`) uses; its cache accessors (`cachedVector()`/`cacheVector()`/
+  etc.) are `public`, not package-private, specifically so `javai-model`'s `JavAIRuntime` and concrete
+  collection types (a different module now) can reach them.
+- `JavAIEmbeddingProvider` has two real implementations, not just the interface: `OllamaEmbeddingProvider`
+  and `TextEmbeddingsInferenceProvider` (Hugging Face's TEI) — both plain `java.net.http.HttpClient`
+  clients, no JSON library dependency. `LocalEmbeddingDefaults` picks between them per host OS (see its own
+  javadoc for why: a confirmed TEI/Candle CPU bug on this project's reference model).
+
+## Provider selection across platforms (discovered building the E2E test, not in the whitepaper)
+
+This module ships two real `JavAIEmbeddingProvider` implementations:
+
+| Implementation | Backend | Status |
+|---|---|---|
+| `TextEmbeddingsInferenceProvider` | Hugging Face TEI (§4.5.2) | The Phase 0 default — `docker/docker-compose.yml`'s `cpu`/`cuda` profiles |
+| `OllamaEmbeddingProvider` | Ollama (GGUF via llama.cpp) | Not in the whitepaper — added for the platform gap below |
+
+The reason a second implementation exists at all: TEI's Candle backend has a confirmed, unresolved upstream
+bug running the reference model, `Qwen/Qwen3-Embedding-0.6B` (§4.5.1), on CPU — "Intel MKL ERROR: Parameter
+8 was incorrect on entry to SGEMM" — reported on native x86_64/AMD hardware, not only under emulation (see
+[huggingface/text-embeddings-inference#667](https://github.com/huggingface/text-embeddings-inference/issues/667)
+and [#636](https://github.com/huggingface/text-embeddings-inference/issues/636); no upstream fix as of this
+writing). It reproduces reliably on macOS, where Apple Silicon additionally needs x86_64 emulation to run
+TEI's `cpu-1.9` image at all (it has no arm64 build).
+
+Ollama runs the same reference model through a genuinely different stack, unaffected by TEI's bug, on an
+image that's natively arm64. `dev.xtrafe.javai.vector.LocalEmbeddingDefaults` is the one place this decision
+is made, so it can't drift between "which provider class gets constructed" and "which container actually
+gets started":
+
+- Defaults to Ollama on macOS, TEI everywhere else (Linux, Windows, unrecognized).
+- Overridable via the `javai.embedding.provider` system property (`ollama` or `tei`).
+- Exposes everything a caller needs to both start the right container (`dockerImage()`, `containerPort()`,
+  `healthCheckPath()`, `modelIdentifierForContainerStartup()`) and construct the matching provider against
+  it (`create(URI)`, `modelLabel()` for the `EmbeddingVector.modelId()` it will produce).
+
+`e2e-client-test`'s `ArticleGraphEmbeddingE2ETest` is built entirely on top of this — it has no
+platform-specific logic of its own, just asks `LocalEmbeddingDefaults` what to do.

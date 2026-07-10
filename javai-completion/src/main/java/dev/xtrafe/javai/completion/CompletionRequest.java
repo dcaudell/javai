@@ -2,7 +2,7 @@ package dev.xtrafe.javai.completion;
 
 import com.github.jknack.handlebars.EscapingStrategy;
 import com.github.jknack.handlebars.Handlebars;
-import dev.xtrafe.javai.runtime.PromptContext;
+import dev.xtrafe.javai.model.PromptContext;
 
 import java.io.IOException;
 import java.util.ArrayList;

@@ -1,16 +1,17 @@
 # Vector Collections
 
-Module: `javai-collections`. Whitepaper: §5.4, §6.4–§6.7. Depends on `javai-runtime` (Vector Core).
+Module: `javai-collections`. Whitepaper: §5.4, §6.4–§6.7. Depends on `javai-vector` + `javai-model` (Vector
+Core).
 
 **Module-placement note (discovered while scaffolding, not in the whitepaper):** `JavAISortable<T>`,
 `JavAIList<T>`, `JavAISet<T>`, and `JavAIMap<K,V>` — described below as part of this extension area —
-physically live in `javai-runtime`, not in this module. Reason: `JavAIVectorizable.query()` returns
-`JavAIList<T>`, and this module depends on `javai-runtime`, not the reverse; keeping `JavAIList` here would
+physically live in `javai-model`, not in this module. Reason: `JavAIVectorizable.query()` returns
+`JavAIList<T>`, and this module depends on `javai-model`, not the reverse; keeping `JavAIList` here would
 create a circular module dependency. What's actually in `javai-collections` is `KnowledgeGraph`,
 `SubgraphResult`, `VectorIndex`, and the `JavAIGraphNode`/`JavAIEdge` interfaces — the types that depend on
-`javai-runtime`'s, not the reverse. Treat the descriptions below as the conceptual primitive surface of
-this extension area; treat `doc/spec/vector-core.md` as where the code actually lives for the
-collection-supertype pieces.
+`javai-model`'s (and `javai-vector`'s), not the reverse. Treat the descriptions below as the conceptual
+primitive surface of this extension area; treat `doc/spec/vector-core.md` as where the code actually lives
+for the collection-supertype pieces.
 
 New, parallel collection types that carry the same vector-search behavior Vector Core gives individual
 objects, plus a native knowledge-graph type. These are what Persistence Bridge maps onto a store and what

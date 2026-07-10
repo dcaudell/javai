@@ -1,6 +1,7 @@
 # Acceleration Substrate
 
-Module: `javai-agent`. Whitepaper: §4.1, §4.2, §5.6. Depends on `javai-annotations` + `javai-runtime`.
+Module: `javai-substrate`. Whitepaper: §4.1, §4.2, §5.6. Depends on `javai-annotations` + `javai-vector` +
+`javai-model`.
 
 Everything below the line an application programmer is expected to think about: the mechanism that makes
 the other five areas real, without being part of their public surface. Nothing here changes the behavior
@@ -8,14 +9,14 @@ described in the other `doc/spec/*.md` files — it only changes how fast or how
 
 **This is the highest-novelty, highest-risk piece of Phase 0. Build and prove a minimal spike here —
 a woven setter on a toy class, correctly setting `FieldDirty`, walking `dependents()`, and lazily
-recomputing on next read — before committing to the full `javai-runtime`/`javai-collections` build-out.**
+recomputing on next read — before committing to the full `javai-model`/`javai-collections` build-out.**
 
 ## Primitives
 
 | Tool / Mechanism | Kind | Role |
 |---|---|---|
 | `javaic` | Compiler driver / javac plugin (Phase 1+, not Phase 0) | Front end: strict Java-superset parser + codegen |
-| `javai-agent` / weaver | Build plugin (Maven/Gradle) or `-javaagent` | Build- or load-time bytecode enhancer (ByteBuddy-based) — the Hibernate-enhancement pattern applied to vectorization |
+| `javai-substrate` / weaver | Build plugin (Maven/Gradle) or `-javaagent` | Build- or load-time bytecode enhancer (ByteBuddy-based) — the Hibernate-enhancement pattern applied to vectorization |
 | `javai` (CLI) | Launcher wrapper | Convenience wrapper around `java`; auto-configures the JavAI runtime jar on the classpath |
 | IntelliJ / VS Code plugin | IDE tooling (later phase) | Syntax highlighting and inline diagnostics |
 | `invokedynamic` backend dispatch | Runtime mechanism (Phase 2+) | Chooses a similarity/embedding backend per call site without new bytecode instructions |
@@ -30,7 +31,7 @@ public void setBody(String body) {
     this.body = body;
 }
 
-// What javai-agent (or javaic, from Phase 1 on) actually weaves in.
+// What javai-substrate (or javaic, from Phase 1 on) actually weaves in.
 // Never written, never seen, not part of any area's public surface:
 public void setBody(String body) {
     this.body = body;

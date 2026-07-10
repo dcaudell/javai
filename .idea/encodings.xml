@@ -1,20 +1,22 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
   <component name="Encoding">
-    <file url="file://$PROJECT_DIR$/javai-agent/src/main/java" charset="UTF-8" />
-    <file url="file://$PROJECT_DIR$/javai-agent/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-annotations/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-annotations/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-collections/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-collections/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-completion/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-completion/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-model/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-model/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-persistence/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-persistence/src/main/resources" charset="UTF-8" />
-    <file url="file://$PROJECT_DIR$/javai-runtime/src/main/java" charset="UTF-8" />
-    <file url="file://$PROJECT_DIR$/javai-runtime/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-substrate/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-substrate/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-supervision/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/javai-supervision/src/main/resources" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-vector/src/main/java" charset="UTF-8" />
+    <file url="file://$PROJECT_DIR$/javai-vector/src/main/resources" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/src/main/java" charset="UTF-8" />
     <file url="file://$PROJECT_DIR$/src/main/resources" charset="UTF-8" />
   </component>

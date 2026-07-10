@@ -3,9 +3,10 @@
 Extension area: **Persistence Bridge**. Whitepaper: §4.4, §4.5.4, §5.2, §6.6. Full detail:
 [`doc/spec/persistence-bridge.md`](../doc/spec/persistence-bridge.md).
 
-Depends on `javai-collections` and `javai-runtime` (not `javai-agent` -- see "What's actually implemented"
-below for why that matters). Takes what Vector Core computes in memory and makes it durable and queryable
-in a real store, without asking the developer to hand-manage a parallel vector index alongside their ORM.
+Depends on `javai-collections`, `javai-vector`, and `javai-model` (not `javai-substrate` -- see "What's
+actually implemented" below for why that matters). Takes what Vector Core computes in memory and makes it
+durable and queryable in a real store, without asking the developer to hand-manage a parallel vector index
+alongside their ORM.
 
 ## Primitives
 
@@ -104,7 +105,7 @@ to separately call `JavAIPI.repository(...)` for a type you intend to query *dir
 
 ## Collections: `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` fields
 
-A field typed as one of `javai-runtime`'s concrete vector-aware collections can never be a *native*
+A field typed as one of `javai-model`'s concrete vector-aware collections can never be a *native*
 Hibernate-mapped collection association -- Hibernate always substitutes its own `PersistentBag`/
 `PersistentSet`/`PersistentMap` wrapper into a mapped collection field the instant it's persisted (confirmed
 empirically: a `ClassCastException` the moment that wrapper can't be assigned back to a field statically
@@ -202,14 +203,14 @@ backend-specific code at all -- it's dispatched in `RepositoryInvocationHandler`
 hermetically fake whether a real similarity search actually ranks correctly, or whether two models' data
 really stay physically separate.
 
-**Deliberately not this module's own weaving.** No `javai-agent` dependency, and no ByteBuddy-based
+**Deliberately not this module's own weaving.** No `javai-substrate` dependency, and no ByteBuddy-based
 Hibernate-enhancement shim of its own either (the whitepaper's original "ByteBuddy enhancement via
 Hibernate's `EnhancementContext`-style SPI" phrasing) -- both would have added real, more fragile machinery
 (a less commonly hand-rolled Hibernate SPI, or a second, module-specific weaver) to auto-manage shadow
 storage on the developer's own entity, when the per-model-table design above delivers the same
 auto-vectorized-on-write behavior without needing to enhance their class at all. `TestArticle` (this
 module's own test fixture) shows the shape a real `@JavAIVectorizable` + `@Entity` class needs:
-`javai-agent`'s weaver, when present, already declares its synthesized state field with the JVM `transient`
+`javai-substrate`'s weaver, when present, already declares its synthesized state field with the JVM `transient`
 modifier specifically so Hibernate's default field-access mapping skips it with no annotation the developer
 never sees in source.
 

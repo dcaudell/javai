@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 

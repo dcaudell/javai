@@ -5,10 +5,10 @@ import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.fixtures.ArticleFixtures;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
-import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 

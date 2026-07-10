@@ -1,15 +1,15 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 
 /**
  * Hand-written stand-in for what a woven {@code @JavAIVectorizable} class would look like -- same
- * pattern as {@code javai-runtime}'s own {@code TestNode}, reimplemented here since that one is
+ * pattern as {@code javai-model}'s own {@code TestNode}, reimplemented here since that one is
  * package-private in a different module. Delegates everything to {@link JavAIRuntime}, exactly like real
  * woven bytecode would.
  */

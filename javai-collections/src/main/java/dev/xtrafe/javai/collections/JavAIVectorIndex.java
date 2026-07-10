@@ -1,10 +1,10 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.CollectionVectorSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIArrayList;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.model.CollectionVectorSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -13,8 +13,8 @@ import java.util.stream.Collectors;
 
 /**
  * The concrete {@link VectorIndex}. Hand-written, not woven -- a plain, user-instantiated container
- * (like {@code javai-runtime}'s {@code JavAIArrayList}), so there's nothing here for
- * {@code javai-agent}'s weaver to do at all. Reuses {@link CollectionVectorSupport#similarityOf} rather
+ * (like {@code javai-model}'s {@code JavAIArrayList}), so there's nothing here for
+ * {@code javai-substrate}'s weaver to do at all. Reuses {@link CollectionVectorSupport#similarityOf} rather
  * than re-deriving the same non-vectorizable-element handling.
  */
 public final class JavAIVectorIndex<T> implements VectorIndex<T> {

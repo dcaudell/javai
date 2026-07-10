@@ -9,7 +9,7 @@
  *   <li><b>Vector Collections</b>: {@link dev.xtrafe.javai.annotations.JavAIGraphNode},
  *       {@link dev.xtrafe.javai.annotations.JavAIEdge}.
  *   <li><b>Completion Fabric</b>: {@link dev.xtrafe.javai.annotations.PromptContext} -- a field-level
- *       allowlist for {@code dev.xtrafe.javai.runtime.PromptContext.defaultMarshall(Object)}'s GSON
+ *       allowlist for {@code dev.xtrafe.javai.model.PromptContext.defaultMarshall(Object)}'s GSON
  *       rendering. Unlike every other annotation here, no weaver processes this one -- GSON's own
  *       reflection (an {@code ExclusionStrategy} in that class) reads it directly at marshalling time, not
  *       at class-load time.
@@ -27,10 +27,10 @@
  * </ul>
  *
  * These are plain annotation definitions with no processing logic of their own -- the weaver in
- * {@code javai-agent} (Vector Core/Collections) or {@code javai-supervision} (Agentic Supervision -- its
- * own, independent weaver; see that module's package-info for why it doesn't reuse javai-agent's) gives
+ * {@code javai-substrate} (Vector Core/Collections) or {@code javai-supervision} (Agentic Supervision -- its
+ * own, independent weaver; see that module's package-info for why it doesn't reuse javai-substrate's) gives
  * most of them behavior; {@code PromptContext} (Completion Fabric) is the one exception, read directly by
- * {@code javai-runtime} rather than any weaver -- see that annotation's own javadoc. See {@code doc/spec/}
+ * {@code javai-model} rather than any weaver -- see that annotation's own javadoc. See {@code doc/spec/}
  * for the full design of each area. Before generating or modifying code that carries the Codegen Guidance
  * annotations, read {@code doc/JavAI_Codegen_Guidance.md} in full.
  *

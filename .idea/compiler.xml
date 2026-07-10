@@ -9,9 +9,11 @@
         <module name="javai-collections" />
         <module name="javai-annotations" />
         <module name="javai-runtime" />
+        <module name="javai-vector" />
         <module name="javai-completion" />
+        <module name="javai-substrate" />
         <module name="javai-persistence" />
-        <module name="javai-agent" />
+        <module name="javai-model" />
         <module name="javai-supervision" />
       </profile>
     </annotationProcessing>

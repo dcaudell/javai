@@ -42,7 +42,7 @@ import java.util.concurrent.Flow;
  * reactive decoder's async tokenizer entirely: read raw NDJSON lines via {@code
  * WebClient.bodyToFlux(String.class)} (proven fast and reliable), then parse each already-complete line
  * synchronously with a plain {@link Gson}, same as parsing any other single, self-contained JSON string.
- * GSON, not Jackson, matching this project's own {@code javai-runtime} (which takes no Jackson dependency
+ * GSON, not Jackson, matching this project's own {@code javai-vector}/{@code javai-model} (which takes no Jackson dependency
  * of its own -- see {@code PromptContext}'s javadoc); {@code ChatResponse}'s snake_case wire fields
  * ({@code done_reason}, {@code total_duration}, ...) need {@link FieldNamingPolicy#LOWER_CASE_WITH_UNDERSCORES},
  * and its {@code createdAt} field needs a custom {@code Instant} adapter, since GSON has no built-in

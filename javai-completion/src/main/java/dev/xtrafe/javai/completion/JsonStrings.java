@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.completion;
 
 /** Minimal JSON string-escaping helper for {@link ReplicateCortex}'s hand-rolled request bodies -- mirrors
- *  {@code javai-runtime}'s own package-private {@code JsonStrings} (not shared across modules, so
+ *  {@code javai-vector}'s own package-private {@code JsonStrings} (not shared across modules, so
  *  duplicated here rather than exposed publicly from a module this one doesn't otherwise depend on for
  *  this reason alone). */
 final class JsonStrings {

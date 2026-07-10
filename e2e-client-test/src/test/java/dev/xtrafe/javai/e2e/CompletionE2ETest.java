@@ -6,10 +6,10 @@ import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
 import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.Comment;
-import dev.xtrafe.javai.runtime.ContextableObject;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
-import dev.xtrafe.javai.runtime.PromptContext;
+import dev.xtrafe.javai.model.ContextableObject;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
+import dev.xtrafe.javai.model.PromptContext;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
@@ -18,7 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Real end-to-end proof that the {@code javai-completion} connector layer and {@code javai-runtime}'s
+ * Real end-to-end proof that the {@code javai-completion} connector layer and {@code javai-model}'s
  * {@code Contextable}/{@code PromptContext} RAG-integration primitives work together against a real
  * backend -- not a hermetic one. {@code javai-completion} was previously never wired into this project
  * ("this pass stayed scoped to javai-completion itself"); this is that wiring's first real usage.

@@ -68,9 +68,19 @@ Persistence Bridge (nothing to persist without it). Vector Collections feeds Per
 (`toContext()` is defined on Vector Collections' result types). Codegen Guidance is mostly a leaf, consumed
 by the Substrate.
 
+**Vector Core is realized by two physical modules, not one** — `javai-vector` (pure vector/embedding
+functionality: `EmbeddingVector`, the CPU similarity backend, the embedding-provider SPI, dirty-tracking
+primitives) and `javai-model` (`JavAIVectorizable`/`JavAIRuntime`, plus the Vector Collections interfaces
+`JavAIList`/`Set`/`Map` and the Completion Fabric RAG primitives `Contextable`/`PromptContext`, all
+physically homed here for the same reason: `JavAIVectorizable.query()` returns `JavAIList<T>`, and
+`JavAIList` implements `JavAIVectorizable` right back, so the two can never live in separate modules
+without an illegal cycle — see `javai-model`'s own package-info.java for the full trace). This mirrors, and
+formalizes, the same "conceptual area ≠ physical module" split this file already documents for `JavAIList`
+below — see the `doc/module-dependency-graph.md` diagram for the actual 8-module Maven reactor shape.
+
 Agentic Supervision is deliberately *not* wired into this graph the way areas 1–6 are. It has its own
 independent weaver rather than extending Acceleration Substrate's, so that its module (`javai-supervision`)
-stays at the same early, cheap-to-prove tier as `javai-agent` instead of pulling Acceleration Substrate
+stays at the same early, cheap-to-prove tier as `javai-substrate` instead of pulling Acceleration Substrate
 downstream of Completion Fabric/Vector Collections. An "Agentic Listener" — a supervision listener whose
 decision is LLM-backed and grounded in RAG over the object graph — is documented as an application-level
 composition of Agentic Supervision's generic listener interfaces with Completion Fabric and Vector
@@ -88,16 +98,17 @@ place to experiment — a mistake there doesn't ripple into the other six areas.
 Phase 0 targets full functional completeness — every annotation, every collection, every auto-generated
 method, both persistence backends, and the entire Completion/RAG API — delivered via runtime bytecode
 weaving instead of a real compiler, because nothing in the functional surface actually requires a compiler
-or a GPU to work correctly, only to work fast. Seven components, each a plain library, each independently
-buildable in the order below:
+or a GPU to work correctly, only to work fast. Eight components (Vector Core is realized by two — see
+above), each a plain library, each independently buildable in the order below:
 
 | Component | Mechanism | Delivers |
 |---|---|---|
 | `javai-annotations` | Plain annotation definitions, no processing logic | Full annotation vocabulary across all seven areas |
-| `javai-agent` (Acceleration Substrate) | ByteBuddy weaving, load-time agent or build-time Maven/Gradle plugin | Implements `JavAIVectorizable`/`JavAIGraphNode` on any annotated class |
+| `javai-vector` (Vector Core, part 1) | Pure Java library | `EmbeddingVector`, CPU similarity, embedding providers, dirty-tracking primitives |
+| `javai-model` (Vector Core, part 2 + physical home for Vector Collections/Completion Fabric primitives) | Pure Java library, depends on `javai-vector` | `JavAIVectorizable`/`JavAIRuntime` (back-edge propagation, `query()`), `JavAIList`/`Set`/`Map`, `Contextable`/`PromptContext` |
+| `javai-substrate` (Acceleration Substrate) | ByteBuddy weaving, load-time agent or build-time Maven/Gradle plugin | Implements `JavAIVectorizable`/`JavAIGraphNode` on any annotated class |
 | `javai-supervision` (Agentic Supervision) | ByteBuddy weaving, its own independent installer | Sync (blocking, read-write) + async (fire-and-forget, observation-only) method/constructor interception |
-| `javai-runtime` (Vector Core) | Pure Java library | `EmbeddingVector`, back-edge propagation, `query()`, CPU similarity, local embedding provider |
-| `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-runtime` | `JavAIList`/`Set`/`Map`, `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
+| `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-vector` + `javai-model` | `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
 | `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim | Both persistence backends real in Phase 0, not aspirational |
 | `javai-completion` (Completion Fabric) | Wraps Spring AI `ChatModel` | Full RAG API — `PromptContext`, `CompletionRequest`/`Result`, `toContext()`, `complete()`/`completeStreaming()` |
 
@@ -137,21 +148,23 @@ Phase 0) `@Summary` tuning parameters: `doc/spec/vector-core.md`.
 
 ## Current status
 
-Phase 0, actively underway. `javai-annotations`, `javai-runtime` (Vector Core, now including the
-`Contextable`/`PromptContext` RAG-integration primitives — see below), `javai-agent` (Acceleration
-Substrate's weaving, including the full lifecycle state machine and summary-vector propagation),
-`javai-collections` (Vector Collections), and `javai-persistence` (Persistence Bridge, both backends,
-including model-versioning/reindex/revert) all have real, tested implementations — see each module's own
-README for exactly what's covered and what's still deliberately out of scope. `javai-completion` (Completion
-Fabric) has both its connector layer (`Cortex`, six providers: OpenAI, Anthropic, Groq, vLLM, Ollama,
-Replicate; `CompletionRequest`/`CompletionResult`, provider-specific tuning parameters) and its
-RAG-integration half real and tested: grounding a completion in a `JavAIList`/`Set`/`Map` via `PromptContext`
-(`Contextable`, `ContextableObject`) — these two primitives live in `javai-runtime`, not `javai-completion`,
-for a real dependency-direction reason documented in both modules' own READMEs. `KnowledgeGraph`/
-`SubgraphResult` (`javai-collections`) don't implement `Contextable` yet — deferred pending a cycle-safe
-design, since GSON's default marshalling has no cycle guard and those types are graph-shaped by design; see
-`javai-completion`'s own README for exactly what's covered. `javai-supervision` (Agentic Supervision) is
-still scaffolding only — annotations and/or interfaces defined,
+Phase 0, actively underway. `javai-annotations`, `javai-vector` + `javai-model` (Vector Core, physically
+split across the two — see above — with `javai-model` also including the `Contextable`/`PromptContext`
+RAG-integration primitives and the `JavAIList`/`Set`/`Map` Vector Collections interfaces), `javai-substrate`
+(Acceleration Substrate's weaving, including the full lifecycle state machine and summary-vector
+propagation), `javai-collections` (Vector Collections' `KnowledgeGraph`/`SubgraphResult`/`VectorIndex`), and
+`javai-persistence` (Persistence Bridge, both backends, including model-versioning/reindex/revert) all have
+real, tested implementations — see each module's own README for exactly what's covered and what's still
+deliberately out of scope. `javai-completion` (Completion Fabric) has both its connector layer (`Cortex`,
+six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
+provider-specific tuning parameters, Handlebars-based prompt templating via `CompletionRequest.render()`)
+and its RAG-integration half real and tested: grounding a completion in a `JavAIList`/`Set`/`Map` via
+`PromptContext` (`Contextable`, `ContextableObject`) — these primitives live in `javai-model`, not
+`javai-completion`, for a real dependency-direction reason documented in both modules' own READMEs.
+`KnowledgeGraph`/`SubgraphResult` (`javai-collections`) don't implement `Contextable` yet — deferred pending
+a cycle-safe design, since GSON's default marshalling has no cycle guard and those types are graph-shaped by
+design; see `javai-completion`'s own README for exactly what's covered. `javai-supervision` (Agentic
+Supervision) is still scaffolding only — annotations and/or interfaces defined,
 no weaving or dispatch logic written yet. Don't assume anything beyond what's in a given module's actual
 source and tests reflects working code; check that module's README before relying
 on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design and may

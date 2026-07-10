@@ -35,13 +35,24 @@ means concretely.
 
 | Area | Module | One-line purpose |
 |---|---|---|
-| Vector Core | `javai-runtime` | Embedding calculation, dirty-state propagation, object-graph `query()` |
+| Vector Core | `javai-vector` + `javai-model` (see note below) | Embedding calculation, dirty-state propagation, object-graph `query()` |
 | Persistence Bridge | `javai-persistence` | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
 | Completion Fabric | `javai-completion` | Provider-agnostic RAG completions, wrapping Spring AI |
-| Vector Collections | `javai-collections` | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` |
+| Vector Collections | `javai-collections` (interfaces in `javai-model` — see note below) | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` |
 | Codegen Guidance | `javai-annotations` (definitions only — see `doc/JavAI_Codegen_Guidance.md`) | Annotations governing what an LLM agent may read/write/trust |
-| Acceleration Substrate | `javai-agent` | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
+| Acceleration Substrate | `javai-substrate` | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
 | Agentic Supervision | `javai-supervision` | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
+
+**`javai-model` is a physical-only module, not an eighth conceptual area.** It's the formalized home for
+whatever has to live upstream of `javai-collections`/`javai-completion` for compile-order reasons rather
+than because it's vector/embedding core: `JavAIVectorizable`/`JavAIRuntime` (Vector Core's contract and
+engine — dependency-direction hostages of `JavAIList`, since `JavAIVectorizable.query()` returns
+`JavAIList<T>` and `JavAIList` extends `JavAIVectorizable` right back), the `JavAIList`/`Set`/`Map`
+interfaces and concrete collections (Vector Collections), and `Contextable`/`PromptContext` (Completion
+Fabric's RAG primitives). `javai-vector` holds only what has zero reference to any of that: `EmbeddingVector`,
+the CPU similarity backend, embedding providers, and dirty-tracking primitives. See `doc/module-dependency-graph.md`
+for the full physical module graph, and `javai-model`'s own package-info.java for the traced-not-assumed
+reasoning behind the split.
 
 `javai-annotations` also carries Vector Core's and Vector Collections' annotation vocabulary (`@Vectorize`,
 `@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.) plus Agentic Supervision's
@@ -51,17 +62,18 @@ depends on, directly or transitively.
 ## Build order (matches the dependency graph in `SPEC.md`)
 
 1. `javai-annotations` — no internal dependencies, unblocks everything else.
-2. `javai-runtime` and `javai-agent` and `javai-supervision` — `javai-runtime` depends only on
-   `javai-annotations`; `javai-agent` depends on `javai-annotations` + `javai-runtime` (it weaves calls into
-   runtime hooks); `javai-supervision` depends only on `javai-annotations` (its own independent weaver — see
-   `doc/spec/agentic-supervision.md` for why it doesn't extend `javai-agent`). These three can proceed in
-   parallel once `javai-annotations` exists.
-3. `javai-collections` — depends on `javai-runtime`.
-4. `javai-persistence` and `javai-completion` — both depend on `javai-collections` (+ `javai-runtime`
-   transitively); order between these two doesn't matter.
+2. `javai-vector` — depends only on `javai-annotations`.
+3. `javai-model` — depends on `javai-annotations` + `javai-vector`.
+4. `javai-substrate` and `javai-supervision` — `javai-substrate` depends on `javai-annotations` +
+   `javai-vector` + `javai-model` (it weaves calls into both); `javai-supervision` depends only on
+   `javai-annotations` (its own independent weaver — see `doc/spec/agentic-supervision.md` for why it
+   doesn't extend `javai-substrate`). These two can proceed in parallel once `javai-model` exists.
+5. `javai-collections` — depends on `javai-vector` + `javai-model`.
+6. `javai-persistence` and `javai-completion` — both depend on `javai-collections` (+ `javai-vector`/
+   `javai-model` transitively); order between these two doesn't matter.
 
 Prove the weaving mechanism itself (a toy `@Vectorize` class, a woven setter, `markDirty()`/`propagateDirty()`
-firing correctly, lazy recomputation on next read) before building out `javai-runtime` and `javai-collections`
+firing correctly, lazy recomputation on next read) before building out `javai-model` and `javai-collections`
 in full — it's the highest-novelty, highest-risk piece, and everything downstream assumes it works.
 `javai-supervision`'s own weaving spike (a toy `@SyncSupervision` method, a listener registered and actually
 firing, PRE-stage argument rewrite proven end to end) is a second, independent risk spike — worth proving
@@ -80,7 +92,7 @@ own supervision-runtime classes must never carry `@SyncSupervision`/`@AsyncSuper
 
 ## Single multi-module build
 
-All seven modules live under this one Maven reactor and are expected to build together (`mvn install` or
+All eight modules live under this one Maven reactor and are expected to build together (`mvn install` or
 `mvn verify` from the repo root), not independently — they're interdependent by design, per the dependency
 graph above. Opening this repository root in IntelliJ IDEA imports all modules as one project automatically,
 since IntelliJ detects the root `pom.xml`.

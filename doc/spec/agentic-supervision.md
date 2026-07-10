@@ -1,7 +1,7 @@
 # Agentic Supervision
 
 Module: `javai-supervision`. Whitepaper: §5.7. Depends only on `javai-annotations` (+ ByteBuddy) — the same
-early, low-risk tier as Acceleration Substrate (`javai-agent`), not downstream of Vector Core, Vector
+early, low-risk tier as Acceleration Substrate (`javai-substrate`), not downstream of Vector Core, Vector
 Collections, or Completion Fabric.
 
 **A reframing worth stating explicitly, since it's the motivation for the whole area:** a classical stack
@@ -35,7 +35,7 @@ read-write access rather than being passive notifications. What changes, and why
   is no need for a separate constructor-flavored enum value the way the original had.
 - **Reflection-and-boxing becomes ByteBuddy `Advice`.** The original's static `Interceptor` reflectively
   re-resolved the `Method`/`Constructor` on every single call and boxed every primitive argument into
-  `Object[]` to do it. ByteBuddy `Advice` is inlined, typed bytecode — see `javai-agent`'s `JavAIWeaver`
+  `Object[]` to do it. ByteBuddy `Advice` is inlined, typed bytecode — see `javai-substrate`'s `JavAIWeaver`
   for the idiom already established in this project (`@Advice.OnMethodExit`, `@Advice.This`,
   `@Advice.Argument`) and follow it here.
 - **Class-level allowlist via a custom `ClassLoader` becomes annotation-scoped `ElementMatchers`,
@@ -78,7 +78,7 @@ had between "this class is `@Managed`" and "an `Advisor` is actually registered 
 | `SyncSupervisionListener` | Interface (`javai-supervision`) | `onPre`/`onPost`/`onException`, real mutation rights, default no-ops |
 | `AsyncSupervisionListener` | Interface (`javai-supervision`) | Same three methods, observation-only, mutations discarded |
 | `JavAISupervisionRuntime` (planned) | Static facade | Listener registration + the dispatch logic Advice calls into |
-| `SupervisionWeaver` (planned) | ByteBuddy `AgentBuilder` installer | Weaves annotated methods/constructors; its own installer, independent of `javai-agent`'s |
+| `SupervisionWeaver` (planned) | ByteBuddy `AgentBuilder` installer | Weaves annotated methods/constructors; its own installer, independent of `javai-substrate`'s |
 
 ## The sync/async model, precisely
 
@@ -183,15 +183,16 @@ denylist has no equivalent here because opt-in selection means there's nothing t
 
 ## Relationship to the rest of JavAI Extensions
 
-**Not implemented via Acceleration Substrate.** `javai-agent` depends only on `javai-annotations` +
-`javai-runtime`, and is deliberately the first thing Phase 0 proves ("prove the weaving mechanism itself...
-before building out javai-runtime and javai-collections in full" — `CLAUDE.md`). If Agentic Supervision's
-weaving lived there instead of in its own module, and an Agentic Listener implementation eventually wants
-`javai-completion` (to call an LLM) or `javai-collections`/`javai-runtime` (to ground its decision), then
-`javai-agent` would transitively need those too — dragging the one module meant to be provable earliest and
-cheapest downstream of the entire rest of the reactor. `javai-supervision` is instead a second, independent,
-equally-early risk spike: its own `AgentBuilder` installer, its own Advice classes, no dependency on
-`javai-agent` and no dependency the other direction either.
+**Not implemented via Acceleration Substrate.** `javai-substrate` depends on `javai-annotations` +
+`javai-vector` + `javai-model`, and is deliberately the first thing Phase 0 proves ("prove the weaving
+mechanism itself... before building out javai-vector/javai-model and javai-collections in full" —
+`CLAUDE.md`). If Agentic Supervision's weaving lived there instead of in its own module, and an Agentic
+Listener implementation eventually wants `javai-completion` (to call an LLM) or
+`javai-collections`/`javai-vector`/`javai-model` (to ground its decision), then `javai-substrate` would
+transitively need those too — dragging the one module meant to be provable earliest and cheapest downstream
+of the entire rest of the reactor. `javai-supervision` is instead a second, independent, equally-early risk
+spike: its own `AgentBuilder` installer, its own Advice classes, no dependency on `javai-substrate` and no
+dependency the other direction either.
 
 **Not the same axis as Codegen Guidance, despite surface similarity.** `@AgentWritable`/`@Frozen`/
 `@HumanOnly` govern what an agent may *edit*, at design/generation time. `@SyncSupervision`/

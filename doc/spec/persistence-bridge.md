@@ -1,7 +1,7 @@
 # Persistence Bridge
 
-Module: `javai-persistence`. Whitepaper: §4.4, §4.5.4, §5.2, §6.6. Depends on `javai-collections` and
-`javai-runtime`.
+Module: `javai-persistence`. Whitepaper: §4.4, §4.5.4, §5.2, §6.6. Depends on `javai-collections`,
+`javai-vector`, and `javai-model`.
 
 Takes what Vector Core computes in memory and makes it durable and queryable in a real store, without
 asking the developer to hand-manage a parallel vector index alongside their ORM.

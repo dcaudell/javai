@@ -5,7 +5,7 @@ already underway; see the "Origin" note below). Full detail:
 [`doc/spec/agentic-supervision.md`](../doc/spec/agentic-supervision.md).
 
 Depends only on `javai-annotations` + ByteBuddy — deliberately the same early, low-risk tier as
-`javai-agent`, not downstream of Vector Core, Vector Collections, or Completion Fabric. Lets a
+`javai-substrate`, not downstream of Vector Core, Vector Collections, or Completion Fabric. Lets a
 `@SyncSupervision`/`@AsyncSupervision`-annotated method or constructor be observed, and optionally
 intervened on, by registered listeners at three moments: PRE (before the body runs), POST (after a normal
 return), EXCEPTION (after a throw).
@@ -100,7 +100,7 @@ runtime's own code. Don't.
 public contract. `SupervisionPointcut`, `@SyncSupervision`, `@AsyncSupervision` — real, in
 `javai-annotations`. Not yet implemented: `JavAISupervisionRuntime` (registration + dispatch) and
 `SupervisionWeaver` (the actual ByteBuddy weaving) — see `package-info.java` for the shape both are
-expected to take, following `javai-agent`'s `JavAIWeaver`/`JavAIRuntime` split as the established idiom.
+expected to take, following `javai-substrate`'s `JavAIWeaver`/`JavAIRuntime` split as the established idiom.
 `DependencyWiringTest` proves the classpath resolves and the event/listener types are usable; it doesn't
 exercise any weaving, because none exists yet.
 
@@ -111,6 +111,6 @@ triggers another async reaction, ...).
 An "Agentic Listener" — a `SyncSupervisionListener`/`AsyncSupervisionListener` implementation that grounds
 its decisions in RAG over the object graph and calls an LLM to decide what to do — is documented as an
 application-level worked example in `doc/spec/agentic-supervision.md`, built on this module's listener
-interfaces plus `javai-completion` (the actual LLM call) and `javai-runtime`/`javai-collections` (the RAG
-grounding). It is not a dependency this module takes on itself, and not part of this module's own Phase 0
-deliverable.
+interfaces plus `javai-completion` (the actual LLM call) and `javai-vector`/`javai-model`/`javai-collections`
+(the RAG grounding). It is not a dependency this module takes on itself, and not part of this module's own
+Phase 0 deliverable.

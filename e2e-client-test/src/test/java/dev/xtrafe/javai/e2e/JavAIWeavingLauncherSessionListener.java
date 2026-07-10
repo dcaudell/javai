@@ -1,6 +1,6 @@
 package dev.xtrafe.javai.e2e;
 
-import dev.xtrafe.javai.agent.JavAIWeaver;
+import dev.xtrafe.javai.substrate.JavAIWeaver;
 import net.bytebuddy.agent.ByteBuddyAgent;
 import org.junit.platform.launcher.LauncherSession;
 import org.junit.platform.launcher.LauncherSessionListener;

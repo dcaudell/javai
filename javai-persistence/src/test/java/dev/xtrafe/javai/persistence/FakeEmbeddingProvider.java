@@ -1,12 +1,12 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIEmbeddingProvider;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
 
 import java.time.Instant;
 
 /**
- * Deterministic, network-free stand-in -- same pattern as {@code javai-collections}'/{@code javai-agent}'s
+ * Deterministic, network-free stand-in -- same pattern as {@code javai-collections}'/{@code javai-substrate}'s
  * own test fixtures of the same name. javai-persistence's tests still need real Postgres/Neo4j containers
  * (there's no meaningful way to hermetically fake "does pgvector's/Neo4j's similarity search actually rank
  * correctly"), but the *embeddings themselves* don't need to be real for that -- only genuinely different

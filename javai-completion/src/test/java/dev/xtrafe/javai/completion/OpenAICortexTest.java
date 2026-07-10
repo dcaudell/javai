@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.completion;
 
 import com.sun.net.httpserver.HttpServer;
-import dev.xtrafe.javai.runtime.PromptContext;
+import dev.xtrafe.javai.model.PromptContext;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 

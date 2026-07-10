@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.e2e.domain;
 
 import dev.xtrafe.javai.persistence.JavAIRepository;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
+import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.util.List;
 

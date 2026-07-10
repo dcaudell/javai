@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.completion;
 
-import dev.xtrafe.javai.runtime.ContextableObject;
-import dev.xtrafe.javai.runtime.PromptContext;
+import dev.xtrafe.javai.model.ContextableObject;
+import dev.xtrafe.javai.model.PromptContext;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;

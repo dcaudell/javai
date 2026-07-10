@@ -4,7 +4,7 @@
  * exists), and provider-specific tuning parameters via {@code CompletionRequest.providerOptions()}.
  *
  * <p>{@code PromptContext} and {@code Contextable} -- the RAG-integration primitives grounding a completion
- * in a {@code JavAIList}/{@code Set}/{@code Map} -- live in {@code dev.xtrafe.javai.runtime}, not here; see
+ * in a {@code JavAIList}/{@code Set}/{@code Map} -- live in {@code dev.xtrafe.javai.model}, not here; see
  * that package's own {@code package-info.java} for why. This module consumes them directly, the same way
  * it consumes {@code JavAIList} itself.
  *

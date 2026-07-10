@@ -1,6 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
+import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;

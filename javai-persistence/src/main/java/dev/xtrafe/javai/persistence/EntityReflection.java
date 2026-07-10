@@ -13,7 +13,7 @@ import java.util.UUID;
 
 /**
  * Small, hierarchy-aware reflection helpers shared by both backends -- mirrors the hierarchy-walking style
- * {@code JavAIRuntime}'s {@code allFields()}/{@code findField()} already use in {@code javai-runtime}, but
+ * {@code JavAIRuntime}'s {@code allFields()}/{@code findField()} already use in {@code javai-model}, but
  * reimplemented here rather than exposed cross-module: this module only needs field *discovery* (annotated
  * names, the {@code @Id} value), never the dirty-tracking/lazy-recompute machinery those live alongside.
  */

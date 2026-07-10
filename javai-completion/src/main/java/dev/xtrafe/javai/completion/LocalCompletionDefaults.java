@@ -4,7 +4,7 @@ import java.net.URI;
 
 /**
  * The one place this repo decides which local chat model {@link OllamaCortex} defaults to for
- * development and testing -- mirrors {@code javai-runtime}'s {@code LocalEmbeddingDefaults} in spirit
+ * development and testing -- mirrors {@code javai-vector}'s {@code LocalEmbeddingDefaults} in spirit
  * (both {@code e2e-client-test}'s Docker image and any local-dev caller read this one class, so the model
  * baked into the container and the model this code asks for can't drift apart), but simpler: unlike the
  * embeddings case, there's no per-platform branching here. Ollama's Docker image is natively multi-arch and

@@ -1,8 +1,8 @@
 package dev.xtrafe.javai.e2e;
 
 import dev.xtrafe.javai.e2e.fixtures.SampleDataSeeder;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.images.builder.ImageFromDockerfile;

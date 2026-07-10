@@ -6,7 +6,7 @@
 
   <parent>
     <groupId>dev.xtrafe.javai</groupId>
-    <artifactId>javai-parent</artifactId>
+    <artifactId>javai</artifactId>
     <version>0.1.0-SNAPSHOT</version>
   </parent>
 
@@ -16,13 +16,13 @@
   <!--
     Agentic Supervision: SupervisionEvent, Sync/AsyncSupervisionListener, JavAISupervision (the
     registration + dispatch facade), SupervisionWeaver (its own, independent ByteBuddy weaver — see
-    package-info for why this doesn't reuse javai-agent). See doc/spec/agentic-supervision.md.
+    package-info for why this doesn't reuse javai-substrate). See doc/spec/agentic-supervision.md.
 
     Depends only on javai-annotations + ByteBuddy, deliberately — same early, low-risk tier as
-    javai-agent, not downstream of Vector Core/Collections/Completion Fabric. An "Agentic Listener" that
+    javai-vector, not downstream of Vector Core/Collections/Completion Fabric. An "Agentic Listener" that
     grounds its decisions in RAG over the object graph is documented as an application-level worked
-    example built on top of this module's generic listener interfaces plus javai-completion/javai-runtime/
-    javai-collections — not a dependency this module itself takes on.
+    example built on top of this module's generic listener interfaces plus javai-completion/javai-vector/
+    javai-model/javai-collections — not a dependency this module itself takes on.
   -->
 
   <dependencies>

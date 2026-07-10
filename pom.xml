@@ -5,7 +5,7 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>dev.xtrafe.javai</groupId>
-  <artifactId>javai-parent</artifactId>
+  <artifactId>javai</artifactId>
   <version>0.1.0-SNAPSHOT</version>
   <packaging>pom</packaging>
 
@@ -17,19 +17,25 @@
   </description>
 
   <!--
-    All seven Phase 0 modules are interdependent by design (see SPEC.md's dependency
-    graph) and are meant to build together, not independently — `mvn install` (or
-    `mvn verify`) from this root builds the whole reactor in dependency order.
-    Build order matches SPEC.md/CLAUDE.md: javai-annotations, then javai-runtime and
-    javai-agent and javai-supervision in parallel (javai-agent and javai-supervision
-    each depend only on javai-annotations, not on each other or on javai-runtime —
-    two independent weavers, two independent risk spikes), then javai-collections,
-    then javai-persistence and javai-completion.
+    Eight modules realizing seven conceptual extension areas (see SPEC.md's dependency graph and its note
+    on why "Vector Core" is physically split across two modules) are interdependent by design and meant to
+    build together, not independently — `mvn install` (or `mvn verify`) from this root builds the whole
+    reactor in dependency order.
+    Build order: javai-annotations, then javai-vector (pure vector/embedding functionality: EmbeddingVector,
+    VectorMath, embedding providers, dirty-tracking primitives — depends only on javai-annotations), then
+    javai-model (the JavAIVectorizable contract + JavAIRuntime engine, JavAIList/Set/Map + concrete
+    collections, and the Contextable/PromptContext RAG primitives — everything that had to live physically
+    upstream of javai-collections/javai-completion for compile-order reasons rather than because it's
+    vector/embedding core; depends on javai-vector), then javai-substrate and javai-supervision in parallel
+    (javai-substrate depends on javai-vector + javai-model; javai-supervision depends only on
+    javai-annotations — two independent weavers, two independent risk spikes, neither depends on the
+    other), then javai-collections, then javai-persistence and javai-completion.
   -->
   <modules>
     <module>javai-annotations</module>
-    <module>javai-runtime</module>
-    <module>javai-agent</module>
+    <module>javai-vector</module>
+    <module>javai-model</module>
+    <module>javai-substrate</module>
     <module>javai-supervision</module>
     <module>javai-collections</module>
     <module>javai-persistence</module>
@@ -43,7 +49,7 @@
     <junit.version>5.11.0</junit.version>
     <!-- TODO: verify/pin current releases before real use — placeholders from scaffolding. -->
     <!--
-      Bumped from the 1.15.10 placeholder while building the javai-agent weaving spike: 1.15.10 hard-fails
+      Bumped from the 1.15.10 placeholder while building the javai-substrate weaving spike: 1.15.10 hard-fails
       parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
       repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
     -->
@@ -65,9 +71,9 @@
       doesn't need yet). Revisit before Phase 0 sign-off.
     -->
     <spring-ai.version>1.0.9</spring-ai.version>
-    <!-- javai-runtime's own Contextable/PromptContext marshalling; deliberately GSON, not the
+    <!-- javai-model's own Contextable/PromptContext marshalling; deliberately GSON, not the
          Jackson that Spring AI pulls in transitively (see javai-completion's Cortex classes' own
-         javadoc for why javai-runtime never took a Jackson dependency of its own). -->
+         javadoc for why javai-vector/javai-model never took a Jackson dependency of their own). -->
     <gson.version>2.14.0</gson.version>
     <!-- CompletionRequest.render()'s Mustache-compatible templating engine (javai-completion). Current
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
@@ -106,7 +112,12 @@
       </dependency>
       <dependency>
         <groupId>dev.xtrafe.javai</groupId>
-        <artifactId>javai-runtime</artifactId>
+        <artifactId>javai-vector</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>dev.xtrafe.javai</groupId>
+        <artifactId>javai-model</artifactId>
         <version>${project.version}</version>
       </dependency>
       <dependency>

@@ -1,6 +1,6 @@
 # e2e-client-test
 
-A standalone client project -- deliberately **not** one of JavAI Extensions' six Phase 0 reactor modules,
+A standalone client project -- deliberately **not** one of JavAI Extensions' eight Phase 0 reactor modules,
 and **not** listed in the root `pom.xml`'s `<modules>`. This is downstream code exercising the library the
 way any other Java project would: its own `pom.xml`, its own dependency versions, `dev.xtrafe.javai:javai-*`
 consumed as ordinary Maven artifacts.
@@ -73,7 +73,7 @@ docker ps -a --filter ancestor=javai-e2e-monolithic --format '{{.ID}}' | xargs -
 ## Provider choice
 
 Which container starts and which `JavAIEmbeddingProvider` gets configured is decided once, by
-`dev.xtrafe.javai.runtime.LocalEmbeddingDefaults` -- this test has no platform-specific logic of its own,
+`dev.xtrafe.javai.vector.LocalEmbeddingDefaults` -- this test has no platform-specific logic of its own,
 it just asks that class what to do. Full story (why a second provider exists at all, the exact upstream
 bug, how the override works) is in
 [`doc/spec/vector-core.md`](../doc/spec/vector-core.md)'s "Provider selection across platforms" section --
@@ -84,7 +84,7 @@ same reference model (`Qwen/Qwen3-Embedding-0.6B`). Force a specific one regardl
 ## Prerequisites
 
 1. Docker running locally (Testcontainers needs it).
-2. The seven reactor modules installed to your local Maven repository:
+2. The eight reactor modules installed to your local Maven repository:
    ```sh
    cd .. && mvn install
    ```
@@ -111,6 +111,6 @@ sidecar), and no packaged `-javaagent` jar. Weaving is installed via `ByteBuddyA
 from a `JavAIWeavingLauncherSessionListener` (`META-INF/services`-registered), not from `@BeforeAll` --
 installing it there doesn't work, because JUnit's own test discovery reflectively touches (and thereby
 unwovenly loads) `Article`/`Comment` before any `@BeforeAll` callback runs; see that class's javadoc. A
-real deployment would use a `-javaagent:javai-agent.jar` JVM flag or a build-time Maven/Gradle plugin
+real deployment would use a `-javaagent:javai-substrate.jar` JVM flag or a build-time Maven/Gradle plugin
 instead (see `doc/spec/acceleration-substrate.md`); packaging that is future work, not required to prove
 the functional behavior here.

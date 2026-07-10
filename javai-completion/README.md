@@ -3,13 +3,13 @@
 Extension area: **Completion Fabric**. Whitepaper: §5.3, §7.1–§7.3. Full detail:
 [`doc/spec/completion-fabric.md`](../doc/spec/completion-fabric.md).
 
-Depends on `javai-collections` (+ `javai-runtime` transitively). Covers both halves of
+Depends on `javai-collections` (+ `javai-vector`/`javai-model` transitively). Covers both halves of
 `doc/spec/completion-fabric.md`: the **connector layer** — naming, constructing, and tuning the objects that
 actually talk to an LLM backend, called a **`Cortex`** per this project's own naming (the spec calls this
 `JavAICompletionProvider`) — six providers (OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate), easy to
 construct several of at once, local or remote, each with its own provider-specific tuning parameters — and
 the **RAG-integration half**: grounding a completion in a `JavAIList`/`Set`/`Map` via `PromptContext`, which
-this module consumes from `javai-runtime` rather than owning — see "RAG integration" below for why.
+this module consumes from `javai-model` rather than owning — see "RAG integration" below for why.
 
 ## Primitives
 
@@ -22,7 +22,7 @@ this module consumes from `javai-runtime` rather than owning — see "RAG integr
 | `LocalCompletionDefaults` | Static utility | The one place this repo decides which local chat model `OllamaCortex` defaults to (`qwen3:8b`) |
 
 `PromptContext`/`Contextable`/`ContextableObject` — the RAG-integration primitives `CompletionRequest`
-carries a `PromptContext` of — live in `javai-runtime`, not here; see "RAG integration" below.
+carries a `PromptContext` of — live in `javai-model`, not here; see "RAG integration" below.
 
 ## Cortex construction: no central registry
 
@@ -73,7 +73,7 @@ lines completes in under a second. This is a known class of async-parser limitat
 deserializers (here, `java.time.Instant`) that an ordinary, fully buffered synchronous parser doesn't hit.
 `OllamaCortex` sidesteps it: read raw NDJSON lines via `WebClient.bodyToFlux(String.class)` (proven fast and
 reliable), then parse each already-complete line synchronously with a plain `Gson` — GSON, not Jackson,
-matching this project's `javai-runtime` (which takes no Jackson dependency of its own; see `PromptContext`'s
+matching this project's `javai-vector`/`javai-model` (which take no Jackson dependency of their own; see `PromptContext`'s
 own javadoc). `ChatResponse`'s snake_case wire fields need `FieldNamingPolicy.LOWER_CASE_WITH_UNDERSCORES`,
 and its `createdAt` field needs a custom `Instant` adapter, since GSON has no built-in `java.time` support
 either. `OllamaCortexRealContainerTest` is what caught the original hang, and re-confirmed the GSON-based
@@ -84,7 +84,7 @@ the bug is specific to how a reactive decoder's async tokenizer behaves against 
 Justified, not a shortcut: no Spring AI `ChatModel` exists for Replicate, and its API is structurally
 different from every other provider here — a call creates a *prediction* (a job), resolved either
 synchronously (via the `Prefer: wait` header, used here) or by polling the prediction's own status URL
-until it reaches a terminal state. `ReplicateCortex` hand-rolls this the same way `javai-runtime`'s
+until it reaches a terminal state. `ReplicateCortex` hand-rolls this the same way `javai-vector`'s
 `OllamaEmbeddingProvider` hand-rolls its own small, fixed-shape JSON rather than pulling in a library.
 `completeStreaming()` on this one Cortex is a first-pass simplification: it computes the full result via
 `complete()` and delivers it as a single chunk, rather than parsing Replicate's real SSE token stream —
@@ -108,7 +108,7 @@ concrete, real, tested examples backing this requirement, not just a claim:
 - **OpenAI/Groq/vLLM**: `"reasoning_effort"` (a `String`: `"low"`/`"medium"`/`"high"`) maps onto
   `OpenAiChatOptions.reasoningEffort(...)`.
 
-## RAG integration: `PromptContext` lives in `javai-runtime`
+## RAG integration: `PromptContext` lives in `javai-model`
 
 `doc/spec/completion-fabric.md`'s original vision put `toContext(): PromptContext` directly on
 `JavAIList<T>`/`SubgraphResult<N,E>`. Taken literally, that's a dependency-direction problem: those types
@@ -117,10 +117,10 @@ returning a `javai-completion` type would be an illegal reverse dependency — t
 deferred for an earlier pass.
 
 The fix: `Contextable` (`String toContext(PromptContext prompt)`) and `PromptContext` itself both live in
-`javai-runtime`, alongside `JavAIList`/`JavAISet`/`JavAIMap`, all three of which implement `Contextable`
+`javai-model`, alongside `JavAIList`/`JavAISet`/`JavAIMap`, all three of which implement `Contextable`
 directly (delegating per-element, so an element's own custom rendering is respected rather than GSON
 reflecting the whole collection as one opaque JSON array). This module simply consumes `PromptContext` from
-`javai-runtime`, the same way it already consumes `JavAIList` — no reverse dependency, no facade:
+`javai-model`, the same way it already consumes `JavAIList` — no reverse dependency, no facade:
 
 ```java
 JavAIList<Comment> concerned = article.query(article.bodyVector(), Comment.class);
@@ -152,7 +152,7 @@ for exactly this reason — see `CompletionE2ETest` there for the real, working 
 `PromptContext`'s assembly rules (stop-at-first-overflow, no partial entries, silent omission, `sourceLabel`
 printed once as a header if set, nested `PromptContext`s honoring their own budget rather than the outer
 context's) and the `@PromptContext` field-allowlist are fully documented on `PromptContext`'s own class
-javadoc in `javai-runtime` — see that module's own README for the full writeup, since the type lives there.
+javadoc in `javai-model` — see that module's own README for the full writeup, since the type lives there.
 
 **Deliberately not covered by this pass:** `Contextable` on `KnowledgeGraph`/`SubgraphResult`/`VectorIndex`
 (`javai-collections`) — those are graph-shaped by design, and GSON's default reflective marshalling has no
@@ -221,13 +221,13 @@ other:
   Postgres/Neo4j needed for a completions-only test), used by `OllamaCortexRealContainerTest`.
 
 Both bake the model in at image-build time rather than pulling it at container-start time, matching this
-project's established pattern (`javai-runtime`'s own embedding-provider images do the same) — `mvn test`
+project's established pattern (`javai-vector`'s own embedding-provider images do the same) — `mvn test`
 never depends on network access at run time, only at (one-time) image-build time.
 
 ## What's actually implemented
 
 `Cortex`, `CompletionRequest`/`CompletionResult`, and all six connector classes described above, plus
-`LocalCompletionDefaults`. `PromptContext`/`Contextable`/`ContextableObject` (consumed from `javai-runtime`)
+`LocalCompletionDefaults`. `PromptContext`/`Contextable`/`ContextableObject` (consumed from `javai-model`)
 are real and tested there — see that module's own README. Every Cortex is covered by hermetic tests
 (request/option-mapping against a fake HTTP server, `com.sun.net.httpserver.HttpServer` — the same pattern
 `OllamaEmbeddingProviderTest` already established). `OllamaCortexRealContainerTest` is this module's one

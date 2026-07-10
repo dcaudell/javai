@@ -1,11 +1,11 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.annotations.Vectorize;
-import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 
@@ -13,8 +13,8 @@ import java.util.UUID;
 
 /**
  * Hand-written stand-in for what a woven {@code @JavAIVectorizable} class would look like -- same pattern
- * as {@code javai-collections}'/{@code javai-agent}'s own test fixtures: this module has no dependency on
- * {@code javai-agent}, so there's no weaver to run in these tests, matching the module dependency graph
+ * as {@code javai-collections}'/{@code javai-substrate}'s own test fixtures: this module has no dependency on
+ * {@code javai-substrate}, so there's no weaver to run in these tests, matching the module dependency graph
  * (Persistence Bridge depends on Vector Core + Vector Collections, not the Acceleration Substrate
  * directly). Delegates everything to {@link JavAIRuntime}, exactly like real woven bytecode would --
  * including the {@code transient $javai$state} field (the JVM modifier, not just an annotation), so

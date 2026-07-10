@@ -1,11 +1,11 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.annotations.Vectorize;
-import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 

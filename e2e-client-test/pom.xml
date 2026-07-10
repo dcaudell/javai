@@ -6,9 +6,9 @@
 
   <!--
     Deliberately standalone: no parent POM, and not listed in the root pom.xml's modules. This is
-    downstream client code exercising JavAI Extensions as a published dependency, not one of the six
+    downstream client code exercising JavAI Extensions as a published dependency, not one of the eight
     Phase 0 reactor components SPEC.md describes. Run `mvn install` from the repo root first so
-    dev.xtrafe.javai:javai-{annotations,runtime,agent}:0.1.0-SNAPSHOT are in the local repository;
+    dev.xtrafe.javai:javai-{annotations,vector,model,substrate}:0.1.0-SNAPSHOT are in the local repository;
     see README.md.
   -->
   <groupId>dev.xtrafe.javai.e2e</groupId>
@@ -72,12 +72,17 @@
     </dependency>
     <dependency>
       <groupId>dev.xtrafe.javai</groupId>
-      <artifactId>javai-runtime</artifactId>
+      <artifactId>javai-vector</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
       <groupId>dev.xtrafe.javai</groupId>
-      <artifactId>javai-agent</artifactId>
+      <artifactId>javai-model</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-substrate</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>

@@ -1,7 +1,7 @@
 # Completion Fabric
 
-Module: `javai-completion`. Whitepaper: §5.3, §7.1–§7.3. Depends on `javai-collections` (+ `javai-runtime`
-transitively).
+Module: `javai-completion`. Whitepaper: §5.3, §7.1–§7.3. Depends on `javai-collections` (+ `javai-vector`/
+`javai-model` transitively).
 
 Takes a result from Vector Core or Vector Collections — a single object, a `query()` list, or a
 `nearestSubgraph()` result — and grounds an LLM completion in it, without the calling code branching on
@@ -33,9 +33,9 @@ generation, and semantic serialization — not another API client.
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `PromptContext` | Record (`javai-runtime`), also fulfills `List<Contextable>` | Composed informing material — an ordered bag of `Contextable` entries, assembled into one String on demand; also a full `List<Contextable>` in its own right, so whole lists of entries can be `add`ed/`addAll`ed onto an already-built instance, not just supplied at construction |
-| `Contextable` | Interface (`javai-runtime`) | `toContext(PromptContext): String` — anything renderable as prompt material; `JavAIList`/`Set`/`Map` implement it directly |
-| `ContextableObject<T>` | Record (`javai-runtime`) | Wraps an arbitrary object as a `Contextable` via GSON's default marshalling |
+| `PromptContext` | Record (`javai-model`), also fulfills `List<Contextable>` | Composed informing material — an ordered bag of `Contextable` entries, assembled into one String on demand; also a full `List<Contextable>` in its own right, so whole lists of entries can be `add`ed/`addAll`ed onto an already-built instance, not just supplied at construction |
+| `Contextable` | Interface (`javai-model`) | `toContext(PromptContext): String` — anything renderable as prompt material; `JavAIList`/`Set`/`Map` implement it directly |
+| `ContextableObject<T>` | Record (`javai-model`) | Wraps an arbitrary object as a `Contextable` via GSON's default marshalling |
 | `CompletionRequest` | Value type (`javai-completion`) | `List<String>` of prompt strings + `PromptContext` + `promptParams` (a Handlebars template model, `Map<String, Object>`) + generation parameters (max tokens, temperature, optional output schema) |
 | `CompletionRequest.render()` | Method (`javai-completion`) | Joins the prompt strings, appends the assembled `PromptContext`, then renders the whole combined text as a Handlebars template against `promptParams` — see "Prompt templating" below |
 | `CompletionResult` | Value type (`javai-completion`) | Text result, or a schema-typed result when structured output was requested |
@@ -47,12 +47,12 @@ generation, and semantic serialization — not another API client.
 method directly on `JavAIList<T>`/`SubgraphResult<N,E>`, returning a `javai-completion` type. Taken
 literally, that's an illegal reverse dependency — those two types live in modules upstream of
 `javai-completion` per `SPEC.md`'s dependency graph. The actual implementation instead puts `Contextable`
-(the method contract) and `PromptContext` (the return type) both in `javai-runtime`, alongside
+(the method contract) and `PromptContext` (the return type) both in `javai-model`, alongside
 `JavAIList`/`JavAISet`/`JavAIMap`, which implement `Contextable` directly — no reverse dependency, and the
 "identical call whether in-memory or persisted" goal is preserved. `KnowledgeGraph`/`SubgraphResult`
 (`javai-collections`) do not implement `Contextable` yet — deferred pending a cycle-safe design, since
 GSON's default marshalling has no protection against the cycles a graph can legitimately contain (see
-`javai-runtime`'s own README).
+`javai-model`'s own README).
 
 The object-level text used for prompting is not a new serialization system: producing an embedding already
 requires deriving text from an object, so that cached text is reused directly as prompt material. Which

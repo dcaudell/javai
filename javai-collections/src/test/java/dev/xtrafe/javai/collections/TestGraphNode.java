@@ -1,11 +1,11 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 
 /**
  * A graph participant carrying both hats the doc's own worked example does --

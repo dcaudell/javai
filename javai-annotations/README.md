@@ -16,7 +16,7 @@ Claude Code).
 ## Two annotation "hats," one module
 
 This module carries two conceptually distinct annotation sets that happen to share a package because
-neither has processing logic of its own — the weaver (`javai-agent`) is what gives the first set behavior,
+neither has processing logic of its own — the weaver (`javai-substrate`) is what gives the first set behavior,
 and an LLM/human reading them is what gives the second set effect.
 
 ### 1. Vectorization / search-visibility (Vector Core, Vector Collections)
@@ -25,7 +25,7 @@ Controls what gets embedded and how it's searched. See `doc/spec/vector-core.md`
 
 | Annotation | Target | Purpose |
 |---|---|---|
-| `JavAIVectorizable` | class | Opts a class into the woven `JavAIVectorizable` interface (see `javai-runtime`) |
+| `JavAIVectorizable` | class | Opts a class into the woven `JavAIVectorizable` interface (see `javai-model`) |
 | `Vectorize` / `VectorizeIgnore` | field | Include/exclude a field from the local embedding |
 | `SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field / class | Search-semantic visibility, independent of Java access modifiers |
 | `Summary` | field / class | Marks contribution to a container's hierarchical summary vector |
@@ -79,11 +79,11 @@ are repeatable, each via a nested `List` container annotation. `AnnotationsSmoke
 every annotation is present, retained, and applicable to the right element kind.
 
 This module itself carries no processing/weaving logic by design (see this README's own architecture
-section above) — that's `javai-agent`'s job, and it's real: a full ByteBuddy weaver reads `@Vectorize`,
+section above) — that's `javai-substrate`'s job, and it's real: a full ByteBuddy weaver reads `@Vectorize`,
 `@Summary`, `@SearchVisibility`, and `@VectorizeIgnore` off classes annotated with this module's
 `@JavAIVectorizable` and synthesizes the entire `JavAIVectorizable`/`JavAIDirtyTracking` contract at
-class-load time. See `javai-agent/README.md` for what's actually implemented there. `EmbeddingModel` is the
+class-load time. See `javai-substrate/README.md` for what's actually implemented there. `EmbeddingModel` is the
 one annotation defined here that nothing downstream reads yet (deliberately deferred, not forgotten — see
-`javai-runtime`/`javai-persistence` for why). The Codegen Guidance annotations
+`javai-vector`/`javai-model`/`javai-persistence` for why). The Codegen Guidance annotations
 (`Requires`/`Ensures`/`Invariant`/`Intent`/`AgentWritable`/`Frozen`/`HumanOnly`/`Nondeterministic`/`Costly`/
 `Provenance`) remain definitions only, with no runtime or agent-facing enforcement built yet.

@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIEmbeddingProvider;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
 
 import java.time.Instant;
 

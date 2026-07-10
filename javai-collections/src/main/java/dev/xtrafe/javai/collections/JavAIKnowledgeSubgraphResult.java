@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.CollectionVectorSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
+import dev.xtrafe.javai.model.CollectionVectorSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.util.Map;
 import java.util.Set;

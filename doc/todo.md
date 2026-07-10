@@ -1,6 +1,6 @@
 - (Done) Update README.md files to reflect the current state of the project. 
 - (Done) Add test-data fixtures to the e2e project to create realistic data volume. 
-- (Done) Add both unit and e2e tests for all collection types declared in javai-runtime
+- (Done) Add both unit and e2e tests for all collection types declared in javai-vector
 - (Done) Make sure in e2e that objects can fully utilize both JPA and Neo4j, and can simultaneously be persisted in both.
 - (Done — whitepaper §5.7 "Agentic Supervision", javai-supervision module scaffolded, doc/spec/agentic-supervision.md) 
 - Executive oversight via AOP cutpoints. Weaver + dispatch runtime (JavAISupervisionRuntime/SupervisionWeaver) still needs real implementation.

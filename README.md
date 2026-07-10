@@ -25,12 +25,12 @@ requirement for correctness.
 | # | Directory | Extension area | Purpose |
 |---|---|---|---|
 | 1 | [`javai-annotations`](javai-annotations/README.md) | Codegen Guidance (+ shared annotation vocabulary) | Every annotation used across all seven areas — plain definitions, no processing logic |
-| 2 | [`javai-runtime`](javai-runtime/README.md) | Vector Core | Embedding calculation, dirty-state propagation, object-graph `query()` |
-| 3 | [`javai-agent`](javai-agent/README.md) | Acceleration Substrate | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
+| 2 | [`javai-vector`](javai-vector/README.md) + [`javai-model`](javai-model/README.md) | Vector Core | Embedding calculation, dirty-state propagation, object-graph `query()` — physically two modules, see note below |
+| 3 | [`javai-substrate`](javai-substrate/README.md) | Acceleration Substrate | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
 | 4 | [`javai-supervision`](javai-supervision/README.md) | Agentic Supervision | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
-| 5 | [`javai-collections`](javai-collections/README.md) | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
+| 5 | [`javai-collections`](javai-collections/README.md) | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` (interfaces `JavAIList`/`Set`/`Map` live in `javai-model`) |
 | 6 | [`javai-persistence`](javai-persistence/README.md) | Persistence Bridge | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
-| 7 | [`javai-completion`](javai-completion/README.md) | Completion Fabric | Provider-agnostic RAG completions, wrapping Spring AI |
+| 7 | [`javai-completion`](javai-completion/README.md) | Completion Fabric | Provider-agnostic RAG completions, wrapping Spring AI (`Contextable`/`PromptContext` live in `javai-model`) |
 
 `javai-annotations` is the one module every other module depends on, directly or transitively — it also
 carries Vector Core's and Vector Collections' vectorization/search-visibility annotation vocabulary
@@ -40,11 +40,11 @@ carries Vector Core's and Vector Collections' vectorization/search-visibility an
 ### Dependency graph
 
 ```
-                     javai-agent (Acceleration Substrate)
+                     javai-substrate (Acceleration Substrate)
                 (compiler / weaver / invokedynamic / GPU dispatch)
                     |            |              |
                     v            v              v
-          javai-runtime   javai-collections   javai-annotations
+       javai-vector+model  javai-collections  javai-annotations
           (Vector Core)   (Vector Collections)  (Codegen Guidance)
                     |            |
                     |    +-------+-------+
@@ -54,32 +54,37 @@ carries Vector Core's and Vector Collections' vectorization/search-visibility an
 
           javai-supervision (Agentic Supervision) — standalone, depends only
           on javai-annotations, its own independent weaver. Not fed by
-          javai-agent and doesn't feed anything else at the module level;
-          an LLM-backed listener composes with javai-completion/javai-runtime/
-          javai-collections at the application level instead. See
+          javai-substrate and doesn't feed anything else at the module level;
+          an LLM-backed listener composes with javai-completion/javai-vector/
+          javai-model/javai-collections at the application level instead. See
           doc/spec/agentic-supervision.md.
 ```
 
-Build order matches this graph: `javai-annotations` → (`javai-runtime`, `javai-agent`, `javai-supervision`
-in parallel — the latter two each depend only on annotations, not on each other) → `javai-collections` →
-(`javai-persistence`, `javai-completion` — order between these two doesn't matter).
+See [`doc/module-dependency-graph.md`](doc/module-dependency-graph.md) for the full, precise 8-module
+physical dependency graph (this diagram groups `javai-vector`/`javai-model` together for readability against
+the seven-*conceptual*-area framing).
+
+Build order matches this graph: `javai-annotations` → `javai-vector` → `javai-model` → (`javai-substrate`,
+`javai-supervision` in parallel — the latter depends only on annotations, not on the former) →
+`javai-collections` → (`javai-persistence`, `javai-completion` — order between these two doesn't matter).
 
 **A note on where things physically live vs. the conceptual area they belong to:** `JavAIVectorizable.query()`
-returns `JavAIList<T>`, and `javai-collections` depends on `javai-runtime`, not the reverse — so
-`JavAISortable`/`JavAIList`/`JavAISet`/`JavAIMap` physically live in `javai-runtime`, even though the
-whitepaper discusses them as part of Vector Collections. See `javai-runtime/README.md` and
+returns `JavAIList<T>`, and `javai-collections` depends on `javai-model`, not the reverse — so
+`JavAIVectorizable`/`JavAIRuntime`/`JavAISortable`/`JavAIList`/`JavAISet`/`JavAIMap` (plus
+`Contextable`/`PromptContext`, for the identical reason) physically live in `javai-model`, even though the
+whitepaper discusses them as part of Vector Collections/Completion Fabric. See `javai-model/README.md` and
 `javai-collections/README.md` for the full explanation.
 
 ## Building
 
-All seven modules live under one Maven reactor and build together — they're interdependent by design, not
+All eight modules live under one Maven reactor and build together — they're interdependent by design, not
 meant to be built independently:
 
 ```
 mvn install
 ```
 
-Opening this repository root in IntelliJ IDEA imports all seven modules as one project automatically, since
+Opening this repository root in IntelliJ IDEA imports all eight modules as one project automatically, since
 IntelliJ detects the root `pom.xml`.
 
 ## Where things are
@@ -98,14 +103,15 @@ IntelliJ detects the root `pom.xml`.
 
 ## Current status
 
-Phase 0, five of seven areas real and verified against real embeddings and real backing stores, not just
-placeholder smoke tests:
+Phase 0, actively underway, verified against real embeddings and real backing stores, not just placeholder
+smoke tests:
 
 - **`javai-annotations`** — the full annotation vocabulary across all seven areas.
-- **`javai-runtime`** (Vector Core) — the full object lifecycle (`FieldDirty`/`SummaryDirty`, lazy
-  recompute), `query()`, real embedding providers (Ollama and Hugging Face's text-embeddings-inference),
-  and the concrete `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` collections.
-- **`javai-agent`** (Acceleration Substrate) — a full ByteBuddy weaver: multi-field `vector()`,
+- **`javai-vector`** + **`javai-model`** (Vector Core, physically split — see above) — the full object
+  lifecycle (`FieldDirty`/`SummaryDirty`, lazy recompute), `query()`, real embedding providers (Ollama and
+  Hugging Face's text-embeddings-inference), the concrete `JavAIArrayList`/`JavAILinkedHashSet`/
+  `JavAILinkedHashMap` collections, and the `Contextable`/`PromptContext` RAG-integration primitives.
+- **`javai-substrate`** (Acceleration Substrate) — a full ByteBuddy weaver: multi-field `vector()`,
   `summaryVector()` propagation through both single references and collections, `query()`, cycle safety,
   `@SearchVisibility`/`@VectorizeIgnore`, and inherited-field support via synthesized setter overrides.
 - **`javai-collections`** (Vector Collections) — `VectorIndex` and `KnowledgeGraph`/`SubgraphResult`
@@ -114,13 +120,16 @@ placeholder smoke tests:
   embedding model, so a provider swap needs no schema migration) and Neo4j (native vector index, one
   model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
   for re-embedding an existing store after a provider swap, reverting non-destructively.
-- **`javai-completion`** (Completion Fabric) — not started; `package-info.java` is a placeholder.
+- **`javai-completion`** (Completion Fabric) — real and tested: six `Cortex` providers (OpenAI, Anthropic,
+  Groq, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
+  parameters, Handlebars-based prompt templating (`CompletionRequest.render()`), and the RAG-integration
+  half grounding a completion in `PromptContext`.
 - **`javai-supervision`** (Agentic Supervision) — new. Its public contract (`SupervisionEvent`,
   `SyncSupervisionListener`, `AsyncSupervisionListener`, plus the `@SyncSupervision`/`@AsyncSupervision`
   annotations in `javai-annotations`) is defined and compiles; the weaver and dispatch runtime that make it
   real are not written yet. See that module's README.
 
-`e2e-client-test` (a standalone downstream consumer, not one of the seven modules) proves the above against a
+`e2e-client-test` (a standalone downstream consumer, not one of the eight modules) proves the above against a
 single monolithic Docker container bundling Postgres+pgvector, Neo4j, and a real embedding provider, not
 fakes or mocks.
 

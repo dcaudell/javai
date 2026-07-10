@@ -7,12 +7,12 @@ import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Attribution;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.domain.RelatesTo;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
-import dev.xtrafe.javai.runtime.LocalEmbeddingDefaults;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -28,7 +28,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Real end-to-end proof, not a hermetic one: a genuine object graph (a single {@code @Summary}
  * reference plus a {@code @Summary} collection), real embeddings from a live container (not
- * {@code javai-runtime}/{@code javai-agent}'s own fake providers), and client code that never writes
+ * {@code javai-vector}/{@code javai-substrate}'s own fake providers), and client code that never writes
  * {@code implements JavAIVectorizable} by hand -- {@code Article}/{@code Comment} are plain annotated
  * classes, built with plain {@code new}. Phase 0 has no real compiler yet (that's {@code javaic},
  * Phase 1+), so there's no compile-time-checked {@code article.vector()} call the way the whitepaper's own

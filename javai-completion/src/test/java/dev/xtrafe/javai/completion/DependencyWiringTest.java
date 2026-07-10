@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.completion;
 
 import dev.xtrafe.javai.collections.JavAIGraphNode;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
+import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.chat.model.ChatModel;
 
@@ -10,7 +10,7 @@ import java.time.Instant;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
- * Proves javai-completion's dependencies (javai-collections, javai-runtime, Spring AI)
+ * Proves javai-completion's dependencies (javai-collections, javai-vector, javai-model, Spring AI)
  * resolve and compile. No real PromptContext/CompletionRequest logic exists yet.
  *
  * The ChatModel reference is load-bearing, not decorative: this module originally

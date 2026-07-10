@@ -6,8 +6,8 @@ import dev.xtrafe.javai.annotations.SearchVisibility;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
-import dev.xtrafe.javai.runtime.JavAIArrayList;
-import dev.xtrafe.javai.runtime.JavAILinkedHashMap;
+import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
@@ -21,7 +21,7 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * Client code exercising both containment shapes doc/spec/vector-core.md's {@code summaryVector()}
  * formula covers: a single {@code @Summary} reference ({@link #featuredComment}) and a
  * {@code @Summary} collection ({@link #comments}, initialized inline and never reassigned -- elements
- * are added through the collection itself, exercising {@code javai-agent}'s constructor-exit wiring for
+ * are added through the collection itself, exercising {@code javai-substrate}'s constructor-exit wiring for
  * that case).
  *
  * <p>{@link #title}/{@link #body} also carry {@code @PromptContext} -- Completion Fabric's field-level

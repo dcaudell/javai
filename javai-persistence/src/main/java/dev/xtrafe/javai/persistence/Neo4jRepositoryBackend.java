@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
@@ -48,7 +48,7 @@ import java.util.concurrent.ConcurrentHashMap;
  *
  * <p><b>Relationship classification is by declared type, not the {@code @Summary} annotation</b> --
  * deliberately decoupled: {@code @Summary} means "contributes to {@code summaryVector()}'s decay-weighted
- * sum" (an in-memory, {@code javai-runtime} concern) and has nothing to do with whether a field should
+ * sum" (an in-memory, {@code javai-model} concern) and has nothing to do with whether a field should
  * persist as a relationship. A field can be graph-shaped without being {@code @Summary} (e.g.
  * {@code Article.draftComment}/{@code attachment}, {@code @SearchVisibility}-relevant but not summary-
  * contributing) and still needs a real relationship to round-trip through Neo4j at all -- conflating the

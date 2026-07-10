@@ -1,8 +1,8 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import jakarta.persistence.Entity;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
@@ -204,7 +204,7 @@ final class HibernatePostgresRepositoryBackend implements RepositoryBackend {
     }
 
     /** A JavAI collection field is one that's both shaped like a {@code Collection}/{@code Map} AND
-     *  implements {@link JavAIDirtyTracking} -- true of every concrete {@code javai-runtime} collection
+     *  implements {@link JavAIDirtyTracking} -- true of every concrete {@code javai-model} collection
      *  type ({@code JavAIArrayList}/{@code JavAILinkedHashSet}/{@code JavAILinkedHashMap}) today, and of any
      *  future one following the same pattern, with zero changes needed here. This check is 100%-confidence,
      *  not a heuristic: such a field can never be validly Hibernate-mapped natively (see this class's own

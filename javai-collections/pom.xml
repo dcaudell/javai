@@ -6,7 +6,7 @@
 
   <parent>
     <groupId>dev.xtrafe.javai</groupId>
-    <artifactId>javai-parent</artifactId>
+    <artifactId>javai</artifactId>
     <version>0.1.0-SNAPSHOT</version>
   </parent>
 
@@ -16,13 +16,19 @@
   <!--
     Vector Collections: KnowledgeGraph/SubgraphResult, VectorIndex, JavAIGraphNode/
     JavAIEdge. See doc/spec/vector-collections.md — and its module-placement note,
-    since JavAIList/Set/Map/Sortable actually live in javai-runtime, not here.
+    since JavAIList/Set/Map/Sortable actually live in javai-model, not here. Depends on
+    javai-vector directly too (EmbeddingVector, VectorMath, JavAIDirtyTracking) alongside
+    javai-model, since KnowledgeGraph/JavAIVectorIndex reference both.
   -->
 
   <dependencies>
     <dependency>
       <groupId>dev.xtrafe.javai</groupId>
-      <artifactId>javai-runtime</artifactId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-model</artifactId>
     </dependency>
   </dependencies>
 </project>

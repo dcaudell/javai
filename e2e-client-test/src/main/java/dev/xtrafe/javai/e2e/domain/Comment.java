@@ -11,7 +11,7 @@ import java.util.UUID;
 
 /**
  * Client code: an ordinary annotated class, no {@code implements JavAIVectorizable}, no hand-written
- * {@code vector()}. The {@code javai-agent} weaver synthesizes all of that at class-load time. Mirrors
+ * {@code vector()}. The {@code javai-substrate} weaver synthesizes all of that at class-load time. Mirrors
  * the whitepaper's own Article/Comment worked example (doc/spec/end-to-end-example.md).
  *
  * <p>{@code author} lives on {@link Attribution}, a plain (non-{@code @JavAIVectorizable}) superclass --

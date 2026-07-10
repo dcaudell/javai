@@ -1,5 +1,5 @@
 ## Pre-work for the Embedding Generation deployment described in the whitepaper's §4.5 ("Embedding
-## Generation") and doc/spec/vector-core.md's JavAIEmbeddingProvider SPI. Nothing in javai-runtime talks
+## Generation") and doc/spec/vector-core.md's JavAIEmbeddingProvider SPI. Nothing in javai-vector talks
 ## to this yet -- JavAIEmbeddingProvider's Phase 0 HTTP client hasn't been written. This compose file is
 ## the deployment target that client will be built against: Hugging Face's text-embeddings-inference
 ## (TEI) as a sidecar container, never a bespoke Python/PyTorch serving process (§4.5.2's "depend on,
@@ -17,7 +17,7 @@
 ##
 ## `--profile ollama` is not one of the whitepaper's three deployment shapes -- it's a workaround for a
 ## confirmed, unresolved bug in TEI's Candle backend running Qwen3-Embedding-0.6B on CPU at all (see
-## README.md). Needs javai-runtime's OllamaEmbeddingProvider on the client side, not
+## README.md). Needs javai-vector's OllamaEmbeddingProvider on the client side, not
 ## TextEmbeddingsInferenceProvider -- the REST contract is different.
 ##
 ## `--profile postgres` / `--profile neo4j` are javai-persistence's (Persistence Bridge) two backends --

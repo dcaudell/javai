@@ -57,6 +57,6 @@ articles.save(zeroDay);
 ```
 
 Nothing above requires a compiler or a GPU — this is the intended Phase 0 experience end to end. Once
-`javai-runtime`, `javai-collections`, `javai-persistence`, and `javai-completion` all exist, this is the
+`javai-vector`, `javai-model`, `javai-collections`, `javai-persistence`, and `javai-completion` all exist, this is the
 natural first integration test: it exercises Vector Core (steps 1, 2, 4, 6), Vector Collections (2, 4),
 Persistence Bridge (1, 7), and Completion Fabric (3, 5) in one coherent flow.

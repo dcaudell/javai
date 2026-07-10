@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>dev.xtrafe.javai</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.0-SNAPSHOT</version>
+  </parent>
+
+  <artifactId>javai-model</artifactId>
+  <packaging>jar</packaging>
+
+  <!--
+    The formalized home for whatever has to live physically upstream of javai-collections/javai-completion
+    for compile-order reasons, rather than because it's vector/embedding core: JavAIVectorizable (the
+    contract) + JavAIRuntime (the engine implementing it, including the query() graph walk); both are
+    dependency-direction hostages of JavAIList, since JavAIVectorizable.query() returns JavAIList<T> and
+    JavAIList extends JavAIVectorizable right back, so the two can never live in separate modules without
+    an illegal cycle or an API change (see this module's own package-info.java for the full reasoning,
+    worked out by tracing actual imports, not assumed). Also holds JavAISortable/JavAIList/Set/Map + their
+    concrete implementations + CollectionVectorSupport (conceptually "Vector Collections"), and
+    Contextable/PromptContext/ContextableObject/PlainTextEntry (conceptually "Completion Fabric"'s RAG
+    primitives); both groups here for the identical reason. Depends on javai-vector for EmbeddingVector,
+    the embedding-provider SPI, and the dirty-tracking primitives JavAIRuntime operates on.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-annotations</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>dev.xtrafe.javai</groupId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <!-- Backs PromptContext.defaultMarshall(); GSON, not Jackson (Spring AI's own transitive
+         dependency, pulled in only by javai-completion); see PromptContext's own javadoc. -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+    </dependency>
+  </dependencies>
+</project>

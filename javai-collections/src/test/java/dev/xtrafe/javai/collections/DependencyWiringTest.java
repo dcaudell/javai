@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIList;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIList;
 import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
@@ -9,8 +9,8 @@ import java.time.Instant;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 /**
- * Proves javai-collections' dependency on javai-runtime resolves and compiles --
- * including the module-placement fix (JavAIList lives in javai-runtime, not here).
+ * Proves javai-collections' dependency on javai-vector/javai-model resolves and compiles --
+ * including the module-placement fix (JavAIList lives in javai-model, not here).
  * No real KnowledgeGraph/VectorIndex logic exists yet.
  */
 class DependencyWiringTest {
@@ -26,7 +26,7 @@ class DependencyWiringTest {
 
     @Test
     void javaiListTypeIsResolvable() {
-        // Compile-time check only: JavAIList<T> must resolve from javai-runtime here.
+        // Compile-time check only: JavAIList<T> must resolve from javai-model here.
         Class<JavAIList> type = JavAIList.class;
         assertNotNull(type);
     }

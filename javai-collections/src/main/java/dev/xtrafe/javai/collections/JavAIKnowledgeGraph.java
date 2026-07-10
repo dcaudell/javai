@@ -1,16 +1,16 @@
 package dev.xtrafe.javai.collections;
 
-import dev.xtrafe.javai.runtime.CollectionVectorSupport;
-import dev.xtrafe.javai.runtime.DirtyTrackingSupport;
-import dev.xtrafe.javai.runtime.EmbeddingVector;
-import dev.xtrafe.javai.runtime.JavAIArrayList;
-import dev.xtrafe.javai.runtime.JavAIDirtyTracking;
-import dev.xtrafe.javai.runtime.JavAILinkedHashSet;
-import dev.xtrafe.javai.runtime.JavAIList;
-import dev.xtrafe.javai.runtime.JavAIRuntime;
-import dev.xtrafe.javai.runtime.JavAISet;
-import dev.xtrafe.javai.runtime.JavAIVectorizable;
-import dev.xtrafe.javai.runtime.VectorMath;
+import dev.xtrafe.javai.model.CollectionVectorSupport;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAILinkedHashSet;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAISet;
+import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.VectorMath;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -25,7 +25,7 @@ import java.util.function.Predicate;
 
 /**
  * The concrete {@link KnowledgeGraph}. Hand-written, not woven -- a plain, user-instantiated container
- * (like {@code javai-runtime}'s {@code JavAIArrayList}): {@code new JavAIKnowledgeGraph<Article,
+ * (like {@code javai-model}'s {@code JavAIArrayList}): {@code new JavAIKnowledgeGraph<Article,
  * RelatesTo>()}, then {@code addNode}/{@code addEdge} imperatively. See package-info for why
  * {@code @JavAIGraphNode}/{@code @JavAIEdge} aren't woven onto node/edge classes either.
  *
