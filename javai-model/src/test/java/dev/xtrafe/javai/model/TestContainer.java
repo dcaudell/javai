@@ -26,9 +26,9 @@ final class TestContainer implements JavAIVectorizable, JavAIDirtyTracking {
     }
 
     void setLabel(String label) {
+        String oldValue = this.label;
         this.label = label;
-        JavAIRuntime.markFieldDirty(this);
-        JavAIRuntime.propagateDirty(this);
+        JavAIRuntime.vectorizeFieldMutated(this, "label", oldValue, label);
     }
 
     void setFeatured(TestNode featured) {
@@ -44,6 +44,11 @@ final class TestContainer implements JavAIVectorizable, JavAIDirtyTracking {
     @Override
     public EmbeddingVector vector() {
         return JavAIRuntime.vector(this, "label");
+    }
+
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "label");
     }
 
     @Override

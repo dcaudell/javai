@@ -203,6 +203,17 @@ backend-specific code at all -- it's dispatched in `RepositoryInvocationHandler`
 hermetically fake whether a real similarity search actually ranks correctly, or whether two models' data
 really stay physically separate.
 
+**Every `save()` on both backends is wrapped in `JavAIRuntime.runWithSubgraphLockedForPersistence(entity, ...)`**
+(`javai-model` -- see `doc/spec/vector-core.md`'s "Embedding concurrency model" section for the full
+mechanism): the whole reachable subgraph is locked and every field/`concatenatedTextVector()` read forced
+accurate for the duration of the flush, regardless of which `EmbeddingConsistencyMode` is globally
+configured. This is what guarantees the database never sees a vector that doesn't match the field value
+being written in that same save -- proven directly by
+`savedVectorIsAlwaysAccurateUnderImmediateConsistency`/
+`savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider` on both backend test
+classes, the latter using a deliberately slow provider to prove the flush doesn't just get lucky racing
+against `EVENTUAL_CONSISTENCY`'s own eager background dispatch.
+
 **Deliberately not this module's own weaving.** No `javai-substrate` dependency, and no ByteBuddy-based
 Hibernate-enhancement shim of its own either (the whitepaper's original "ByteBuddy enhancement via
 Hibernate's `EnhancementContext`-style SPI" phrasing) -- both would have added real, more fragile machinery

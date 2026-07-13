@@ -50,6 +50,11 @@ final class TestTag implements JavAIVectorizable {
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "label");
+    }
+
+    @Override
     public EmbeddingVector summaryVector() {
         return JavAIRuntime.summaryVector(this, "", "label");
     }

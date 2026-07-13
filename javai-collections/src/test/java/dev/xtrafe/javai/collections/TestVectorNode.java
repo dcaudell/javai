@@ -25,14 +25,19 @@ final class TestVectorNode implements JavAIVectorizable, JavAIDirtyTracking {
     }
 
     void setText(String text) {
+        String oldValue = this.text;
         this.text = text;
-        JavAIRuntime.markFieldDirty(this);
-        JavAIRuntime.propagateDirty(this);
+        JavAIRuntime.vectorizeFieldMutated(this, "text", oldValue, text);
     }
 
     @Override
     public EmbeddingVector vector() {
         return JavAIRuntime.vector(this, "text");
+    }
+
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "text");
     }
 
     @Override

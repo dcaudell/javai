@@ -100,6 +100,11 @@ public final class JavAILinkedHashSet<T> extends LinkedHashSet<T> implements Jav
         throw new UnsupportedOperationException("JavAILinkedHashSet has no @Vectorize fields of its own");
     }
 
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        throw new UnsupportedOperationException("JavAILinkedHashSet has no @Vectorize fields of its own");
+    }
+
     // ---- JavAISortable / JavAISet ----
 
     @Override

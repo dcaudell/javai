@@ -5,6 +5,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -26,21 +27,23 @@ class JavAIRuntimeLifecycleTest {
 
     @Test
     void vectorRecomputesLazilyOnlyOnNextRead() {
+        // vector() is now compositional -- it combines each @Vectorize field's own cached VectorCacheSlot
+        // (see JavAIRuntime.fieldVector) rather than caching one single result of its own, so a repeat read
+        // recombines fresh every time (cheap, in-memory) rather than returning a literal cached instance.
+        // FieldDirty itself is no longer vector()'s concern at all -- it's now purely summaryVector()'s
+        // staleness signal for its own base term (see JavAIRuntime.summaryVector's javadoc) -- so this test
+        // asserts on the vector's actual values, not on FieldDirty transitions around vector() calls.
         TestNode node = new TestNode("first");
 
-        assertTrue(node.isFieldDirty(), "never-computed object starts dirty");
         EmbeddingVector first = node.vector();
-        assertFalse(node.isFieldDirty(), "reading vector() clears FieldDirty");
-
         EmbeddingVector reread = node.vector();
-        assertEquals(first, reread, "a repeat clean read must return the cached vector, not recompute");
+        assertArrayEquals(first.values(), reread.values(), 1e-6f,
+                "a repeat read with no mutation in between must recompute to the same values");
 
         node.setText("second, different text");
-        assertTrue(node.isFieldDirty(), "mutating setText marks FieldDirty");
-
         EmbeddingVector second = node.vector();
-        assertFalse(node.isFieldDirty());
-        assertNotEquals(first, second, "a changed field must produce a different vector");
+        assertFalse(java.util.Arrays.equals(first.values(), second.values()),
+                "a changed field must produce a different vector");
     }
 
     @Test

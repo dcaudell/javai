@@ -191,7 +191,7 @@ class ArticleGraphEmbeddingE2ETest {
         EmbeddingVector second = featuredV.vector();
 
         assertEquals(toList(first.values()), toList(second.values()),
-                "an @VectorizeIgnore'd field's value must never affect vector()'s canonical text");
+                "an @VectorizeIgnore'd field's value must never affect vector()'s concatenated text");
     }
 
     @Test

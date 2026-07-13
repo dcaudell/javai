@@ -10,7 +10,17 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
  */
 public interface JavAIVectorizable {
 
+    /** This object's aggregate vector, composed from each {@code @Vectorize} field's own boxed vector
+     *  (see {@code dev.xtrafe.javai.model.VectorizableString}) -- not a single embedding of concatenated
+     *  text. See {@link #concatenatedTextVector()} for that. */
     EmbeddingVector vector();
+
+    /** A single embedding of this object's {@code @Vectorize} fields concatenated into one text
+     *  block -- a holistic representation an embedding model may capture relationships in that combining
+     *  separately-embedded fields arithmetically ({@link #vector()}) cannot. Kept as its own explicit,
+     *  stable accessor precisely so {@link #vector()} is free to evolve (e.g. incorporating non-text
+     *  {@code @Vectorize} fields in a multi-modal future) without changing what this method means. */
+    EmbeddingVector concatenatedTextVector();
 
     EmbeddingVector summaryVector();
 

@@ -60,6 +60,11 @@ final class TestArticleWithTags implements JavAIVectorizable {
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "title");
+    }
+
+    @Override
     public EmbeddingVector summaryVector() {
         return JavAIRuntime.summaryVector(this, "", "title");
     }

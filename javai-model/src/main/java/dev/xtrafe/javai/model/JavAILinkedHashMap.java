@@ -94,6 +94,11 @@ public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implemen
         throw new UnsupportedOperationException("JavAILinkedHashMap has no @Vectorize fields of its own");
     }
 
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        throw new UnsupportedOperationException("JavAILinkedHashMap has no @Vectorize fields of its own");
+    }
+
     // ---- JavAISortable<V> / JavAIMap ----
 
     @Override

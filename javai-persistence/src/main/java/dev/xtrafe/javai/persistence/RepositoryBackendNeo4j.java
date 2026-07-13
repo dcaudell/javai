@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
@@ -131,12 +132,17 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     @Override
     public Object save(Class<?> entityType, Object entity) {
-        try (Session session = driver().session()) {
-            session.executeWrite(tx -> {
-                saveNode(tx, entity, new IdentityHashMap<>());
-                return null;
-            });
-        }
+        // Same rationale as RepositoryBackendHibernatePostgres.save(): locks the whole reachable subgraph
+        // and forces every vector read inside saveNode() to be accurate to the field values being written in
+        // this same call, regardless of the ambient EmbeddingConsistencyMode.
+        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> {
+            try (Session session = driver().session()) {
+                session.executeWrite(tx -> {
+                    saveNode(tx, entity, new IdentityHashMap<>());
+                    return null;
+                });
+            }
+        });
         return entity;
     }
 

@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import jakarta.persistence.Entity;
 import org.hibernate.Session;
@@ -236,35 +237,43 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public Object save(Class<?> entityType, Object entity) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
-            Transaction tx = session.beginTransaction();
-            try {
-                // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
-                // element this backend persists itself) needs its own id set before Hibernate/this backend
-                // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
-                ensureIdsAssigned(entity, new IdentityHashMap<>());
-                Object managed = session.merge(entity);
-                session.flush();
-                writeVectors(session, entityType, managed);
-                writeVectorsForRelatedEntities(session, managed);
-                // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
-                // merge() never copies its contents onto the managed instance (transient state isn't part
-                // of what merge() reconciles) -- managed.comments would still be the empty list its own
-                // no-arg constructor produced. entity's id was already assigned above, so it matches.
-                syncCollectionMembers(session, entityType, entity);
-                tx.commit();
-                // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
-                // @Transient collection fields are left empty by merge(), so returning it would hand the
-                // caller back an Article whose in-memory `comments` looks wrong immediately after save().
-                // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
-                // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
-                return entity;
-            } catch (RuntimeException e) {
-                tx.rollback();
-                throw e;
+        // The whole reachable subgraph is locked (and every field/summary vector forced accurate) for the
+        // duration of the flush below -- this is what guarantees writeVectors()/writeVectorsForRelatedEntities()
+        // below can never persist a vector that's stale relative to the field value committed in this same
+        // transaction, regardless of the ambient EmbeddingConsistencyMode.
+        Object[] result = new Object[1];
+        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> {
+            SessionFactory factory = sessionFactory();
+            try (Session session = factory.openSession()) {
+                Transaction tx = session.beginTransaction();
+                try {
+                    // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
+                    // element this backend persists itself) needs its own id set before Hibernate/this backend
+                    // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
+                    ensureIdsAssigned(entity, new IdentityHashMap<>());
+                    Object managed = session.merge(entity);
+                    session.flush();
+                    writeVectors(session, entityType, managed);
+                    writeVectorsForRelatedEntities(session, managed);
+                    // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
+                    // merge() never copies its contents onto the managed instance (transient state isn't part
+                    // of what merge() reconciles) -- managed.comments would still be the empty list its own
+                    // no-arg constructor produced. entity's id was already assigned above, so it matches.
+                    syncCollectionMembers(session, entityType, entity);
+                    tx.commit();
+                    // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
+                    // @Transient collection fields are left empty by merge(), so returning it would hand the
+                    // caller back an Article whose in-memory `comments` looks wrong immediately after save().
+                    // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
+                    // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
+                    result[0] = entity;
+                } catch (RuntimeException e) {
+                    tx.rollback();
+                    throw e;
+                }
             }
-        }
+        });
+        return result[0];
     }
 
     @Override

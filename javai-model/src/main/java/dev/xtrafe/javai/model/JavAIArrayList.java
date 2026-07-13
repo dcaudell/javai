@@ -132,6 +132,11 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
         throw new UnsupportedOperationException("JavAIArrayList has no @Vectorize fields of its own");
     }
 
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        throw new UnsupportedOperationException("JavAIArrayList has no @Vectorize fields of its own");
+    }
+
     // ---- JavAISortable / JavAIList ----
 
     @Override

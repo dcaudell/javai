@@ -46,6 +46,11 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
+    <!-- Overridable via -Djavai.excludedTestGroups=(blank, to include performance tests) on the command
+         line: see the maven-surefire-plugin configuration below for why this needs to be a property
+         indirection rather than a literal value directly in that plugin's excludedGroups element. -->
+    <javai.excludedTestGroups>performance</javai.excludedTestGroups>
+
     <junit.version>5.11.0</junit.version>
     <!-- TODO: verify/pin current releases before real use — placeholders from scaffolding. -->
     <!--
@@ -197,6 +202,22 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-surefire-plugin</artifactId>
           <version>3.5.2</version>
+          <configuration>
+            <!--
+              "performance"-tagged tests are hand-run profiling harnesses (see EmbeddingConsistencyBenchmark
+              in javai-model), not correctness tests: they take much longer than the rest of the suite and
+              their assertions are loose by nature (comparative timings, not exact values). Excluded from the
+              default `mvn test`/`mvn install` run repo-wide; run them explicitly with
+              `mvn -pl javai-model test -Djavai.excludedTestGroups=`.
+
+              Deliberately an indirection through the javai.excludedTestGroups property (rather than the
+              literal string "performance" directly here): surefire only auto-binds its own -DexcludedGroups
+              command-line property to this element when the element itself is absent from the effective POM.
+              Once it's set explicitly (as it must be, to default to excluding "performance"), only this kind
+              of property reference stays overridable from the command line.
+            -->
+            <excludedGroups>${javai.excludedTestGroups}</excludedGroups>
+          </configuration>
         </plugin>
       </plugins>
     </pluginManagement>

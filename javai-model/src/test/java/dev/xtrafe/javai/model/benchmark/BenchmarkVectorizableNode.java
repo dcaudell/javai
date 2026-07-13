@@ -1,33 +1,33 @@
-package dev.xtrafe.javai.model;
+package dev.xtrafe.javai.model.benchmark;
 
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.vector.DirtyTrackingSupport;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 
 /**
- * Hand-written stand-in for what {@code javai-substrate}'s weaver would generate on a
- * {@code @JavAIVectorizable} class with one {@code @Vectorize} field -- delegates every method straight
- * to {@link JavAIRuntime}'s static helpers, exactly like woven bytecode would, so this module's tests can
- * exercise {@link JavAIRuntime}'s reflection-based lifecycle/propagation logic without depending on
- * {@code javai-substrate} or ByteBuddy at all. The weaver's own load-time-weaving-specific test lives in
- * {@code javai-substrate}.
+ * Minimal hand-woven {@code @JavAIVectorizable} fixture (one {@code @Vectorize}-equivalent field, "text"),
+ * self-contained within this benchmark package rather than reusing {@code dev.xtrafe.javai.model}'s own
+ * correctness-test fixtures (e.g. {@code TestNode}): those are package-private, and Java grants a
+ * subpackage no special access to a parent package's package-private members. Duplicating a fixture this
+ * small keeps every benchmark suite decoupled from whatever the correctness tests happen to use -- the
+ * same reasoning this project already applies to duplicating {@code FakeEmbeddingProvider} per module
+ * rather than sharing test code across module boundaries via a test-jar dependency.
  *
- * <p>The {@code $javai$state} field name must match {@link JavAIRuntime#STATE_FIELD} exactly -- that's
- * the one piece of "magic" a real woven class and this hand-written stand-in both rely on.
+ * <p>The {@code $javai$state} field name must match {@link JavAIRuntime#STATE_FIELD} exactly, same
+ * requirement as every other hand-written stand-in for woven bytecode in this project.
  */
-final class TestNode implements JavAIVectorizable, JavAIDirtyTracking {
+final class BenchmarkVectorizableNode implements JavAIVectorizable, JavAIDirtyTracking {
 
     @SuppressWarnings("unused") // reflectively accessed via JavAIRuntime.STATE_FIELD
     private DirtyTrackingSupport $javai$state;
 
     private String text;
 
-    TestNode(String text) {
+    BenchmarkVectorizableNode(String text) {
         this.text = text;
-    }
-
-    String getText() {
-        return text;
     }
 
     void setText(String text) {

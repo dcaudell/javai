@@ -31,6 +31,11 @@ final class InvisibleTypeNode implements JavAIVectorizable, JavAIDirtyTracking {
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "");
+    }
+
+    @Override
     public EmbeddingVector summaryVector() {
         return JavAIRuntime.summaryVector(this, "child", "");
     }

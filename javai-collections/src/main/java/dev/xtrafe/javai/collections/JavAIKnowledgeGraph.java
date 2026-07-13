@@ -173,6 +173,11 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        throw new UnsupportedOperationException("JavAIKnowledgeGraph has no @Vectorize fields of its own");
+    }
+
+    @Override
     public JavAIList<N> sortByCosineDistance(EmbeddingVector reference) {
         return new JavAILinkedHashSet<>(nodes).sortByCosineDistance(reference);
     }

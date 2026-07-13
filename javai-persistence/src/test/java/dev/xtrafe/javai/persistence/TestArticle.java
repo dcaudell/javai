@@ -54,9 +54,9 @@ final class TestArticle implements JavAIVectorizable {
     }
 
     void setTitle(String title) {
+        String oldValue = this.title;
         this.title = title;
-        JavAIRuntime.markFieldDirty(this);
-        JavAIRuntime.propagateDirty(this);
+        JavAIRuntime.vectorizeFieldMutated(this, "title", oldValue, title);
     }
 
     String getBody() {
@@ -64,14 +64,19 @@ final class TestArticle implements JavAIVectorizable {
     }
 
     void setBody(String body) {
+        String oldValue = this.body;
         this.body = body;
-        JavAIRuntime.markFieldDirty(this);
-        JavAIRuntime.propagateDirty(this);
+        JavAIRuntime.vectorizeFieldMutated(this, "body", oldValue, body);
     }
 
     @Override
     public EmbeddingVector vector() {
         return JavAIRuntime.vector(this, "title,body");
+    }
+
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "title,body");
     }
 
     @Override

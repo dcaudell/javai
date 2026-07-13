@@ -70,6 +70,14 @@ import static net.bytebuddy.matcher.ElementMatchers.named;
  */
 public final class JavAIWeaver {
 
+    /** Every method name this weaver synthesizes onto a woven class, checked against each
+     *  {@code @Vectorize} field's own {@code fieldName + "Vector"} accessor name -- see the collision check
+     *  in {@link #weave} for why this exists. */
+    private static final Set<String> RESERVED_METHOD_NAMES = Set.of(
+            "markFieldDirty", "isFieldDirty", "clearFieldDirty", "markSummaryDirty", "isSummaryDirty",
+            "clearSummaryDirty", "addDependent", "dependents", "vector", "concatenatedTextVector", "fieldVector",
+            "summaryVector", "similarityTo", "query");
+
     private static final Method MARK_FIELD_DIRTY = runtimeMethod("markFieldDirty", Object.class);
     private static final Method IS_FIELD_DIRTY = runtimeMethod("isFieldDirty", Object.class);
     private static final Method CLEAR_FIELD_DIRTY = runtimeMethod("clearFieldDirty", Object.class);
@@ -79,6 +87,7 @@ public final class JavAIWeaver {
     private static final Method ADD_DEPENDENT = runtimeMethod("addDependent", Object.class, Object.class);
     private static final Method DEPENDENTS = runtimeMethod("dependents", Object.class);
     private static final Method VECTOR = runtimeMethod("vector", Object.class, String.class);
+    private static final Method CONCATENATED_TEXT_VECTOR = runtimeMethod("concatenatedTextVector", Object.class, String.class);
     private static final Method FIELD_VECTOR = runtimeMethod("fieldVector", Object.class, String.class);
     private static final Method SUMMARY_VECTOR =
             runtimeMethod("summaryVector", Object.class, String.class, String.class);
@@ -139,6 +148,8 @@ public final class JavAIWeaver {
 
                 .defineMethod("vector", EmbeddingVector.class, Visibility.PUBLIC)
                 .intercept(MethodCall.invoke(VECTOR).withThis().with(vectorizeFieldsCsv))
+                .defineMethod("concatenatedTextVector", EmbeddingVector.class, Visibility.PUBLIC)
+                .intercept(MethodCall.invoke(CONCATENATED_TEXT_VECTOR).withThis().with(vectorizeFieldsCsv))
                 .defineMethod("fieldVector", EmbeddingVector.class, Visibility.PUBLIC)
                 .withParameters(String.class)
                 .intercept(MethodCall.invoke(FIELD_VECTOR).withThis().withArgument(0))
@@ -158,7 +169,19 @@ public final class JavAIWeaver {
                 .intercept(MethodCall.invoke(QUERY).withThis().withArgument(0).withArgument(1).withArgument(2));
 
         for (String fieldName : vectorizeFields) {
-            result = result.defineMethod(fieldName + "Vector", EmbeddingVector.class, Visibility.PUBLIC)
+            String accessorName = fieldName + "Vector";
+            if (RESERVED_METHOD_NAMES.contains(accessorName)) {
+                // A @Vectorize field named e.g. "text" or "concatenatedText" would produce a per-field
+                // accessor ("textVector"/"concatenatedTextVector") that collides with one of this interface's
+                // own reserved method names -- confirmed empirically to otherwise fail silently at weave
+                // time (ByteBuddy throws IllegalStateException: "Duplicate method signature", which
+                // AgentBuilder's default configuration swallows, leaving the class entirely unwoven rather
+                // than surfacing the real cause). Fail loud and specific instead.
+                throw new IllegalStateException("@Vectorize field \"" + fieldName + "\" on "
+                        + typeDescription.getName() + " produces a per-field accessor (" + accessorName
+                        + ") that collides with a reserved JavAIVectorizable method name -- rename the field.");
+            }
+            result = result.defineMethod(accessorName, EmbeddingVector.class, Visibility.PUBLIC)
                     .intercept(MethodCall.invoke(FIELD_VECTOR).withThis().with(fieldName));
         }
 
@@ -190,10 +213,16 @@ public final class JavAIWeaver {
                         .withParameters(inherited.getParameters().asTypeList())
                         .intercept(SuperMethodCall.INSTANCE);
             }
-            Class<?> advice = vectorizeFields.contains(fieldName)
-                    ? VectorizeFieldSetterAdvice.class
-                    : SummaryOnlyFieldSetterAdvice.class;
-            result = result.visit(Advice.to(advice).on(named(setterName)));
+            if (vectorizeFields.contains(fieldName)) {
+                // FieldName bound explicitly, per setter, at weave time -- see VectorizeFieldSetterAdvice's
+                // own javadoc for why this replaced an earlier @Advice.Origin-based approach.
+                result = result.visit(Advice.withCustomMapping()
+                        .bind(FieldName.class, fieldName)
+                        .to(VectorizeFieldSetterAdvice.class)
+                        .on(named(setterName)));
+            } else {
+                result = result.visit(Advice.to(SummaryOnlyFieldSetterAdvice.class).on(named(setterName)));
+            }
         }
 
         return result;

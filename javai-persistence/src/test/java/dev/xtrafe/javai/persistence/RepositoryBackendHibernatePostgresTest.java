@@ -1,7 +1,9 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,11 +16,13 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,6 +56,12 @@ class RepositoryBackendHibernatePostgresTest {
 
     @BeforeEach
     void resetProvider() {
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    @AfterEach
+    void resetConsistencyMode() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
     }
 
@@ -197,5 +207,89 @@ class RepositoryBackendHibernatePostgresTest {
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+    }
+
+    /**
+     * The persistence must-have that doesn't depend on which {@link EmbeddingConsistencyMode} is active:
+     * a save() immediately following a mutation, with no intervening explicit read, must still persist the
+     * vector matching the field's *final* value -- IMMEDIATE_CONSISTENCY never eagerly computes on mutation
+     * (only a subsequent read does), so without {@code writeVectors()}'s own forced-blocking read via
+     * {@code fieldVector()}, this would either persist a stale value or fail outright.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderImmediateConsistency() throws Exception {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        article.setTitle("second title, mutated just before save");
+        TestArticle resaved = repository.save(article);
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        try (Connection connection = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
+            float[] stored = readVectorLiteral(connection,
+                    "javai_vectors__" + ModelIds.sanitize(expected.modelId()), id, "title");
+            assertArrayEquals(expected.values(), stored, 1e-4f,
+                    "the persisted vector must match the field's value as of save(), not some earlier value");
+        }
+    }
+
+    /**
+     * The race this whole locking mechanism (JavAIRuntime.runWithSubgraphLockedForPersistence) exists to
+     * prevent: under EVENTUAL_CONSISTENCY with a deliberately slow provider, a mutation's own eager
+     * background dispatch has *not* landed by the time save() is called immediately afterward -- if
+     * writeVectors() merely read whatever {@code fieldVector()} would serve under the ambient (non-forced)
+     * mode, it would persist the OLD, now-stale vector. Forcing accuracy for the duration of the flush is
+     * what makes the persisted value correct regardless.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider() throws Exception {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        FakeEmbeddingProvider fast = new FakeEmbeddingProvider();
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            try {
+                Thread.sleep(300); // slower than this test's own save() call would otherwise wait for
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return fast.embed(text);
+        });
+
+        article.setTitle("second title, mutated just before a slow-provider save");
+        TestArticle resaved = repository.save(article); // must block on the slow provider, not skip ahead
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        try (Connection connection = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
+            float[] stored = readVectorLiteral(connection,
+                    "javai_vectors__" + ModelIds.sanitize(expected.modelId()), id, "title");
+            assertArrayEquals(expected.values(), stored, 1e-4f,
+                    "EVENTUAL_CONSISTENCY's slow background dispatch must never be allowed to leave a stale "
+                            + "vector in the database -- the flush itself must have forced an accurate, "
+                            + "blocking recompute");
+        }
+    }
+
+    private static float[] readVectorLiteral(Connection connection, String table, UUID id, String fieldName)
+            throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT vector::text FROM " + table + " WHERE owner_id = ? AND field_name = ?")) {
+            statement.setObject(1, id);
+            statement.setString(2, fieldName);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                assertTrue(resultSet.next(), "expected a row in " + table + " for " + id + "/" + fieldName);
+                String literal = resultSet.getString(1); // pgvector's text form, e.g. "[0.1,0.2,0.3]"
+                String[] parts = literal.substring(1, literal.length() - 1).split(",");
+                float[] values = new float[parts.length];
+                for (int i = 0; i < parts.length; i++) {
+                    values[i] = Float.parseFloat(parts[i]);
+                }
+                return values;
+            }
+        }
     }
 }

@@ -64,6 +64,21 @@ CREATE TABLE embedding_version (
 The fast-path columns (`body_vector`, `body_vector_model`) serve the current model; the side table holds
 old/new vectors coexisting during a migration window, tied to `EmbeddingVector.modelId`.
 
+## Accuracy must-have, independent of embedding consistency mode
+
+Vector Core's embedding concurrency model (`doc/spec/vector-core.md`) lets a mutation's own recompute
+happen synchronously (`IMMEDIATE_CONSISTENCY`) or in the background (`EVENTUAL_CONSISTENCY`/
+`COALESCED_CONSISTENCY`) -- but the database must never see a vector that doesn't match the field value
+being written in the same flush, regardless of which mode is active. `JavAIRuntime.runWithSubgraphLockedForPersistence(root, action)`
+is the mechanism both real backends wrap every `save()` call in: it locks every reachable
+`JavAIVectorizable` in the subgraph being flushed (the same per-object lock `IMMEDIATE_CONSISTENCY` itself
+uses) and forces every field/`concatenatedTextVector()` read on the calling thread to block for an accurate
+value for the duration of the flush, overriding whichever consistency mode is globally configured just for
+that thread and that call. Because every setter, under every mode, briefly takes this same lock around its
+own bookkeeping, the subgraph is genuinely frozen against mutation for the duration too -- not just
+protected on the read side. See `javai-persistence/README.md`'s own "What's actually implemented" section
+for the tests proving this holds under all three modes.
+
 ## A JPA-style query, contrasted with an object-level query
 
 A repository query (`findNearestByBodyVector`) is scoped to the whole persisted store; an object-level

@@ -77,28 +77,29 @@ class VectorizationWeavingTest {
 
     @Test
     void mutationMarksDirtyAndRecomputationIsLazy() throws Exception {
+        // vector() is now compositional -- it combines each @Vectorize field's own cached VectorCacheSlot
+        // (see JavAIRuntime.fieldVector) rather than caching one single result of its own, so a repeat read
+        // recombines fresh every time (cheap, in-memory) rather than returning a literal cached instance.
+        // FieldDirty itself is no longer vector()'s concern at all -- it's now purely summaryVector()'s
+        // staleness signal for its own base term (see JavAIRuntime.summaryVector's javadoc) -- so this test
+        // asserts on the vector's actual values, not on FieldDirty transitions around vector() calls.
         ClassLoader loader = loadFixtures(VectorizableWidget.class);
         Class<?> widgetClass = loader.loadClass(VectorizableWidget.class.getName());
         Object widget = widgetClass.getDeclaredConstructor().newInstance();
 
         Method setDescription = widgetClass.getMethod("setDescription", String.class);
         Method vector = widgetClass.getMethod("vector");
-        Method isFieldDirty = widgetClass.getMethod("isFieldDirty");
 
         setDescription.invoke(widget, "first description");
-        assertTrue((boolean) isFieldDirty.invoke(widget), "mutating a setter must mark FieldDirty");
-
         EmbeddingVector first = (EmbeddingVector) vector.invoke(widget);
-        assertFalse((boolean) isFieldDirty.invoke(widget), "reading vector() must clear FieldDirty");
-
         EmbeddingVector reread = (EmbeddingVector) vector.invoke(widget);
-        assertEquals(first, reread, "a repeat clean read must return the cached vector, not recompute");
+        assertArrayEquals(first.values(), reread.values(), 1e-6f,
+                "a repeat read with no mutation in between must recompute to the same values");
 
         setDescription.invoke(widget, "second, different description");
-        assertTrue((boolean) isFieldDirty.invoke(widget));
-
         EmbeddingVector second = (EmbeddingVector) vector.invoke(widget);
-        assertNotEquals(first, second, "a changed field must produce a different vector");
+        assertFalse(java.util.Arrays.equals(first.values(), second.values()),
+                "a changed field must produce a different vector");
     }
 
     @Test
@@ -196,7 +197,7 @@ class VectorizationWeavingTest {
         EmbeddingVector second = (EmbeddingVector) vector.invoke(widget);
 
         assertArrayEquals(first.values(), second.values(),
-                "an @VectorizeIgnore'd field's value must never affect vector()'s canonical text");
+                "an @VectorizeIgnore'd field's value must never affect vector()'s concatenated text");
     }
 
     @Test
@@ -213,24 +214,17 @@ class VectorizationWeavingTest {
         Method setLabelViaBaseReference = baseClass.getMethod("setLabel", String.class);
         Method setDetail = leafClass.getMethod("setDetail", String.class);
         Method vector = leafClass.getMethod("vector");
-        Method isFieldDirty = leafClass.getMethod("isFieldDirty");
 
         setLabelViaBaseReference.invoke(leaf, "first label");
         setDetail.invoke(leaf, "first detail");
-        assertTrue((boolean) isFieldDirty.invoke(leaf),
-                "mutating an inherited @Vectorize field's setter must mark FieldDirty");
-
         EmbeddingVector first = (EmbeddingVector) vector.invoke(leaf);
-        assertFalse((boolean) isFieldDirty.invoke(leaf), "reading vector() must clear FieldDirty");
 
         // Mutate only the inherited field -- proves the synthesized override, not some coincidental effect
         // of also touching the leaf's own field.
         setLabelViaBaseReference.invoke(leaf, "second label");
-        assertTrue((boolean) isFieldDirty.invoke(leaf),
-                "mutating the inherited field via the ancestor's own Method token must still mark FieldDirty");
-
         EmbeddingVector second = (EmbeddingVector) vector.invoke(leaf);
-        assertNotEquals(first, second, "changing the inherited field's value must change vector()");
+        assertFalse(java.util.Arrays.equals(first.values(), second.values()),
+                "changing the inherited field's value must change vector()");
     }
 
     private static ClassLoader loadFixtures(Class<?>... fixtureClasses) throws IOException {

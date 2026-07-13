@@ -51,6 +51,7 @@ triggers full codegen.
 public interface JavAIVectorizable {
 
     EmbeddingVector vector();
+    EmbeddingVector concatenatedTextVector();
     EmbeddingVector summaryVector();
 
     double similarityTo(JavAIVectorizable other);
@@ -73,7 +74,10 @@ public interface JavAIVectorizable {
 | Element | Kind | Purpose |
 |---|---|---|
 | `JavAIVectorizable` | Interface (weaver-implemented) | Implemented automatically on any `@JavAIVectorizable` class |
-| `JavAIRuntime` | Static engine | Back-edge propagation, lazy recompute, the `query()` graph walk — every woven method delegates here |
+| `JavAIRuntime` | Static engine | Back-edge propagation, per-field mode-aware recompute, the `query()` graph walk, whole-subgraph persistence locking — every woven method delegates here |
+| `EmbeddingConsistencyMode` | Enum | `IMMEDIATE_CONSISTENCY` (default) / `EVENTUAL_CONSISTENCY` / `COALESCED_CONSISTENCY` — see "Embedding concurrency model" below |
+| `EmbeddingFailureMode` | Enum | `THROW` (default) / `RETURN_NULL` — paired blocking/background failure behavior, see below |
+| `VectorizableString` | Concrete implementation | Standalone, directly usable immutable `String` box implementing the full `JavAIVectorizable` contract — the boxing idea below, made concrete and public |
 | `JavAISortable<T>` | Interface | `sortByCosineDistance(EmbeddingVector): JavAIList<T>` |
 | `JavAIList<T>` / `JavAISet<T>` / `JavAIMap<K,V>` | Interfaces | Extend both their `java.util` counterpart and `JavAISortable`/`JavAIVectorizable`/`Contextable`; add `nearestN`, `filterByMinSimilarity`, `centroid()` |
 | `JavAIArrayList` / `JavAILinkedHashSet` / `JavAILinkedHashMap` | Concrete collections | Real `ArrayList`/`LinkedHashSet`/`LinkedHashMap` subclasses implementing the above by hand, not woven |
@@ -125,29 +129,34 @@ method signature references `PromptContext` (see the module-placement note above
 
 ## Object lifecycle state machine
 
-Every `JavAIVectorizable` instance carries **two independent staleness flags**, not one:
+Every `JavAIVectorizable` instance carries **two independent staleness flags** — `FieldDirty` and
+`SummaryDirty`. `vector()` itself is no longer cached at the object level (it's a purely compositional
+centroid of each field's own cache, see "Embedding concurrency model" below), so `FieldDirty`'s sole
+remaining job is gating `summaryVector()`'s own base-term recompute:
 
 ```
 This object:              Clean --setter mutates a @Vectorize field--> FieldDirty
-                           FieldDirty --next read of vector()/similarityTo()/query()--> EmbeddingRecomputing
-                           EmbeddingRecomputing --embedding computed--> Clean
+                           FieldDirty --next read of summaryVector()--> (consumed as its own base-term
+                                                                          staleness signal)
 
 Each live dependent,       SummaryDirty <--markDirty() walks dependents(), stops at any node already dirty-- FieldDirty
 transitively:              SummaryDirty --next read of summaryVector()/toContext()--> SummaryRecomputing
                            SummaryRecomputing --summary computed--> Clean
 ```
 
-- **Clean** — `vector()` and `summaryVector()` both reflect current field state; nothing pending.
-- **FieldDirty** — a `@Vectorize` field was mutated via a woven setter; this object's own `vector()` is stale.
+- **Clean** — every `@Vectorize` field's own cache slot is current and `summaryVector()` reflects it.
+- **FieldDirty** — a `@Vectorize` field was mutated via a woven setter; consumed only by `summaryVector()`,
+  which always includes `vector(self)` as its own base term.
 - **SummaryDirty** — a reachable descendant went dirty and the back-edge walk (`JavAIRuntime.propagateDirty`)
   reached this object; only `summaryVector()` is stale.
-- **EmbeddingRecomputing** / **SummaryRecomputing** — transient states entered by the next *read*, never by
-  the write — recomputation is a read-time side effect, never eager.
+- **SummaryRecomputing** — transient state entered by the next *read* of `summaryVector()`, never by the
+  write — recomputation is a read-time side effect, never eager, for this pair of flags specifically (each
+  `@Vectorize` field's own recompute timing is mode-dependent — see below).
 
 An object can be FieldDirty and SummaryDirty simultaneously; each clears independently on its own
 corresponding read. The propagation walk stops the instant it reaches a node already marked SummaryDirty —
-the cycle-safety guarantee. There is no global generation counter: each object's pair of flags is the
-entire durable state.
+the cycle-safety guarantee. There is no global generation counter *for these two flags* — that's separate
+from the per-field generation counters described next, which solve a different problem.
 
 ```java
 // What the developer writes -- and all they ever see:
@@ -158,10 +167,54 @@ public void setBody(String body) {
 // What the weaver actually ships:
 public void setBody(String body) {
     this.body = body;
-    this.markDirty();
-    JavAIRuntime.propagateDirty(this);
+    JavAIRuntime.vectorizeFieldMutated(this, "body", body);
 }
 ```
+
+## Embedding concurrency model
+
+Full contract in `doc/spec/vector-core.md`'s "Embedding concurrency model" section — summary here:
+
+- Each `@Vectorize` field (and `concatenatedTextVector()`) has its own `VectorCacheSlot` (`javai-vector`),
+  keyed by field name in `DirtyTrackingSupport`. `vector()` recombines them fresh on every call; it has no
+  cache of its own.
+- **Reassigning a field to its current value is a complete no-op**, under every mode — checked via
+  `Objects.equals` against the value captured just before the assignment (`@Advice.OnMethodEnter`, since by
+  the time an exit-only advice would see it, the assignment would already have overwritten it). No
+  dirty-marking, no generation bump, no dispatch, no lock touch.
+- **`EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY`** (default): mutation never triggers computation; a
+  read of a dirty slot blocks and recomputes inline, snapshotting the field's current value, while holding
+  the whole object's lock (`DirtyTrackingSupport.objectLock()`) for the duration — every setter, every mode,
+  briefly takes that same lock around its own bookkeeping, so a concurrent setter or getter on this object
+  genuinely waits rather than racing. Every request is accurate to the field's state at the time of the
+  request, even under races.
+- **`EVENTUAL_CONSISTENCY`**: mutation eagerly dispatches a background recompute; a read of an
+  already-computed slot returns the last known-good value immediately and dispatches its own background
+  recompute only if nothing is already outstanding for the current generation (so a burst of concurrent
+  readers of a stale value shares at most one real `embed()` call). A slot's very first computation always
+  blocks regardless of mode.
+- **`COALESCED_CONSISTENCY`**: mutation is eager and non-blocking, exactly like `EVENTUAL_CONSISTENCY`. A
+  read of a dirty slot **blocks**, joining whatever computation is already outstanding rather than starting
+  its own (dispatching a fresh one to join only if nothing's outstanding) — cheaper than
+  `IMMEDIATE_CONSISTENCY` under concurrent readers, but every reader still gets a real, blocking answer
+  rather than `EVENTUAL_CONSISTENCY`'s possibly-stale immediate one.
+- **`JavAIRuntime.configureMaxConcurrentEmbeddingCalls(int)`** (default 8) bounds concurrent `embed()` calls
+  globally, blocking and background alike — rapid mutation degrades to "slower," never unbounded parallel
+  HTTP calls.
+- **`EmbeddingFailureMode.THROW`** (default) rethrows a blocking failure (including to every
+  `COALESCED_CONSISTENCY` joiner) and keeps serving the last known-good value on a background failure;
+  **`RETURN_NULL`** returns/serves `null` instead either way. A failed attempt never marks a slot clean,
+  under any mode.
+- **`JavAIRuntime.runWithSubgraphLockedForPersistence(root, action)`** locks every reachable
+  `JavAIVectorizable`'s own per-object lock (fixed global order, deadlock-free — the same lock
+  `IMMEDIATE_CONSISTENCY` uses) and forces every `fieldVector()`/`concatenatedTextVector()` read on the
+  calling thread to block for an accurate value for the duration of `action`, regardless of the ambient
+  mode — what `javai-persistence`'s backends wrap every `save()` in, so the database never sees a stale
+  vector. Because every setter takes this same lock (see above), the subgraph is genuinely frozen against
+  mutation for the duration too, not just protected on the read side.
+
+All of the above is configured once, ideally at startup alongside the embedding provider — undefined
+behavior on a mid-flight toggle.
 
 ## Summary-vector formula
 
@@ -204,6 +257,21 @@ specification proposals only; do not implement until there's a demonstrated need
 - The lifecycle state machine and summary-vector formula above are exactly what's implemented and tested:
   state-transition tests, cycle-safety tests, and duplicate-reference-stacking tests all exist and pass,
   both hermetically (a fake embedding provider) and against real embeddings in `e2e-client-test`.
+- The embedding concurrency model above is real and tested: `EmbeddingConcurrencyTest` proves all three
+  consistency modes never serve a vector that doesn't match some genuinely-assigned field value under real
+  concurrent races, proves convergence to the final mutation once activity settles, proves the
+  `configureMaxConcurrentEmbeddingCalls` gate under rapid mutation, proves both `EmbeddingFailureMode`s'
+  blocking/background behavior including the opportunistic-retry guarantee, proves the no-op-reassignment
+  skip never triggers a new `embed()` call under any mode, proves `IMMEDIATE_CONSISTENCY`'s setter genuinely
+  blocks while a concurrent read is mid-computation, and proves `COALESCED_CONSISTENCY`'s blocking joiners
+  share exactly one real computation (not one each) and see the same THROW/RETURN_NULL outcome the owning
+  computation produced. `PersistenceSupportTest` proves `runWithSubgraphLockedForPersistence`'s
+  forced-accuracy override doesn't leak past its own block, and proves an ordinary setter (any mode) genuinely
+  waits out an in-progress flush. `EmbeddingConsistencyBenchmark` is a separate, hand-run comparative
+  profiling harness (tagged `"performance"`, excluded from the default `mvn test` run — see the root
+  `pom.xml`) reporting throughput and read-latency percentiles for all three modes side by side under a
+  representative concurrent workload. `VectorizableString` has its own dedicated test suite
+  (`VectorizableStringTest`).
 - `Contextable`/`ContextableObject`/`PromptContext` — real and tested (`PromptContextTest`,
   `PromptContextListContractTest`, `ContextableCollectionsTest`, plus delegation tests in
   `JavAIArrayListTest`/`JavAILinkedHashSetTest`/`JavAILinkedHashMapTest`): stop-at-first-overflow budgeted

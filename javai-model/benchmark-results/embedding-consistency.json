@@ -1,0 +1,26 @@
+{
+  "IMMEDIATE_CONSISTENCY": {
+    "throughputOpsPerSec": 2816.7253631155095,
+    "totalMillis": 1136.071,
+    "readMaxMillis": 67.908083,
+    "readP50Millis": 0.00675,
+    "readP99Millis": 39.531916,
+    "readP95Millis": 22.593625
+  },
+  "COALESCED_CONSISTENCY": {
+    "throughputOpsPerSec": 3387.975914667474,
+    "totalMillis": 944.51675,
+    "readMaxMillis": 60.701708,
+    "readP50Millis": 0.003209,
+    "readP99Millis": 42.816542,
+    "readP95Millis": 22.728541
+  },
+  "EVENTUAL_CONSISTENCY": {
+    "throughputOpsPerSec": 666302.2826058667,
+    "totalMillis": 4.802625,
+    "readMaxMillis": 0.864958,
+    "readP50Millis": 0.0065,
+    "readP99Millis": 0.130333,
+    "readP95Millis": 0.011
+  }
+}

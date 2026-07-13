@@ -6,6 +6,8 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
 import dev.xtrafe.javai.vector.EmbeddingProviderTextEmbeddingsInference;
+import dev.xtrafe.javai.vector.VectorCacheSlot;
+import dev.xtrafe.javai.vector.VectorCacheSlot.PendingComputation;
 import dev.xtrafe.javai.vector.VectorMath;
 
 import java.lang.reflect.Field;
@@ -18,7 +20,14 @@ import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Semaphore;
+import java.util.function.Supplier;
 
 /**
  * The back-edge propagation engine and lazy-recompute machinery doc/spec/vector-core.md's worked example
@@ -52,15 +61,63 @@ public final class JavAIRuntime {
      */
     public static final float DEFAULT_SUMMARY_DECAY = 0.5f;
 
+    /** A reasonable default bound on simultaneous in-flight {@code embed()} calls -- see
+     *  {@link #configureMaxConcurrentEmbeddingCalls(int)}. */
+    public static final int DEFAULT_MAX_CONCURRENT_EMBEDDING_CALLS = 8;
+
     private static volatile JavAIEmbeddingProvider embeddingProvider;
+    private static volatile EmbeddingConsistencyMode consistencyMode = EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY;
+    private static volatile EmbeddingFailureMode failureMode = EmbeddingFailureMode.THROW;
+    private static volatile Semaphore embeddingCallGate = new Semaphore(DEFAULT_MAX_CONCURRENT_EMBEDDING_CALLS);
+
+    /** Set for the duration of {@link #runWithSubgraphLockedForPersistence} on whichever thread is running
+     *  it -- forces every {@code fieldVector}/{@code concatenatedTextVector} read on that thread to block for
+     *  an accurate value regardless of the globally configured {@link EmbeddingConsistencyMode}, since a
+     *  persistence flush must never write a stale vector to the database. */
+    private static final ThreadLocal<Boolean> FORCE_ACCURATE = ThreadLocal.withInitial(() -> false);
 
     private JavAIRuntime() {
     }
 
-    // ---- provider configuration -------------------------------------------------------------
+    // ---- provider / concurrency-mode configuration ----------------------------------------------
 
     public static void configureEmbeddingProvider(JavAIEmbeddingProvider provider) {
         embeddingProvider = provider;
+    }
+
+    /** Configure once, ideally at startup alongside {@link #configureEmbeddingProvider} -- see
+     *  {@link EmbeddingConsistencyMode}'s own javadoc for what each mode guarantees. Undefined behavior if
+     *  changed after the provider is already handling real traffic. */
+    public static void configureConsistencyMode(EmbeddingConsistencyMode mode) {
+        consistencyMode = mode;
+    }
+
+    public static EmbeddingConsistencyMode consistencyMode() {
+        return consistencyMode;
+    }
+
+    /** See {@link EmbeddingFailureMode}'s own javadoc for the exact THROW/RETURN_NULL semantics and their
+     *  paired background-failure behavior. */
+    public static void configureFailureMode(EmbeddingFailureMode mode) {
+        failureMode = mode;
+    }
+
+    public static EmbeddingFailureMode failureMode() {
+        return failureMode;
+    }
+
+    /** Bounds how many {@code embed()} calls may be in flight simultaneously, across every woven object and
+     *  every consistency mode -- both {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY}'s blocking
+     *  calls and {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}'s eager background dispatches acquire
+     *  a permit from the same gate before ever calling into the configured provider. Under a burst of rapid
+     *  mutation this is what makes the system degrade to "slower" rather than "unboundedly many concurrent
+     *  HTTP calls" -- callers simply block on the gate until a permit frees up. */
+    public static void configureMaxConcurrentEmbeddingCalls(int max) {
+        embeddingCallGate = new Semaphore(max);
+    }
+
+    static Semaphore embeddingCallGate() {
+        return embeddingCallGate;
     }
 
     static JavAIEmbeddingProvider embeddingProvider() {
@@ -75,6 +132,150 @@ public final class JavAIRuntime {
             }
         }
         return provider;
+    }
+
+    // ---- shared mode-aware compute helpers -- used by both a woven object's own vector()/concatenatedTextVector()
+    // cache slots and every VectorizableString-boxed field's own slot ------------------------------------
+
+    /** Backs {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}'s background dispatches -- one shared,
+     *  unbounded-thread-count executor (virtual threads: cheap to spawn one per dispatch, and this work is
+     *  entirely I/O-bound waiting on the embedding provider's own HTTP call), gated by
+     *  {@link #embeddingCallGate()} for the actual concurrency bound, not by this executor itself. */
+    private static final ExecutorService BACKGROUND_EXECUTOR = Executors.newVirtualThreadPerTaskExecutor();
+
+    /**
+     * Computes {@code text} for {@code targetGeneration} inline, blocking the calling thread -- used for
+     * every {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY} read of a dirty slot, and for the very
+     * first computation ever performed for any slot regardless of mode (there is no prior real value to
+     * fall back on, so even {@code EVENTUAL_CONSISTENCY} must block here). Returns the vector this
+     * particular caller should see -- the result of its own snapshot, not necessarily whatever a racing
+     * newer computation ends up winning the shared cache -- per "the thread that asked for a stale
+     * embedding receives a vector accurate to the state of the field at that time." Applies
+     * {@link #failureMode()} on failure: {@link EmbeddingFailureMode#THROW} rethrows the provider's
+     * exception (wrapped, if it isn't already a {@code RuntimeException}); {@link EmbeddingFailureMode#RETURN_NULL}
+     * swallows it and returns {@code null}. Either way, {@code slot} is left dirty -- see
+     * {@link VectorCacheSlot#commitFailure}.
+     */
+    static EmbeddingVector computeBlocking(VectorCacheSlot slot, long targetGeneration, String text) {
+        acquireUninterruptibly(embeddingCallGate());
+        try {
+            EmbeddingVector result;
+            try {
+                result = embeddingProvider().embed(text);
+            } catch (RuntimeException e) {
+                slot.commitFailure(targetGeneration, failureMode() == EmbeddingFailureMode.RETURN_NULL);
+                if (failureMode() == EmbeddingFailureMode.THROW) {
+                    throw e;
+                }
+                return null;
+            }
+            slot.commitSuccess(targetGeneration, result);
+            return result;
+        } finally {
+            embeddingCallGate().release();
+        }
+    }
+
+    /**
+     * Fires a background computation of {@code text} for {@code targetGeneration}, but only if nothing is
+     * already outstanding for that exact generation ({@link VectorCacheSlot#claimPendingComputation}) --
+     * {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}'s eager-on-mutation dispatch and its
+     * opportunistic re-dispatch from a stale (but already-computed-at-least-once) read both funnel through
+     * here, so a burst of concurrent readers observing the same stale generation triggers at most one real
+     * {@code embed()} call between them, not one each. Also completes the claimed {@link PendingComputation}'s
+     * future on success or failure -- what lets {@link EmbeddingConsistencyMode#COALESCED_CONSISTENCY}'s
+     * blocking reads join this same dispatch instead of starting their own. Nobody who *dispatched* this is
+     * waiting on it directly, so a failure is recorded per {@link #failureMode()}'s paired background
+     * behavior (see that enum's javadoc) and never thrown from here -- only a joiner's own {@link #awaitPending}
+     * call surfaces it.
+     */
+    static void dispatchBackground(VectorCacheSlot slot, long targetGeneration, String text) {
+        PendingComputation claim = slot.claimPendingComputation(targetGeneration);
+        if (!claim.owner()) {
+            return;
+        }
+        BACKGROUND_EXECUTOR.execute(() -> {
+            acquireUninterruptibly(embeddingCallGate());
+            try {
+                EmbeddingVector result;
+                try {
+                    result = embeddingProvider().embed(text);
+                } catch (RuntimeException e) {
+                    boolean nullOut = failureMode() == EmbeddingFailureMode.RETURN_NULL;
+                    slot.commitFailure(targetGeneration, nullOut);
+                    // Mirrors computeBlocking's own failureMode() branch: RETURN_NULL resolves the future
+                    // normally (with null), THROW resolves it exceptionally -- so a COALESCED_CONSISTENCY
+                    // joiner's awaitPending sees exactly the outcome this mode promises, not always an
+                    // exception regardless of mode.
+                    if (nullOut) {
+                        claim.future().complete(null);
+                    } else {
+                        claim.future().completeExceptionally(e);
+                    }
+                    return;
+                }
+                slot.commitSuccess(targetGeneration, result);
+                claim.future().complete(result);
+            } finally {
+                embeddingCallGate().release();
+                slot.clearPendingComputation(targetGeneration);
+            }
+        });
+    }
+
+    /**
+     * {@link EmbeddingConsistencyMode#COALESCED_CONSISTENCY}'s read path: claims the right to compute
+     * {@code targetGeneration}, and either becomes the one real, blocking computation (exactly like
+     * {@link #computeBlocking}, plus completing the claim's future so any joiners unblock) or -- if a
+     * computation for this generation is already outstanding, whether dispatched by this same read path or
+     * by {@link #dispatchBackground}'s eager-on-mutation trigger -- simply awaits it instead of duplicating
+     * the work.
+     */
+    static EmbeddingVector coalescedRead(VectorCacheSlot slot, long targetGeneration, String text) {
+        PendingComputation claim = slot.claimPendingComputation(targetGeneration);
+        if (!claim.owner()) {
+            return awaitPending(claim.future());
+        }
+        try {
+            EmbeddingVector result = computeBlocking(slot, targetGeneration, text);
+            claim.future().complete(result);
+            return result;
+        } catch (RuntimeException e) {
+            claim.future().completeExceptionally(e);
+            throw e;
+        } finally {
+            slot.clearPendingComputation(targetGeneration);
+        }
+    }
+
+    /** Blocks for {@code future} to resolve, unwrapping and rethrowing the original {@code RuntimeException}
+     *  if the computation that owns it failed under {@link EmbeddingFailureMode#THROW} -- every joiner sees
+     *  the exact same outcome the owning computation itself produced (a value, possibly {@code null} under
+     *  {@link EmbeddingFailureMode#RETURN_NULL}, or a thrown exception), never a re-derived one of its own. */
+    private static EmbeddingVector awaitPending(CompletableFuture<EmbeddingVector> future) {
+        try {
+            return future.join();
+        } catch (CompletionException e) {
+            if (e.getCause() instanceof RuntimeException cause) {
+                throw cause;
+            }
+            throw e;
+        }
+    }
+
+    private static void acquireUninterruptibly(Semaphore gate) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                gate.acquire();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private static JavAIEmbeddingProvider defaultProviderFromSystemProperties() {
@@ -184,30 +385,183 @@ public final class JavAIRuntime {
         }
     }
 
-    // ---- vector computation, wired onto every woven class's vector()/summaryVector()/etc. ----
+    // ---- vector computation, wired onto every woven class's vector()/concatenatedTextVector()/summaryVector()/etc. ----
 
-    /** {@code vectorizeFieldNames} is a comma-joined list of field names, baked in at weave time. */
+    /**
+     * The compositional aggregate: combines each {@code @Vectorize} field's own {@link #fieldVector} into
+     * one centroid (the same {@link VectorMath#centroid} operation a collection already uses to combine its
+     * elements' vectors -- not a single embedding of concatenated text; see {@link #concatenatedTextVector} for that).
+     * Deliberately uncached at this level: each constituent {@link #fieldVector} already caches (and
+     * respects {@link EmbeddingConsistencyMode} for) its own recomputation, so recombining them here is
+     * cheap, in-memory arithmetic every time, never itself a source of staleness or blocking beyond
+     * whatever an individual field's own first-ever computation requires.
+     *
+     * <p>{@code vectorizeFieldNames} is a comma-joined list of field names, baked in at weave time.
+     */
     public static EmbeddingVector vector(Object self, String vectorizeFieldNames) {
-        DirtyTrackingSupport state = stateOf(self);
-        if (state.cachedVector() == null || state.isFieldDirty()) {
-            String canonicalText = canonicalFieldText(self, vectorizeFieldNames);
-            EmbeddingVector recomputed = embeddingProvider().embed(canonicalText);
-            state.cacheVector(recomputed);
-            state.clearFieldDirty();
+        if (vectorizeFieldNames.isBlank()) {
+            // No @Vectorize fields at all -- still a real, correctly-dimensioned vector from the current
+            // model, never a fabricated zero vector, so combining it arithmetically elsewhere never hits a
+            // dims mismatch. Rare enough (an @JavAIVectorizable class with no vectorized fields) not to
+            // warrant its own cache slot.
+            return embeddingProvider().embed("");
         }
-        return state.cachedVector();
+        List<EmbeddingVector> fieldVectors = new ArrayList<>();
+        for (String fieldName : vectorizeFieldNames.split(",")) {
+            fieldVectors.add(fieldVector(self, fieldName));
+        }
+        return VectorMath.centroid(fieldVectors);
     }
 
     /**
-     * Always recomputes -- no per-field cache. Doc/spec/vector-core.md's lazy-recompute lifecycle is
-     * specified for {@code vector()}/{@code summaryVector()} only; a single shared {@code FieldDirty} flag
-     * can't safely gate several independently-cached per-field vectors (whichever accessor is read first
-     * after a mutation would clear the flag and leave every other field's cache stale). Simpler and
-     * correct beats a caching scheme that needs per-field dirty bits this spec doesn't have.
+     * A single embedding of every {@code @Vectorize} field's current value concatenated into one
+     * text block -- exactly what {@code vector()} computed before this class introduced per-field caching;
+     * preserved verbatim under its own name (see {@link dev.xtrafe.javai.model.JavAIVectorizable#concatenatedTextVector}'s
+     * own javadoc for why). Cached via its own {@link VectorCacheSlot} (invalidated by any {@code @Vectorize}
+     * field changing -- there's no way to incrementally update one holistic text embedding when only one of
+     * several concatenated fields changed), and mode-aware exactly like {@link #fieldVector}.
+     */
+    public static EmbeddingVector concatenatedTextVector(Object self, String vectorizeFieldNames) {
+        DirtyTrackingSupport state = stateOf(self);
+        VectorCacheSlot slot = state.concatenatedTextSlot();
+        return readSlot(state, slot, () -> concatenatedFieldText(self, vectorizeFieldNames));
+    }
+
+    /**
+     * A single {@code @Vectorize} field's own cached vector -- real per-field caching (unlike this method's
+     * pre-concurrency-model incarnation, which always recomputed with no cache at all: a single shared
+     * {@code FieldDirty} flag couldn't safely gate several independently-cached per-field vectors, but a
+     * dedicated {@link VectorCacheSlot} per field name can). Mode-aware -- see {@link EmbeddingConsistencyMode}'s
+     * own javadoc for what each of the three modes guarantees on this read path.
      */
     public static EmbeddingVector fieldVector(Object self, String fieldName) {
-        Object value = readField(self, fieldName);
-        return embeddingProvider().embed(value == null ? "" : String.valueOf(value));
+        DirtyTrackingSupport state = stateOf(self);
+        VectorCacheSlot slot = state.fieldSlot(fieldName);
+        return readSlot(state, slot, () -> fieldTextOf(self, fieldName));
+    }
+
+    /**
+     * Shared read path for both {@link #fieldVector} and {@link #concatenatedTextVector}: a clean slot
+     * returns its cached value with no locking or coordination at all. A dirty slot dispatches to one of
+     * two strategies depending on whether this call needs to be serialized against concurrent access to the
+     * same object:
+     *
+     * <ul>
+     *   <li>{@link #mustBlockUnderObjectLock} cases (the slot's very first-ever computation,
+     *       {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY}, or {@link #runWithSubgraphLockedForPersistence}
+     *       overriding the ambient mode for this thread) -- {@link #computeBlockingUnderObjectLock} holds
+     *       the whole object's lock for the duration, so no concurrent getter or setter on this object can
+     *       race the computation.</li>
+     *   <li>Otherwise, mode-specific and lock-free: {@link EmbeddingConsistencyMode#COALESCED_CONSISTENCY}
+     *       blocks via {@link #coalescedRead}; {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY} fires
+     *       {@link #dispatchBackground} (a no-op if one's already outstanding) and returns the cached value
+     *       immediately.</li>
+     * </ul>
+     */
+    private static EmbeddingVector readSlot(DirtyTrackingSupport state, VectorCacheSlot slot,
+            Supplier<String> textSupplier) {
+        if (!slot.isDirty()) {
+            return slot.cachedValue();
+        }
+        if (mustBlockUnderObjectLock(slot)) {
+            return computeBlockingUnderObjectLock(state, slot, textSupplier);
+        }
+        long generation = slot.currentGeneration();
+        String text = textSupplier.get();
+        if (consistencyMode() == EmbeddingConsistencyMode.COALESCED_CONSISTENCY) {
+            return coalescedRead(slot, generation, text);
+        }
+        dispatchBackground(slot, generation, text);
+        return slot.cachedValue();
+    }
+
+    /** True when a stale slot must be computed under the object's own lock rather than lock-free: the
+     *  slot's very first computation (nothing to fall back on, under any mode), {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY},
+     *  or {@link #runWithSubgraphLockedForPersistence} overriding the ambient mode for the current thread --
+     *  persistence must never write a stale vector to the database, regardless of the globally configured
+     *  mode (see that method's own javadoc). */
+    private static boolean mustBlockUnderObjectLock(VectorCacheSlot slot) {
+        return !slot.everComputed()
+                || consistencyMode() == EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY
+                || FORCE_ACCURATE.get();
+    }
+
+    /**
+     * Holds {@code state.objectLock()} for the full duration of a blocking recompute -- the guarantee
+     * {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY} makes explicit ("no further vector getters or
+     * field setters can run until the embedding call returns"): every setter briefly takes this same lock
+     * around its own bookkeeping (see {@link #vectorizeFieldMutated}), so a concurrent setter genuinely
+     * waits rather than racing this computation, and a concurrent getter re-checks {@code isDirty()} after
+     * acquiring the lock rather than assuming it still needs to compute (whoever held the lock first may
+     * have already landed a fresh value while this thread was waiting). Reentrant: a persistence flush
+     * already holding this same lock (via {@link #runWithSubgraphLockedForPersistence}) re-enters it
+     * trivially when its own forced-accurate reads recurse through {@code vector()}/{@code summaryVector()}.
+     */
+    private static EmbeddingVector computeBlockingUnderObjectLock(DirtyTrackingSupport state, VectorCacheSlot slot,
+            Supplier<String> textSupplier) {
+        state.objectLock().lock();
+        try {
+            if (!slot.isDirty()) {
+                return slot.cachedValue();
+            }
+            long generation = slot.currentGeneration();
+            String text = textSupplier.get();
+            return computeBlocking(slot, generation, text);
+        } finally {
+            state.objectLock().unlock();
+        }
+    }
+
+    /**
+     * Wired onto every woven {@code @Vectorize} field's setter (replacing that field's old direct
+     * {@code markFieldDirty}/{@code registerDependency}/{@code propagateDirty} calls, which still happen
+     * here, unchanged): a no-op reassignment (the new value {@link Objects#equals} the old one) skips
+     * everything below entirely -- nothing about the field's own state, its dependents, or any cache
+     * actually needs to change, under any consistency mode. Otherwise briefly holds {@code self}'s
+     * {@link DirtyTrackingSupport#objectLock()} around this bookkeeping -- both so a concurrent
+     * {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY} getter's blocking computation genuinely
+     * excludes this setter (see {@link #computeBlockingUnderObjectLock}), and so a persistence flush
+     * (which holds every reachable object's lock for the whole flush -- see
+     * {@link #runWithSubgraphLockedForPersistence}) actually excludes ordinary mutation regardless of mode,
+     * not just {@code IMMEDIATE_CONSISTENCY}'s -- then bumps this field's own {@link VectorCacheSlot}
+     * generation, and this object's {@link DirtyTrackingSupport#concatenatedTextSlot()} generation
+     * (concatenatedTextVector's concatenated text depends on every field, so any one of them changing
+     * invalidates it too -- but recomputing it is comparatively expensive, so it stays lazily refreshed on
+     * next read rather than eagerly dispatched here). Under {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}
+     * or {@link EmbeddingConsistencyMode#COALESCED_CONSISTENCY}, additionally dispatches this field's own
+     * eager background recompute immediately, using the value the setter already has in hand -- "vector
+     * calculations are eager on mutation." Under {@link EmbeddingConsistencyMode#IMMEDIATE_CONSISTENCY},
+     * mutation never triggers computation; only a subsequent read of the now-dirty slot does.
+     */
+    public static void vectorizeFieldMutated(Object self, String fieldName, Object oldValue, Object newValue) {
+        if (Objects.equals(oldValue, newValue)) {
+            return;
+        }
+
+        DirtyTrackingSupport state = stateOf(self);
+        state.objectLock().lock();
+        try {
+            vectorizeFieldMutatedLocked(self, fieldName, newValue, state);
+        } finally {
+            state.objectLock().unlock();
+        }
+    }
+
+    private static void vectorizeFieldMutatedLocked(Object self, String fieldName, Object newValue,
+            DirtyTrackingSupport state) {
+        markFieldDirty(self);
+        registerDependency(self, newValue);
+        propagateDirty(self);
+
+        VectorCacheSlot fieldSlot = state.fieldSlot(fieldName);
+        long fieldGeneration = fieldSlot.bumpGeneration();
+        state.concatenatedTextSlot().bumpGeneration();
+
+        EmbeddingConsistencyMode mode = consistencyMode();
+        if (mode == EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY || mode == EmbeddingConsistencyMode.COALESCED_CONSISTENCY) {
+            String text = newValue == null ? "" : String.valueOf(newValue);
+            dispatchBackground(fieldSlot, fieldGeneration, text);
+        }
     }
 
     public static EmbeddingVector summaryVector(Object self, String summaryFieldNames, String vectorizeFieldNames) {
@@ -246,11 +600,21 @@ public final class JavAIRuntime {
                         new EmbeddingVector(VectorMath.normalize(sum), own.modelId(), sum.length, Instant.now());
                 state.cacheSummaryVector(recomputed);
                 state.clearSummaryDirty();
+                // vector()'s own cache no longer clears this (it has no cache of its own to gate on
+                // anymore -- see vector()'s javadoc); summaryVector() is now the only remaining consumer of
+                // this flag, so it must be the one to clear it, or it would stay set forever after the
+                // first mutation and force a full recompute on every subsequent call.
+                state.clearFieldDirty();
             } finally {
                 exitSummaryComputation(self);
             }
         }
         return state.cachedSummaryVector();
+    }
+
+    private static String fieldTextOf(Object self, String fieldName) {
+        Object value = readField(self, fieldName);
+        return value == null ? "" : String.valueOf(value);
     }
 
     /**
@@ -381,9 +745,111 @@ public final class JavAIRuntime {
         return List.of(value);
     }
 
+    // ---- persistence support: whole-subgraph locking + forced accuracy ----------------------
+
+    /**
+     * Runs {@code action} with every {@link JavAIVectorizable} reachable from {@code root} (root included)
+     * locked for the duration, and every {@code fieldVector}/{@code concatenatedTextVector} read on this
+     * thread forced to compute accurately (blocking, never serving a stale value) regardless of the
+     * globally configured {@link EmbeddingConsistencyMode} -- the two guarantees {@code javai-persistence}
+     * needs: the database must never see a vector that doesn't match its field's current value, and nothing
+     * in the locked subgraph can mutate out from under the flush while it's in progress. The second
+     * guarantee is only real because every setter, under every consistency mode, briefly takes this same
+     * per-object lock around its own bookkeeping (see {@link #vectorizeFieldMutated}) -- without that, an
+     * ordinary {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}/{@link EmbeddingConsistencyMode#COALESCED_CONSISTENCY}
+     * setter would proceed completely unobstructed while this method believes the subgraph is frozen.
+     *
+     * <p>Locks are acquired in {@link DirtyTrackingSupport#sequenceNumber()} order (assigned once, at each
+     * object's construction) -- a fixed, global, per-object order that holds regardless of which root or
+     * traversal order a particular call started from, which is what makes this deadlock-free even when two
+     * overlapping subgraphs are locked concurrently by separate persistence operations.
+     */
+    public static void runWithSubgraphLockedForPersistence(Object root, Runnable action) {
+        List<DirtyTrackingSupport> states = new ArrayList<>();
+        for (Object node : reachableVectorizables(root)) {
+            states.add(stateOf(node));
+        }
+        states.sort(Comparator.comparingLong(DirtyTrackingSupport::sequenceNumber));
+
+        int locked = 0;
+        try {
+            for (DirtyTrackingSupport state : states) {
+                state.objectLock().lock();
+                locked++;
+            }
+            boolean alreadyForcing = FORCE_ACCURATE.get();
+            FORCE_ACCURATE.set(true);
+            try {
+                action.run();
+            } finally {
+                FORCE_ACCURATE.set(alreadyForcing);
+            }
+        } finally {
+            for (int i = 0; i < locked; i++) {
+                states.get(i).objectLock().unlock();
+            }
+        }
+    }
+
+    /**
+     * Every {@link JavAIVectorizable} reachable from {@code root} (including {@code root} itself, and
+     * including an intermediate collection like a {@code JavAIArrayList} in its own right, not just its
+     * elements -- {@code CollectionVectorSupport} reads and writes that collection's own
+     * {@link DirtyTrackingSupport} state too, so it needs locking exactly like any domain object does).
+     *
+     * <p>Deliberately narrower than it might look: only ever reflects over a node's declared fields when
+     * that node is itself {@code JavAIVectorizable} (matching {@link #query}'s own "only descend into
+     * graph-shaped values" rule) -- a plain leaf (a {@code String}, a boxed number...) is never reflected
+     * into, both because its own fields aren't meaningful graph edges and because {@code java.lang}'s own
+     * fields aren't reliably reflectively accessible under the module system regardless.
+     */
+    public static Set<Object> reachableVectorizables(Object root) {
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
+        Set<Object> result = Collections.newSetFromMap(new IdentityHashMap<>());
+        collectReachableVectorizables(root, visited, result);
+        return result;
+    }
+
+    private static void collectReachableVectorizables(Object node, Set<Object> visited, Set<Object> result) {
+        if (node == null || !visited.add(node)) {
+            return;
+        }
+        if (node instanceof JavAIVectorizable) {
+            result.add(node);
+        }
+        if (node instanceof Map<?, ?> || node instanceof Iterable<?>) {
+            // A collection's own elements are the graph edges worth following; its JDK-internal fields
+            // (backing array, size, ...) never are, so this never falls through to the field-reflection
+            // loop below for the collection object itself.
+            for (Object element : expand(node)) {
+                collectReachableVectorizables(element, visited, result);
+            }
+            return;
+        }
+        if (!(node instanceof JavAIVectorizable)) {
+            return;
+        }
+        for (Field field : allFields(node.getClass())) {
+            if (field.getName().equals(STATE_FIELD)) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object value;
+            try {
+                value = field.get(node);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException(
+                        "Cannot read " + field + " while collecting reachable vectorizables", e);
+            }
+            if (value != null) {
+                collectReachableVectorizables(value, visited, result);
+            }
+        }
+    }
+
     // ---- shared reflection helpers -------------------------------------------------------------
 
-    private static String canonicalFieldText(Object self, String vectorizeFieldNames) {
+    private static String concatenatedFieldText(Object self, String vectorizeFieldNames) {
         if (vectorizeFieldNames.isBlank()) {
             return "";
         }
@@ -397,7 +863,11 @@ public final class JavAIRuntime {
         return text.toString();
     }
 
-    private static Object readField(Object self, String fieldName) {
+    /** Public (not just used internally) so {@code javai-substrate}'s woven setter advice can read a
+     *  field's pre-assignment value at {@code @Advice.OnMethodEnter} time -- the no-op-reassignment check
+     *  (see {@link #vectorizeFieldMutated}'s own javadoc) needs the value as it was *before* the setter's
+     *  own assignment runs, which this same reflective path already knows how to find. */
+    public static Object readField(Object self, String fieldName) {
         Field field = findField(self.getClass(), fieldName);
         try {
             field.setAccessible(true);

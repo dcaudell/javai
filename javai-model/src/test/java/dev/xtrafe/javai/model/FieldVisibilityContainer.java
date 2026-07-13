@@ -35,6 +35,11 @@ final class FieldVisibilityContainer implements JavAIVectorizable, JavAIDirtyTra
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "");
+    }
+
+    @Override
     public EmbeddingVector summaryVector() {
         return JavAIRuntime.summaryVector(this, "hiddenChild,visibleChild", "");
     }

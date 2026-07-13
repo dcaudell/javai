@@ -1,13 +1,16 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
+import org.neo4j.driver.Value;
 import org.testcontainers.containers.Neo4jContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
@@ -18,6 +21,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -52,6 +56,12 @@ class RepositoryBackendNeo4jTest {
 
     @BeforeEach
     void resetProvider() {
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    @AfterEach
+    void resetConsistencyMode() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
     }
 
@@ -218,5 +228,71 @@ class RepositoryBackendNeo4jTest {
         assertEquals(2, reloaded.getTagsByCode().size());
         assertEquals("alpha", reloaded.getTagsByCode().get("first").getLabel());
         assertEquals("beta", reloaded.getTagsByCode().get("second").getLabel());
+    }
+
+    /**
+     * See {@link RepositoryBackendHibernatePostgresTest#savedVectorIsAlwaysAccurateUnderImmediateConsistency}
+     * -- same must-have, same reasoning, proven against this backend instead.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderImmediateConsistency() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        article.setTitle("second title, mutated just before save");
+        TestArticle resaved = repository.save(article);
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        float[] stored = readVectorProperty(id, "titleVector__" + ModelIds.sanitize(expected.modelId()));
+        assertArrayEquals(expected.values(), stored, 1e-4f,
+                "the persisted vector must match the field's value as of save(), not some earlier value");
+    }
+
+    /**
+     * See {@link RepositoryBackendHibernatePostgresTest#savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider}
+     * -- same race, same reasoning, proven against this backend instead.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        FakeEmbeddingProvider fast = new FakeEmbeddingProvider();
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            try {
+                Thread.sleep(300); // slower than this test's own save() call would otherwise wait for
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return fast.embed(text);
+        });
+
+        article.setTitle("second title, mutated just before a slow-provider save");
+        TestArticle resaved = repository.save(article); // must block on the slow provider, not skip ahead
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        float[] stored = readVectorProperty(id, "titleVector__" + ModelIds.sanitize(expected.modelId()));
+        assertArrayEquals(expected.values(), stored, 1e-4f,
+                "EVENTUAL_CONSISTENCY's slow background dispatch must never be allowed to leave a stale "
+                        + "vector in the database -- the flush itself must have forced an accurate, "
+                        + "blocking recompute");
+    }
+
+    private static float[] readVectorProperty(UUID id, String property) {
+        try (Driver driver = GraphDatabase.driver(neo4j.getBoltUrl(), AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+                var session = driver.session()) {
+            Value value = session.run("MATCH (n:TestArticle {id: $id}) RETURN n[$property] AS v",
+                            org.neo4j.driver.Values.parameters("id", id.toString(), "property", property))
+                    .single().get("v");
+            assertTrue(!value.isNull(), "expected property " + property + " to be set on node " + id);
+            List<Float> values = value.asList(Value::asFloat);
+            float[] result = new float[values.size()];
+            for (int i = 0; i < result.length; i++) {
+                result[i] = values.get(i);
+            }
+            return result;
+        }
     }
 }

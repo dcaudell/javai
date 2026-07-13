@@ -24,6 +24,11 @@ final class GenericHolder implements JavAIVectorizable, JavAIDirtyTracking {
     }
 
     @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "");
+    }
+
+    @Override
     public EmbeddingVector summaryVector() {
         return JavAIRuntime.summaryVector(this, "item", "");
     }

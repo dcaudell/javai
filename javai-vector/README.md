@@ -32,7 +32,8 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
 | `VectorMath` | Static utility | `normalize`, `addWeighted`, `cosineSimilarity`, `centroid` — CPU similarity backend |
 | `JavAIEmbeddingProvider` | SPI interface | Pluggable, versioned embedding-model provider |
 | `JavAIDirtyTracking` | Interface | `addDependent`/`dependents()`, `isFieldDirty`/`markFieldDirty`/`clearFieldDirty`, `isSummaryDirty`/`markSummaryDirty`/`clearSummaryDirty` |
-| `DirtyTrackingSupport` | Concrete implementation | The entire durable per-object dirty-tracking state, as one object — a woven class gets one synthesized field of this type; concrete collections in `javai-model` hold one directly |
+| `DirtyTrackingSupport` | Concrete implementation | The entire durable per-object dirty-tracking state, as one object — a woven class gets one synthesized field of this type; concrete collections in `javai-model` hold one directly. Also owns one `VectorCacheSlot` per `@Vectorize` field (keyed by field name) plus one for `concatenatedTextVector()`, a per-object `objectLock()` (whole-subgraph persistence flushes *and* `IMMEDIATE_CONSISTENCY`'s read/write exclusion — every setter, every mode, briefly takes it), and a construction-time sequence number giving lock acquisition a fixed global order |
+| `VectorCacheSlot` | Concrete implementation | Lock-free, generation-guarded cache primitive backing every per-field/`concatenatedTextVector()` cache — see `doc/spec/vector-core.md`'s "Embedding concurrency model" for the full IMMEDIATE/EVENTUAL_CONSISTENCY contract this enables (that config surface itself lives in `javai-model`'s `JavAIRuntime`, since it's the one place both modules' concerns meet) |
 | `EndpointRateLimiter` | Public utility | Cross-instance, cross-module 429/backoff coordination, keyed by normalized endpoint URL — see "Rate limiting" below |
 | `RetrySupport` | Public utility | Synchronous retry loop built on `EndpointRateLimiter`; used by both this module's embedding providers and, via the module dependency, `javai-completion`'s `Cortex` implementations |
 | `TooManyRequestsException` / `RetryAfterParser` | Public types | The shared 429 signal and `Retry-After` header parser every provider's own detection code funnels into |
@@ -56,6 +57,24 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
   `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq` alongside `javai-completion`'s `CortexAnthropic`/
   `CortexGroq` — those two vendors have no native embeddings API to wrap.
 - All five providers retry a `429` via `RetrySupport`/`EndpointRateLimiter` — see "Rate limiting" below.
+
+## Embedding concurrency: `VectorCacheSlot`
+
+`VectorCacheSlot` is the lock-free primitive behind every per-field cache and `concatenatedTextVector()`'s own
+cache — one slot per `@Vectorize` field, held in `DirtyTrackingSupport`'s field map. It tracks a
+monotonically increasing generation (bumped once per mutation) and separately records the highest
+generation any computation has *attempted* versus the highest that actually *succeeded*, so a slower, stale
+success racing in behind a newer failure can never regress the cache, while a legitimate *retry* of the
+same generation after an earlier failure can still land. A second, related primitive,
+`claimPendingComputation`/`clearPendingComputation`, tracks a single-flight `CompletableFuture` per
+generation -- what lets several concurrent callers share one real `embed()` call instead of each firing a
+redundant one, and lets a blocking reader join a computation someone else already started rather than
+starting its own. Together these are what make `JavAIRuntime`'s three `EmbeddingConsistencyMode` values
+(`javai-model`) possible -- see `doc/spec/vector-core.md`'s "Embedding concurrency model" section for the
+full contract, including the no-op-reassignment optimization, bounded concurrency, failure handling, and
+the persistence must-haves this enables. Tested in isolation (`VectorCacheSlotTest`, including a
+32-thread concurrent stress test and dedicated claim/clear tests) independent of `JavAIRuntime`, which has
+its own separate race/convergence suite in `javai-model`.
 
 ## Rate limiting: 429s, exponential backoff, coordinated across instances and modules
 
