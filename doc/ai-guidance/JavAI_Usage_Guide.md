@@ -200,6 +200,22 @@ interoperate, and not reasoning about which subset a given task needs is one les
 `javai-annotations` isn't listed above because it's transitively required by every other module — it comes
 along automatically.
 
+For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
+
+```kotlin
+dependencies {
+    implementation("io.github.dcaudell:javai-vector:0.1.1")
+    implementation("io.github.dcaudell:javai-model:0.1.1")
+    implementation("io.github.dcaudell:javai-substrate:0.1.1")
+    implementation("io.github.dcaudell:javai-supervision:0.1.1")
+    implementation("io.github.dcaudell:javai-collections:0.1.1")
+    implementation("io.github.dcaudell:javai-persistence:0.1.1")
+    implementation("io.github.dcaudell:javai-completion:0.1.1")
+}
+```
+
+Every module publishes both a POM and Gradle Module Metadata (`.module`) to Maven Central.
+
 ## Activating the weaver (required for `@JavAIVectorizable`/`@SyncSupervision`/`@AsyncSupervision` to do anything)
 
 `javai-substrate` (Vector Core weaving) and `javai-supervision` (Agentic Supervision weaving) are **load-time
