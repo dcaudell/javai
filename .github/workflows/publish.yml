@@ -70,6 +70,15 @@ jobs:
         # click" in Central's own web UI -- see doc/release-process.md for that last step.
 
       - name: Create a GitHub Release for this tag
-        run: gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
+        # Idempotent: a Release for this tag may already exist if it was created via the GitHub UI (which
+        # also creates the tag, and that tag push is what triggers this very workflow) rather than by
+        # tagging an existing commit from the command line. Either path is fine -- this step's only job is
+        # making sure a Release exists by the end, not insisting it be the one to create it.
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            echo "Release ${GITHUB_REF_NAME} already exists -- nothing to do."
+          else
+            gh release create "${GITHUB_REF_NAME}" --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
