@@ -17,6 +17,13 @@
 # surfaced only once real clients connected (Neo4j's Debian package ships every listen-address config line
 # commented out, but its *actual* compiled-in default is loopback-only despite its own startup log
 # claiming "0.0.0.0" -- fixed below, not assumed).
+#
+# MongoDB is deliberately NOT folded into this image -- see MonolithicContainer.java's own javadoc for why:
+# mongot (the separate process real $vectorSearch needs) has no apt package, no scriptable download URL,
+# and its bootstrap coordination with mongod inside MongoDB's own official image is proprietary/compiled
+# (a Go binary, no public source), confirmed empirically not to be safely reproducible by hand-invoking the
+# same binaries with the same flags outside that image's own orchestration. MongoDB runs as a second,
+# separate container instead, using mongodb/mongodb-atlas-local unmodified.
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

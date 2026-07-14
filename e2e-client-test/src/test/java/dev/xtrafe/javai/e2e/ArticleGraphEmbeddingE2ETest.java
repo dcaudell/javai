@@ -104,10 +104,23 @@ class ArticleGraphEmbeddingE2ETest {
 
         assertTrue(articleD.isFieldDirty(), "never-read object starts dirty");
         EmbeddingVector before = articleV.vector();
-        assertFalse(articleD.isFieldDirty(), "reading vector() must clear FieldDirty");
 
+        // vector() itself always constructs a fresh EmbeddingVector (a new centroid over its constituent
+        // fieldVector() results, each with its own computedAt) -- it's never the literal same instance on a
+        // repeat call, so this compares by value (matching this file's own toList() convention elsewhere),
+        // not via EmbeddingVector's record-generated equals(), which would compare the values array by
+        // reference and always fail here regardless of whether a real recompute happened underneath.
         EmbeddingVector reread = articleV.vector();
-        assertEquals(before, reread, "a repeat clean read must return the cached vector, not recompute");
+        assertEquals(toList(before.values()), toList(reread.values()),
+                "a repeat clean read must return the same values from the cached per-field vectors, not recompute");
+
+        // vector() itself never clears FieldDirty -- it's deliberately uncached at this level (each
+        // @Vectorize field caches independently via its own VectorCacheSlot; see JavAIRuntime.vector()'s
+        // own javadoc), so there's no single object-level cache left for it to gate on. Establish a
+        // known-clean baseline directly through the interface instead, so the assertion below actually
+        // proves the setter's mutation is what (re-)marks the object dirty, not just that the flag was
+        // never cleared in the first place.
+        articleD.clearFieldDirty();
 
         article.setTitle("Zero-day disclosed in widely used TLS library -- UPDATED");
         assertTrue(articleD.isFieldDirty(), "mutating a @Vectorize field must mark FieldDirty");
@@ -160,7 +173,10 @@ class ArticleGraphEmbeddingE2ETest {
         JavAIDirtyTracking featuredD = dirtyTracking(featured);
 
         EmbeddingVector before = featuredV.vector();
-        assertFalse(featuredD.isFieldDirty());
+        // vector() no longer clears FieldDirty itself (see vectorLifecycleIsLazyAndReflectsMutation's own
+        // comment above for why) -- establish a known-clean baseline directly through the interface so the
+        // assertion below actually proves the inherited setter's mutation is what marks it dirty.
+        featuredD.clearFieldDirty();
 
         // Reference statically typed as the plain, unwoven ancestor -- Attribution -- not Comment. Java
         // resolves instance method calls virtually against the runtime type, so this must still reach the

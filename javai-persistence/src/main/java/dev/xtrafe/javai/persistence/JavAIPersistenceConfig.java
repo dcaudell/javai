@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import org.hibernate.SessionFactory;
 import org.neo4j.driver.Driver;
+import org.springframework.data.mongodb.core.MongoTemplate;
 
 import java.util.Locale;
 
@@ -9,18 +10,21 @@ import java.util.Locale;
  * Backend selection + connection settings for {@link JavAIPI#repository(Class)}. Self-contained by
  * default -- {@link #fromSystemProperties()} mirrors {@code JavAIRuntime.configureEmbeddingProvider}'s own
  * {@code javai.embedding.*} pattern -- but fully overridable: {@link Builder#sessionFactory(SessionFactory)}
- * / {@link Builder#neo4jDriver(Driver)} accept a {@code SessionFactory}/{@code Driver} the calling
- * application already built and owns, instead of letting this module bootstrap its own.
+ * / {@link Builder#neo4jDriver(Driver)} / {@link Builder#mongoTemplate(MongoTemplate)} accept a
+ * {@code SessionFactory}/{@code Driver}/{@code MongoTemplate} the calling application already built and
+ * owns, instead of letting this module bootstrap its own.
  *
  * <p>System properties read by {@link #fromSystemProperties()}: {@code javai.persistence.backend}
- * ({@code postgres} [default] or {@code neo4j}), {@code javai.persistence.postgres.url|username|password},
- * {@code javai.persistence.neo4j.uri|username|password}.
+ * ({@code postgres} [default], {@code neo4j}, or {@code mongodb}),
+ * {@code javai.persistence.postgres.url|username|password},
+ * {@code javai.persistence.neo4j.uri|username|password}, {@code javai.persistence.mongodb.uri|database}.
  */
 public final class JavAIPersistenceConfig {
 
     public enum Backend {
         POSTGRES,
-        NEO4J
+        NEO4J,
+        MONGODB
     }
 
     private final Backend backend;
@@ -32,6 +36,9 @@ public final class JavAIPersistenceConfig {
     private final String neo4jUsername;
     private final String neo4jPassword;
     private final Driver externalNeo4jDriver;
+    private final String mongoUri;
+    private final String mongoDatabase;
+    private final MongoTemplate externalMongoTemplate;
 
     private JavAIPersistenceConfig(Builder builder) {
         this.backend = builder.backend;
@@ -43,6 +50,9 @@ public final class JavAIPersistenceConfig {
         this.neo4jUsername = builder.neo4jUsername;
         this.neo4jPassword = builder.neo4jPassword;
         this.externalNeo4jDriver = builder.externalNeo4jDriver;
+        this.mongoUri = builder.mongoUri;
+        this.mongoDatabase = builder.mongoDatabase;
+        this.externalMongoTemplate = builder.externalMongoTemplate;
     }
 
     public static JavAIPersistenceConfig fromSystemProperties() {
@@ -50,8 +60,9 @@ public final class JavAIPersistenceConfig {
         Backend backend = switch (backendProperty) {
             case "postgres", "postgres+pgvector" -> Backend.POSTGRES;
             case "neo4j" -> Backend.NEO4J;
-            default -> throw new IllegalArgumentException(
-                    "Unknown javai.persistence.backend '" + backendProperty + "' -- expected 'postgres' or 'neo4j'");
+            case "mongodb", "mongo" -> Backend.MONGODB;
+            default -> throw new IllegalArgumentException("Unknown javai.persistence.backend '" + backendProperty
+                    + "' -- expected 'postgres', 'neo4j', or 'mongodb'");
         };
         return builder()
                 .backend(backend)
@@ -61,6 +72,8 @@ public final class JavAIPersistenceConfig {
                 .neo4jUri(System.getProperty("javai.persistence.neo4j.uri", "bolt://localhost:7687"))
                 .neo4jUsername(System.getProperty("javai.persistence.neo4j.username", "neo4j"))
                 .neo4jPassword(System.getProperty("javai.persistence.neo4j.password", "javai12345"))
+                .mongoUri(System.getProperty("javai.persistence.mongodb.uri", "mongodb://localhost:27017"))
+                .mongoDatabase(System.getProperty("javai.persistence.mongodb.database", "javai"))
                 .build();
     }
 
@@ -104,6 +117,18 @@ public final class JavAIPersistenceConfig {
         return externalNeo4jDriver;
     }
 
+    String mongoUri() {
+        return mongoUri;
+    }
+
+    String mongoDatabase() {
+        return mongoDatabase;
+    }
+
+    MongoTemplate externalMongoTemplate() {
+        return externalMongoTemplate;
+    }
+
     public static final class Builder {
         private Backend backend = Backend.POSTGRES;
         private String postgresUrl;
@@ -114,6 +139,9 @@ public final class JavAIPersistenceConfig {
         private String neo4jUsername;
         private String neo4jPassword;
         private Driver externalNeo4jDriver;
+        private String mongoUri;
+        private String mongoDatabase;
+        private MongoTemplate externalMongoTemplate;
 
         private Builder() {
         }
@@ -162,6 +190,22 @@ public final class JavAIPersistenceConfig {
         /** Supplies a {@code Driver} the calling app already built -- skips self-contained bootstrap. */
         public Builder neo4jDriver(Driver neo4jDriver) {
             this.externalNeo4jDriver = neo4jDriver;
+            return this;
+        }
+
+        public Builder mongoUri(String mongoUri) {
+            this.mongoUri = mongoUri;
+            return this;
+        }
+
+        public Builder mongoDatabase(String mongoDatabase) {
+            this.mongoDatabase = mongoDatabase;
+            return this;
+        }
+
+        /** Supplies a {@code MongoTemplate} the calling app already built -- skips self-contained bootstrap. */
+        public Builder mongoTemplate(MongoTemplate mongoTemplate) {
+            this.externalMongoTemplate = mongoTemplate;
             return this;
         }
 

@@ -18,7 +18,8 @@ import java.util.stream.Collectors;
  */
 public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implements JavAIMap<K, V>, JavAIDirtyTracking {
 
-    private final DirtyTrackingSupport state = new DirtyTrackingSupport();
+    // Named to match JavAIRuntime.STATE_FIELD exactly -- see JavAIArrayList's own field javadoc for why.
+    private final DirtyTrackingSupport $javai$state = new DirtyTrackingSupport();
 
     public JavAILinkedHashMap() {
     }
@@ -31,7 +32,7 @@ public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implemen
     public V put(K key, V value) {
         V previous = super.put(key, value);
         JavAIRuntime.registerDependency(this, value);
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
         return previous;
     }
 
@@ -41,32 +42,32 @@ public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implemen
         for (V value : entries.values()) {
             JavAIRuntime.registerDependency(this, value);
         }
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
     }
 
     @Override
     public V remove(Object key) {
         V removed = super.remove(key);
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
         return removed;
     }
 
     @Override
     public void clear() {
         super.clear();
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
     }
 
     // ---- JavAIVectorizable ----
 
     @Override
     public EmbeddingVector vector() {
-        return CollectionVectorSupport.vector(state, values());
+        return CollectionVectorSupport.vector($javai$state, values());
     }
 
     @Override
     public EmbeddingVector summaryVector() {
-        return CollectionVectorSupport.summaryVector(state, values());
+        return CollectionVectorSupport.summaryVector($javai$state, values());
     }
 
     @Override
@@ -119,41 +120,41 @@ public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implemen
 
     @Override
     public void addDependent(Object dependent) {
-        state.addDependent(dependent);
+        $javai$state.addDependent(dependent);
     }
 
     @Override
     public Iterable<Object> dependents() {
-        return state.dependents();
+        return $javai$state.dependents();
     }
 
     @Override
     public boolean isFieldDirty() {
-        return state.isFieldDirty();
+        return $javai$state.isFieldDirty();
     }
 
     @Override
     public void markFieldDirty() {
-        state.markFieldDirty();
+        $javai$state.markFieldDirty();
     }
 
     @Override
     public void clearFieldDirty() {
-        state.clearFieldDirty();
+        $javai$state.clearFieldDirty();
     }
 
     @Override
     public boolean isSummaryDirty() {
-        return state.isSummaryDirty();
+        return $javai$state.isSummaryDirty();
     }
 
     @Override
     public void markSummaryDirty() {
-        state.markSummaryDirty();
+        $javai$state.markSummaryDirty();
     }
 
     @Override
     public void clearSummaryDirty() {
-        state.clearSummaryDirty();
+        $javai$state.clearSummaryDirty();
     }
 }

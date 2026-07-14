@@ -108,6 +108,7 @@ public final class JavAIPI {
         return BACKENDS.computeIfAbsent(config, cfg -> switch (cfg.backend()) {
             case POSTGRES -> new RepositoryBackendHibernatePostgres(cfg);
             case NEO4J -> new RepositoryBackendNeo4j(cfg);
+            case MONGODB -> new RepositoryBackendSpringDataMongo(cfg);
         });
     }
 }

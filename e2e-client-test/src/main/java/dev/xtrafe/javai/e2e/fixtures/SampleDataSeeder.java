@@ -4,7 +4,10 @@ import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
+import com.mongodb.client.MongoClient;
+import com.mongodb.client.MongoClients;
 import net.datafaker.Faker;
+import org.bson.Document;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
@@ -68,22 +71,26 @@ public final class SampleDataSeeder {
     }
 
     /**
-     * Truncates all Postgres tables and wipes the Neo4j graph, then seeds both fresh -- every run, not just
-     * the first, since domain data is deliberately not persisted across runs (see class javadoc).
+     * Truncates all Postgres tables, wipes the Neo4j graph, and drops every Mongo collection, then seeds
+     * all three fresh -- every run, not just the first, since domain data is deliberately not persisted
+     * across runs (see class javadoc).
      *
      * <p>Takes already-built repositories rather than constructing its own: {@code JavAIEnvironment} is now
      * the single place that calls {@code JavAIPI.configurePersistence}/{@code JavAIPI.repository}, so this
-     * class only needs the raw JDBC/Bolt URLs for the truncate/wipe step (not part of the {@code
-     * JavAIRepository} contract) and the two already-realized repositories for the actual seeding.
+     * class only needs the raw JDBC/Bolt/Mongo URLs for the truncate/wipe step (not part of the {@code
+     * JavAIRepository} contract) and the three already-realized repositories for the actual seeding.
      */
     public static void resetAndSeed(
-            String postgresUrl, String neo4jUri, ArticleRepository postgresRepository, ArticleRepository neo4jRepository) {
+            String postgresUrl, String neo4jUri, String mongoUri,
+            ArticleRepository postgresRepository, ArticleRepository neo4jRepository, ArticleRepository mongoRepository) {
         resetPostgres(postgresUrl);
         resetNeo4j(neo4jUri);
+        resetMongo(mongoUri);
 
         for (Article article : generateArticles()) {
             postgresRepository.save(article);
             neo4jRepository.save(article);
+            mongoRepository.save(article);
         }
     }
 
@@ -145,6 +152,25 @@ public final class SampleDataSeeder {
                 driver.verifyConnectivity();
                 try (Session session = driver.session()) {
                     session.run("MATCH (n) DETACH DELETE n").consume();
+                }
+                return;
+            } catch (RuntimeException e) {
+                lastFailure = e;
+                sleep(READINESS_RETRY_DELAY_MILLIS);
+            }
+        }
+        throw lastFailure;
+    }
+
+    /** Drops every collection in the {@code javai} database rather than just {@code Article}: related
+     *  types ({@code Comment}, {@code Attachment}) get their own top-level collections too, per {@code
+     *  RepositoryBackendSpringDataMongo}'s reference-not-embed design (see that class's own javadoc). */
+    private static void resetMongo(String mongoUri) {
+        RuntimeException lastFailure = null;
+        for (int attempt = 1; attempt <= READINESS_RETRY_ATTEMPTS; attempt++) {
+            try (MongoClient client = MongoClients.create(mongoUri)) {
+                for (String collectionName : client.getDatabase("javai").listCollectionNames()) {
+                    client.getDatabase("javai").getCollection(collectionName).deleteMany(new Document());
                 }
                 return;
             } catch (RuntimeException e) {
