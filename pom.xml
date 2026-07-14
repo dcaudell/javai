@@ -91,7 +91,7 @@
     <neo4j-driver.version>5.27.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
-    <postgresql-driver.version>42.7.7</postgresql-driver.version>
+    <postgresql-driver.version>42.7.13</postgresql-driver.version>
     <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
     <testcontainers.version>1.21.4</testcontainers.version>
     <!--
