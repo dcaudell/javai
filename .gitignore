@@ -16,3 +16,4 @@ out/
 #secrets
 secrets.md
 secrets.*
+private-key.asc
