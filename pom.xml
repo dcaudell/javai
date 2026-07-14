@@ -111,7 +111,7 @@
          via `mvn dependency:tree` that spring-data-mongodb 4.5.1 only pulls in mongodb-driver-core
          transitively (BSON/wire-protocol types), not mongodb-driver-sync (MongoClient/MongoCollection),
          which needs its own explicit dependency below. -->
-    <spring-data-mongodb.version>4.5.1</spring-data-mongodb.version>
+    <spring-data-mongodb.version>5.1.0</spring-data-mongodb.version>
     <mongodb-driver.version>5.5.1</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
