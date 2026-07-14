@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.completion;
 
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.ollama.api.OllamaApi;
 import org.testcontainers.containers.GenericContainer;
@@ -31,7 +32,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@code ImageFromDockerfile}'s default random {@code localhost/testcontainers/<random>} tag) so an
  * interrupted run's leftover image is identifiable in {@code docker images} instead of showing up as an
  * unlabelled {@code <none>:<none>} dangling image.
+ *
+ * <p>Tagged {@code "requires-model"} and excluded from the default {@code mvn test}/{@code mvn install}
+ * run repo-wide (see the root {@code pom.xml}'s surefire configuration) -- a multi-gigabyte model pull is
+ * a real compute/bandwidth cost this project's CI pipelines deliberately don't pay on every PR. Run it
+ * explicitly: {@code mvn -pl javai-completion -am test -Dtest=CortexOllamaRealContainerTest -Djavai.excludedTestGroups=}.
  */
+@Tag("requires-model")
 @Testcontainers
 class CortexOllamaRealContainerTest {
 

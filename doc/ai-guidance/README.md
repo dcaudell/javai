@@ -1,7 +1,7 @@
 # JavAI Extensions — AI Guidance Package
 
 This directory is a self-contained, copyable package of documentation for an AI coding agent (Claude Code
-or similar) helping a developer in a project that depends on **JavAI Extensions** (`dev.xtrafe.javai:*`) as
+or similar) helping a developer in a project that depends on **JavAI Extensions** (`io.github.dcaudell:*`) as
 an ordinary Maven library. It is written for that downstream consumer, not for a contributor working inside
 *this* repository — contributors should read this repo's own root `SPEC.md`/`CLAUDE.md` instead.
 
@@ -9,7 +9,7 @@ Two files, read for different reasons:
 
 | File | Read this... | Covers |
 |---|---|---|
-| [`JavAI_Usage_Guide.md`](JavAI_Usage_Guide.md) | **Always**, before writing or editing any code that uses `dev.xtrafe.javai:*` | What the library does, the full annotation vocabulary, every method a woven class gains at runtime that isn't in its source, and how to install/build/activate it |
+| [`JavAI_Usage_Guide.md`](JavAI_Usage_Guide.md) | **Always**, before writing or editing any code that uses `io.github.dcaudell:*` | What the library does, the full annotation vocabulary, every method a woven class gains at runtime that isn't in its source, and how to install/build/activate it |
 | [`JavAI_Codegen_Guidance.md`](JavAI_Codegen_Guidance.md) | **Only** when the code you're touching carries `@Requires`/`@Ensures`/`@Invariant`, `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`, `@Nondeterministic`/`@Costly`, or `@Provenance` | A separate, narrower feature: annotations a *human* puts on their own code to constrain what an AI agent is allowed to read, generate, or modify — not a general usage guide |
 
 They're kept separate deliberately: the first is "what can this library do and how do I call it," the
@@ -37,7 +37,7 @@ you, on their behalf) has to place it once. The straightforward version:
    that only reads its own instructions file literally), add a plain sentence instead, near the top of
    whatever instructions file it does read:
 
-   > Before writing or editing any code that uses `dev.xtrafe.javai:*` (JavAI Extensions), read
+   > Before writing or editing any code that uses `io.github.dcaudell:*` (JavAI Extensions), read
    > `docs/javai-guidance/README.md` first.
 
 4. **Once JavAI Extensions is published to Maven Central**, shipping this package inside the

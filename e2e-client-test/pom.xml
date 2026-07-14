@@ -8,12 +8,12 @@
     Deliberately standalone: no parent POM, and not listed in the root pom.xml's modules. This is
     downstream client code exercising JavAI Extensions as a published dependency, not one of the eight
     Phase 0 reactor components SPEC.md describes. Run `mvn install` from the repo root first so
-    dev.xtrafe.javai:javai-{annotations,vector,model,substrate}:0.1.0-SNAPSHOT are in the local repository;
+    io.github.dcaudell:javai-{annotations,vector,model,substrate}:0.1.0 are in the local repository;
     see README.md.
   -->
   <groupId>dev.xtrafe.javai.e2e</groupId>
   <artifactId>e2e-client-test</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
   <packaging>jar</packaging>
 
   <name>JavAI Extensions -- End-to-End Client Test</name>
@@ -27,7 +27,7 @@
     <maven.compiler.release>21</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
-    <javai.version>0.1.0-SNAPSHOT</javai.version>
+    <javai.version>0.1.0</javai.version>
     <junit.version>5.11.0</junit.version>
     <lombok.version>1.18.46</lombok.version>
     <!--
@@ -66,22 +66,22 @@
 
   <dependencies>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-annotations</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-vector</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-model</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-substrate</artifactId>
       <version>${javai.version}</version>
     </dependency>
@@ -89,17 +89,17 @@
          alongside javai-substrate's in JavAIWeavingLauncherSessionListener for the same early-class-loading
          reason. -->
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-supervision</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-collections</artifactId>
       <version>${javai.version}</version>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-persistence</artifactId>
       <version>${javai.version}</version>
     </dependency>
@@ -107,7 +107,7 @@
          consumers); no separate BOM/version management needed here, same as javai-persistence already
          bringing in Hibernate/the Postgres driver above without re-declaring versions. -->
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-completion</artifactId>
       <version>${javai.version}</version>
     </dependency>

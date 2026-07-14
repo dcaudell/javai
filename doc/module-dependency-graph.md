@@ -54,7 +54,7 @@ eight as ordinary published artifacts.
 
 ## Per-module direct dependencies (confirmed by grepping actual imports, not assumed)
 
-| Module | Depends on (`dev.xtrafe.javai:*`) | Depends on (third-party) |
+| Module | Depends on (`io.github.dcaudell:*`) | Depends on (third-party) |
 |---|---|---|
 | `javai-annotations` | — | — |
 | `javai-vector` | `javai-annotations` | — |

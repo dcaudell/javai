@@ -5,13 +5,14 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>dev.xtrafe.javai</groupId>
+    <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
   </parent>
 
   <artifactId>javai-model</artifactId>
   <packaging>jar</packaging>
+  <description>Vector Core (part 2/2): the JavAIVectorizable contract/runtime, Vector Collections interfaces, and Completion Fabric's RAG primitives for JavAI Extensions.</description>
 
   <!--
     The formalized home for whatever has to live physically upstream of javai-collections/javai-completion
@@ -29,11 +30,11 @@
 
   <dependencies>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-annotations</artifactId>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-vector</artifactId>
     </dependency>
     <!-- Backs PromptContext.defaultMarshall(); GSON, not Jackson (Spring AI's own transitive
