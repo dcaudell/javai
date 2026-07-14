@@ -80,7 +80,7 @@
          Actions CI workflow in .github/workflows runs) never pays for either. -->
     <javai.excludedTestGroups>performance, requires-model</javai.excludedTestGroups>
 
-    <junit.version>5.11.0</junit.version>
+    <junit.version>6.1.2</junit.version>
     <!--
       Bumped from the 1.15.10 placeholder while building the javai-substrate weaving spike: 1.15.10 hard-fails
       parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
