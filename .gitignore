@@ -12,3 +12,7 @@ out/
 
 # Logs
 *.log
+
+#secrets
+secrets.md
+secrets.*
