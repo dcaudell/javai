@@ -2,7 +2,7 @@
 
 A standalone client project -- deliberately **not** one of JavAI Extensions' eight Phase 0 reactor modules,
 and **not** listed in the root `pom.xml`'s `<modules>`. This is downstream code exercising the library the
-way any other Java project would: its own `pom.xml`, its own dependency versions, `dev.xtrafe.javai:javai-*`
+way any other Java project would: its own `pom.xml`, its own dependency versions, `io.github.dcaudell:javai-*`
 consumed as ordinary Maven artifacts.
 
 ## What this proves

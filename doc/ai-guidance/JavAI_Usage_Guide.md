@@ -1,10 +1,10 @@
 # JavAI Extensions — Usage Guide for AI Coding Agents
 
 **Audience: an AI coding assistant helping a developer in a project that depends on JavAI Extensions
-(`dev.xtrafe.javai:*`) as an ordinary Maven library.** This is not for someone contributing to the JavAI
+(`io.github.dcaudell:*`) as an ordinary Maven library.** This is not for someone contributing to the JavAI
 Extensions repository itself — that repository has its own `SPEC.md`/`CLAUDE.md` for that audience.
 
-Read this file before generating or editing any code in a project that has a `dev.xtrafe.javai:*`
+Read this file before generating or editing any code in a project that has a `io.github.dcaudell:*`
 dependency, or before adding one. See the sibling file, `JavAI_Codegen_Guidance.md`, for a separate,
 narrower set of rules that only apply when the code you're touching carries one of five specific
 meta-annotations (`@Requires`/`@Intent`/`@AgentWritable`/`@Nondeterministic`/`@Provenance` and friends) —
@@ -155,45 +155,45 @@ mvn install   # builds and installs all 8 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.0-SNAPSHOT` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.0` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
 ```xml
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 <dependency>
-  <groupId>dev.xtrafe.javai</groupId>
+  <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.0-SNAPSHOT</version>
+  <version>0.1.0</version>
 </dependency>
 ```
 

@@ -5,13 +5,14 @@
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
-    <groupId>dev.xtrafe.javai</groupId>
+    <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.0-SNAPSHOT</version>
+    <version>0.1.0</version>
   </parent>
 
   <artifactId>javai-substrate</artifactId>
   <packaging>jar</packaging>
+  <description>Acceleration Substrate: the ByteBuddy load-time weaver that implements JavAIVectorizable on annotated classes for JavAI Extensions.</description>
 
   <!--
     Acceleration Substrate: ByteBuddy-based weaving that implements JavAIVectorizable/
@@ -26,15 +27,15 @@
 
   <dependencies>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-annotations</artifactId>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-vector</artifactId>
     </dependency>
     <dependency>
-      <groupId>dev.xtrafe.javai</groupId>
+      <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-model</artifactId>
     </dependency>
     <dependency>

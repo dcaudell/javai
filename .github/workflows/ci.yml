@@ -1,0 +1,72 @@
+name: CI
+
+# Runs on every PR targeting either protected branch: Dev (feature-branch -> Dev) and main (Dev -> main).
+# The `test` job is identical scope for both -- see the root pom.xml's javai.excludedTestGroups property
+# for exactly what's excluded and why (performance-profiling harnesses and anything needing a real
+# LLM/embedding model running in a container). The `release-readiness` job only runs for PRs targeting
+# main: it proves the release-profile build (javadoc + sources jars) succeeds and that the version has
+# actually been bumped off SNAPSHOT, without needing any signing/publishing secrets to do so.
+on:
+  pull_request:
+    branches:
+      - Dev
+      - main
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test (excludes e2e / real-model tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - name: mvn test
+        run: mvn -B -ntp test
+        # javai-persistence's Postgres/Neo4j Testcontainers tests DO run here -- they need Docker (already
+        # present on ubuntu-latest) but never a real embedding/completion model, so they're squarely within
+        # the intended CI scope, not the "e2e/real-model" carve-out.
+
+  release-readiness:
+    name: Release-profile build (javadoc/sources, no signing, no deploy)
+    if: github.base_ref == 'main'
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '26'
+          cache: maven
+
+      - name: Verify the version is not a SNAPSHOT
+        run: |
+          VERSION=$(mvn -q help:evaluate -Dexpression=project.version -DforceStdout)
+          echo "Resolved version: $VERSION"
+          if [[ "$VERSION" == *-SNAPSHOT ]]; then
+            echo "::error::Root pom.xml is still a SNAPSHOT version ($VERSION) -- bump it before merging to main."
+            exit 1
+          fi
+
+      - name: mvn -Prelease verify (javadoc + sources jars; GPG signing skipped here on purpose)
+        run: mvn -B -ntp -Prelease -Dgpg.skip=true verify
+        # Deliberately stops at `verify`, not `deploy`: proves every module's release-profile artifacts
+        # (this is where a broken javadoc comment gets caught) build cleanly, without needing any GPG/
+        # Central Portal secrets in this workflow at all -- gpg.skip=true bypasses maven-gpg-plugin's sign
+        # goal entirely. The real signed, published build only happens in publish.yml, gated behind manual
+        # approval, once a version tag is pushed. See doc/release-process.md.

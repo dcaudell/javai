@@ -120,37 +120,37 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
    ```xml
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-vector</artifactId>
      <version>0.1.0</version> <!-- match the current release -->
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-model</artifactId>
      <version>0.1.0</version>
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-substrate</artifactId>
      <version>0.1.0</version>
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-supervision</artifactId>
      <version>0.1.0</version>
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-collections</artifactId>
      <version>0.1.0</version>
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-persistence</artifactId>
      <version>0.1.0</version>
    </dependency>
    <dependency>
-     <groupId>dev.xtrafe.javai</groupId>
+     <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-completion</artifactId>
      <version>0.1.0</version>
    </dependency>
@@ -287,4 +287,4 @@ fakes or mocks.
 
 ## License
 
-GPLv3 — see [`LICENSE`](LICENSE).
+Apache License, Version 2.0 — see [`LICENSE`](LICENSE) and [`NOTICE`](NOTICE).
