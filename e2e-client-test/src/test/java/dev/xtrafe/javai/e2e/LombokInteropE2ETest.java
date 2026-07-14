@@ -57,7 +57,12 @@ class LombokInteropE2ETest {
         EmbeddingVector first = vectorizable.vector();
         assertNotNull(first);
         assertTrue(first.dims() > 0);
-        assertFalse(dirtyTracking.isFieldDirty(), "must be clean immediately after computing the vector");
+        // vector() itself never clears FieldDirty -- it's deliberately uncached at this level (each
+        // @Vectorize field caches independently via its own VectorCacheSlot; see JavAIRuntime.vector()'s
+        // own javadoc), so there's no single object-level cache left for it to gate on. Establish a
+        // known-clean baseline directly through the interface instead, so the assertion below actually
+        // proves Lombok's setter is what marks it dirty, not just that the flag was never cleared at all.
+        dirtyTracking.clearFieldDirty();
 
         // The point of this test: Tag.setLabel(String) is entirely Lombok-generated -- @Setter never wrote
         // a single line of this method's bytecode by hand. VectorizeFieldSetterAdvice must still be the
@@ -68,7 +73,6 @@ class LombokInteropE2ETest {
         EmbeddingVector second = vectorizable.vector();
         assertFalse(Arrays.equals(first.values(), second.values()),
                 "changing the vectorized field through Lombok's setter must produce a genuinely different embedding");
-        assertFalse(dirtyTracking.isFieldDirty(), "must be clean again immediately after recomputing");
     }
 
     @Test
