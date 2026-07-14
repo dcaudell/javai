@@ -40,7 +40,7 @@
       longer applies; kept anyway as cheap, defensive version pinning across whatever else transitively
       touches Jackson (Spring AI, Hibernate).
     -->
-    <jackson.version>2.21.4</jackson.version>
+    <jackson.version>2.22.1</jackson.version>
 
     <!--
       Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
