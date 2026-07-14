@@ -295,7 +295,7 @@
                  disabling the linter for jar-generation purposes is the correct fix, not a workaround. -->
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-javadoc-plugin</artifactId>
-            <version>3.11.2</version>
+            <version>3.12.0</version>
             <configuration>
               <doclint>none</doclint>
               <quiet>true</quiet>
