@@ -122,37 +122,37 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-vector</artifactId>
-     <version>0.1.0</version> <!-- match the current release -->
+     <version>0.1.1</version> <!-- match the current release -->
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-model</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-substrate</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-supervision</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-collections</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-persistence</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-completion</artifactId>
-     <version>0.1.0</version>
+     <version>0.1.1</version>
    </dependency>
    ```
 
