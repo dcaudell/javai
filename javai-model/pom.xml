@@ -12,6 +12,7 @@
 
   <artifactId>javai-model</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Vector Core (Model)</name>
   <description>Vector Core (part 2/2): the JavAIVectorizable contract/runtime, Vector Collections interfaces, and Completion Fabric's RAG primitives for JavAI Extensions.</description>
 
   <!--

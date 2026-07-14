@@ -12,6 +12,7 @@
 
   <artifactId>javai-persistence</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Persistence Bridge</name>
   <description>Persistence Bridge: JPA/Hibernate and Neo4j automation for vectorized, searchable persistence in JavAI Extensions.</description>
 
   <!--
