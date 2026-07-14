@@ -103,7 +103,7 @@
       GA; staying off 2.0 for now since it pairs with a Spring Boot 4 migration this project
       doesn't need yet). Revisit before Phase 0 sign-off.
     -->
-    <spring-ai.version>1.0.9</spring-ai.version>
+    <spring-ai.version>2.0.0</spring-ai.version>
     <!-- javai-model's own Contextable/PromptContext marshalling; deliberately GSON, not the
          Jackson that Spring AI pulls in transitively (see javai-completion's Cortex classes' own
          javadoc for why javai-vector/javai-model never took a Jackson dependency of their own). -->
