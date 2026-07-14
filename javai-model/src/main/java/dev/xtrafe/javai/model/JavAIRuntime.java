@@ -471,8 +471,14 @@ public final class JavAIRuntime {
         if (consistencyMode() == EmbeddingConsistencyMode.COALESCED_CONSISTENCY) {
             return coalescedRead(slot, generation, text);
         }
+        // Snapshot before dispatching, not after: dispatchBackground's virtual thread can start and commit
+        // before this thread's very next line runs, so reading cachedValue() afterward would sometimes hand
+        // this caller the freshly-redispatched value instead of the value that was actually on file when it
+        // asked -- breaking the "this call sees state as of entry" guarantee for a stale/failed slot's very
+        // next read.
+        EmbeddingVector valueAtEntry = slot.cachedValue();
         dispatchBackground(slot, generation, text);
-        return slot.cachedValue();
+        return valueAtEntry;
     }
 
     /** True when a stale slot must be computed under the object's own lock rather than lock-free: the
@@ -558,7 +564,15 @@ public final class JavAIRuntime {
         state.concatenatedTextSlot().bumpGeneration();
 
         EmbeddingConsistencyMode mode = consistencyMode();
-        if (mode == EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY || mode == EmbeddingConsistencyMode.COALESCED_CONSISTENCY) {
+        // Skip the eager dispatch for a slot that's never computed anything yet: readSlot's
+        // mustBlockUnderObjectLock forces ANY read of such a slot to block and compute directly,
+        // regardless of mode, since there's no prior value to fall back on -- so this eager dispatch
+        // would either race that forced blocking computation (a wasted, duplicate embed() call for the
+        // exact same generation) or simply be discarded unread. Once the slot has computed at least once,
+        // a later mutation's eager dispatch is exactly what lets EVENTUAL_CONSISTENCY/COALESCED_CONSISTENCY
+        // reads stay lock-free, so this guard only ever suppresses the genuinely redundant first case.
+        if ((mode == EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY || mode == EmbeddingConsistencyMode.COALESCED_CONSISTENCY)
+                && fieldSlot.everComputed()) {
             String text = newValue == null ? "" : String.valueOf(newValue);
             dispatchBackground(fieldSlot, fieldGeneration, text);
         }
