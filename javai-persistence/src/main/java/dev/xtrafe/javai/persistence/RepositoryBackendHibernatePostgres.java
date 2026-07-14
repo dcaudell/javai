@@ -358,7 +358,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     // ---- vector read/write -------------------------------------------------------------------
 
     private void writeVectors(Session session, Class<?> entityType, Object entity) {
-        JavAIVectorizable vectorizable = (JavAIVectorizable) entity;
+        // Not every persisted @Entity is @JavAIVectorizable -- a @Taggable-only entity (no embedding of
+        // its own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) is fully valid to
+        // save through this same JavAIRepository path, it just has nothing to write here.
+        if (!(entity instanceof JavAIVectorizable vectorizable)) {
+            return;
+        }
         UUID id = EntityReflection.readId(entity);
         String ownerType = entityType.getName();
 

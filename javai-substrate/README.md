@@ -98,6 +98,17 @@ The full weaving contract, not just the mechanism spike that preceded it:
 Deliberately still out of scope: non-conventional setters, and multiple annotated fields sharing one
 setter.
 
+- `JavAIBuildTimeWeaverPlugin` — a `net.bytebuddy.build.Plugin` implementation, added as a prerequisite for
+  `javai-tagging` (the first module to ship its own pre-woven `@JavAIVectorizable` classes inside its own
+  jar, rather than only providing machinery for a *consumer's* classes to be woven). Delegates to the exact
+  same `JavAIWeaver.weave(...)` static method the load-time `-javaagent` path above already uses (made
+  package-private, not private, specifically for this) — build-time (Maven-plugin) and load-time weaving
+  share one transform, with no second implementation to keep in sync. Driven by the official
+  `net.bytebuddy:byte-buddy-maven-plugin`; see `javai-tagging/pom.xml` for a worked configuration example
+  (its own `<plugin>` block, including the two required `<dependencies>` overrides for the plugin's own
+  isolated classloader). Proven with a real, deletable toy-class spike (a `@JavAIVectorizable` class + a
+  JUnit test installing zero javaagent) before being relied on.
+
 Byte Buddy was bumped from the `1.15.10` scaffolding placeholder to `1.18.11` while building the original
 spike: `1.15.10` cannot parse class files compiled by this repo's JDK 26 toolchain ("Java 26 (70) is not
 supported"). `ByteBuddyAgent.install()` also needs `-Djdk.attach.allowAttachSelf=true` to self-attach on

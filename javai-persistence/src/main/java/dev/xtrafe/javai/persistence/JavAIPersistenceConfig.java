@@ -81,19 +81,28 @@ public final class JavAIPersistenceConfig {
         return new Builder();
     }
 
-    Backend backend() {
+    // The plain connection-detail accessors below are public (not just package-private, unlike the
+    // external-override accessors further down) specifically so javai-tagging's own backends can build
+    // their own independent connections from the exact same values a caller already configured for
+    // JavAIPI -- reusing this same config type rather than inventing a parallel one, per doc/spec/tagging.md's
+    // "Persistence, across all three backends" (Tags/TagSets/Taggings are ordinary persisted data, not a
+    // fourth abstraction). Deliberately does NOT expose a way to reuse the *same* SessionFactory/Driver/
+    // MongoTemplate object instance across both modules -- see externalSessionFactory()/externalNeo4jDriver()/
+    // externalMongoTemplate() below, which stay package-private; javai-tagging opens its own connections
+    // instead, an accepted Phase 0 simplification.
+    public Backend backend() {
         return backend;
     }
 
-    String postgresUrl() {
+    public String postgresUrl() {
         return postgresUrl;
     }
 
-    String postgresUsername() {
+    public String postgresUsername() {
         return postgresUsername;
     }
 
-    String postgresPassword() {
+    public String postgresPassword() {
         return postgresPassword;
     }
 
@@ -101,15 +110,15 @@ public final class JavAIPersistenceConfig {
         return externalSessionFactory;
     }
 
-    String neo4jUri() {
+    public String neo4jUri() {
         return neo4jUri;
     }
 
-    String neo4jUsername() {
+    public String neo4jUsername() {
         return neo4jUsername;
     }
 
-    String neo4jPassword() {
+    public String neo4jPassword() {
         return neo4jPassword;
     }
 
@@ -117,11 +126,11 @@ public final class JavAIPersistenceConfig {
         return externalNeo4jDriver;
     }
 
-    String mongoUri() {
+    public String mongoUri() {
         return mongoUri;
     }
 
-    String mongoDatabase() {
+    public String mongoDatabase() {
         return mongoDatabase;
     }
 

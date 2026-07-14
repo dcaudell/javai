@@ -20,5 +20,12 @@
 - (Deferred) MongoDB Extension for Hibernate ORM support (https://www.mongodb.com/docs/languages/java/mongodb-hibernate/current/)
 
 
-- Add javai-tagging module to the whitepaper. (Taggable interface, tags are taggable - recursive tagging. Tags are mebmers of tagsets. Objects can be inspected for which tags of a tagset should be applied to the object. Tags have an English slug and display name. Tags are linked to objects by a tag-instance table that applies a tag to an entity. Fitler the instance table by target type, then tag set, then tag to get at all objects of a certain type with a certain tag. ... still more thought required )
+- (Done) Tagging: whitepaper §5.8, `doc/spec/tagging.md`, `javai-tagging` module implemented and tested
+  against all three persistence backends. `@Taggable` is an unwoven marker (orthogonal to
+  `@JavAIVectorizable`); classification is LLM-based via `javai-completion`, client-invoked only (never
+  auto-triggered by TagSet edits); a Tag's slug is unique per-TagSet, not globally (a stated invariant, not
+  yet a DB-level constraint on any backend); tag-similarity search reuses `VectorIndex<T>` over a new
+  persistence-layer-only tag-summary-vector index rather than inventing a new collection type. Required
+  adding real build-time (Maven-plugin) weaving to `javai-substrate` as a prerequisite, since this is the
+  first module to ship its own pre-woven `@JavAIVectorizable` classes (`Tag`/`TagSet`) inside its own jar.
 - Add recursive MCP microservice fabric to the whitepaper.

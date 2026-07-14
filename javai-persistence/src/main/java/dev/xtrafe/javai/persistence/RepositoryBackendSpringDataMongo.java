@@ -366,8 +366,6 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         alreadySaved.put(entity, id);
 
         Class<?> entityType = entity.getClass();
-        JavAIVectorizable vectorizable = (JavAIVectorizable) entity;
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
 
         Map<String, Object> updates = new HashMap<>();
         for (Field field : EntityReflection.allFields(entityType)) {
@@ -386,21 +384,26 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             }
             // else: not reference-shaped but also not a simple type -- documented Phase 0 boundary, skipped.
         }
-        for (String fieldName : vectorizeFields) {
-            EmbeddingVector vector = vectorizable.fieldVector(fieldName);
-            String qualified = qualify(fieldName + "Vector", vector.modelId());
-            updates.put(qualified, toDoubleList(vector.values()));
-            updates.put(qualified + "ComputedAt", vector.computedAt().toString());
-        }
-        EmbeddingVector combined = vectorizable.vector();
-        String qualifiedCombined = qualify("vector", combined.modelId());
-        updates.put(qualifiedCombined, toDoubleList(combined.values()));
-        updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+        // Not every persisted @Entity is @JavAIVectorizable -- a @Taggable-only entity (no embedding of its
+        // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets its plain
+        // fields written above, it just has no vector fields to add here.
+        if (entity instanceof JavAIVectorizable vectorizable) {
+            for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+                EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                String qualified = qualify(fieldName + "Vector", vector.modelId());
+                updates.put(qualified, toDoubleList(vector.values()));
+                updates.put(qualified + "ComputedAt", vector.computedAt().toString());
+            }
+            EmbeddingVector combined = vectorizable.vector();
+            String qualifiedCombined = qualify("vector", combined.modelId());
+            updates.put(qualifiedCombined, toDoubleList(combined.values()));
+            updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
 
-        EmbeddingVector summary = vectorizable.summaryVector();
-        String qualifiedSummary = qualify("summaryVector", summary.modelId());
-        updates.put(qualifiedSummary, toDoubleList(summary.values()));
-        updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            EmbeddingVector summary = vectorizable.summaryVector();
+            String qualifiedSummary = qualify("summaryVector", summary.modelId());
+            updates.put(qualifiedSummary, toDoubleList(summary.values()));
+            updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+        }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
         // ("Writes are additive") for why a replace would destroy older models' already-written vectors.

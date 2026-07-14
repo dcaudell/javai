@@ -42,7 +42,7 @@
   </scm>
 
   <!--
-    Eight modules realizing seven conceptual extension areas (see SPEC.md's dependency graph and its note
+    Nine modules realizing eight conceptual extension areas (see SPEC.md's dependency graph and its note
     on why "Vector Core" is physically split across two modules) are interdependent by design and meant to
     build together, not independently — `mvn install` (or `mvn verify`) from this root builds the whole
     reactor in dependency order.
@@ -54,7 +54,9 @@
     vector/embedding core; depends on javai-vector), then javai-substrate and javai-supervision in parallel
     (javai-substrate depends on javai-vector + javai-model; javai-supervision depends only on
     javai-annotations — two independent weavers, two independent risk spikes, neither depends on the
-    other), then javai-collections, then javai-persistence and javai-completion.
+    other), then javai-collections, then javai-persistence and javai-completion, then javai-tagging last —
+    the only module depending on javai-collections AND javai-persistence AND javai-completion all three at
+    once (plus javai-substrate directly, to weave its own shipped Tag/TagSet — see doc/spec/tagging.md).
   -->
   <modules>
     <module>javai-annotations</module>
@@ -65,6 +67,7 @@
     <module>javai-collections</module>
     <module>javai-persistence</module>
     <module>javai-completion</module>
+    <module>javai-tagging</module>
   </modules>
 
   <properties>
@@ -87,6 +90,16 @@
       repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
     -->
     <byte-buddy.version>1.18.11</byte-buddy.version>
+    <!-- Backs javai-tagging's build-time self-weaving (see JavAIBuildTimeWeaverPlugin in javai-substrate).
+         Confirmed on Maven Central: the plugin's own release train lags core byte-buddy; 1.17.5 is
+         current for the plugin, well behind the 1.18.11 core already pinned above. The plugin's own POM
+         declares a same-version byte-buddy core dependency transitively; javai-tagging/pom.xml's own
+         <plugin><dependencies> block explicitly overrides that to ${byte-buddy.version} (a nearer, direct
+         declaration wins Maven's dependency mediation), for the same "Java 26 (70) is not supported"
+         reason 1.15.10 was rejected above; untested whether 1.17.5's own bundled core would hit the same
+         wall running under this repo's JDK 26 dev/CI toolchain, but there's no reason to risk finding out
+         empirically when overriding to the already-proven-working version costs nothing. -->
+    <byte-buddy-maven-plugin.version>1.17.5</byte-buddy-maven-plugin.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
     <neo4j-driver.version>6.2.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
@@ -131,6 +144,19 @@
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
     <handlebars.version>4.5.3</handlebars.version>
+    <!-- Forces jackson-annotations onto the same release line as the jackson-databind Spring AI already
+         pulls in transitively (2.21.x). javai-tagging is the first module to combine Hibernate
+         (javai-persistence) with Spring AI's own Jackson stack (javai-completion) and Testcontainers'
+         docker-java-api (test scope), and docker-java-api's own bundled jackson-annotations:2.10.3 wins
+         Maven's nearest-declaration mediation over the correct, deeper-transitive 2.21.x, confirmed via a
+         real test run: Hibernate 7's own optional Jackson-based JSON format mapper auto-detects
+         jackson-databind on the classpath at SessionFactory bootstrap and eagerly initializes it,
+         regardless of whether any entity actually uses a JSON-mapped column, and jackson-databind:2.21.4
+         calling into a mismatched jackson-annotations:2.10.3 throws NoClassDefFoundError on
+         JsonSerializeAs (removed from jackson-annotations well before 2.10, present in whatever
+         jackson-databind:2.21.4 itself expects). Pinned here in dependencyManagement, which overrides
+         transitive resolution for every reactor module regardless of declaration depth. -->
+    <jackson-annotations.version>2.21</jackson-annotations.version>
   </properties>
 
   <!--
@@ -156,6 +182,12 @@
         <type>pom</type>
         <scope>import</scope>
       </dependency>
+      <dependency>
+        <!-- See jackson-annotations.version's own definition above for why this override exists. -->
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-annotations</artifactId>
+        <version>${jackson-annotations.version}</version>
+      </dependency>
 
       <dependency>
         <groupId>io.github.dcaudell</groupId>
@@ -175,6 +207,25 @@
       <dependency>
         <groupId>io.github.dcaudell</groupId>
         <artifactId>javai-collections</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <!-- Not needed by any reactor module until javai-tagging (it ships its own pre-woven Tag/TagSet
+             at build time; see doc/spec/tagging.md's "this module weaves itself"); every prior consumer
+             of javai-substrate (e2e-client-test) is a standalone project outside this reactor and pins its
+             own version explicitly instead. -->
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-substrate</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-persistence</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-completion</artifactId>
         <version>${project.version}</version>
       </dependency>
 
@@ -254,6 +305,19 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>3.13.0</version>
+        </plugin>
+        <!-- Build-time self-weaving, currently only bound in javai-tagging/pom.xml (the first module
+             shipping its own pre-built @JavAIVectorizable classes); see JavAIBuildTimeWeaverPlugin's own
+             javadoc (javai-substrate) for the mechanism and doc/spec/tagging.md's "this module weaves
+             itself" for why it's needed there specifically. Only version-pinned here; the actual
+             <executions>/<configuration>/<dependencies> (including the byte-buddy core version override
+             the version-mismatch note on ${byte-buddy-maven-plugin.version} above explains) live in
+             whichever module's pom.xml actually binds it, matching how few-enough modules need this to not
+             warrant a shared <plugins> block. -->
+        <plugin>
+          <groupId>net.bytebuddy</groupId>
+          <artifactId>byte-buddy-maven-plugin</artifactId>
+          <version>${byte-buddy-maven-plugin.version}</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
