@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="CompilerConfiguration">
+    <annotationProcessing>
+      <profile name="Maven default annotation processors profile" enabled="true">
+        <sourceOutputDir name="target/generated-sources/annotations" />
+        <sourceTestOutputDir name="target/generated-test-sources/test-annotations" />
+        <outputRelativeToContentRoot value="true" />
+        <module name="javai-collections" />
+        <module name="javai-annotations" />
+        <module name="javai-runtime" />
+        <module name="javai-vector" />
+        <module name="javai-completion" />
+        <module name="javai-substrate" />
+        <module name="javai-persistence" />
+        <module name="javai-model" />
+        <module name="javai-supervision" />
+      </profile>
+    </annotationProcessing>
+  </component>
+</project>

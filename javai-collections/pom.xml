@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.dcaudell</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>javai-collections</artifactId>
+  <packaging>jar</packaging>
+  <description>Vector Collections: KnowledgeGraph, SubgraphResult, and VectorIndex for JavAI Extensions.</description>
+
+  <!--
+    Vector Collections: KnowledgeGraph/SubgraphResult, VectorIndex, JavAIGraphNode/
+    JavAIEdge. See doc/spec/vector-collections.md — and its module-placement note,
+    since JavAIList/Set/Map/Sortable actually live in javai-model, not here. Depends on
+    javai-vector directly too (EmbeddingVector, VectorMath, JavAIDirtyTracking) alongside
+    javai-model, since KnowledgeGraph/JavAIVectorIndex reference both.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-model</artifactId>
+    </dependency>
+  </dependencies>
+</project>

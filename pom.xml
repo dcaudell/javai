@@ -1,0 +1,354 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.dcaudell</groupId>
+  <artifactId>javai</artifactId>
+  <version>0.1.0</version>
+  <packaging>pom</packaging>
+
+  <name>JavAI Extensions</name>
+  <description>
+    A set of extensions to Java that make semantic embedding vectors, knowledge-graph
+    structure, and LLM-codegen guidance first-class, automatically-maintained properties
+    of the object model. See SPEC.md.
+  </description>
+  <url>https://github.com/dcaudell/javai</url>
+
+  <!-- Required by Maven Central's publish validation on every published artifact (this parent POM
+       included, since child modules resolve their <parent> reference there too). -->
+  <licenses>
+    <license>
+      <name>Apache License, Version 2.0</name>
+      <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+      <distribution>repo</distribution>
+    </license>
+  </licenses>
+
+  <developers>
+    <developer>
+      <name>Dominic Caudell</name>
+      <email>dominic.caudell@gmail.com</email>
+    </developer>
+  </developers>
+
+  <scm>
+    <connection>scm:git:https://github.com/dcaudell/javai.git</connection>
+    <developerConnection>scm:git:https://github.com/dcaudell/javai.git</developerConnection>
+    <url>https://github.com/dcaudell/javai</url>
+    <tag>HEAD</tag>
+  </scm>
+
+  <!--
+    Eight modules realizing seven conceptual extension areas (see SPEC.md's dependency graph and its note
+    on why "Vector Core" is physically split across two modules) are interdependent by design and meant to
+    build together, not independently — `mvn install` (or `mvn verify`) from this root builds the whole
+    reactor in dependency order.
+    Build order: javai-annotations, then javai-vector (pure vector/embedding functionality: EmbeddingVector,
+    VectorMath, embedding providers, dirty-tracking primitives — depends only on javai-annotations), then
+    javai-model (the JavAIVectorizable contract + JavAIRuntime engine, JavAIList/Set/Map + concrete
+    collections, and the Contextable/PromptContext RAG primitives — everything that had to live physically
+    upstream of javai-collections/javai-completion for compile-order reasons rather than because it's
+    vector/embedding core; depends on javai-vector), then javai-substrate and javai-supervision in parallel
+    (javai-substrate depends on javai-vector + javai-model; javai-supervision depends only on
+    javai-annotations — two independent weavers, two independent risk spikes, neither depends on the
+    other), then javai-collections, then javai-persistence and javai-completion.
+  -->
+  <modules>
+    <module>javai-annotations</module>
+    <module>javai-vector</module>
+    <module>javai-model</module>
+    <module>javai-substrate</module>
+    <module>javai-supervision</module>
+    <module>javai-collections</module>
+    <module>javai-persistence</module>
+    <module>javai-completion</module>
+  </modules>
+
+  <properties>
+    <maven.compiler.release>21</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <!-- Overridable via -Djavai.excludedTestGroups=(blank, or a subset, to include performance/real-model
+         tests) on the command line: see the maven-surefire-plugin configuration below for why this needs
+         to be a property indirection rather than a literal value directly in that plugin's excludedGroups
+         element. "performance" is hand-run profiling harnesses (see EmbeddingConsistencyBenchmark);
+         "requires-model" is real-container tests needing an actual LLM/embedding model running (see
+         CortexOllamaRealContainerTest); both excluded by default so plain `mvn test` (what every GitHub
+         Actions CI workflow in .github/workflows runs) never pays for either. -->
+    <javai.excludedTestGroups>performance, requires-model</javai.excludedTestGroups>
+
+    <junit.version>5.11.0</junit.version>
+    <!--
+      Bumped from the 1.15.10 placeholder while building the javai-substrate weaving spike: 1.15.10 hard-fails
+      parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
+      repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
+    -->
+    <byte-buddy.version>1.18.11</byte-buddy.version>
+    <hibernate.version>6.6.4.Final</hibernate.version>
+    <neo4j-driver.version>5.27.0</neo4j-driver.version>
+    <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
+         hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
+    <postgresql-driver.version>42.7.7</postgresql-driver.version>
+    <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
+    <testcontainers.version>1.21.4</testcontainers.version>
+    <!--
+      1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
+      and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
+      then got split into spring-ai-model (ChatModel/EmbeddingModel) + spring-ai-client-chat
+      (ChatClient) before 1.0.0 GA shipped. Pinned here to 1.0.9, the last patch on the
+      original 1.0.x line (current stable lines as of mid-2026 are 1.0.x, 1.1.x, and 2.0.0
+      GA; staying off 2.0 for now since it pairs with a Spring Boot 4 migration this project
+      doesn't need yet). Revisit before Phase 0 sign-off.
+    -->
+    <spring-ai.version>1.0.9</spring-ai.version>
+    <!-- javai-model's own Contextable/PromptContext marshalling; deliberately GSON, not the
+         Jackson that Spring AI pulls in transitively (see javai-completion's Cortex classes' own
+         javadoc for why javai-vector/javai-model never took a Jackson dependency of their own). -->
+    <gson.version>2.14.0</gson.version>
+    <!-- CompletionRequest.render()'s Mustache-compatible templating engine (javai-completion). Current
+         stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
+         automatically via its published POM, no separate version management needed. -->
+    <handlebars.version>4.5.3</handlebars.version>
+  </properties>
+
+  <!--
+    Dependency versions are pinned once here; module POMs declare dependencies without
+    versions. Note this is not a perfect analogue of Gradle's api/implementation split —
+    Maven's default "compile" scope is transitive to consumers of a module, closer to
+    Gradle's "api" than "implementation". Not load-bearing for Phase 0; revisit if a
+    module's transitive-dependency surface ever becomes a real problem.
+  -->
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.junit</groupId>
+        <artifactId>junit-bom</artifactId>
+        <version>${junit.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.ai</groupId>
+        <artifactId>spring-ai-bom</artifactId>
+        <version>${spring-ai.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-annotations</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-vector</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-model</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-collections</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-agent</artifactId>
+        <version>${byte-buddy.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.hibernate.orm</groupId>
+        <artifactId>hibernate-core</artifactId>
+        <version>${hibernate.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.hibernate.orm</groupId>
+        <artifactId>hibernate-vector</artifactId>
+        <version>${hibernate.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.neo4j.driver</groupId>
+        <artifactId>neo4j-java-driver</artifactId>
+        <version>${neo4j-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.postgresql</groupId>
+        <artifactId>postgresql</artifactId>
+        <version>${postgresql-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.testcontainers</groupId>
+        <artifactId>testcontainers-bom</artifactId>
+        <version>${testcontainers.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>com.google.code.gson</groupId>
+        <artifactId>gson</artifactId>
+        <version>${gson.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.github.jknack</groupId>
+        <artifactId>handlebars</artifactId>
+        <version>${handlebars.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <!-- Every module gets JUnit 5 in test scope without repeating this block. -->
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-compiler-plugin</artifactId>
+          <version>3.13.0</version>
+        </plugin>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <version>3.5.2</version>
+          <configuration>
+            <!--
+              "performance"-tagged tests are hand-run profiling harnesses (see EmbeddingConsistencyBenchmark
+              in javai-model), not correctness tests: they take much longer than the rest of the suite and
+              their assertions are loose by nature (comparative timings, not exact values). "requires-model"-
+              tagged tests (see CortexOllamaRealContainerTest) need an actual LLM/embedding model running in
+              a real container; a real compute/bandwidth cost, not something any CI workflow in
+              .github/workflows should pay on every PR. Both excluded from the default `mvn test`/
+              `mvn install` run repo-wide; run either explicitly with, e.g.,
+              `mvn -pl javai-model test -Djavai.excludedTestGroups=` (drops both) or
+              `mvn -pl javai-completion test -Djavai.excludedTestGroups=performance` (drops just
+              requires-model, keeps performance excluded).
+
+              Deliberately an indirection through the javai.excludedTestGroups property (rather than the
+              literal string directly here): surefire only auto-binds its own -DexcludedGroups command-line
+              property to this element when the element itself is absent from the effective POM. Once it's
+              set explicitly (as it must be, to default to excluding both tags), only this kind of property
+              reference stays overridable from the command line.
+            -->
+            <excludedGroups>${javai.excludedTestGroups}</excludedGroups>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+
+  <!--
+    Activated explicitly (`mvn -Prelease ...`), never implicitly; ordinary dev builds never pay for
+    javadoc/sources generation or GPG signing. This is what .github/workflows/ci.yml's release-readiness
+    job runs (verify only, no deploy) on every PR targeting main, and what .github/workflows/publish.yml
+    runs for real (verify + deploy) when a v*.*.* tag is pushed. See doc/release-process.md for the full
+    Maven Central publishing walkthrough: account/namespace verification, GPG key generation, and the
+    GitHub secrets this profile's plugins expect, none of which this repository can supply on its own.
+  -->
+  <profiles>
+    <profile>
+      <id>release</id>
+      <build>
+        <plugins>
+          <plugin>
+            <!-- Every artifact Central publishes needs a matching sources jar. -->
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-source-plugin</artifactId>
+            <version>3.3.1</version>
+            <executions>
+              <execution>
+                <id>attach-sources</id>
+                <goals>
+                  <goal>jar-no-fork</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <!-- Every artifact Central publishes needs a matching javadoc jar. Central's own validation
+                 just checks the artifact exists and is signed, not that every method is documented.
+                 doclint disabled (confirmed necessary, not a guess: a real local run of this profile
+                 failed with 10 errors/94 warnings otherwise) because this project's own convention is
+                 deliberately terse javadoc: full comments only where the WHY isn't obvious from a
+                 well-named signature, never boilerplate @param/@return on every public method purely to
+                 satisfy a doc linter. Retrofitting exhaustive javadoc across every public method to satisfy
+                 doclint would be a large, style-contradicting undertaking with no real reader benefit;
+                 disabling the linter for jar-generation purposes is the correct fix, not a workaround. -->
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-javadoc-plugin</artifactId>
+            <version>3.11.2</version>
+            <configuration>
+              <doclint>none</doclint>
+              <quiet>true</quiet>
+            </configuration>
+            <executions>
+              <execution>
+                <id>attach-javadocs</id>
+                <goals>
+                  <goal>jar</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <!-- Signs every attached artifact (jar, sources jar, javadoc jar, pom); required by Central,
+                 regardless of publisher. Needs a GPG key configured wherever this runs (see
+                 doc/release-process.md); this is why the release-readiness CI job only runs `verify`, not
+                 `deploy`: signing still happens, proving the key/passphrase secrets are wired correctly,
+                 without also attempting to publish anything. -->
+            <groupId>org.apache.maven.plugins</groupId>
+            <artifactId>maven-gpg-plugin</artifactId>
+            <version>3.2.7</version>
+            <executions>
+              <execution>
+                <id>sign-artifacts</id>
+                <phase>verify</phase>
+                <goals>
+                  <goal>sign</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
+          <plugin>
+            <!-- The current (post-OSSRH-sunset) official Central publishing mechanism: replaces the
+                 legacy nexus-staging-maven-plugin + distributionManagement combination entirely; no
+                 <distributionManagement> block is needed alongside this plugin. publishingServerId refers
+                 to a <server> entry in the *running machine's* settings.xml (local or CI), never committed
+                 here (see doc/release-process.md). autoPublish left false deliberately: this uploads a
+                 release bundle to the Central Portal and stops, requiring one more manual "Publish" click
+                 in Central's own web UI; an extra, deliberate checkpoint on top of the GitHub Environment
+                 approval gate in publish.yml, worth keeping until the release flow has proven itself a few
+                 times over. Flip to true later if that checkpoint stops earning its keep. -->
+            <groupId>org.sonatype.central</groupId>
+            <artifactId>central-publishing-maven-plugin</artifactId>
+            <version>0.7.0</version>
+            <extensions>true</extensions>
+            <configuration>
+              <publishingServerId>central</publishingServerId>
+              <autoPublish>false</autoPublish>
+            </configuration>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
+  </profiles>
+</project>

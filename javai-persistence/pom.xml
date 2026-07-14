@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.dcaudell</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>javai-persistence</artifactId>
+  <packaging>jar</packaging>
+  <description>Persistence Bridge: JPA/Hibernate and Neo4j automation for vectorized, searchable persistence in JavAI Extensions.</description>
+
+  <!--
+    Persistence Bridge: JavAIPI, JavAIRepository, Hibernate/pgvector + Neo4j shims. See
+    doc/spec/persistence-bridge.md.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-collections</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-model</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.hibernate.orm</groupId>
+      <artifactId>hibernate-core</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Native pgvector column mapping: @JdbcTypeCode(SqlTypes.VECTOR) + @Array(length=n) on a plain
+           float[] field. Confirmed on Maven Central at the same version as hibernate-core. -->
+      <groupId>org.hibernate.orm</groupId>
+      <artifactId>hibernate-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.postgresql</groupId>
+      <artifactId>postgresql</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.neo4j.driver</groupId>
+      <artifactId>neo4j-java-driver</artifactId>
+    </dependency>
+
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>neo4j</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

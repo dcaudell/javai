@@ -1,0 +1,19 @@
+# Maven
+target/
+
+# IntelliJ IDEA
+*.iml
+*.ipr
+*.iws
+out/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+#secrets
+secrets.md
+secrets.*
+private-key.asc

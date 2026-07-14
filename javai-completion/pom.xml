@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.dcaudell</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>javai-completion</artifactId>
+  <packaging>jar</packaging>
+  <description>Completion Fabric: provider-agnostic RAG completions wrapping Spring AI for JavAI Extensions.</description>
+
+  <!--
+    Completion Fabric: PromptContext, CompletionRequest/Result, Cortex (the connector interface;
+    see doc/spec/completion-fabric.md's JavAICompletionProvider, renamed per the user's own naming
+    request), wrapping Spring AI ChatModel implementations rather than writing new provider clients
+    for OpenAI/Anthropic/Ollama. Groq and vLLM are OpenAI-wire-compatible (repointed spring-ai-openai,
+    different base-url), so they need no separate Spring AI module. Replicate has no Spring AI
+    ChatModel at all; its own Cortex is a hand-rolled HTTP client, the one deliberate deviation from
+    "wrap Spring AI, never write a provider client" (see this module's own README for why).
+
+    Note: "spring-ai-core" (referenced here originally) doesn't exist as a GA artifact —
+    Spring AI split it into spring-ai-model (ChatModel/EmbeddingModel, the abstractions
+    this module wraps) and spring-ai-client-chat (the ChatClient fluent builder used in
+    doc/spec/completion-fabric.md's worked examples) before 1.0.0 GA. Both come in
+    transitively via spring-ai-bom, pinned in the root pom.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-collections</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-model</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-model</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-client-chat</artifactId>
+    </dependency>
+    <!-- Real ChatModel implementations, not just the abstractions above. spring-ai-openai backs
+         CortexOpenAI directly, and CortexGroq/CortexVLlm too (both OpenAI-wire-compatible, just a
+         repointed base-url/api-key/model, no separate Spring AI module needed for either). -->
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-openai</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-anthropic</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>org.springframework.ai</groupId>
+      <artifactId>spring-ai-ollama</artifactId>
+    </dependency>
+    <!-- CortexOllama's own hand-rolled NDJSON line parsing (see its own class javadoc); comes in
+         transitively via javai-model too, declared directly here since this module's own code
+         imports it. -->
+    <dependency>
+      <groupId>com.google.code.gson</groupId>
+      <artifactId>gson</artifactId>
+    </dependency>
+    <!-- Mustache-compatible templating for CompletionRequest.render() (see its own javadoc for the
+         %%...%% delimiter + EscapingStrategy.NOOP choices). -->
+    <dependency>
+      <groupId>com.github.jknack</groupId>
+      <artifactId>handlebars</artifactId>
+    </dependency>
+    <!-- CortexOllamaRealContainerTest's own real backend; see javai-persistence/pom.xml for the same
+         pattern (testcontainers-bom already imported at the root). -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+</project>

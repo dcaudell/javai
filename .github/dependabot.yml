@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # The main 8-module reactor (javai-annotations through javai-completion) -- Dependabot's Maven support
+  # is multi-module-aware when pointed at the reactor root.
+  - package-ecosystem: maven
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: Dev
+    open-pull-requests-limit: 10
+
+  # Standalone project, not part of the reactor above (see its own pom.xml's header comment) -- its own
+  # separate dependency graph, needs its own Dependabot entry.
+  - package-ecosystem: maven
+    directory: /e2e-client-test
+    schedule:
+      interval: weekly
+    target-branch: Dev
+    open-pull-requests-limit: 5
+
+  # Keeps actions/checkout, actions/setup-java, etc. in .github/workflows current too -- a stale pinned
+  # Action version is the same kind of drift as a stale Maven dependency.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    target-branch: Dev

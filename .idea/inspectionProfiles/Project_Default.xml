@@ -1,0 +1,22 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <!--
+      Disables IntelliJ's own Markdown-specific inspections project-wide (not scope-limited: these
+      inspections only ever fire on .md files in the first place, so there's no need to also gate them by
+      the "Markdown files" scope defined in .idea/scopes/Markdown_files.xml; that scope exists for adding
+      further per-inspection overrides below, or selecting in Settings | Editor | Inspections yourself).
+      Best-effort list of the Markdown plugin's inspection IDs; if a specific Markdown warning still shows
+      up after reloading, right-click its underline, choose "Disable inspection", which appends the correct
+      entry to this same file automatically.
+    -->
+    <inspection_tool class="MarkdownNoAlt" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownIncorrectlyNumberedListing" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownIncorrectTableFormatting" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownUnresolvedFileReference" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownUnresolvedHeaderReference" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownLinkDestinationWithSpaces" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownHeaderStyle" enabled="false" level="WARNING" enabled_by_default="false" />
+    <inspection_tool class="MarkdownNoRequiredSpaceAfterBlockquote" enabled="false" level="WARNING" enabled_by_default="false" />
+  </profile>
+</component>

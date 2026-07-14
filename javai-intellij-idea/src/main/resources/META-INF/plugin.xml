@@ -1,0 +1,24 @@
+<idea-plugin>
+    <id>dev.xtrafe.javai.intellij</id>
+    <name>JavAI Extensions Support</name>
+    <vendor url="https://github.com/xtrafe-dev/javai">JavAI Extensions</vendor>
+
+    <description><![CDATA[
+        Teaches IntelliJ IDEA about the members javai-substrate's ByteBuddy weaver adds to a
+        <code>@JavAIVectorizable</code>-annotated class at class-load time -- the JavAIVectorizable/
+        JavAIDirtyTracking contract methods, plus a per-<code>@Vectorize</code>-field
+        <code>&lt;field&gt;Vector()</code> accessor -- so the editor stops reporting "cannot resolve method"
+        for code that is correct and works at runtime, without requiring a cast through
+        <code>JavAIVectorizable</code>/<code>JavAIDirtyTracking</code> first.
+        <p>
+        This plugin only affects IDE analysis (inspections, autocomplete, navigation). It does not run, call,
+        or depend on the real weaver, and changes nothing about how your project actually compiles or runs.
+        See doc/spec/intellij-plugin.md in the javai repository for the full design.
+    ]]></description>
+
+    <depends>com.intellij.modules.java</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <psiAugmentProvider implementation="dev.xtrafe.javai.intellij.JavAIPsiAugmentProvider"/>
+    </extensions>
+</idea-plugin>

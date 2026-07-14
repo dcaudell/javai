@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>io.github.dcaudell</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>javai-supervision</artifactId>
+  <packaging>jar</packaging>
+  <description>Agentic Supervision: AOP-style sync/async interception for JavAI Extensions.</description>
+
+  <!--
+    Agentic Supervision: SupervisionEvent, SupervisionListener, JavAISupervision (the
+    registration + dispatch facade), SupervisionWeaver (its own, independent ByteBuddy weaver — see
+    package-info for why this doesn't reuse javai-substrate). See doc/spec/agentic-supervision.md.
+
+    Depends only on javai-annotations + ByteBuddy, deliberately — same early, low-risk tier as
+    javai-vector, not downstream of Vector Core/Collections/Completion Fabric. An "Agentic Listener" that
+    grounds its decisions in RAG over the object graph is documented as an application-level worked
+    example built on top of this module's generic listener interface plus javai-completion/javai-vector/
+    javai-model/javai-collections — not a dependency this module itself takes on.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-annotations</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <configuration>
+          <!--
+            ByteBuddyAgent.install() self-attaches to this same JVM to obtain an Instrumentation instance
+            for the weaving tests. Self-attach is disabled by default since JDK 9; without this flag the
+            tests fail with "does not support attachment" rather than exercising any weaving logic. Same
+            requirement as javai-substrate's pom.xml, for the identical reason.
+          -->
+          <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

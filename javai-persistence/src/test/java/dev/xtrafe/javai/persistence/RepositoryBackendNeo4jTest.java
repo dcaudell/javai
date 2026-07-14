@@ -1,0 +1,298 @@
+package dev.xtrafe.javai.persistence;
+
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.neo4j.driver.AuthTokens;
+import org.neo4j.driver.Driver;
+import org.neo4j.driver.GraphDatabase;
+import org.neo4j.driver.Value;
+import org.testcontainers.containers.Neo4jContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+import org.testcontainers.utility.DockerImageName;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * Real container, not hermetic: there's no meaningful way to fake whether Neo4j's native vector index
+ * actually ranks correctly. See {@link RepositoryBackendHibernatePostgresTest}'s javadoc for why
+ * {@link FakeEmbeddingProvider} is still fine for the embeddings themselves.
+ */
+@Testcontainers
+class RepositoryBackendNeo4jTest {
+
+    private static final String NEO4J_PASSWORD = "javai-test-password";
+
+    @Container
+    static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:5.26-community"))
+            .withAdminPassword(NEO4J_PASSWORD);
+
+    private static TestArticleRepository repository;
+
+    @BeforeAll
+    static void configurePersistenceAndProvider() {
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
+                .build());
+        repository = JavAIPI.repository(TestArticleRepository.class);
+    }
+
+    @BeforeEach
+    void resetProvider() {
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    @AfterEach
+    void resetConsistencyMode() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    @Test
+    void saveAndFindByIdRoundTrips() {
+        TestArticle article = new TestArticle("Zero-day disclosed", "A critical vulnerability was patched today.");
+        TestArticle saved = repository.save(article);
+        assertTrue(saved.getId() != null);
+
+        Optional<TestArticle> found = repository.findById(saved.getId());
+        assertTrue(found.isPresent());
+        assertEquals("Zero-day disclosed", found.get().getTitle());
+        assertEquals("A critical vulnerability was patched today.", found.get().getBody());
+    }
+
+    @Test
+    void findNearestByFieldVectorRanksBySimilarity() {
+        TestArticle security = repository.save(new TestArticle("Zero-day disclosed",
+                "A critical vulnerability affecting a widely used TLS library was patched today."));
+        repository.save(new TestArticle("Weeknight pasta recipes",
+                "Quick, easy pasta dishes you can make in under thirty minutes."));
+        repository.save(new TestArticle("Championship game recap",
+                "The local team secured a dramatic overtime victory last night."));
+
+        EmbeddingVector reference = security.fieldVector("title");
+        List<TestArticle> nearest = repository.findNearestByTitleVector(reference, 1);
+
+        assertEquals(1, nearest.size());
+        assertEquals(security.getId(), nearest.get(0).getId(),
+                "the article whose own title produced the reference vector must rank nearest to itself");
+    }
+
+    @Test
+    void findNearestByVectorAndSummaryVectorAlsoWork() {
+        TestArticle article = repository.save(new TestArticle("Combined and summary vector test",
+                "Proves the whole-object vector() and summaryVector() query variants, not just per-field."));
+
+        List<TestArticle> byVector = repository.findNearestByVector(article.vector(), 5);
+        assertTrue(byVector.stream().anyMatch(a -> a.getId().equals(article.getId())));
+
+        List<TestArticle> bySummary = repository.findNearestBySummaryVector(article.summaryVector(), 5);
+        assertTrue(bySummary.stream().anyMatch(a -> a.getId().equals(article.getId())));
+    }
+
+    /**
+     * Structural proof, not just behavioral: two different models' vectors for the *same* field of the
+     * *same* node land under two entirely separate, model-qualified property names (named from
+     * {@link ModelIds#sanitize}) -- the old model's property is never overwritten by a newer model's save.
+     */
+    @Test
+    void savingUnderADifferentModelUsesASeparatePropertyPerModel() {
+        TestArticle article = repository.save(new TestArticle("Model migration test", "Original text."));
+        UUID id = article.getId();
+        String originalModelId = article.fieldVector("title").modelId();
+
+        FakeEmbeddingProvider baseProvider = new FakeEmbeddingProvider();
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            EmbeddingVector base = baseProvider.embed(text);
+            return new EmbeddingVector(base.values(), "fake-test-model-v2", base.dims(), Instant.now());
+        });
+        TestArticle reloaded = repository.findById(id).orElseThrow();
+        repository.save(reloaded);
+
+        try (Driver driver = GraphDatabase.driver(neo4j.getBoltUrl(), AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+                var session = driver.session()) {
+            String originalProperty = "titleVector__" + ModelIds.sanitize(originalModelId);
+            String newProperty = "titleVector__" + ModelIds.sanitize("fake-test-model-v2");
+            boolean bothPropertiesPresent = session.run(
+                    "MATCH (n:TestArticle {id: $id}) RETURN n[$originalProperty] IS NOT NULL AS hasOriginal, "
+                            + "n[$newProperty] IS NOT NULL AS hasNew",
+                    org.neo4j.driver.Values.parameters("id", id.toString(),
+                            "originalProperty", originalProperty, "newProperty", newProperty))
+                    .single().get("hasOriginal").asBoolean();
+            assertTrue(bothPropertiesPresent,
+                    "the original model's property must still be present, untouched by the newer model's save");
+        }
+    }
+
+    /**
+     * A different-dimension model swap is now *exactly* the same operation as a same-dimension one: just
+     * {@code configureEmbeddingProvider(...)}, nothing else. Each model gets its own, independently and
+     * correctly dimensioned property + vector index the first time it's needed, so there's no shared-
+     * property conflict to hit -- contrast with the earlier, since-replaced shared-property design, where
+     * a different-dimension swap left a node silently inconsistent with its own vector index.
+     */
+    @Test
+    void differentDimensionModelSwapWorksTheSameAsASameDimensionSwap() {
+        TestArticle article = repository.save(new TestArticle("Dimension swap test", "Original text."));
+        UUID id = article.getId();
+
+        JavAIRuntime.configureEmbeddingProvider(text -> new EmbeddingVector(
+                new float[] {0.1f, 0.2f, 0.3f, 0.4f}, "fake-test-model-4dim", 4, Instant.now()));
+        TestArticle reloaded = repository.findById(id).orElseThrow();
+        TestArticle resaved = repository.save(reloaded); // must NOT throw
+
+        List<TestArticle> found = repository.findNearestByTitleVector(resaved.fieldVector("title"), 5);
+        assertTrue(found.stream().anyMatch(a -> a.getId().equals(id)));
+    }
+
+    @Test
+    void reindexAllReembedsExistingEntitiesUnderTheNewModel() {
+        TestArticle article = repository.save(new TestArticle("Reindex test", "Some original text about topic A."));
+        UUID id = article.getId();
+
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            EmbeddingVector base = new FakeEmbeddingProvider().embed(text);
+            return new EmbeddingVector(base.values(), "fake-test-model-reindexed", base.dims(), Instant.now());
+        });
+        repository.reindexAll();
+
+        TestArticle reloaded = repository.findById(id).orElseThrow();
+        List<TestArticle> found = repository.findNearestByTitleVector(reloaded.fieldVector("title"), 5);
+        assertTrue(found.stream().anyMatch(a -> a.getId().equals(id)),
+                "reindexAll() must re-embed and persist every existing entity under the newly configured model");
+    }
+
+    @Test
+    void revertingToAPreviousProviderNeedsNoReindexing() {
+        TestArticle article = repository.save(new TestArticle("Revert test", "Some original text about topic B."));
+        UUID id = article.getId();
+        EmbeddingVector originalReference = article.fieldVector("title");
+
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            EmbeddingVector base = new FakeEmbeddingProvider().embed(text);
+            return new EmbeddingVector(base.values(), "fake-test-model-temporary", base.dims(), Instant.now());
+        });
+        repository.reindexAll();
+
+        // Revert -- deliberately no reindexAll() call here.
+        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+
+        List<TestArticle> found = repository.findNearestByTitleVector(originalReference, 5);
+        assertTrue(found.stream().anyMatch(a -> a.getId().equals(id)),
+                "the original model's property/index must still hold this entity -- reverting must not need reindexing");
+    }
+
+    @Test
+    void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+    }
+
+    /**
+     * Proves the fix for a real, previously-confirmed gap: {@code hydrateRelationshipField} used to only
+     * handle {@code Collection}-typed relationship fields, and {@code saveNode} never persisted a
+     * {@code Map} field's keys at all -- so a {@code Map}-typed field couldn't correctly round-trip through
+     * Neo4j (it would either throw trying to assign a related node directly into a {@code Map}-typed field
+     * slot, or -- before that fix -- have no way to know what key to reconstruct it under even if hydration
+     * were fixed in isolation). {@code TestArticleWithTags.tagsByCode} is a real
+     * {@code Map<String, TestTag>}, not a {@code Collection}; both entries' keys must survive the round trip
+     * exactly, not just their values.
+     */
+    @Test
+    void mapFieldRoundTripsWithKeysPreserved() {
+        JavAIPI.repository(TestTagRepository.class);
+        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class);
+
+        TestArticleWithTags article = new TestArticleWithTags("Map field test");
+        article.getTagsByCode().put("first", new TestTag("alpha"));
+        article.getTagsByCode().put("second", new TestTag("beta"));
+
+        TestArticleWithTags saved = repository.save(article);
+        TestArticleWithTags reloaded = repository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getTagsByCode().size());
+        assertEquals("alpha", reloaded.getTagsByCode().get("first").getLabel());
+        assertEquals("beta", reloaded.getTagsByCode().get("second").getLabel());
+    }
+
+    /**
+     * See {@link RepositoryBackendHibernatePostgresTest#savedVectorIsAlwaysAccurateUnderImmediateConsistency}
+     * -- same must-have, same reasoning, proven against this backend instead.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderImmediateConsistency() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        article.setTitle("second title, mutated just before save");
+        TestArticle resaved = repository.save(article);
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        float[] stored = readVectorProperty(id, "titleVector__" + ModelIds.sanitize(expected.modelId()));
+        assertArrayEquals(expected.values(), stored, 1e-4f,
+                "the persisted vector must match the field's value as of save(), not some earlier value");
+    }
+
+    /**
+     * See {@link RepositoryBackendHibernatePostgresTest#savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider}
+     * -- same race, same reasoning, proven against this backend instead.
+     */
+    @Test
+    void savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider() {
+        JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.EVENTUAL_CONSISTENCY);
+        TestArticle article = repository.save(new TestArticle("first title", "first body"));
+        UUID id = article.getId();
+
+        FakeEmbeddingProvider fast = new FakeEmbeddingProvider();
+        JavAIRuntime.configureEmbeddingProvider(text -> {
+            try {
+                Thread.sleep(300); // slower than this test's own save() call would otherwise wait for
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            return fast.embed(text);
+        });
+
+        article.setTitle("second title, mutated just before a slow-provider save");
+        TestArticle resaved = repository.save(article); // must block on the slow provider, not skip ahead
+
+        EmbeddingVector expected = resaved.fieldVector("title");
+        float[] stored = readVectorProperty(id, "titleVector__" + ModelIds.sanitize(expected.modelId()));
+        assertArrayEquals(expected.values(), stored, 1e-4f,
+                "EVENTUAL_CONSISTENCY's slow background dispatch must never be allowed to leave a stale "
+                        + "vector in the database -- the flush itself must have forced an accurate, "
+                        + "blocking recompute");
+    }
+
+    private static float[] readVectorProperty(UUID id, String property) {
+        try (Driver driver = GraphDatabase.driver(neo4j.getBoltUrl(), AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+                var session = driver.session()) {
+            Value value = session.run("MATCH (n:TestArticle {id: $id}) RETURN n[$property] AS v",
+                            org.neo4j.driver.Values.parameters("id", id.toString(), "property", property))
+                    .single().get("v");
+            assertTrue(!value.isNull(), "expected property " + property + " to be set on node " + id);
+            List<Float> values = value.asList(Value::asFloat);
+            float[] result = new float[values.size()];
+            for (int i = 0; i < result.length; i++) {
+                result[i] = values.get(i);
+            }
+            return result;
+        }
+    }
+}
