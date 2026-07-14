@@ -12,6 +12,7 @@
 
   <artifactId>javai-substrate</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Acceleration Substrate</name>
   <description>Acceleration Substrate: the ByteBuddy load-time weaver that implements JavAIVectorizable on annotated classes for JavAI Extensions.</description>
 
   <!--
