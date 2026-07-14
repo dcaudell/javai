@@ -28,7 +28,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <javai.version>0.1.0</javai.version>
-    <junit.version>5.11.0</junit.version>
+    <junit.version>6.1.2</junit.version>
     <lombok.version>1.18.46</lombok.version>
     <!--
       Originally confirmed via `mvn dependency:tree -Dverbose` to fix a real, severe cross-version jackson
