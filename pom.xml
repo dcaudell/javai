@@ -88,7 +88,7 @@
     -->
     <byte-buddy.version>1.18.11</byte-buddy.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
-    <neo4j-driver.version>5.27.0</neo4j-driver.version>
+    <neo4j-driver.version>6.2.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
     <postgresql-driver.version>42.7.13</postgresql-driver.version>
