@@ -16,6 +16,7 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 | Hibernate-based enhancement shim | Mechanism | ByteBuddy enhancement via Hibernate's `EnhancementContext`-style SPI |
 | `hibernate-vector` module | Dependency | Native pgvector column mapping (`@JdbcTypeCode(SqlTypes.VECTOR)`) |
 | Neo4j-facing shim | Mechanism | Parallel graph-native persistence backend, same `JavAIPI` contract |
+| MongoDB-facing shim | Mechanism | `RepositoryBackendSpringDataMongo` -- Spring Data MongoDB's `MongoTemplate` for connection/database access, raw driver reads/writes/`$vectorSearch` for the vector-specific work, same `JavAIPI` contract |
 | `embedding_version` side table / expand-contract migration | Pattern | Versioned vector storage across model changes, non-destructive |
 
 ## Reference implementation shape
@@ -39,7 +40,41 @@ List<Article> hits = repo.findNearestByBodyVector(queryVector, 20);
 // Swapping the persisted backend is configuration, not code:
 //   javai.persistence.backend=postgres+pgvector   (default, via hibernate-vector)
 //   javai.persistence.backend=neo4j               (native vector index + Cypher traversal)
+//   javai.persistence.backend=mongodb             (Spring Data MongoDB + native $vectorSearch)
 ```
+
+## Why MongoDB is a Spring Data MongoDB shim, not a Hibernate one
+
+MongoDB publishes its own "MongoDB Extension for Hibernate ORM," which would have kept this backend
+structurally symmetric with the Postgres shim above. It was deliberately not used: as of this writing it's
+Public Preview ("not recommended for production deployments, because breaking changes might be
+introduced" -- MongoDB's own words), it doesn't support JPA associations (`@OneToOne`/`@OneToMany`/
+`@ManyToMany` are all unsupported, which the Postgres shim's own singular-relationship handling depends
+on), and vector search is reachable only via un-parameterized native MQL, not a first-class API. Spring
+Data MongoDB, by contrast, has mature `$vectorSearch` support and needs no association model at all (this
+backend stores related/collection-typed fields as `{type, id}` reference pointers it manages itself, the
+same reference-not-embed choice `RepositoryBackendNeo4j` already makes for its own graph relationships).
+See `javai-persistence/README.md`'s "MongoDB backend" section for the full mapping rules.
+
+## Persisting one entity type to more than one store at once
+
+There is no dual-write `save()` -- an entity type persisted to two backends simultaneously means two
+independently-created repository proxies, one per backend, each permanently bound to whichever
+`JavAIPersistenceConfig` was active when `JavAIPI.repository(...)` created it:
+
+```java
+JavAIPI.configurePersistence(JavAIPersistenceConfig.builder().backend(Backend.POSTGRES)./* ... */.build());
+ArticleRepository postgresRepo = JavAIPI.repository(ArticleRepository.class);
+
+JavAIPI.configurePersistence(JavAIPersistenceConfig.builder().backend(Backend.MONGODB)./* ... */.build());
+ArticleRepository mongoRepo = JavAIPI.repository(ArticleRepository.class);
+
+postgresRepo.save(article); // writes to Postgres only
+mongoRepo.save(article);    // writes to MongoDB only -- the caller owns cross-store consistency
+```
+
+Both proxies stay independently usable afterward regardless of which config is currently active -- a
+proxy's backend binding is fixed at creation time, not re-resolved on each call.
 
 ## Embedding-model versioning: expand/contract migration
 

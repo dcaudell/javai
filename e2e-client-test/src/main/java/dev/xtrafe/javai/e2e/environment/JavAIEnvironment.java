@@ -28,13 +28,14 @@ import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
  * <p>{@link JavAIPI#repository(Class)} returns a proxy bound to whichever backend was configured at the
  * moment it was created -- switching {@link JavAIPI#configurePersistence} afterward doesn't retroactively
  * affect an already-created proxy (see that class's own javadoc). That's what lets this class safely build
- * and hand out both a Postgres-backed and a Neo4j-backed {@code ArticleRepository} here, once, for every
- * test class to share, rather than each test needing to reconstruct its own.
+ * and hand out a Postgres-backed, a Neo4j-backed, <em>and</em> a MongoDB-backed {@code ArticleRepository}
+ * here, once, for every test class to share, rather than each test needing to reconstruct its own.
  */
 public final class JavAIEnvironment {
 
     private static final ArticleRepository POSTGRES_ARTICLE_REPOSITORY;
     private static final ArticleRepository NEO4J_ARTICLE_REPOSITORY;
+    private static final ArticleRepository MONGO_ARTICLE_REPOSITORY;
     private static final Cortex CORTEX;
 
     static {
@@ -63,10 +64,20 @@ public final class JavAIEnvironment {
         JavAIPI.repository(AttachmentRepository.class);
         NEO4J_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class);
 
+        // No CommentRepository/AttachmentRepository pre-registration here either: RepositoryBackendSpringDataMongo
+        // recursively auto-registers related types too, matching Postgres's convenience rather than Neo4j's
+        // explicit-registration requirement.
+        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.MONGODB)
+                .mongoUri(MonolithicContainer.mongoUri())
+                .mongoDatabase("javai")
+                .build());
+        MONGO_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class);
+
         CORTEX = LocalCompletionDefaults.create(MonolithicContainer.completionEndpoint());
 
-        SampleDataSeeder.resetAndSeed(MonolithicContainer.postgresUrl(), MonolithicContainer.neo4jUri(),
-                POSTGRES_ARTICLE_REPOSITORY, NEO4J_ARTICLE_REPOSITORY);
+        SampleDataSeeder.resetAndSeed(MonolithicContainer.postgresUrl(), MonolithicContainer.neo4jUri(), MonolithicContainer.mongoUri(),
+                POSTGRES_ARTICLE_REPOSITORY, NEO4J_ARTICLE_REPOSITORY, MONGO_ARTICLE_REPOSITORY);
     }
 
     private JavAIEnvironment() {
@@ -83,6 +94,10 @@ public final class JavAIEnvironment {
 
     public static ArticleRepository neo4jArticleRepository() {
         return NEO4J_ARTICLE_REPOSITORY;
+    }
+
+    public static ArticleRepository mongoArticleRepository() {
+        return MONGO_ARTICLE_REPOSITORY;
     }
 
     public static Cortex cortex() {

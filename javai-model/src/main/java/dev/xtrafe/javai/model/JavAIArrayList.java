@@ -25,7 +25,12 @@ import java.util.stream.Collectors;
  */
 public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T>, JavAIDirtyTracking {
 
-    private final DirtyTrackingSupport state = new DirtyTrackingSupport();
+    // Named to match JavAIRuntime.STATE_FIELD exactly, not just "state": JavAIRuntime's whole-subgraph
+    // persistence lock (runWithSubgraphLockedForPersistence) reflectively looks up this field by that
+    // literal name on every JavAIVectorizable node it locks, including collection nodes like this one (see
+    // that method's own javadoc) -- it doesn't special-case hand-written vs. woven implementers, so this
+    // field has to be named identically to the one the weaver synthesizes on user classes.
+    private final DirtyTrackingSupport $javai$state = new DirtyTrackingSupport();
 
     public JavAIArrayList() {
     }
@@ -56,7 +61,7 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
             for (T element : elements) {
                 JavAIRuntime.registerDependency(this, element);
             }
-            CollectionVectorSupport.onMutated(state, this);
+            CollectionVectorSupport.onMutated($javai$state, this);
         }
         return changed;
     }
@@ -71,7 +76,7 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
     @Override
     public T remove(int index) {
         T removed = super.remove(index);
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
         return removed;
     }
 
@@ -79,7 +84,7 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
     public boolean remove(Object element) {
         boolean changed = super.remove(element);
         if (changed) {
-            CollectionVectorSupport.onMutated(state, this);
+            CollectionVectorSupport.onMutated($javai$state, this);
         }
         return changed;
     }
@@ -87,24 +92,24 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
     @Override
     public void clear() {
         super.clear();
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
     }
 
     private void afterAdd(T element) {
         JavAIRuntime.registerDependency(this, element);
-        CollectionVectorSupport.onMutated(state, this);
+        CollectionVectorSupport.onMutated($javai$state, this);
     }
 
     // ---- JavAIVectorizable ----
 
     @Override
     public EmbeddingVector vector() {
-        return CollectionVectorSupport.vector(state, this);
+        return CollectionVectorSupport.vector($javai$state, this);
     }
 
     @Override
     public EmbeddingVector summaryVector() {
-        return CollectionVectorSupport.summaryVector(state, this);
+        return CollectionVectorSupport.summaryVector($javai$state, this);
     }
 
     @Override
@@ -170,41 +175,41 @@ public final class JavAIArrayList<T> extends ArrayList<T> implements JavAIList<T
 
     @Override
     public void addDependent(Object dependent) {
-        state.addDependent(dependent);
+        $javai$state.addDependent(dependent);
     }
 
     @Override
     public Iterable<Object> dependents() {
-        return state.dependents();
+        return $javai$state.dependents();
     }
 
     @Override
     public boolean isFieldDirty() {
-        return state.isFieldDirty();
+        return $javai$state.isFieldDirty();
     }
 
     @Override
     public void markFieldDirty() {
-        state.markFieldDirty();
+        $javai$state.markFieldDirty();
     }
 
     @Override
     public void clearFieldDirty() {
-        state.clearFieldDirty();
+        $javai$state.clearFieldDirty();
     }
 
     @Override
     public boolean isSummaryDirty() {
-        return state.isSummaryDirty();
+        return $javai$state.isSummaryDirty();
     }
 
     @Override
     public void markSummaryDirty() {
-        state.markSummaryDirty();
+        $javai$state.markSummaryDirty();
     }
 
     @Override
     public void clearSummaryDirty() {
-        state.clearSummaryDirty();
+        $javai$state.clearSummaryDirty();
     }
 }

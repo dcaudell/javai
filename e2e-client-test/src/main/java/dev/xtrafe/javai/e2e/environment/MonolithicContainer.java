@@ -37,6 +37,23 @@ import java.util.concurrent.TimeUnit;
  * not automatically invalidate an already-running container. Force a rebuild by removing it yourself:
  * {@code docker rm -f javai-e2e-monolithic}. Hashing the Dockerfile's actual content to auto-detect this
  * was judged not worth the complexity, same call the predecessor made.
+ *
+ * <p><b>MongoDB is a second, separate container, not a fourth process folded into the monolith.</b> The
+ * real {@code $vectorSearch} support this project needs comes from {@code mongodb/mongodb-atlas-local},
+ * which bundles {@code mongod} and a second internal process ({@code mongot}) that talk to each other
+ * through orchestration logic baked into that image's own entrypoint -- a compiled Go binary
+ * ({@code /usr/local/bin/runner server}) with no public source. An attempt to hand-roll that same
+ * mongod+mongot pairing inside this project's own monolithic image (curl-installing {@code mongot} and
+ * driving it with the same flags the official image uses) was tried and abandoned: {@code mongot}
+ * crash-looped with {@code IllegalArgumentException: The connection string contains an invalid host and
+ * port}, thrown from an internal, undocumented bootstrap class ({@code
+ * com.xgen.atlas.config.provider.localdev.LocalDevBootstrapper}) not reachable via any public CLI flag.
+ * Third-party research into how {@code mongodb-atlas-local} itself is composed confirmed the actual
+ * supported shape is mongod and mongot as independent processes/containers addressing each other by
+ * hostname, which is exactly what running the official image unmodified, as its own container, already
+ * gives us for free -- so that's what {@link #ensureRunning()} now also does for Mongo, matched by its own
+ * fixed container name ({@value #MONGO_CONTAINER_NAME}) using the same reuse-by-name idempotency as the
+ * monolith above, just with no {@code docker build} step of our own since the image is used as-is.
  */
 public final class MonolithicContainer {
 
@@ -45,21 +62,31 @@ public final class MonolithicContainer {
     private static final Path DOCKERFILE = Path.of("docker", "Dockerfile");
     private static final Path BUILD_CONTEXT = Path.of("docker");
 
-    // Shifted well off each service's common native-install default (5432/7474/7687/11434) so this
-    // container's fixed host ports don't collide with, e.g., a locally-installed Ollama or Postgres.
+    // The MongoDB companion container -- see this class's own javadoc for why it's separate rather than
+    // folded into the monolith above. Unmodified official image, no Dockerfile/build step of our own.
+    private static final String MONGO_CONTAINER_NAME = "javai-e2e-mongo";
+    private static final String MONGO_IMAGE_NAME = "mongodb/mongodb-atlas-local:8.2";
+
+    // Shifted well off each service's common native-install default (5432/7474/7687/11434/27017) so this
+    // container's fixed host ports don't collide with, e.g., a locally-installed Ollama, Postgres, or Mongo.
     private static final int HOST_POSTGRES_PORT = 15432;
     private static final int HOST_NEO4J_HTTP_PORT = 17474;
     private static final int HOST_NEO4J_BOLT_PORT = 17687;
     private static final int HOST_OLLAMA_PORT = 21434;
+    private static final int HOST_MONGO_PORT = 27417;
 
     private static final int CONTAINER_POSTGRES_PORT = 5432;
     private static final int CONTAINER_NEO4J_HTTP_PORT = 7474;
     private static final int CONTAINER_NEO4J_BOLT_PORT = 7687;
     private static final int CONTAINER_OLLAMA_PORT = 11434;
+    private static final int CONTAINER_MONGO_PORT = 27017;
 
     private static final Duration HEALTH_CHECK_TIMEOUT = Duration.ofMinutes(10);
     private static final Duration BUILD_TIMEOUT = Duration.ofMinutes(30);
     private static final Duration RUN_TIMEOUT = Duration.ofMinutes(1);
+    // mongodb-atlas-local is a multi-hundred-MB image; the first `docker run` on a machine that doesn't
+    // have it cached yet has to pull it, which the plain 1-minute RUN_TIMEOUT isn't sized for.
+    private static final Duration MONGO_RUN_TIMEOUT = Duration.ofMinutes(15);
 
     // javai/javai (Postgres), neo4j/javai12345 (Neo4j) -- baked into docker/Dockerfile itself
     // (CREATE USER .../neo4j-admin dbms set-initial-password ...); centralized here since three separate
@@ -83,11 +110,11 @@ public final class MonolithicContainer {
         // selection must be pinned regardless of what LocalEmbeddingDefaults' own host-OS auto-detection
         // would otherwise pick (TEI on Linux/Windows) -- must be set before anything else here runs.
         System.setProperty(LocalEmbeddingDefaults.OVERRIDE_PROPERTY, "ollama");
-        if (!isRunning()) {
-            if (containerExists()) {
+        if (!isRunning(CONTAINER_NAME)) {
+            if (containerExists(CONTAINER_NAME)) {
                 run(RUN_TIMEOUT, "docker", "start", CONTAINER_NAME);
             } else {
-                if (!imageExists()) {
+                if (!imageExists(IMAGE_NAME)) {
                     run(BUILD_TIMEOUT, "docker", "build", "-t", IMAGE_NAME, "-f", DOCKERFILE.toString(), BUILD_CONTEXT.toString());
                 }
                 run(RUN_TIMEOUT, "docker", "run", "-d", "--name", CONTAINER_NAME,
@@ -102,7 +129,27 @@ public final class MonolithicContainer {
         waitForPort(HOST_NEO4J_HTTP_PORT);
         waitForPort(HOST_NEO4J_BOLT_PORT);
         waitForPort(HOST_OLLAMA_PORT);
+        ensureMongoRunning();
         ensured = true;
+    }
+
+    /**
+     * Starts the unmodified {@code mongodb/mongodb-atlas-local} companion container if it isn't already
+     * running -- see this class's own javadoc for why Mongo lives in its own container rather than as a
+     * fourth process inside the monolith. No {@code docker build}: {@code docker run} pulls the image
+     * itself the first time, same as any other unmodified base image.
+     */
+    private static void ensureMongoRunning() {
+        if (!isRunning(MONGO_CONTAINER_NAME)) {
+            if (containerExists(MONGO_CONTAINER_NAME)) {
+                run(RUN_TIMEOUT, "docker", "start", MONGO_CONTAINER_NAME);
+            } else {
+                run(MONGO_RUN_TIMEOUT, "docker", "run", "-d", "--name", MONGO_CONTAINER_NAME,
+                        "-p", HOST_MONGO_PORT + ":" + CONTAINER_MONGO_PORT,
+                        MONGO_IMAGE_NAME);
+            }
+        }
+        waitForPort(HOST_MONGO_PORT);
     }
 
     public static URI embeddingEndpoint() {
@@ -123,18 +170,26 @@ public final class MonolithicContainer {
         return "bolt://localhost:" + HOST_NEO4J_BOLT_PORT;
     }
 
-    private static boolean isRunning() {
+    /** {@code directConnection=true} is required: a single-node replica set (what
+     *  {@code mongodb-atlas-local} runs) advertises its own container hostname, which is unreachable from
+     *  outside the container -- this bypasses replica-set topology discovery and talks to the mapped port
+     *  directly, confirmed the same way {@code RepositoryBackendSpringDataMongoTest} already does. */
+    public static String mongoUri() {
+        return "mongodb://localhost:" + HOST_MONGO_PORT + "/?directConnection=true";
+    }
+
+    private static boolean isRunning(String containerName) {
         return !runCapturingOutput(RUN_TIMEOUT, "docker", "ps",
-                "--filter", "name=^/" + CONTAINER_NAME + "$", "--filter", "status=running", "-q").isEmpty();
+                "--filter", "name=^/" + containerName + "$", "--filter", "status=running", "-q").isEmpty();
     }
 
-    private static boolean containerExists() {
+    private static boolean containerExists(String containerName) {
         return !runCapturingOutput(RUN_TIMEOUT, "docker", "ps", "-a",
-                "--filter", "name=^/" + CONTAINER_NAME + "$", "-q").isEmpty();
+                "--filter", "name=^/" + containerName + "$", "-q").isEmpty();
     }
 
-    private static boolean imageExists() {
-        return !runCapturingOutput(RUN_TIMEOUT, "docker", "images", "-q", IMAGE_NAME).isEmpty();
+    private static boolean imageExists(String imageName) {
+        return !runCapturingOutput(RUN_TIMEOUT, "docker", "images", "-q", imageName).isEmpty();
     }
 
     private static void waitForPort(int port) {

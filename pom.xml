@@ -94,6 +94,25 @@
     <postgresql-driver.version>42.7.13</postgresql-driver.version>
     <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
     <testcontainers.version>1.21.4</testcontainers.version>
+    <!-- Backs RepositoryBackendSpringDataMongo (javai-persistence): MongoTemplate as the configured
+         connection holder, with the actual vector read/write/search issued via the raw driver (mirroring
+         this module's own raw-JDBC-under-Hibernate and raw-Cypher-under-the-Neo4j-driver precedent).
+         Pinned to the 4.5.x line, NOT the newer 5.x (current stable on Maven Central); confirmed via a
+         real e2e-client-test run that 5.1.0 pulls in Spring Framework 7.0.8 transitively, which collides
+         with Spring AI 1.0.9's own Spring Framework 6.2.19 requirement (javai-completion) on the same
+         classpath: Maven's dependency mediation picked 7.0.8's org.springframework.util.MimeType, which no
+         longer has the nested SpecificityComparator class spring-web:6.2.19's own compiled MediaType
+         expects, producing a real NoClassDefFoundError that broke nearly every e2e test class, not just the
+         Mongo ones. 4.5.1 depends on Spring Framework 6.2.8, the same 6.2.x line spring-ai already needs;
+         confirmed via `mvn dependency:tree` this resolves cleanly with no version conflict. We never
+         actually need spring-data-mongodb's own newer vector-search API (see this class's own javadoc: this
+         backend only uses MongoTemplate as a connection holder), so there's no reason to chase the 5.x line
+         at all. mongodb-driver-sync is pinned to match mongodb-driver-core's own resolved version; confirmed
+         via `mvn dependency:tree` that spring-data-mongodb 4.5.1 only pulls in mongodb-driver-core
+         transitively (BSON/wire-protocol types), not mongodb-driver-sync (MongoClient/MongoCollection),
+         which needs its own explicit dependency below. -->
+    <spring-data-mongodb.version>4.5.1</spring-data-mongodb.version>
+    <mongodb-driver.version>5.5.1</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
       and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
@@ -188,6 +207,16 @@
         <groupId>org.postgresql</groupId>
         <artifactId>postgresql</artifactId>
         <version>${postgresql-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.data</groupId>
+        <artifactId>spring-data-mongodb</artifactId>
+        <version>${spring-data-mongodb.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.mongodb</groupId>
+        <artifactId>mongodb-driver-sync</artifactId>
+        <version>${mongodb-driver.version}</version>
       </dependency>
       <dependency>
         <groupId>org.testcontainers</groupId>
