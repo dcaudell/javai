@@ -12,6 +12,7 @@
 
   <artifactId>javai-vector</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Vector Core (Vector)</name>
   <description>Vector Core (part 1/2): embedding computation, dirty-state tracking, and pluggable embedding providers for JavAI Extensions.</description>
 
   <!--

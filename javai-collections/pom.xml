@@ -12,6 +12,7 @@
 
   <artifactId>javai-collections</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Vector Collections</name>
   <description>Vector Collections: KnowledgeGraph, SubgraphResult, and VectorIndex for JavAI Extensions.</description>
 
   <!--

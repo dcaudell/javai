@@ -12,6 +12,7 @@
 
   <artifactId>javai-supervision</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Agentic Supervision</name>
   <description>Agentic Supervision: AOP-style sync/async interception for JavAI Extensions.</description>
 
   <!--

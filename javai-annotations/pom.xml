@@ -12,6 +12,7 @@
 
   <artifactId>javai-annotations</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Codegen Guidance</name>
   <description>Codegen Guidance and vectorization annotation vocabulary for JavAI Extensions (@Vectorize, @Summary, @Requires/@Ensures, and friends).</description>
 
   <!--

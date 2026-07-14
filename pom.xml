@@ -80,18 +80,18 @@
          Actions CI workflow in .github/workflows runs) never pays for either. -->
     <javai.excludedTestGroups>performance, requires-model</javai.excludedTestGroups>
 
-    <junit.version>5.11.0</junit.version>
+    <junit.version>6.1.2</junit.version>
     <!--
       Bumped from the 1.15.10 placeholder while building the javai-substrate weaving spike: 1.15.10 hard-fails
       parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
       repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
     -->
     <byte-buddy.version>1.18.11</byte-buddy.version>
-    <hibernate.version>6.6.4.Final</hibernate.version>
+    <hibernate.version>7.4.5.Final</hibernate.version>
     <neo4j-driver.version>5.27.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
-    <postgresql-driver.version>42.7.7</postgresql-driver.version>
+    <postgresql-driver.version>42.7.13</postgresql-driver.version>
     <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
     <testcontainers.version>1.21.4</testcontainers.version>
     <!--
@@ -295,7 +295,7 @@
                  disabling the linter for jar-generation purposes is the correct fix, not a workaround. -->
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-javadoc-plugin</artifactId>
-            <version>3.11.2</version>
+            <version>3.12.0</version>
             <configuration>
               <doclint>none</doclint>
               <quiet>true</quiet>
@@ -317,7 +317,7 @@
                  without also attempting to publish anything. -->
             <groupId>org.apache.maven.plugins</groupId>
             <artifactId>maven-gpg-plugin</artifactId>
-            <version>3.2.7</version>
+            <version>3.2.8</version>
             <executions>
               <execution>
                 <id>sign-artifacts</id>
@@ -340,7 +340,7 @@
                  times over. Flip to true later if that checkpoint stops earning its keep. -->
             <groupId>org.sonatype.central</groupId>
             <artifactId>central-publishing-maven-plugin</artifactId>
-            <version>0.7.0</version>
+            <version>0.11.0</version>
             <extensions>true</extensions>
             <configuration>
               <publishingServerId>central</publishingServerId>

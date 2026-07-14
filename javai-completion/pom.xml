@@ -12,6 +12,7 @@
 
   <artifactId>javai-completion</artifactId>
   <packaging>jar</packaging>
+  <name>JavAI Extensions -- Completion Fabric</name>
   <description>Completion Fabric: provider-agnostic RAG completions wrapping Spring AI for JavAI Extensions.</description>
 
   <!--

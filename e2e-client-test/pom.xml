@@ -28,7 +28,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <javai.version>0.1.0</javai.version>
-    <junit.version>5.11.0</junit.version>
+    <junit.version>6.1.2</junit.version>
     <lombok.version>1.18.46</lombok.version>
     <!--
       Originally confirmed via `mvn dependency:tree -Dverbose` to fix a real, severe cross-version jackson
@@ -40,7 +40,7 @@
       longer applies; kept anyway as cheap, defensive version pinning across whatever else transitively
       touches Jackson (Spring AI, Hibernate).
     -->
-    <jackson.version>2.21.4</jackson.version>
+    <jackson.version>2.22.1</jackson.version>
 
     <!--
       Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
@@ -151,7 +151,7 @@
            test discovery reflectively touches (and thereby unwovenly loads) the domain classes. -->
       <groupId>org.junit.platform</groupId>
       <artifactId>junit-platform-launcher</artifactId>
-      <version>1.11.0</version>
+      <version>6.1.2</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -161,7 +161,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.13.0</version>
+        <version>3.15.0</version>
         <configuration>
           <!--
             Confirmed empirically, not assumed: with this module's full dependency set on the classpath,
@@ -185,7 +185,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.2</version>
+        <version>3.5.6</version>
         <configuration>
           <!--
             ByteBuddyAgent.install() self-attaches to this JVM to weave the domain classes below;
