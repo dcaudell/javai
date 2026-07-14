@@ -156,6 +156,22 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
    </dependency>
    ```
 
+   **Gradle** (`build.gradle.kts`) works the same way — every module publishes to Maven Central with both a
+   POM and Gradle Module Metadata (`.module`), so `mavenCentral()` alone is enough; no extra repository or
+   variant configuration needed:
+
+   ```kotlin
+   dependencies {
+       implementation("io.github.dcaudell:javai-vector:0.1.1")
+       implementation("io.github.dcaudell:javai-model:0.1.1")
+       implementation("io.github.dcaudell:javai-substrate:0.1.1")
+       implementation("io.github.dcaudell:javai-supervision:0.1.1")
+       implementation("io.github.dcaudell:javai-collections:0.1.1")
+       implementation("io.github.dcaudell:javai-persistence:0.1.1")
+       implementation("io.github.dcaudell:javai-completion:0.1.1")
+   }
+   ```
+
 2. **Install both weavers** before any annotated class is loaded — as early as possible in `main()`, or,
    for a JUnit 5 test suite, from a `LauncherSessionListener` (not `@BeforeAll`, which runs too late):
 

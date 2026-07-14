@@ -347,6 +347,33 @@
               <autoPublish>false</autoPublish>
             </configuration>
           </plugin>
+          <plugin>
+            <!-- Publishing from Maven doesn't produce Gradle Module Metadata (the .module file) the way
+                 Gradle's own maven-publish plugin does when it's the one doing the publishing; Gradle
+                 consumers still resolve this library fine from the plain POM alone (Gradle has always
+                 natively understood Maven repositories), but without a .module file they lose out on
+                 variant-aware resolution (Gradle 6+ prefers Module Metadata over the POM when both are
+                 present). This plugin derives an equivalent .module file from the same POM/dependency
+                 information already declared here and attaches it as an extra artifact, the same way
+                 maven-source-plugin/maven-javadoc-plugin attach their own jars above; no separate
+                 dependency declarations to keep in sync. Declared last: its `gmm` goal binds to the
+                 `package` phase and must run after anything else that rewrites the jar/POM in that same
+                 phase (shade/flatten/moditect; none of which this project uses, but the ordering
+                 requirement is the plugin's own documented caveat, so kept last on principle). Runs before
+                 maven-gpg-plugin's `verify`-phase sign goal in the lifecycle, so the .module file gets
+                 signed right along with the jar/sources/javadoc, and before central-publishing-maven-plugin
+                 stages/uploads everything, so it ships in the same release bundle with no extra wiring. -->
+            <groupId>org.gradlex</groupId>
+            <artifactId>gradle-module-metadata-maven-plugin</artifactId>
+            <version>1.2</version>
+            <executions>
+              <execution>
+                <goals>
+                  <goal>gmm</goal>
+                </goals>
+              </execution>
+            </executions>
+          </plugin>
         </plugins>
       </build>
     </profile>
