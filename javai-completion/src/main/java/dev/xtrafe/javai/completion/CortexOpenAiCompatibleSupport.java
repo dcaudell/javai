@@ -1,5 +1,7 @@
 package dev.xtrafe.javai.completion;
 
+import com.openai.errors.RateLimitException;
+import dev.xtrafe.javai.vector.RetryAfterParser;
 import dev.xtrafe.javai.vector.RetrySupport;
 import dev.xtrafe.javai.vector.TooManyRequestsException;
 import org.springframework.ai.chat.model.ChatResponse;
@@ -7,9 +9,8 @@ import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.openai.OpenAiChatModel;
 import org.springframework.ai.openai.OpenAiChatOptions;
-import org.springframework.ai.openai.api.OpenAiApi;
-import org.springframework.web.reactive.function.client.WebClient;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.concurrent.Flow;
 
@@ -21,6 +22,16 @@ import java.util.concurrent.Flow;
  * implementation, three distinct public classes -- the user asked for three separately-named connector
  * types, and that vocabulary should show up in code, even though underneath all three just configure a
  * repointed {@code OpenAiChatModel}.
+ *
+ * <p><b>429 detection, since Spring AI 2.0</b>: {@code OpenAiChatModel} now wraps OpenAI's own official
+ * Java SDK (a {@code com.openai.client.OpenAIClient}, constructed internally from {@code apiKey}/
+ * {@code baseUrl} set directly on {@link OpenAiChatOptions} -- there's no more {@code OpenAiApi}/
+ * {@code WebClient} layer of our own to hang a {@code ResponseErrorHandler} off of). The SDK throws its own
+ * typed {@link RateLimitException} on HTTP 429, caught here and converted to {@link
+ * TooManyRequestsException} -- the same shape {@link RetrySupport}/{@code CortexStreamingRetry} already
+ * coordinate through for every other provider. {@code maxRetries(0)} below turns off the SDK's own internal
+ * retry-on-transient-error behavior, so {@code RetrySupport}/{@link dev.xtrafe.javai.vector.EndpointRateLimiter}
+ * stay the single source of truth for retry/backoff timing, unchanged from before this migration.
  */
 final class CortexOpenAiCompatibleSupport implements Cortex {
 
@@ -36,15 +47,13 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
         this.model = model;
         this.baseUrl = baseUrl;
         this.contextWindowTokensOverride = contextWindowTokensOverride;
-        OpenAiApi api = OpenAiApi.builder()
-                .baseUrl(baseUrl)
-                .apiKey(apiKey == null ? "" : apiKey)
-                .responseErrorHandler(new TooManyRequestsResponseErrorHandler())
-                .webClientBuilder(WebClient.builder().filter(TooManyRequestsExchangeFilterFunction.create()))
-                .build();
         this.chatModel = OpenAiChatModel.builder()
-                .openAiApi(api)
-                .defaultOptions(OpenAiChatOptions.builder().model(model).build())
+                .options(OpenAiChatOptions.builder()
+                        .model(model)
+                        .apiKey(apiKey == null ? "" : apiKey)
+                        .baseUrl(baseUrl)
+                        .maxRetries(0)
+                        .build())
                 .toolCallingManager(ToolCallingManager.builder().build())
                 .build();
     }
@@ -54,20 +63,36 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
         Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
         ChatResponse response;
         try {
-            response = RetrySupport.withRetry(baseUrl, () -> chatModel.call(prompt));
+            response = RetrySupport.withRetry(baseUrl, () -> callChecked(prompt));
         } catch (TooManyRequestsException e) {
             throw new CompletionException(providerId + " rate-limited too many times", e);
         }
         return new CompletionResult(response.getResult().getOutput().getText(), providerId, model, Instant.now());
     }
 
+    private ChatResponse callChecked(Prompt prompt) {
+        try {
+            return chatModel.call(prompt);
+        } catch (RateLimitException e) {
+            throw toTooManyRequests(e);
+        }
+    }
+
     @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
         Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
         CortexStreaming.bridge(
-                CortexStreamingRetry.withRetry(baseUrl, chatModel.stream(prompt)),
+                CortexStreamingRetry.withRetry(baseUrl,
+                        chatModel.stream(prompt).onErrorMap(RateLimitException.class,
+                                CortexOpenAiCompatibleSupport::toTooManyRequests)),
                 subscriber,
                 chatResponse -> chatResponse.getResult() == null ? null : chatResponse.getResult().getOutput().getText());
+    }
+
+    private static TooManyRequestsException toTooManyRequests(RateLimitException e) {
+        Duration retryAfter = RetryAfterParser.parse(
+                e.headers().values("retry-after").stream().findFirst().orElse(null));
+        return new TooManyRequestsException("Rate limited: HTTP 429", retryAfter);
     }
 
     @Override

@@ -53,7 +53,8 @@ class EndpointRateLimiterCrossInstanceTest {
                 exchange.getResponseBody().write(body);
             } else {
                 byte[] body = """
-                        {"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+                        {"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"gpt-4.1",
+                         "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
                         """.getBytes(StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().add("Content-Type", "application/json");
                 exchange.sendResponseHeaders(200, body.length);
