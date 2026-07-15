@@ -34,17 +34,18 @@ fallback. Individual extensions that prove valuable are candidates for proposal 
 extensions that don't earn adoption remain a useful, self-contained library. See `SPEC.md` for what that
 means concretely.
 
-## The seven extension areas, and where their code lives
+## The eight extension areas, and where their code lives
 
 | Area | Module | One-line purpose |
 |---|---|---|
 | Vector Core | `javai-vector` + `javai-model` (see note below) | Embedding calculation, dirty-state propagation, object-graph `query()` |
-| Persistence Bridge | `javai-persistence` | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
+| Persistence Bridge | `javai-persistence` | JPA/Hibernate + Neo4j + Spring Data MongoDB automation for vectorized, searchable persistence |
 | Completion Fabric | `javai-completion` | Provider-agnostic RAG completions, wrapping Spring AI |
 | Vector Collections | `javai-collections` (interfaces in `javai-model` — see note below) | `JavAIList`/`Set`/`Map`, `KnowledgeGraph`, `VectorIndex` |
 | Codegen Guidance | `javai-annotations` (definitions only — see `doc/ai-guidance/JavAI_Codegen_Guidance.md`) | Annotations governing what an LLM agent may read/write/trust |
 | Acceleration Substrate | `javai-substrate` | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
 | Agentic Supervision | `javai-supervision` | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
+| Tagging | `javai-tagging` | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, tag-collection similarity search — see `doc/spec/tagging.md` |
 
 **`javai-model` is a physical-only module, not an eighth conceptual area.** It's the formalized home for
 whatever has to live upstream of `javai-collections`/`javai-completion` for compile-order reasons rather
@@ -58,9 +59,10 @@ for the full physical module graph, and `javai-model`'s own package-info.java fo
 reasoning behind the split.
 
 `javai-annotations` also carries Vector Core's and Vector Collections' annotation vocabulary (`@Vectorize`,
-`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.) plus Agentic Supervision's
-(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`) — it is the one module every other module
-depends on, directly or transitively.
+`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.), Agentic Supervision's
+(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`), and Tagging's (`@Taggable`, `@TagIgnore`
+— both unwoven markers, see `doc/spec/tagging.md`'s "Orthogonality" section for why) — it is the one module
+every other module depends on, directly or transitively.
 
 ## Build order (matches the dependency graph in `SPEC.md`)
 
@@ -74,6 +76,11 @@ depends on, directly or transitively.
 5. `javai-collections` — depends on `javai-vector` + `javai-model`.
 6. `javai-persistence` and `javai-completion` — both depend on `javai-collections` (+ `javai-vector`/
    `javai-model` transitively); order between these two doesn't matter.
+7. `javai-tagging` — depends on `javai-collections`, `javai-persistence`, *and* `javai-completion` all
+   three, built last. Unlike every module before it, it also needs `javai-substrate` directly (not just
+   transitively) to weave its own shipped `Tag`/`TagSet` classes at build time — see
+   `doc/spec/tagging.md`'s "this module weaves itself" for why that's a new situation this project hasn't
+   hit before.
 
 Prove the weaving mechanism itself (a toy `@Vectorize` class, a woven setter, `markDirty()`/`propagateDirty()`
 firing correctly, lazy recomputation on next read) before building out `javai-model` and `javai-collections`

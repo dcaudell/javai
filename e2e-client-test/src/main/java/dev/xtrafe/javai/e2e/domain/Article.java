@@ -4,6 +4,7 @@ import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.PromptContext;
 import dev.xtrafe.javai.annotations.SearchVisibility;
 import dev.xtrafe.javai.annotations.Summary;
+import dev.xtrafe.javai.annotations.Taggable;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
@@ -38,7 +39,11 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  *
  * <p>{@code implements JavAIGraphNode} lets {@code Article} instances participate directly in a
  * {@code javai-collections} {@code KnowledgeGraph} -- a hand-declared, unwoven marker interface, per that
- * module's own README.
+ * module's own README. {@code implements dev.xtrafe.javai.tagging.Taggable} (referenced by fully-qualified
+ * name in the {@code implements} clause below, since its simple name {@code Taggable} collides with the
+ * {@code @Taggable} annotation imported above) is the analogous unwoven marker for {@code javai-tagging} --
+ * both interfaces are hand-declared, never woven, and freely composable per each module's own orthogonality
+ * principle; see {@code TaggingE2ETest}.
  *
  * <p>{@code @Entity} + {@link #id}, for {@code javai-persistence}: {@link #getId()} is what
  * {@code ArticleRepository} (see {@code PersistenceE2ETest}) uses as the JavAI-fixed {@code UUID} identity
@@ -60,7 +65,8 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  */
 @Entity
 @JavAIVectorizable
-public class Article implements JavAIGraphNode {
+@Taggable
+public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggable {
 
     @Id
     private UUID id;

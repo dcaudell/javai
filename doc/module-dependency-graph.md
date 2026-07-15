@@ -1,6 +1,6 @@
 # Module dependency graph
 
-The physical Maven reactor graph — eight modules realizing the seven conceptual extension areas
+The physical Maven reactor graph — nine modules realizing the eight conceptual extension areas
 `SPEC.md` describes. This is deliberately a separate artifact from `SPEC.md`'s own dependency-graph diagram:
 that one is organized by *conceptual area* (per the whitepaper); this one is organized by *physical module*,
 since one conceptual area (Vector Core) is realized by two modules (`javai-vector` + `javai-model`), and one
@@ -30,7 +30,18 @@ module (`javai-model`) is the physical home for pieces of three different concep
                                           +--------+--------+
                                           v                 v
                                   javai-persistence   javai-completion
-                                (Hibernate + Neo4j)   (Cortex, wraps Spring AI)
+                              (Hibernate + Neo4j +   (Cortex, wraps Spring AI)
+                               Spring Data MongoDB)
+                                          |                 |
+                                          +--------+--------+
+                                                   v
+                                            javai-tagging
+                                (Tag/TagSet/Tagging, JavAITagRepository --
+                                 depends on javai-collections AND
+                                 javai-persistence AND javai-completion,
+                                 plus javai-substrate directly to weave
+                                 its own shipped Tag/TagSet classes --
+                                 see doc/spec/tagging.md)
 
   javai-supervision — standalone, depends only on javai-annotations. Its own
   independent weaver; not fed by javai-substrate and doesn't feed anything
@@ -48,9 +59,13 @@ module (`javai-model`) is the physical home for pieces of three different concep
 6. `javai-persistence` and `javai-completion` (parallel) — both depend on `javai-collections` (+
    `javai-vector`/`javai-model` transitively, and directly where their own source references those types
    — see the table below).
+7. `javai-tagging` — depends on `javai-collections`, `javai-persistence`, *and* `javai-completion`, built
+   last since it's the only module composing three others at once. Also depends on `javai-substrate`
+   directly (unlike `javai-persistence`/`javai-completion`, which don't) — it ships its own pre-woven
+   `Tag`/`TagSet`, not just machinery for a consumer's classes to be woven; see `doc/spec/tagging.md`.
 
-`e2e-client-test` is a ninth, standalone project (not in the root reactor's `<modules>`), depending on all
-eight as ordinary published artifacts.
+`e2e-client-test` is a tenth, standalone project (not in the root reactor's `<modules>`), depending on all
+nine as ordinary published artifacts.
 
 ## Per-module direct dependencies (confirmed by grepping actual imports, not assumed)
 
@@ -62,9 +77,10 @@ eight as ordinary published artifacts.
 | `javai-substrate` | `javai-annotations`, `javai-vector`, `javai-model` | `byte-buddy`, `byte-buddy-agent` |
 | `javai-supervision` | `javai-annotations` | `byte-buddy`, `byte-buddy-agent` |
 | `javai-collections` | `javai-vector`, `javai-model` | — |
-| `javai-persistence` | `javai-collections`, `javai-vector`, `javai-model` | `hibernate-core`, `hibernate-vector`, `postgresql`, `neo4j-java-driver` |
+| `javai-persistence` | `javai-collections`, `javai-vector`, `javai-model` | `hibernate-core`, `hibernate-vector`, `postgresql`, `neo4j-java-driver`, `spring-data-mongodb`, `mongodb-driver-sync` |
 | `javai-completion` | `javai-collections`, `javai-vector`, `javai-model` | `spring-ai-*`, `gson`, `handlebars` |
-| `e2e-client-test` (standalone) | `javai-annotations`, `javai-vector`, `javai-model`, `javai-substrate`, `javai-collections`, `javai-persistence`, `javai-completion` | `datafaker`, `testcontainers`, `junit` |
+| `javai-tagging` | `javai-collections`, `javai-vector`, `javai-model`, `javai-substrate`, `javai-persistence`, `javai-completion` | — (see `doc/spec/tagging.md`) |
+| `e2e-client-test` (standalone) | `javai-annotations`, `javai-vector`, `javai-model`, `javai-substrate`, `javai-collections`, `javai-persistence`, `javai-completion`, `javai-tagging` | `datafaker`, `testcontainers`, `junit` |
 
 Every module that references `EmbeddingVector`/`VectorMath`/`JavAIDirtyTracking`/embedding providers directly
 declares `javai-vector`; every module that references `JavAIVectorizable`/`JavAIRuntime`/`JavAIList`-family

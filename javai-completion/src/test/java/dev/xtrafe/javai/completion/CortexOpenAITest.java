@@ -70,7 +70,8 @@ class CortexOpenAITest {
     @Test
     void promptContextIsAppendedToThePrompt() throws IOException {
         String baseUrl = startFakeServer("""
-                {"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+                {"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"gpt-4.1",
+                 "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
                 """);
 
         Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
@@ -86,7 +87,8 @@ class CortexOpenAITest {
     @Test
     void reasoningEffortProviderOptionIsSentThrough() throws IOException {
         String baseUrl = startFakeServer("""
-                {"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+                {"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"gpt-4.1",
+                 "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
                 """);
 
         Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
@@ -115,7 +117,8 @@ class CortexOpenAITest {
     @Test
     void concurrentCallsAllSucceed() throws IOException, InterruptedException {
         String baseUrl = startFakeServer("""
-                {"choices":[{"index":0,"message":{"role":"assistant","content":"concurrent ok"},"finish_reason":"stop"}]}
+                {"id":"chatcmpl-3","object":"chat.completion","created":1,"model":"gpt-4.1",
+                 "choices":[{"index":0,"message":{"role":"assistant","content":"concurrent ok"},"finish_reason":"stop"}]}
                 """);
 
         Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();

@@ -15,9 +15,28 @@
 - (Done) Double check that a method or constructor can have both synchronous and asynchronous advice simultaneously.
 - (Done) Should be only one SupervisionListener interface; not different contract for synchronous and asynchronous advice.
 - (Done) See if we can use reflection at runtime to fill in the instance variables in pointcut events. 
+- (Done) Export transcripts and rank ability
+- (Done) Spring Data MongoDB support
+- (Deferred) MongoDB Extension for Hibernate ORM support (https://www.mongodb.com/docs/languages/java/mongodb-hibernate/current/)
 
-- Add javai-tagging module to the whitepaper. (Taggable interface, tags are taggable - recursive tagging. Tags are mebmers of tagsets. Objects can be inspected for which tags of a tagset should be applied to the object. Tags have an English slug and display name. Tags are linked to objects by a tag-instance table that applies a tag to an entity. Fitler the instance table by target type, then tag set, then tag to get at all objects of a certain type with a certain tag. ... still more thought required )
-- Spring Data MongoDB support
-- MongoDB Extension for Hibernate ORM support (https://www.mongodb.com/docs/languages/java/mongodb-hibernate/current/)
+
+- (Done) Tagging: whitepaper §5.8, `doc/spec/tagging.md`, `javai-tagging` module implemented and tested
+  against all three persistence backends. `@Taggable` is an unwoven marker (orthogonal to
+  `@JavAIVectorizable`); classification is LLM-based via `javai-completion`, client-invoked only (never
+  auto-triggered by TagSet edits); a Tag's slug is unique per-TagSet, not globally (a stated invariant, not
+  yet a DB-level constraint on any backend); tag-similarity search reuses `VectorIndex<T>` over a new
+  persistence-layer-only tag-summary-vector index rather than inventing a new collection type. Required
+  adding real build-time (Maven-plugin) weaving to `javai-substrate` as a prerequisite, since this is the
+  first module to ship its own pre-woven `@JavAIVectorizable` classes (`Tag`/`TagSet`) inside its own jar.
+- (Done) Remove ambient/global static state from `JavAIPI` and `javai-tagging`: `JavAIPI.repository(Class)`
+  used to resolve against a single ambient "current config" static pointer set by
+  `configurePersistence(...)`; it now takes the `JavAIPersistenceConfig` as an explicit argument
+  (`repository(Class, JavAIPersistenceConfig)`), and `configurePersistence`/the ambient field are gone
+  entirely. `JavAITagging` (a static facade with the same ambient-config shape, plus an ambient `Cortex`)
+  was deleted outright and replaced with `JavAITagRepository`, a plain instance wrapping an already-realized
+  `TagRepository` -- multiple instances (one per backend) now coexist with zero global state and zero
+  attempt at cross-store synchronization. See `SPEC.md`'s new "Coding standard: static/global scope is the
+  exception, not the default" section for the policy this established, and its "known, tracked debt" note on
+  `JavAISupervisionRuntime` (same static-facade shape, not yet fixed -- its dispatch entry points are called
+  directly from woven advice with no current path to an instance, so a fix needs its own design pass).
 - Add recursive MCP microservice fabric to the whitepaper.
-- Export transcripts and rank ability

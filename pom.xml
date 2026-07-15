@@ -6,7 +6,7 @@
 
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
   <packaging>pom</packaging>
 
   <name>JavAI Extensions</name>
@@ -42,7 +42,7 @@
   </scm>
 
   <!--
-    Eight modules realizing seven conceptual extension areas (see SPEC.md's dependency graph and its note
+    Nine modules realizing eight conceptual extension areas (see SPEC.md's dependency graph and its note
     on why "Vector Core" is physically split across two modules) are interdependent by design and meant to
     build together, not independently — `mvn install` (or `mvn verify`) from this root builds the whole
     reactor in dependency order.
@@ -54,7 +54,9 @@
     vector/embedding core; depends on javai-vector), then javai-substrate and javai-supervision in parallel
     (javai-substrate depends on javai-vector + javai-model; javai-supervision depends only on
     javai-annotations — two independent weavers, two independent risk spikes, neither depends on the
-    other), then javai-collections, then javai-persistence and javai-completion.
+    other), then javai-collections, then javai-persistence and javai-completion, then javai-tagging last —
+    the only module depending on javai-collections AND javai-persistence AND javai-completion all three at
+    once (plus javai-substrate directly, to weave its own shipped Tag/TagSet — see doc/spec/tagging.md).
   -->
   <modules>
     <module>javai-annotations</module>
@@ -65,6 +67,7 @@
     <module>javai-collections</module>
     <module>javai-persistence</module>
     <module>javai-completion</module>
+    <module>javai-tagging</module>
   </modules>
 
   <properties>
@@ -87,23 +90,63 @@
       repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
     -->
     <byte-buddy.version>1.18.11</byte-buddy.version>
+    <!-- Backs javai-tagging's build-time self-weaving (see JavAIBuildTimeWeaverPlugin in javai-substrate).
+         Confirmed on Maven Central: the plugin's own release train lags core byte-buddy; 1.17.5 is
+         current for the plugin, well behind the 1.18.11 core already pinned above. The plugin's own POM
+         declares a same-version byte-buddy core dependency transitively; javai-tagging/pom.xml's own
+         <plugin><dependencies> block explicitly overrides that to ${byte-buddy.version} (a nearer, direct
+         declaration wins Maven's dependency mediation), for the same "Java 26 (70) is not supported"
+         reason 1.15.10 was rejected above; untested whether 1.17.5's own bundled core would hit the same
+         wall running under this repo's JDK 26 dev/CI toolchain, but there's no reason to risk finding out
+         empirically when overriding to the already-proven-working version costs nothing. -->
+    <byte-buddy-maven-plugin.version>1.17.5</byte-buddy-maven-plugin.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
     <neo4j-driver.version>6.2.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
     <postgresql-driver.version>42.7.13</postgresql-driver.version>
-    <!-- Matches e2e-client-test/pom.xml's pin, for javai-persistence's own real-container test suite. -->
-    <testcontainers.version>1.21.4</testcontainers.version>
+    <!-- For the reactor's own real-container test suites (javai-persistence/javai-tagging/javai-completion).
+         2.x renamed every module artifact with a "testcontainers-" prefix (e.g. "postgresql" ->
+         "testcontainers-postgresql"); each module's pom.xml dependency declarations were updated to match,
+         confirmed against the real testcontainers-bom 2.0.5 POM on Maven Central. No further source-level
+         API changes needed: PostgreSQLContainer/Neo4jContainer/GenericContainer/@Container/@Testcontainers/
+         DockerImageName all kept their existing packages and signatures across the 1.x -> 2.x jump. -->
+    <testcontainers.version>2.0.5</testcontainers.version>
+    <!-- Backs RepositoryBackendSpringDataMongo (javai-persistence): MongoTemplate as the configured
+         connection holder, with the actual vector read/write/search issued via the raw driver (mirroring
+         this module's own raw-JDBC-under-Hibernate and raw-Cypher-under-the-Neo4j-driver precedent).
+         Now on the 5.x line (previously pinned to 4.5.1; see git history for that reasoning, since
+         superseded). 5.1.0 pulls in Spring Framework 7.0.8 transitively (confirmed via `mvn dependency:tree`),
+         which used to collide with Spring AI 1.0.9's own Spring Framework 6.2.19 requirement
+         (javai-completion) on a combined classpath (e2e-client-test); that collision is resolved now that
+         spring-ai.version below is also on its own 2.0.0 line, which resolves to the identical Spring
+         Framework 7.0.8, confirmed via `mvn dependency:tree` on both modules independently. These two
+         properties and spring-ai.version below must move together for exactly this reason — bumping only
+         one recreates the collision the other side of this pair was resolving. mongodb-driver.version is
+         pinned to 5.8.0, not the newer 5.9.0 a bare "bump the driver" pass would reach for: 5.8.0 is
+         spring-data-mongodb-parent 5.1.0's own tested `<mongo>` property (confirmed against its real POM on
+         Maven Central), and mongodb-driver-sync/mongodb-driver-core must resolve to the exact same version
+         as each other — they're released as a matched pair, and a mismatch (e.g. sync at 5.9.0 while
+         spring-data-mongodb's own transitive mongodb-driver-core stays at 5.8.0-or-earlier) throws
+         NoClassDefFoundError on an internal driver class at runtime, confirmed by reproducing it locally
+         before finding this exact pairing. mongodb-driver-sync is not pulled in transitively by
+         spring-data-mongodb (confirmed via `mvn dependency:tree`: it only brings mongodb-driver-core —
+         BSON/wire-protocol types), so it needs its own explicit dependency below regardless. -->
+    <spring-data-mongodb.version>5.1.0</spring-data-mongodb.version>
+    <mongodb-driver.version>5.9.0</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
       and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
       then got split into spring-ai-model (ChatModel/EmbeddingModel) + spring-ai-client-chat
-      (ChatClient) before 1.0.0 GA shipped. Pinned here to 1.0.9, the last patch on the
-      original 1.0.x line (current stable lines as of mid-2026 are 1.0.x, 1.1.x, and 2.0.0
-      GA; staying off 2.0 for now since it pairs with a Spring Boot 4 migration this project
-      doesn't need yet). Revisit before Phase 0 sign-off.
+      (ChatClient) before 1.0.0 GA shipped. Now on the 2.0.0 GA line (previously pinned to 1.0.9,
+      the last patch on the original 1.0.x line, specifically to avoid the Spring Boot 4 /
+      Spring Framework 7 migration 2.0.0 pairs with; see git history for that original reasoning,
+      since superseded). Moved here together with spring-data-mongodb.version above, not in
+      isolation — see that property's own comment for why: 2.0.0 resolves to Spring Framework
+      7.0.8, exactly matching spring-data-mongodb 5.1.0's own transitive requirement, which is
+      what makes running both on a combined classpath (e2e-client-test) safe again.
     -->
-    <spring-ai.version>1.0.9</spring-ai.version>
+    <spring-ai.version>2.0.0</spring-ai.version>
     <!-- javai-model's own Contextable/PromptContext marshalling; deliberately GSON, not the
          Jackson that Spring AI pulls in transitively (see javai-completion's Cortex classes' own
          javadoc for why javai-vector/javai-model never took a Jackson dependency of their own). -->
@@ -112,6 +155,19 @@
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
     <handlebars.version>4.5.3</handlebars.version>
+    <!-- Forces jackson-annotations onto the same release line as the jackson-databind Spring AI already
+         pulls in transitively (2.21.x). javai-tagging is the first module to combine Hibernate
+         (javai-persistence) with Spring AI's own Jackson stack (javai-completion) and Testcontainers'
+         docker-java-api (test scope), and docker-java-api's own bundled jackson-annotations:2.10.3 wins
+         Maven's nearest-declaration mediation over the correct, deeper-transitive 2.21.x, confirmed via a
+         real test run: Hibernate 7's own optional Jackson-based JSON format mapper auto-detects
+         jackson-databind on the classpath at SessionFactory bootstrap and eagerly initializes it,
+         regardless of whether any entity actually uses a JSON-mapped column, and jackson-databind:2.21.4
+         calling into a mismatched jackson-annotations:2.10.3 throws NoClassDefFoundError on
+         JsonSerializeAs (removed from jackson-annotations well before 2.10, present in whatever
+         jackson-databind:2.21.4 itself expects). Pinned here in dependencyManagement, which overrides
+         transitive resolution for every reactor module regardless of declaration depth. -->
+    <jackson-annotations.version>2.21</jackson-annotations.version>
   </properties>
 
   <!--
@@ -137,6 +193,12 @@
         <type>pom</type>
         <scope>import</scope>
       </dependency>
+      <dependency>
+        <!-- See jackson-annotations.version's own definition above for why this override exists. -->
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-annotations</artifactId>
+        <version>${jackson-annotations.version}</version>
+      </dependency>
 
       <dependency>
         <groupId>io.github.dcaudell</groupId>
@@ -156,6 +218,25 @@
       <dependency>
         <groupId>io.github.dcaudell</groupId>
         <artifactId>javai-collections</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <!-- Not needed by any reactor module until javai-tagging (it ships its own pre-woven Tag/TagSet
+             at build time; see doc/spec/tagging.md's "this module weaves itself"); every prior consumer
+             of javai-substrate (e2e-client-test) is a standalone project outside this reactor and pins its
+             own version explicitly instead. -->
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-substrate</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-persistence</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-completion</artifactId>
         <version>${project.version}</version>
       </dependency>
 
@@ -188,6 +269,16 @@
         <groupId>org.postgresql</groupId>
         <artifactId>postgresql</artifactId>
         <version>${postgresql-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.data</groupId>
+        <artifactId>spring-data-mongodb</artifactId>
+        <version>${spring-data-mongodb.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.mongodb</groupId>
+        <artifactId>mongodb-driver-sync</artifactId>
+        <version>${mongodb-driver.version}</version>
       </dependency>
       <dependency>
         <groupId>org.testcontainers</groupId>
@@ -224,7 +315,20 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
-          <version>3.13.0</version>
+          <version>3.15.0</version>
+        </plugin>
+        <!-- Build-time self-weaving, currently only bound in javai-tagging/pom.xml (the first module
+             shipping its own pre-built @JavAIVectorizable classes); see JavAIBuildTimeWeaverPlugin's own
+             javadoc (javai-substrate) for the mechanism and doc/spec/tagging.md's "this module weaves
+             itself" for why it's needed there specifically. Only version-pinned here; the actual
+             <executions>/<configuration>/<dependencies> (including the byte-buddy core version override
+             the version-mismatch note on ${byte-buddy-maven-plugin.version} above explains) live in
+             whichever module's pom.xml actually binds it, matching how few-enough modules need this to not
+             warrant a shared <plugins> block. -->
+        <plugin>
+          <groupId>net.bytebuddy</groupId>
+          <artifactId>byte-buddy-maven-plugin</artifactId>
+          <version>${byte-buddy-maven-plugin.version}</version>
         </plugin>
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
@@ -346,6 +450,33 @@
               <publishingServerId>central</publishingServerId>
               <autoPublish>false</autoPublish>
             </configuration>
+          </plugin>
+          <plugin>
+            <!-- Publishing from Maven doesn't produce Gradle Module Metadata (the .module file) the way
+                 Gradle's own maven-publish plugin does when it's the one doing the publishing; Gradle
+                 consumers still resolve this library fine from the plain POM alone (Gradle has always
+                 natively understood Maven repositories), but without a .module file they lose out on
+                 variant-aware resolution (Gradle 6+ prefers Module Metadata over the POM when both are
+                 present). This plugin derives an equivalent .module file from the same POM/dependency
+                 information already declared here and attaches it as an extra artifact, the same way
+                 maven-source-plugin/maven-javadoc-plugin attach their own jars above; no separate
+                 dependency declarations to keep in sync. Declared last: its `gmm` goal binds to the
+                 `package` phase and must run after anything else that rewrites the jar/POM in that same
+                 phase (shade/flatten/moditect; none of which this project uses, but the ordering
+                 requirement is the plugin's own documented caveat, so kept last on principle). Runs before
+                 maven-gpg-plugin's `verify`-phase sign goal in the lifecycle, so the .module file gets
+                 signed right along with the jar/sources/javadoc, and before central-publishing-maven-plugin
+                 stages/uploads everything, so it ships in the same release bundle with no extra wiring. -->
+            <groupId>org.gradlex</groupId>
+            <artifactId>gradle-module-metadata-maven-plugin</artifactId>
+            <version>1.2</version>
+            <executions>
+              <execution>
+                <goals>
+                  <goal>gmm</goal>
+                </goals>
+              </execution>
+            </executions>
           </plugin>
         </plugins>
       </build>

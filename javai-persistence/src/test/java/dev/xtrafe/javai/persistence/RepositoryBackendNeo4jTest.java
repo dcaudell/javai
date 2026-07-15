@@ -40,18 +40,19 @@ class RepositoryBackendNeo4jTest {
     static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:5.26-community"))
             .withAdminPassword(NEO4J_PASSWORD);
 
+    private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
+        config = JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.NEO4J)
                 .neo4jUri(neo4j.getBoltUrl())
                 .neo4jUsername("neo4j")
                 .neo4jPassword(NEO4J_PASSWORD)
-                .build());
-        repository = JavAIPI.repository(TestArticleRepository.class);
+                .build();
+        repository = JavAIPI.repository(TestArticleRepository.class, config);
     }
 
     @BeforeEach
@@ -200,7 +201,7 @@ class RepositoryBackendNeo4jTest {
 
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
-        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class, config));
     }
 
     /**
@@ -215,8 +216,8 @@ class RepositoryBackendNeo4jTest {
      */
     @Test
     void mapFieldRoundTripsWithKeysPreserved() {
-        JavAIPI.repository(TestTagRepository.class);
-        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class);
+        JavAIPI.repository(TestTagRepository.class, config);
+        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class, config);
 
         TestArticleWithTags article = new TestArticleWithTags("Map field test");
         article.getTagsByCode().put("first", new TestTag("alpha"));

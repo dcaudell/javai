@@ -6,7 +6,6 @@ import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
-import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.junit.jupiter.api.BeforeAll;
@@ -16,8 +15,11 @@ import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
 import org.neo4j.driver.Values;
 
+import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -27,24 +29,52 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Persistence Bridge, end to end: real embeddings (via {@code JavAIEnvironment}'s Ollama, same as
  * {@link ArticleGraphEmbeddingE2ETest}), real weaving, and this project's own {@link Article}/
  * {@link Comment} domain -- not {@code javai-persistence}'s own flat, non-relational test fixture --
- * saved into and queried back out of both real backends the monolithic container provides.
+ * saved into and queried back out of all three real backends the e2e infrastructure provides (the
+ * monolithic container's Postgres/Neo4j, plus the separate MongoDB companion container -- see {@code
+ * MonolithicContainer}'s own javadoc for why Mongo is a second container rather than a fourth process).
  *
- * <p>A repository proxy is bound to whichever backend was configured at the moment
- * {@link JavAIPI#repository(Class)} created it -- switching {@link JavAIPI#configurePersistence} afterward
- * doesn't retroactively affect an already-created proxy. That's what lets {@code JavAIEnvironment} build
- * both a Postgres-backed and a Neo4j-backed {@code ArticleRepository} once, up front, each fully
- * independent, for this test class (and every other) to share.
+ * <p>A repository proxy is bound at creation time to whichever {@code JavAIPersistenceConfig} was passed to
+ * the {@code JavAIPI.repository(Class, JavAIPersistenceConfig)} call that created it -- there's no ambient
+ * "current config" it could be retroactively affected by. That's what lets {@code JavAIEnvironment} build a
+ * Postgres-backed, a Neo4j-backed, and a MongoDB-backed {@code ArticleRepository} once, up front, each
+ * fully independent, for this test class (and every other) to share.
  */
 class PersistenceE2ETest {
 
     private static ArticleRepository postgresRepository;
     private static ArticleRepository neo4jRepository;
+    private static ArticleRepository mongoRepository;
 
     @BeforeAll
     static void configureProviderAndRepositories() {
         JavAIEnvironment.ensureRunning();
         postgresRepository = JavAIEnvironment.postgresArticleRepository();
         neo4jRepository = JavAIEnvironment.neo4jArticleRepository();
+        mongoRepository = JavAIEnvironment.mongoArticleRepository();
+    }
+
+    /**
+     * MongoDB Search's {@code $vectorSearch} index updates near-real-time, not synchronously with the
+     * write that produced the indexed document -- confirmed empirically, not a flake, see {@code
+     * RepositoryBackendSpringDataMongoTest}'s own javadoc. A just-saved article can briefly be absent from
+     * a {@code findNearestBy*} result even though the save itself already returned; poll briefly rather
+     * than asserting on the very first query.
+     */
+    private static List<Article> awaitNearest(Supplier<List<Article>> query, Article expected) {
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(15));
+        List<Article> result;
+        while (true) {
+            result = query.get();
+            if (result.stream().anyMatch(a -> a.getId().equals(expected.getId())) || Instant.now().isAfter(deadline)) {
+                return result;
+            }
+            try {
+                Thread.sleep(200);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return result;
+            }
+        }
     }
 
     private static Article newArticle(String title, String body) {
@@ -209,26 +239,98 @@ class PersistenceE2ETest {
     }
 
     /**
-     * The same Article instance, saved to *both* backends -- proves an object isn't backend-exclusive:
-     * whichever repository proxy you saved it through, the other backend's own copy is independently
-     * correct and independently queryable, sharing only the {@code UUID} identity.
+     * The same Article instance, saved to *all three* backends -- proves an object isn't backend-exclusive:
+     * whichever repository proxy you saved it through, each other backend's own copy is independently
+     * correct and independently queryable, sharing only the {@code UUID} identity. This is what "simultaneous
+     * multi-store persistence" means in practice: three independent proxies, no dual-write machinery (see
+     * {@code javai-persistence/README.md}'s own multi-store section).
      */
     @Test
-    void sameArticleCanBePersistedSimultaneouslyToBothBackends() {
-        Article article = fullArticle("Dual-persisted article");
+    void sameArticleCanBePersistedSimultaneouslyToAllThreeBackends() {
+        Article article = fullArticle("Triple-persisted article");
 
         Article postgresManaged = postgresRepository.save(article);
         Article neo4jManaged = neo4jRepository.save(article);
-        assertEquals(postgresManaged.getId(), neo4jManaged.getId(), "both saves share the same identity");
+        Article mongoManaged = mongoRepository.save(article);
+        assertEquals(postgresManaged.getId(), neo4jManaged.getId(), "all three saves share the same identity");
+        assertEquals(postgresManaged.getId(), mongoManaged.getId(), "all three saves share the same identity");
 
         Article fromPostgres = postgresRepository.findById(article.getId()).orElseThrow();
         Article fromNeo4j = neo4jRepository.findById(article.getId()).orElseThrow();
+        Article fromMongo = mongoRepository.findById(article.getId()).orElseThrow();
 
-        assertEquals("Dual-persisted article", fromPostgres.getTitle());
-        assertEquals("Dual-persisted article", fromNeo4j.getTitle());
+        assertEquals("Triple-persisted article", fromPostgres.getTitle());
+        assertEquals("Triple-persisted article", fromNeo4j.getTitle());
+        assertEquals("Triple-persisted article", fromMongo.getTitle());
         assertEquals(2, fromPostgres.getComments().size());
         assertEquals(2, fromNeo4j.getComments().size());
+        assertEquals(2, fromMongo.getComments().size());
         assertEquals(fromPostgres.getFeaturedComment().getText(), fromNeo4j.getFeaturedComment().getText());
+        assertEquals(fromPostgres.getFeaturedComment().getText(), fromMongo.getFeaturedComment().getText());
+    }
+
+    // ---- MongoDB ------------------------------------------------------------------------------
+
+    @Test
+    void mongoSaveAndFindByIdRoundTrips() {
+        Article article = mongoRepository.save(newArticle("Zero-day disclosed",
+                "A critical vulnerability affecting a widely used TLS library was patched today."));
+        assertTrue(article.getId() != null);
+
+        Optional<Article> found = mongoRepository.findById(article.getId());
+        assertTrue(found.isPresent());
+        assertEquals("Zero-day disclosed", found.get().getTitle());
+    }
+
+    @Test
+    void mongoFindNearestByFieldVectorRanksByRealSimilarity() {
+        Article security = mongoRepository.save(newArticle("Zero-day disclosed in widely used TLS library",
+                "Researchers disclosed a critical vulnerability prompting an emergency patch cycle."));
+        mongoRepository.save(newArticle("Simple weeknight pasta recipes",
+                "Quick, easy pasta dishes you can make in under thirty minutes on a busy weeknight."));
+        mongoRepository.save(newArticle("Local team advances to championship game",
+                "A dramatic overtime victory secured the local team a spot in next week's championship."));
+
+        EmbeddingVector reference = ((JavAIVectorizable) security).fieldVector("title");
+        List<Article> nearest = awaitNearest(() -> mongoRepository.findNearestByTitleVector(reference, 1), security);
+
+        assertEquals(1, nearest.size());
+        assertEquals(security.getId(), nearest.get(0).getId(),
+                "the article whose own title produced the reference vector must rank nearest to itself");
+    }
+
+    /** Same as {@link #postgresFullObjectGraphRoundTrips()}, against MongoDB's reference-based related-entity
+     *  handling (see {@code RepositoryBackendSpringDataMongo}'s own javadoc: related/collection fields are
+     *  stored as {@code {type, id}} pointers, not embedded documents). */
+    @Test
+    void mongoFullObjectGraphRoundTrips() {
+        Article article = fullArticle("Full graph test (MongoDB)");
+        Article saved = mongoRepository.save(article);
+
+        Article reloaded = mongoRepository.findById(saved.getId()).orElseThrow();
+        assertEquals("first take: Full graph test (MongoDB)", reloaded.getFeaturedComment().getText());
+        assertEquals(2, reloaded.getComments().size());
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("first listed comment")));
+        assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("second listed comment")));
+        assertNotNull(reloaded.getDraftComment(), "draftComment must round-trip as a real reference");
+        assertEquals("an unpublished draft", reloaded.getDraftComment().getText());
+        assertNotNull(reloaded.getAttachment(), "attachment must round-trip as a real reference");
+        assertEquals("report.pdf", reloaded.getAttachment().getFilename());
+    }
+
+    /** Same as {@link #postgresJavAILinkedHashMapFieldRoundTrips()}, against MongoDB. */
+    @Test
+    void mongoJavAILinkedHashMapFieldRoundTrips() {
+        Article article = newArticle("Map field test (MongoDB)", "Body text for the map field test.");
+        article.getRelatedComments().put("first", new Comment("erin", "first related comment"));
+        article.getRelatedComments().put("second", new Comment("frank", "second related comment"));
+
+        Article saved = mongoRepository.save(article);
+        Article reloaded = mongoRepository.findById(saved.getId()).orElseThrow();
+
+        assertEquals(2, reloaded.getRelatedComments().size());
+        assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
+        assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
     }
 
     private static Article fullArticle(String title) {

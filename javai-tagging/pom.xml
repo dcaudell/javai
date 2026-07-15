@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion> <!-- do_not_remove: published-with-gradle-metadata -->
+
+  <parent>
+    <groupId>io.github.dcaudell</groupId>
+    <artifactId>javai</artifactId>
+    <version>0.1.2</version>
+  </parent>
+
+  <artifactId>javai-tagging</artifactId>
+  <packaging>jar</packaging>
+  <name>JavAI Extensions -- Tagging</name>
+  <description>Tagging: @Taggable objects, recursive Tags/TagSets, LLM-based classification, and tag-collection similarity search for JavAI Extensions.</description>
+
+  <!--
+    Tagging: @Taggable/@TagIgnore, Tag/TagSet/Tagging, JavAITagging, TaggableRef, the tag-summary-vector
+    index. See doc/spec/tagging.md.
+
+    Notably depends on javai-substrate directly, unlike javai-persistence/javai-completion: this module
+    ships its own pre-woven Tag/TagSet classes rather than only providing machinery for a consumer's classes
+    to be woven; see doc/spec/tagging.md's "A new structural situation: this module weaves itself" and this
+    pom's own build-time-weaving plugin block below.
+  -->
+
+  <dependencies>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-model</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-collections</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-persistence</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-completion</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Build-time weaving of this module's own shipped Tag/TagSet; see the module-level note above. -->
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-substrate</artifactId>
+    </dependency>
+
+    <!-- Real-container e2e tests, mirroring javai-persistence's own pattern; test-scope dependencies
+         never propagate transitively, so these need re-declaring here even though javai-persistence
+         already depends on all four. -->
+    <dependency>
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Renamed from "postgresql" in testcontainers 2.x — every module artifact is now prefixed
+           "testcontainers-" (confirmed against the real testcontainers-bom 2.0.5 POM on Maven Central). -->
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-postgresql</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Renamed from "neo4j" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-neo4j</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Same mongodb/mongodb-atlas-local real container RepositoryBackendSpringDataMongoTest already
+           uses; see that class's own javadoc for why this module's own MongoDBContainer isn't used.
+           Renamed from "mongodb" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-mongodb</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Renamed from "junit-jupiter" in testcontainers 2.x — see the postgresql dependency's own comment
+           above. -->
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <!--
+          Build-time self-weaving: transforms this module's own compiled classes (in target/classes,
+          during process-classes; after compile, before test-compile/test, and well before this jar gets
+          packaged) so Tag/TagSet arrive in javai-tagging.jar already implementing JavAIVectorizable/
+          JavAIDirtyTracking, exactly the way javai-substrate's load-time -javaagent would have transformed
+          them in a consuming application, but without requiring one. See
+          dev.xtrafe.javai.substrate.JavAIBuildTimeWeaverPlugin's own javadoc for the mechanism; it
+          delegates to the exact same JavAIWeaver.weave(...) the load-time path uses, so there is no second
+          transform to keep in sync.
+
+          Two <dependencies> overrides below, both required, neither optional:
+          - net.bytebuddy:byte-buddy pinned to ${byte-buddy.version} (1.18.11), not whatever
+            byte-buddy-maven-plugin:${byte-buddy-maven-plugin.version} (1.17.5) declares transitively;
+            see that property's own definition in the root pom for why (this repo's dev/CI JVM is JDK 26,
+            and an older byte-buddy already failed to parse its class files once before). A direct
+            <dependency> declaration here is nearer than the plugin's own transitive one, so Maven's
+            mediation picks this version.
+          - io.github.dcaudell:javai-substrate itself, so the Maven plugin's own isolated classloader can
+            actually find JavAIBuildTimeWeaverPlugin; an ordinary <dependencies> entry on this project
+            does NOT put a class on a *plugin's* classpath; only a dependency declared directly under
+            <plugin> does that. javai-annotations/javai-vector/javai-model (JavAIWeaver's own imports) come
+            along transitively through this one declaration, same as they do for any other consumer.
+        -->
+        <groupId>net.bytebuddy</groupId>
+        <artifactId>byte-buddy-maven-plugin</artifactId>
+        <configuration>
+          <transformations>
+            <transformation>
+              <plugin>dev.xtrafe.javai.substrate.JavAIBuildTimeWeaverPlugin</plugin>
+            </transformation>
+          </transformations>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>transform</goal>
+            </goals>
+          </execution>
+        </executions>
+        <dependencies>
+          <dependency>
+            <groupId>net.bytebuddy</groupId>
+            <artifactId>byte-buddy</artifactId>
+            <version>${byte-buddy.version}</version>
+          </dependency>
+          <dependency>
+            <groupId>io.github.dcaudell</groupId>
+            <artifactId>javai-substrate</artifactId>
+            <version>${project.version}</version>
+          </dependency>
+        </dependencies>
+      </plugin>
+    </plugins>
+  </build>
+</project>

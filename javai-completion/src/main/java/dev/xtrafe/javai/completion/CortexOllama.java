@@ -8,6 +8,7 @@ import com.google.gson.JsonSyntaxException;
 import dev.xtrafe.javai.vector.RetrySupport;
 import dev.xtrafe.javai.vector.TooManyRequestsException;
 import org.springframework.ai.ollama.api.OllamaApi;
+import org.springframework.ai.ollama.api.ThinkOption;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
@@ -157,7 +158,7 @@ public final class CortexOllama implements Cortex {
                 .stream(stream)
                 .options(options);
         if (request.providerOptions().get(ENABLE_THINKING_KEY) instanceof Boolean enableThinking) {
-            builder.think(enableThinking);
+            builder.think(new ThinkOption.ThinkBoolean(enableThinking));
         }
         return builder.build();
     }

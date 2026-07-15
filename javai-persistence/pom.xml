@@ -2,12 +2,12 @@
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-  <modelVersion>4.0.0</modelVersion>
+  <modelVersion>4.0.0</modelVersion> <!-- do_not_remove: published-with-gradle-metadata -->
 
   <parent>
     <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.1</version>
+    <version>0.1.2</version>
   </parent>
 
   <artifactId>javai-persistence</artifactId>
@@ -51,6 +51,19 @@
       <groupId>org.neo4j.driver</groupId>
       <artifactId>neo4j-java-driver</artifactId>
     </dependency>
+    <dependency>
+      <!-- MongoTemplate as the configured connection holder for RepositoryBackendSpringDataMongo. -->
+      <groupId>org.springframework.data</groupId>
+      <artifactId>spring-data-mongodb</artifactId>
+    </dependency>
+    <dependency>
+      <!-- Not pulled in transitively by spring-data-mongodb; confirmed via dependency:tree that it only
+           brings mongodb-driver-core. This is what actually provides MongoClient/MongoCollection/
+           MongoDatabase, used directly for vector read/write/search (see RepositoryBackendSpringDataMongo's
+           own javadoc). -->
+      <groupId>org.mongodb</groupId>
+      <artifactId>mongodb-driver-sync</artifactId>
+    </dependency>
 
     <dependency>
       <groupId>org.testcontainers</groupId>
@@ -58,18 +71,32 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "postgresql" in testcontainers 2.x — every module artifact is now prefixed
+           "testcontainers-" (confirmed against the real testcontainers-bom 2.0.5 POM on Maven Central). -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>postgresql</artifactId>
+      <artifactId>testcontainers-postgresql</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "neo4j" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>neo4j</artifactId>
+      <artifactId>testcontainers-neo4j</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- RepositoryBackendSpringDataMongoTest's real container; see that class's own javadoc for why
+           mongodb/mongodb-atlas-local (bundled mongod+mongot, real $vectorSearch) is used instead of this
+           module's own MongoDBContainer, which doesn't know about that image's bundled-search port layout.
+           Renamed from "mongodb" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers-mongodb</artifactId>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <!-- Renamed from "junit-jupiter" in testcontainers 2.x — see the postgresql dependency's own comment
+           above. -->
+      <groupId>org.testcontainers</groupId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

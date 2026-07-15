@@ -104,25 +104,34 @@ and ended up with a running container on a different image than the one actually
 `MonolithicContainer` matches by container **name** instead (`javai-e2e-monolithic`, fixed, not
 Testcontainers-style random): `docker ps`/`docker ps -a` for that name first, building only if truly
 absent. No cache-drift rebuild can ever silently duplicate the container again -- a rebuild only happens if
-the container doesn't exist at all. Ports are fixed too (`15432`/`17474`/`17687`/`21434` on the host,
-shifted off each service's common native-install default to avoid colliding with, e.g., a locally-installed
-Ollama), so there's no more Testcontainers-style dynamic port-mapping lookup either. **No per-machine setup
-is required for this to work** -- unlike the old Testcontainers-based reuse, which needed
+the container doesn't exist at all. Ports are fixed too (`15432`/`17474`/`17687`/`21434`/`27417` on the
+host, shifted off each service's common native-install default to avoid colliding with, e.g., a
+locally-installed Ollama), so there's no more Testcontainers-style dynamic port-mapping lookup either. **No
+per-machine setup is required for this to work** -- unlike the old Testcontainers-based reuse, which needed
 `~/.testcontainers.properties` opt-in; that requirement is gone entirely.
+
+**MongoDB is a second, separate container (`javai-e2e-mongo`), not a fourth process inside the monolith.**
+Real `$vectorSearch` support needs `mongod` plus a second internal process (`mongot`) that only the official
+`mongodb/mongodb-atlas-local` image knows how to bootstrap together -- that coordination logic is a
+proprietary compiled binary with no public source, confirmed not safely reproducible by hand-driving the
+same two processes inside this project's own monolithic image (a real attempt at that crash-looped `mongot`
+against an internal, undocumented bootstrap class). So `MonolithicContainer` runs that image completely
+unmodified as its own container instead, matched by name the same reuse-idempotent way as the monolith, with
+its own fixed host port (`27417` -> `27017`).
 
 Domain *data* does **not** persist the same way, though -- every run, `SampleDataSeeder`
 (`src/main/java/.../fixtures/`, called from `JavAIEnvironment`'s one-time static initializer) truncates
-every Postgres table and wipes the whole Neo4j graph, then re-seeds ~50
+every Postgres table, wipes the whole Neo4j graph, and drops every MongoDB collection, then re-seeds ~50
 [DataFaker](https://www.datafaker.net/)-generated articles (four themed topics — Business, Music, Currency,
 Color — real English vocabulary, not random noise, chosen so the generated text still carries real
-embeddable signal) across both backends. This is deliberate, not a missed optimization: every pre-existing
-e2e test inserts its own hand-written fixtures fresh with no deduplication, an assumption that only held
-before because the whole database reset with every fresh (non-persistent) container — once the container
-started surviving across runs, those fixtures began accumulating as duplicate rows and caused real self-rank
-test failures under embedding noise; see `SampleDataSeeder`'s own class javadoc for the full story.
-Resetting the (cheap) domain data every run while keeping the (expensive) container/image itself persistent
-gets both properties at once. The seeded topics are deliberately distinct from `ArticleFixtures`'s own
-topics (Cybersecurity, Cooking, Sports, Space) — an earlier version mirrored those same four and caused a
+embeddable signal) across all three backends. This is deliberate, not a missed optimization: every
+pre-existing e2e test inserts its own hand-written fixtures fresh with no deduplication, an assumption that
+only held before because the whole database reset with every fresh (non-persistent) container — once the
+container started surviving across runs, those fixtures began accumulating as duplicate rows and caused
+real self-rank test failures under embedding noise; see `SampleDataSeeder`'s own class javadoc for the full
+story. Resetting the (cheap) domain data every run while keeping the (expensive) container/image itself
+persistent gets both properties at once. The seeded topics are deliberately distinct from `ArticleFixtures`'s
+own topics (Cybersecurity, Cooking, Sports, Space) — an earlier version mirrored those same four and caused a
 separate real, reproducible test failure from semantic overlap with a hand-written fixture; see the same
 javadoc.
 
@@ -132,6 +141,9 @@ yourself:
 ```sh
 docker rm -f javai-e2e-monolithic
 ```
+(The Mongo companion container needs no equivalent -- it's never built from a local Dockerfile, only run
+from the unmodified upstream image, so there's nothing of ours to go stale. `docker rm -f javai-e2e-mongo`
+still works if you want a truly fresh Mongo instance for some other reason.)
 
 ## Provider choice
 
@@ -165,10 +177,11 @@ mvn test
 ```
 
 First run builds the monolithic image (Postgres+pgvector, Neo4j, Ollama with both models baked in — slow,
-several-GB pull) and starts it; every subsequent run attaches to the same already-running container by name
-and skips the build entirely. Sample data is reset and re-seeded on *every* run regardless (see "Persistent
-container + seeded sample data" above) — cheap compared to the image build, and necessary for existing
-tests' fresh-database assumptions to hold.
+several-GB pull) and starts it, and separately pulls+starts the unmodified `mongodb/mongodb-atlas-local`
+companion container (no build, just an image pull); every subsequent run attaches to the same
+already-running containers by name and skips both entirely. Sample data is reset and re-seeded on *every*
+run regardless (see "Persistent container + seeded sample data" above) — cheap compared to the image
+build/pull, and necessary for existing tests' fresh-database assumptions to hold.
 
 ## What's deliberately not here
 

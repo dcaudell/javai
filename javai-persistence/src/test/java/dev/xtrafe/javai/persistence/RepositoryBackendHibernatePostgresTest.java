@@ -40,18 +40,19 @@ class RepositoryBackendHibernatePostgresTest {
     static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
             DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres"));
 
+    private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
+        config = JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.POSTGRES)
                 .postgresUrl(postgres.getJdbcUrl())
                 .postgresUsername(postgres.getUsername())
                 .postgresPassword(postgres.getPassword())
-                .build());
-        repository = JavAIPI.repository(TestArticleRepository.class);
+                .build();
+        repository = JavAIPI.repository(TestArticleRepository.class, config);
     }
 
     @BeforeEach
@@ -206,7 +207,7 @@ class RepositoryBackendHibernatePostgresTest {
 
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
-        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class, config));
     }
 
     /**

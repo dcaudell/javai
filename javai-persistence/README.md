@@ -12,13 +12,14 @@ alongside their ORM.
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `JavAIPI` | Static facade | `repository(Class)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`; `configurePersistence(...)` overrides the self-contained default |
+| `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
 | `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()`, fixed to `UUID` identity |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Derived query convention | The *only* derived queries supported -- validated at repository-creation time, not on first call |
-| `JavAIPersistenceConfig` | Value object | Backend selection + connection settings, self-contained by default (`javai.persistence.*` system properties) but overridable with an externally-built `SessionFactory`/`Driver` |
+| `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
 | `javai_vectors__<model>` / `javai_summary_vectors__<model>` | Postgres tables, owned by this module, one pair per model | Per-field + combined vectors, and `summaryVector()`, respectively -- never the developer's own entity table |
 | `<field>Vector__<model>` / `vector__<model>` / `summaryVector__<model>` | Neo4j node properties, one set per model | Same idea as the Postgres tables, applied to a schemaless node instead |
-| `ModelIds.sanitize(modelId)` | Shared helper | Turns an arbitrary model id string into the identifier fragment both backends key their per-model tables/properties/indexes on |
+| `<field>Vector__<model>` / `vector__<model>` / `summaryVector__<model>` | MongoDB document fields, one set per model | Same idea again -- one collection per entity type, per-model-qualified field names within each document, not a physical collection per model |
+| `ModelIds.sanitize(modelId)` | Shared helper | Turns an arbitrary model id string into the identifier fragment all three backends key their per-model tables/properties/fields/indexes on |
 
 ## Model versioning: the methodology in full
 
@@ -71,7 +72,11 @@ interface ArticleRepository extends JavAIRepository<Article> {
     List<Article> findNearestByBodyVector(EmbeddingVector reference, int limit);
 }
 
-ArticleRepository repo = JavAIPI.repository(ArticleRepository.class);
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        .build();
+ArticleRepository repo = JavAIPI.repository(ArticleRepository.class, config);
 
 repo.save(article);   // auto-vectorized on write -- every @Vectorize/@Summary vector recomputed and persisted
 
@@ -84,10 +89,19 @@ repo.reindexAll();
 // Revert: one step, no reindexing --
 JavAIRuntime.configureEmbeddingProvider(oldProvider);
 
-// Swapping the persisted *backend* (not the model) is also configuration, not code:
-//   javai.persistence.backend=postgres   (default)
-//   javai.persistence.backend=neo4j
+// Swapping the persisted *backend* (not the model) is also configuration, not code -- just a different
+// JavAIPersistenceConfig.Backend value passed to repository(...); JavAIPersistenceConfig.fromSystemProperties()
+// reads javai.persistence.backend=postgres|neo4j|mongodb (plus the matching connection properties) if you
+// want that convenience instead of building the config by hand.
 ```
+
+**No ambient configuration.** `JavAIPI.repository(Class, JavAIPersistenceConfig)` takes its config
+explicitly, every call -- there is no `configurePersistence(...)`-style static setter and no "current
+config" pointer to race or accidentally leave pointed at the wrong backend for an unrelated later call.
+Reuse the *same* `JavAIPersistenceConfig` instance across every `repository(...)` call meant to share one
+backend connection/pool: `JavAIPersistenceConfig` has no `equals()`/`hashCode()` override, so the internal
+per-config backend cache is keyed by reference identity -- a fresh `.builder()...build()` call with
+identical field values on every invocation would silently multiply backends instead of sharing one.
 
 `<Field>` in `findNearestBy<Field>Vector` names the same accessor the weaver already synthesizes in memory
 (`bodyVector()` -> `findNearestByBodyVector`), not the bare field name -- deliberately the same name a
@@ -97,11 +111,12 @@ are the whole-object variants, for the object's own combined `vector()`/`summary
 **Register every repository before using any of them.** `JavAIPI.repository(...)` accumulates entity types
 under the hood; the Postgres backend's internal `SessionFactory` is built, once, lazily, on the *first*
 actual method call across any repository -- Hibernate's boot-time metadata is immutable afterward, so an
-entity type registered later would never be mapped. On Postgres, this is narrower than it sounds in
-practice: `JavAIPI.repository(ArticleRepository.class)` alone is enough even if `Article` references
-`Comment`/`Attachment` (singly or through a collection) -- related entity types reachable through an
-already-registered type's own fields are discovered and registered automatically, recursively. You only need
-to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and independently*.
+entity type registered later would never be mapped. On Postgres and MongoDB, this is narrower than it
+sounds in practice: `JavAIPI.repository(ArticleRepository.class)` alone is enough even if `Article`
+references `Comment`/`Attachment` (singly or through a collection) -- related entity types reachable through
+an already-registered type's own fields are discovered and registered automatically, recursively. You only
+need to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and
+independently* (Neo4j is the exception here -- see below).
 
 ## Collections: `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` fields
 
@@ -144,6 +159,22 @@ than one owner/key) -- `K` must be `String`, validated eagerly at `registerEntit
 field works on both backends as of this pass -- `RepositoryBackendNeo4jTest.mapFieldRoundTripsWithKeysPreserved`
 and `RepositoryBackendHibernatePostgresTest`/e2e's own Postgres map test both prove it.
 
+**MongoDB stores collection/map fields as references, not embedded documents** -- a deliberate choice, not
+the more idiomatic-for-Mongo alternative. Embedding a `Comment` inside its `Article` would mean it can never
+be independently found via its own `findNearestByTextVector` once nested, breaking the "every `@Entity` type
+is independently queryable" symmetry both other backends share. Instead, a reference/collection field is
+classified by declared type exactly like Neo4j's own relationship-field test (`Map`/`Collection`/
+`JavAIVectorizable`-assignable), and stored as a `{type, id}` pointer (plus `ordinal`/`key` for
+collection/map members) in an array under the field's own name on the owner's document -- the referenced
+entity keeps its own top-level document in its own collection. Same `String`-only `Map`-key limitation as
+the other two backends, kept for cross-backend consistency even though MongoDB documents could technically
+hold richer keys. `RepositoryBackendSpringDataMongoTest.mapFieldRoundTripsWithKeysPreserved` proves this
+the same way `RepositoryBackendNeo4jTest`'s equivalent test does.
+
+**`deleteById` does not cascade** on MongoDB, unlike Postgres (which cascades collection members) -- a
+referenced document simply becomes unreferenced, not deleted. Documented as a known Phase 0 boundary in
+`RepositoryBackendSpringDataMongo`'s own javadoc, not an oversight.
+
 **Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
 Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
 implementation stand in for `PersistentBag`/`PersistentSet`/`PersistentMap` and could in principle preserve
@@ -183,35 +214,52 @@ recursively-saved related nodes, which therefore need their own `@Id`. `deleteBy
 `DETACH DELETE`, removing every model's properties on that node in one step -- simpler than the Postgres
 side here, since there's no separate per-model table to clean up.
 
+**MongoDB**: `<field>Vector__<model>` per `@Vectorize` field, plus `vector__<model>`/`summaryVector__<model>`
+(each with a `...ComputedAt__<model>` sibling) -- fields within the entity type's *one* MongoDB collection
+(named from the entity's simple class name, same Phase 0 assumption as Neo4j's label), never a physical
+collection per model. Every write goes through `$set` (via the driver's `updateOne(..., upsert)`), never a
+whole-document `replaceOne` -- the same reason both other backends never let a newer model's write touch an
+older model's storage: a full-document replace would silently destroy whatever the older model's fields
+held. A MongoDB Search vector index is created lazily per `(collection, field, model)` triple the first time
+it's needed, named `javai_<collection>_<field>` and scoped to that field's own dimension -- but unlike
+Postgres's HNSW index or Neo4j's native vector index (both usable the instant they're created), a MongoDB
+Search index builds *asynchronously* in the background; `RepositoryBackendSpringDataMongo` polls until it
+reports `queryable: true` before the first query against it, and separately retries past a real, confirmed
+startup race where a freshly-started deployment's Search Index Management service (`mongot`) isn't
+reachable for the first several seconds after the deployment's own port is already accepting connections.
+
 ## Dependencies pinned in the root `pom.xml`
 
 `org.hibernate.orm:hibernate-core` + `hibernate-vector` (native `@JdbcTypeCode(SqlTypes.VECTOR)` pgvector
-column mapping, confirmed on the same release train as `hibernate-core`), `org.postgresql:postgresql`, and
-`org.neo4j.driver:neo4j-java-driver`. Vector query parameters bind as pgvector's own text literal format
-(`?::vector`) rather than a JDBC PGobject type -- simpler and avoids connection-unwrapping uncertainty
-through Hibernate's layer.
+column mapping, confirmed on the same release train as `hibernate-core`), `org.postgresql:postgresql`,
+`org.neo4j.driver:neo4j-java-driver`, and `org.springframework.data:spring-data-mongodb` +
+`org.mongodb:mongodb-driver-sync` (the latter not pulled in transitively by the former -- confirmed via
+`mvn dependency:tree` -- so it's declared explicitly, pinned to the same version). Vector query parameters
+bind as pgvector's own text literal format (`?::vector`) rather than a JDBC PGobject type -- simpler and
+avoids connection-unwrapping uncertainty through Hibernate's layer.
 
 ## What's actually implemented
 
 `JavAIRepository`/`JavAIPI`/`JavAIPersistenceConfig` (`RepositoryBackendHibernatePostgres`/
-`RepositoryBackendNeo4j` behind a `java.lang.reflect.Proxy`), both backends' save/findById/findAll/
-deleteById/reindexAll plus the three `findNearestBy*` variants, described above. `reindexAll()` needed no
-backend-specific code at all -- it's dispatched in `RepositoryInvocationHandler` purely as a
-`findAll()` + `save(...)` loop over each backend's existing methods. Covered by
-`RepositoryBackendHibernatePostgresTest`/`RepositoryBackendNeo4jTest` against real
-`pgvector/pgvector:pg16`/`neo4j:5.26-community` containers (Testcontainers) -- there's no meaningful way to
-hermetically fake whether a real similarity search actually ranks correctly, or whether two models' data
-really stay physically separate.
+`RepositoryBackendNeo4j`/`RepositoryBackendSpringDataMongo` behind a `java.lang.reflect.Proxy`), all three
+backends' save/findById/findAll/deleteById/reindexAll plus the three `findNearestBy*` variants, described
+above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
+`RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
+methods. Covered by `RepositoryBackendHibernatePostgresTest`/`RepositoryBackendNeo4jTest`/
+`RepositoryBackendSpringDataMongoTest` against real `pgvector/pgvector:pg16`/`neo4j:5.26-community`/
+`mongodb/mongodb-atlas-local:8.2` containers (Testcontainers) -- there's no meaningful way to hermetically
+fake whether a real similarity search actually ranks correctly, or whether two models' data really stay
+physically separate.
 
-**Every `save()` on both backends is wrapped in `JavAIRuntime.runWithSubgraphLockedForPersistence(entity, ...)`**
+**Every `save()` on all three backends is wrapped in `JavAIRuntime.runWithSubgraphLockedForPersistence(entity, ...)`**
 (`javai-model` -- see `doc/spec/vector-core.md`'s "Embedding concurrency model" section for the full
 mechanism): the whole reachable subgraph is locked and every field/`concatenatedTextVector()` read forced
 accurate for the duration of the flush, regardless of which `EmbeddingConsistencyMode` is globally
 configured. This is what guarantees the database never sees a vector that doesn't match the field value
 being written in that same save -- proven directly by
 `savedVectorIsAlwaysAccurateUnderImmediateConsistency`/
-`savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider` on both backend test
-classes, the latter using a deliberately slow provider to prove the flush doesn't just get lucky racing
+`savedVectorIsAlwaysAccurateUnderEventualConsistencyDespiteASlowBackgroundProvider` on all three backend
+test classes, the latter using a deliberately slow provider to prove the flush doesn't just get lucky racing
 against `EVENTUAL_CONSISTENCY`'s own eager background dispatch.
 
 **Deliberately not this module's own weaving.** No `javai-substrate` dependency, and no ByteBuddy-based
@@ -225,6 +273,17 @@ module's own test fixture) shows the shape a real `@JavAIVectorizable` + `@Entit
 modifier specifically so Hibernate's default field-access mapping skips it with no annotation the developer
 never sees in source.
 
+**Also deliberately not MongoDB's own "Hibernate Extension for MongoDB."** MongoDB publishes an official
+Hibernate ORM extension, which would have kept the Mongo backend structurally symmetric with the Postgres
+one above. Not used: as of this writing it's Public Preview ("not recommended for production deployments,
+because breaking changes might be introduced" -- MongoDB's own docs), it doesn't support JPA associations
+(`@OneToOne`/`@OneToMany`/`@ManyToMany` are all unsupported -- the Postgres backend's own singular-reference
+handling depends on exactly this), and vector search is reachable only through un-parameterized native MQL,
+not a first-class API. Spring Data MongoDB was used instead: mature `$vectorSearch` support, and no
+association model to fight in the first place, since this backend manages its own `{type, id}` reference
+pointers directly (see "Collections" above) rather than asking an ORM to manage relationships it can't yet
+express.
+
 **Not yet built, and documented rather than silently dropped:**
 - `reindexAll()` loads every entity into memory via `findAll()`, matching that method's own existing scope
   -- no batching/pagination for very large tables yet.
@@ -234,17 +293,23 @@ never sees in source.
 - Arbitrary Spring-Data-style derived queries (`findByTitle` and friends) -- only the `findNearestBy*`
   family above is supported, and anything else fails fast, with a clear message, at repository-creation
   time.
-- `JavAILinkedHashMap`/any `Map` relationship field with a non-`String` key type, on either backend -- see
+- `JavAILinkedHashMap`/any `Map` relationship field with a non-`String` key type, on any backend -- see
   "Collections" above.
 - Neo4j's `registerEntityType` doesn't (yet) recursively auto-register related entity types reachable
-  through a field the way the Postgres backend now does -- a related type still needs its own
+  through a field the way the Postgres and MongoDB backends now do -- a related type still needs its own
   `JavAIPI.repository(...)` call made first (see `RepositoryBackendNeo4jTest`'s own test fixtures for the
   pattern this implies today).
+- MongoDB's `deleteById` doesn't cascade to referenced entities' own documents -- see "Collections" above.
+- No dual-write/transactional multi-backend `save()` -- persisting one entity type to more than one store
+  simultaneously means two independently-created repository proxies, one per backend (see
+  `doc/spec/persistence-bridge.md`'s own section on this).
 - The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
   not started.
 
 `e2e-client-test` now exercises this module directly: `PersistenceE2ETest`/`ArticleFixtureVolumeE2ETest`
 save/query this project's own real `Article`/`Comment`/`Attachment` domain (not this module's own flat test
-fixture) against both real backends running in the same monolithic container as the rest of the e2e suite,
-including the full object graph (singular references, the `JavAIArrayList`/`JavAILinkedHashMap` collection
-fields above, real embeddings) and realistic-volume/semantic-similarity checks.
+fixture) against the Postgres and Neo4j backends running in the same monolithic container as the rest of
+the e2e suite, including the full object graph (singular references, the `JavAIArrayList`/
+`JavAILinkedHashMap` collection fields above, real embeddings) and realistic-volume/semantic-similarity
+checks. The MongoDB backend is proven at the unit level (`RepositoryBackendSpringDataMongoTest`, a real
+container) but not yet wired into the monolithic e2e container/`JavAIEnvironment` alongside the other two.

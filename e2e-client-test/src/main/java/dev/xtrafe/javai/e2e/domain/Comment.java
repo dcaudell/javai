@@ -2,6 +2,7 @@ package dev.xtrafe.javai.e2e.domain;
 
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.PromptContext;
+import dev.xtrafe.javai.annotations.Taggable;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.annotations.VectorizeIgnore;
 import jakarta.persistence.Entity;
@@ -23,6 +24,12 @@ import java.util.UUID;
  * either, for the same reason its name suggests: internal, never meant to surface -- not in an embedding,
  * not in a prompt.
  *
+ * <p>{@code @Taggable} + {@code implements dev.xtrafe.javai.tagging.Taggable} (fully-qualified in the
+ * {@code implements} clause below to avoid colliding with the {@code @Taggable} annotation's own simple
+ * name) -- a {@code Comment} is independently taggable alongside {@link Article}, letting
+ * {@code TaggingE2ETest} exercise a genuinely heterogeneous {@code taggedWith(...)} query (an
+ * {@code Article} and a {@code Comment} sharing one tag, retrieved together as a mixed-type result).
+ *
  * <p>{@code @Entity} + {@link #id}: a real, independently-persistable entity on both backends --
  * {@link Article#getFeaturedComment()}/{@link Article#getDraftComment()} are real Postgres
  * {@code @OneToOne}s, and {@link Article#getComments()} round-trips through
@@ -32,7 +39,8 @@ import java.util.UUID;
  */
 @Entity
 @JavAIVectorizable
-public class Comment extends Attribution {
+@Taggable
+public class Comment extends Attribution implements dev.xtrafe.javai.tagging.Taggable {
 
     @Id
     private UUID id;

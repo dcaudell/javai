@@ -38,13 +38,17 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
 
     final Set<N> nodes = new LinkedHashSet<>();
     final Map<N, Map<N, Set<E>>> adjacency = new LinkedHashMap<>();
-    private final DirtyTrackingSupport state = new DirtyTrackingSupport();
+    // Named to match JavAIRuntime.STATE_FIELD exactly, not just "state" -- see JavAIArrayList's own field
+    // javadoc (javai-model) for why: JavAIRuntime's reflection-based helpers (stateOf(), and everything
+    // built on it, including the whole-subgraph persistence lock) look up this field by that literal name
+    // on any JavAIVectorizable node, hand-written or woven alike.
+    private final DirtyTrackingSupport $javai$state = new DirtyTrackingSupport();
 
     @Override
     public void addNode(N node) {
         if (nodes.add(node)) {
             JavAIRuntime.registerDependency(this, node);
-            CollectionVectorSupport.onMutated(state, this);
+            CollectionVectorSupport.onMutated($javai$state, this);
         }
     }
 
@@ -57,7 +61,7 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
                 .add(edge);
         if (changed) {
             JavAIRuntime.registerDependency(this, edge);
-            CollectionVectorSupport.onMutated(state, this);
+            CollectionVectorSupport.onMutated($javai$state, this);
         }
     }
 
@@ -139,12 +143,12 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
 
     @Override
     public EmbeddingVector vector() {
-        return CollectionVectorSupport.vector(state, nodes);
+        return CollectionVectorSupport.vector($javai$state, nodes);
     }
 
     @Override
     public EmbeddingVector summaryVector() {
-        return CollectionVectorSupport.summaryVector(state, nodes);
+        return CollectionVectorSupport.summaryVector($javai$state, nodes);
     }
 
     @Override
@@ -184,41 +188,41 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
 
     @Override
     public void addDependent(Object dependent) {
-        state.addDependent(dependent);
+        $javai$state.addDependent(dependent);
     }
 
     @Override
     public Iterable<Object> dependents() {
-        return state.dependents();
+        return $javai$state.dependents();
     }
 
     @Override
     public boolean isFieldDirty() {
-        return state.isFieldDirty();
+        return $javai$state.isFieldDirty();
     }
 
     @Override
     public void markFieldDirty() {
-        state.markFieldDirty();
+        $javai$state.markFieldDirty();
     }
 
     @Override
     public void clearFieldDirty() {
-        state.clearFieldDirty();
+        $javai$state.clearFieldDirty();
     }
 
     @Override
     public boolean isSummaryDirty() {
-        return state.isSummaryDirty();
+        return $javai$state.isSummaryDirty();
     }
 
     @Override
     public void markSummaryDirty() {
-        state.markSummaryDirty();
+        $javai$state.markSummaryDirty();
     }
 
     @Override
     public void clearSummaryDirty() {
-        state.clearSummaryDirty();
+        $javai$state.clearSummaryDirty();
     }
 }

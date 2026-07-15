@@ -20,22 +20,24 @@ with the JavAI runtime as an ordinary classpath dependency. Any custom JVM, GPU 
 bytecode may exist only as an optional accelerated path with a required correct fallback, never as a
 requirement for correctness.
 
-## The seven extension areas
+## The eight extension areas
 
 | # | Directory | Extension area | Purpose |
 |---|---|---|---|
-| 1 | [`javai-annotations`](javai-annotations/README.md) | Codegen Guidance (+ shared annotation vocabulary) | Every annotation used across all seven areas — plain definitions, no processing logic |
+| 1 | [`javai-annotations`](javai-annotations/README.md) | Codegen Guidance (+ shared annotation vocabulary) | Every annotation used across all eight areas — plain definitions, no processing logic |
 | 2 | [`javai-vector`](javai-vector/README.md) + [`javai-model`](javai-model/README.md) | Vector Core | Embedding calculation, dirty-state propagation, object-graph `query()` — physically two modules, see note below |
 | 3 | [`javai-substrate`](javai-substrate/README.md) | Acceleration Substrate | ByteBuddy weaving that makes Vector Core/Collections real without a compiler |
 | 4 | [`javai-supervision`](javai-supervision/README.md) | Agentic Supervision | AoP-style sync (blocking, read-write) + async (fire-and-forget) interception, its own independent weaver |
 | 5 | [`javai-collections`](javai-collections/README.md) | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` (interfaces `JavAIList`/`Set`/`Map` live in `javai-model`) |
-| 6 | [`javai-persistence`](javai-persistence/README.md) | Persistence Bridge | JPA/Hibernate + Neo4j automation for vectorized, searchable persistence |
+| 6 | [`javai-persistence`](javai-persistence/README.md) | Persistence Bridge | JPA/Hibernate + Neo4j + Spring Data MongoDB automation for vectorized, searchable persistence |
 | 7 | [`javai-completion`](javai-completion/README.md) | Completion Fabric | Provider-agnostic RAG completions, wrapping Spring AI (`Contextable`/`PromptContext` live in `javai-model`) |
+| 8 | [`javai-tagging`](javai-tagging/README.md) | Tagging | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, tag-collection similarity search |
 
 `javai-annotations` is the one module every other module depends on, directly or transitively — it also
 carries Vector Core's and Vector Collections' vectorization/search-visibility annotation vocabulary
-(`@Vectorize`, `@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`) and Agentic Supervision's
-(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`), not just the Codegen Guidance ones.
+(`@Vectorize`, `@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`), Agentic Supervision's
+(`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`), and Tagging's (`@Taggable`, `@TagIgnore`),
+not just the Codegen Guidance ones.
 
 ### Dependency graph
 
@@ -51,6 +53,11 @@ carries Vector Core's and Vector Collections' vectorization/search-visibility an
                     v    v               v
           javai-persistence      javai-completion
           (Persistence Bridge)   (Completion Fabric)
+                    |                   |
+                    +--------+----------+
+                             v
+                       javai-tagging
+                         (Tagging)
 
           javai-supervision (Agentic Supervision) — standalone, depends only
           on javai-annotations, its own independent weaver. Not fed by
@@ -60,9 +67,9 @@ carries Vector Core's and Vector Collections' vectorization/search-visibility an
           doc/spec/agentic-supervision.md.
 ```
 
-See [`doc/module-dependency-graph.md`](doc/module-dependency-graph.md) for the full, precise 8-module
+See [`doc/module-dependency-graph.md`](doc/module-dependency-graph.md) for the full, precise 9-module
 physical dependency graph (this diagram groups `javai-vector`/`javai-model` together for readability against
-the seven-*conceptual*-area framing).
+the eight-*conceptual*-area framing).
 
 Build order matches this graph: `javai-annotations` → `javai-vector` → `javai-model` → (`javai-substrate`,
 `javai-supervision` in parallel — the latter depends only on annotations, not on the former) →
@@ -77,14 +84,14 @@ whitepaper discusses them as part of Vector Collections/Completion Fabric. See `
 
 ## Building
 
-All eight modules live under one Maven reactor and build together — they're interdependent by design, not
+All nine modules live under one Maven reactor and build together — they're interdependent by design, not
 meant to be built independently:
 
 ```
 mvn install
 ```
 
-Opening this repository root in IntelliJ IDEA imports all eight modules as one project automatically, since
+Opening this repository root in IntelliJ IDEA imports all nine modules as one project automatically, since
 IntelliJ detects the root `pom.xml`.
 
 ## How to install
@@ -92,7 +99,7 @@ IntelliJ detects the root `pom.xml`.
 The above is for building *this* repository. To add JavAI Extensions to your own project instead, from
 standard public Maven repositories:
 
-These instructions install the **full module set** — all seven extension areas — rather than picking and
+These instructions install the **full module set** — all eight extension areas — rather than picking and
 choosing. You can technically get away with fewer modules if you only want one or two capabilities, but the
 whole set is small, every module is designed to interoperate with the others, and not having to reason
 about which subset you need is one less decision to make.
@@ -100,7 +107,7 @@ about which subset you need is one less decision to make.
 ### Automated install
 
 **Do not copy this repository's own `SPEC.md`** — that file orients a *contributor* to this repo's own
-8-module Phase 0 build, not a downstream consumer, and would just confuse an assistant reading it in your
+9-module Phase 0 build, not a downstream consumer, and would just confuse an assistant reading it in your
 project. Copy only the [`doc/ai-guidance/`](doc/ai-guidance/README.md) directory into your project (e.g.
 `docs/javai-guidance/`) — it's the one piece written specifically for this, and is self-contained — then
 tell Claude Code (or another AI coding assistant) something like:
@@ -115,45 +122,67 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
 ### Manual install
 
-1. **Add all seven modules** as dependencies (`javai-annotations` comes along transitively — no need to
+1. **Add all eight modules** as dependencies (`javai-annotations` comes along transitively — no need to
    declare it directly):
 
    ```xml
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-vector</artifactId>
-     <version>0.1.1</version> <!-- match the current release -->
+     <version>0.1.2</version> <!-- match the current release -->
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-model</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-substrate</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-supervision</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-collections</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-persistence</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-completion</artifactId>
-     <version>0.1.1</version>
+     <version>0.1.2</version>
    </dependency>
+   <dependency>
+     <groupId>io.github.dcaudell</groupId>
+     <artifactId>javai-tagging</artifactId>
+     <version>0.1.2</version>
+   </dependency>
+   ```
+
+   **Gradle** (`build.gradle.kts`) works the same way — every module publishes to Maven Central with both a
+   POM and Gradle Module Metadata (`.module`), so `mavenCentral()` alone is enough; no extra repository or
+   variant configuration needed:
+
+   ```kotlin
+   dependencies {
+       implementation("io.github.dcaudell:javai-vector:0.1.2")
+       implementation("io.github.dcaudell:javai-model:0.1.2")
+       implementation("io.github.dcaudell:javai-substrate:0.1.2")
+       implementation("io.github.dcaudell:javai-supervision:0.1.2")
+       implementation("io.github.dcaudell:javai-collections:0.1.2")
+       implementation("io.github.dcaudell:javai-persistence:0.1.2")
+       implementation("io.github.dcaudell:javai-completion:0.1.2")
+       implementation("io.github.dcaudell:javai-tagging:0.1.2")
+   }
    ```
 
 2. **Install both weavers** before any annotated class is loaded — as early as possible in `main()`, or,
@@ -256,7 +285,7 @@ the exact timing trap that silently leaves a class unwoven if the weaver install
 Phase 0, actively underway, verified against real embeddings and real backing stores, not just placeholder
 smoke tests:
 
-- **`javai-annotations`** — the full annotation vocabulary across all seven areas.
+- **`javai-annotations`** — the full annotation vocabulary across all eight areas.
 - **`javai-vector`** + **`javai-model`** (Vector Core, physically split — see above) — the full object
   lifecycle (`FieldDirty`/`SummaryDirty`, lazy recompute), `query()`, real embedding providers (Ollama and
   Hugging Face's text-embeddings-inference), the concrete `JavAIArrayList`/`JavAILinkedHashSet`/
@@ -280,8 +309,14 @@ smoke tests:
   virtual-thread-per-task executor, and an improvement over its AoP predecessor (EXCEPTION now catches an
   exception propagated from a called method, not just a literal `throw`). See that module's README for two
   JVM-imposed method/constructor asymmetries discovered while building it.
+- **`javai-tagging`** (Tagging) — `@Taggable`/`@TagIgnore` unwoven markers, recursive `Tag`/`TagSet`
+  structures, tag-collection similarity search over a tag-summary-vector `VectorIndex<TaggableRef>`, and
+  LLM-based auto-classification via `javai-completion`'s `Cortex`, tested against all three persistence
+  backends. Tagging operations are scoped to a `JavAITagRepository` instance wrapping an already-realized
+  `TagRepository`, not a static facade — see `doc/spec/tagging.md` and `SPEC.md`'s "Coding standard:
+  static/global scope is the exception" section.
 
-`e2e-client-test` (a standalone downstream consumer, not one of the eight modules) proves the above against a
+`e2e-client-test` (a standalone downstream consumer, not one of the nine modules) proves the above against a
 single monolithic Docker container bundling Postgres+pgvector, Neo4j, and a real embedding provider, not
 fakes or mocks.
 

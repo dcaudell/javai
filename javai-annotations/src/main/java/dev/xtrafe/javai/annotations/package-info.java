@@ -1,5 +1,5 @@
 /**
- * The full JavAI Extensions annotation vocabulary, across five extension areas:
+ * The full JavAI Extensions annotation vocabulary, across six extension areas:
  *
  * <ul>
  *   <li><b>Vector Core</b> (search-visibility hat): {@link dev.xtrafe.javai.annotations.JavAIVectorizable},
@@ -13,6 +13,12 @@
  *       rendering. Unlike every other annotation here, no weaver processes this one -- GSON's own
  *       reflection (an {@code ExclusionStrategy} in that class) reads it directly at marshalling time, not
  *       at class-load time.
+ *   <li><b>Tagging</b>: {@link dev.xtrafe.javai.annotations.Taggable} -- same unwoven, class-level marker
+ *       shape as {@code JavAIGraphNode} above, paired with a hand-implemented {@code Taggable} interface in
+ *       {@code javai-tagging}. {@link dev.xtrafe.javai.annotations.TagIgnore} -- a field-level filter layered
+ *       on top of {@code PromptContext} (excludes an otherwise-classifier-visible field from tag
+ *       classification specifically), read by {@code javai-tagging}'s own reflection utility, not by
+ *       {@code javai-completion}. See doc/spec/tagging.md.
  *   <li><b>Codegen Guidance</b> (LLM/codegen-guidance hat): {@link dev.xtrafe.javai.annotations.Requires},
  *       {@link dev.xtrafe.javai.annotations.Ensures}, {@link dev.xtrafe.javai.annotations.Invariant},
  *       {@link dev.xtrafe.javai.annotations.Intent}, {@link dev.xtrafe.javai.annotations.AgentWritable},
