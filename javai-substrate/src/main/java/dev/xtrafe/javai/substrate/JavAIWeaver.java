@@ -109,7 +109,12 @@ public final class JavAIWeaver {
                 .installOn(instrumentation);
     }
 
-    private static DynamicType.Builder<?> weave(DynamicType.Builder<?> builder, TypeDescription typeDescription) {
+    /** Package-private, not private: {@link JavAIBuildTimeWeaverPlugin} calls this directly so build-time
+     *  (Maven-plugin) weaving and load-time ({@code -javaagent}) weaving share the exact same transform --
+     *  this method never references {@code Instrumentation}/a live classloader, so it works identically
+     *  whether it's driven by a {@link AgentBuilder.Transformer} at load time or by ByteBuddy's own
+     *  {@code Plugin} SPI at build time. */
+    static DynamicType.Builder<?> weave(DynamicType.Builder<?> builder, TypeDescription typeDescription) {
         Set<String> vectorizeFields = fieldNamesAnnotatedWith(typeDescription, Vectorize.class);
         // @VectorizeIgnore wins over @Vectorize if a field somehow carries both -- an explicit "exclude"
         // signal should never be silently overridden by an "include" one on the same field.

@@ -28,7 +28,7 @@ accelerated execution path with a required correct fallback — never as a requi
 work at all. If you're ever tempted to make correctness depend on something only a custom runtime provides,
 stop — that breaks the one constraint everything else is built around.
 
-## The seven extension areas
+## The eight extension areas
 
 | # | Area | Purpose | Detail |
 |---|---|---|---|
@@ -39,6 +39,7 @@ stop — that breaks the one constraint everything else is built around.
 | 5 | **Codegen Guidance** | Annotations governing what an LLM coding agent may read, generate, or modify | `doc/spec/codegen-guidance.md` |
 | 6 | **Acceleration Substrate** | The compiler/weaver/dispatch mechanism beneath Vector Core, Vector Collections, and Codegen Guidance | `doc/spec/acceleration-substrate.md` |
 | 7 | **Agentic Supervision** | AoP-style method/constructor interception (sync, read-write + async, observation-only) enabling an LLM-backed listener to observe or intervene on execution | `doc/spec/agentic-supervision.md` |
+| 8 | **Tagging** | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, and tag-collection similarity search — independent of Vector Core, composable with it | `doc/spec/tagging.md` |
 
 ## Dependency graph between the areas
 
@@ -57,6 +58,11 @@ stop — that breaks the one constraint everything else is built around.
                                      depending only on javai-annotations; not
                                      fed by, and does not feed, any area above
                                      at the module level — see below)
+
+          8. Tagging   (depends on Vector Core [1], Vector Collections [4],
+                         Persistence Bridge [2], and Completion Fabric [3] —
+                         the highest-tier area, consuming three others rather
+                         than feeding into them; see below)
 ```
 
 Read arrows as "required by." Acceleration Substrate is the foundation for areas 1, 4, and 5 — it's the
@@ -88,29 +94,42 @@ Core/Collections, not a hard dependency any of those modules take on each other.
 `doc/spec/agentic-supervision.md`'s "Relationship to the rest of JavAI Extensions" section for the full
 reasoning.
 
+Tagging is the mirror image of Agentic Supervision's isolation: instead of standing apart from the graph, it
+sits at the *top* of it, genuinely depending on three other areas at once — Vector Core (a `Tag` is
+`@JavAIVectorizable`), Persistence Bridge (Tags/TagSets/Taggings are persisted, three backends), and
+Completion Fabric (classification is an LLM call). It does not extend `KnowledgeGraph`/Vector Collections as
+a hard dependency, even though the two compose naturally where an object happens to be both `@Taggable` and
+`@JavAIGraphNode` — see `doc/spec/tagging.md`'s "Optional composition with KnowledgeGraph." Unlike every
+area before it, `@Taggable` itself is deliberately *unwoven* (the same lightweight, hand-implemented-marker
+shape as `@JavAIGraphNode`, not `@JavAIVectorizable`'s full weave) — see that same doc's "Orthogonality"
+section for why tagging state doesn't need Acceleration Substrate's mutation-interception mechanism at all.
+
 Practical implication: Acceleration Substrate and Vector Core are where a design mistake is most expensive
 to unwind, since three or four other areas build on them. Persistence Bridge and Completion Fabric are the
 safest place to experiment. Agentic Supervision, being structurally isolated, is a similarly safe, low-blast-radius
-place to experiment — a mistake there doesn't ripple into the other six areas.
+place to experiment — a mistake there doesn't ripple into the other six areas. Tagging is the opposite kind
+of low-risk: expensive to get wrong in its *own* design, but incapable of rippling back downward into the
+three areas it depends on, since nothing below it takes a dependency on `javai-tagging`.
 
 ## Phase 0: the Golden Contract
 
 Phase 0 targets full functional completeness — every annotation, every collection, every auto-generated
-method, both persistence backends, and the entire Completion/RAG API — delivered via runtime bytecode
-weaving instead of a real compiler, because nothing in the functional surface actually requires a compiler
-or a GPU to work correctly, only to work fast. Eight components (Vector Core is realized by two — see
-above), each a plain library, each independently buildable in the order below:
+method, all three persistence backends, the entire Completion/RAG API, and Tagging — delivered via runtime
+bytecode weaving instead of a real compiler, because nothing in the functional surface actually requires a
+compiler or a GPU to work correctly, only to work fast. Nine components (Vector Core is realized by two —
+see above), each a plain library, each independently buildable in the order below:
 
 | Component | Mechanism | Delivers |
 |---|---|---|
-| `javai-annotations` | Plain annotation definitions, no processing logic | Full annotation vocabulary across all seven areas |
+| `javai-annotations` | Plain annotation definitions, no processing logic | Full annotation vocabulary across all eight areas |
 | `javai-vector` (Vector Core, part 1) | Pure Java library | `EmbeddingVector`, CPU similarity, embedding providers, dirty-tracking primitives |
 | `javai-model` (Vector Core, part 2 + physical home for Vector Collections/Completion Fabric primitives) | Pure Java library, depends on `javai-vector` | `JavAIVectorizable`/`JavAIRuntime` (back-edge propagation, `query()`), `JavAIList`/`Set`/`Map`, `Contextable`/`PromptContext` |
 | `javai-substrate` (Acceleration Substrate) | ByteBuddy weaving, load-time agent or build-time Maven/Gradle plugin | Implements `JavAIVectorizable`/`JavAIGraphNode` on any annotated class |
 | `javai-supervision` (Agentic Supervision) | ByteBuddy weaving, its own independent installer | Sync (blocking, read-write) + async (fire-and-forget, observation-only) method/constructor interception |
 | `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-vector` + `javai-model` | `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
-| `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim | Both persistence backends real in Phase 0, not aspirational |
+| `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim + Spring Data MongoDB shim | All three persistence backends real in Phase 0, not aspirational |
 | `javai-completion` (Completion Fabric) | Wraps Spring AI `ChatModel` | Full RAG API — `PromptContext`, `CompletionRequest`/`Result`, `toContext()`, `complete()`/`completeStreaming()` |
+| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagging`, the tag-summary-vector `VectorIndex<TaggableRef>` |
 
 Nothing past Phase 0 (a real `javaic` compiler, `invokedynamic` dispatch, GPU acceleration, an optional
 JavAIVM) adds a capability a Phase 0 developer doesn't already have — each replaces an internal mechanism
@@ -168,7 +187,68 @@ Supervision) also has a real, tested implementation now: `SupervisionWeaver` (it
 weaver) and `JavAISupervisionRuntime` (listener registration + sync-then-async dispatch), proven end to end
 by `SupervisionWeavingTest` — PRE/POST/EXCEPTION, sync veto and rewrite rights, async off-thread dispatch
 that can't block or mutate the call, and two JVM-imposed asymmetries between methods and constructors
-discovered (not assumed) while building it; see that module's own README for the full detail. Don't assume
-anything beyond what's in a given module's actual source and tests reflects working code; check that module's README before relying
-on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design and may
-be ahead of or behind any one module's real implementation state at a given moment.
+discovered (not assumed) while building it; see that module's own README for the full detail. `javai-tagging`
+(Tagging) also has a real, tested implementation now: `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`
+against all three persistence backends, LLM-based classification via `JavAITagRepository.classify`/
+`classifyAll` (a `Cortex`-backed diff against `source = "auto"` associations), and the tag-summary-vector
+`VectorIndex<TaggableRef>` (`tagSimilarityIndex()`) — the first module to ship its own pre-woven
+`@JavAIVectorizable` classes inside its own jar, which required adding real build-time (Maven-plugin)
+weaving to `javai-substrate` as a prerequisite (see that module's own README). `JavAITagRepository` is an
+instance wrapper, not a static facade — see "Coding standard: static/global scope is the exception" below,
+which this module (alongside `javai-persistence`'s own `JavAIPI.repository(Class, JavAIPersistenceConfig)`)
+is the reference example for. Don't assume anything beyond what's in a given module's actual source and
+tests reflects working code; check that module's README before relying on a claim from this file,
+`doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
+module's real implementation state at a given moment.
+
+## Coding standard: static/global scope is the exception, not the default
+
+A recurring anti-pattern surfaced and was removed from this codebase: a `final` class exposing only
+`public static` methods over `private static` mutable state, configured via a `configureXxx(...)`-style
+setter that every other static method implicitly reads. `JavAIPI` used to work this way
+(`configurePersistence(...)` set an ambient "current config" `repository(Class)` read); `javai-tagging`'s
+`JavAITagging` used to work this way too (a `configureTagging(...)`/`configureClassification(...)` pair
+feeding every other static method). Both were replaced: `JavAIPI.repository(Class, JavAIPersistenceConfig)`
+now takes its config as an explicit argument, and `JavAITagging` was deleted outright in favor of
+`JavAITagRepository`, a plain instance constructed from its dependencies.
+
+**The problem with the removed shape**: an ambient "configure once, read anywhere" pointer means any two
+unrelated call sites in the same process can interfere with each other's configuration, the order code runs
+in becomes load-bearing in ways that aren't visible at any single call site, and there is no way to have two
+independently-configured instances of the same capability coexist (e.g. tagging against two different
+backends at once) without inventing an escape hatch (this codebase's own now-removed
+`activatePostgresTagging()`-style methods in `e2e-client-test` were exactly that escape hatch, made
+unnecessary once the underlying facade stopped needing one).
+
+**The standard going forward**: prefer instance-scoped state, constructed explicitly and passed as a
+constructor or method argument, over static/global mutable state. This applies repo-wide, not just to the
+two classes above.
+
+**The one sanctioned exception**: `JavAIRuntime`'s embedding-provider/consistency-mode/concurrency-gate
+configuration (`javai-model`) stays a static, process-wide concern — it is the "most basic vector provider /
+runtime concern" this project treats as a deliberate carve-out, since every `@JavAIVectorizable` object in
+the process needs to resolve the same embedding provider without threading a dependency through every woven
+setter by hand. A narrow additional allow-list, each independently justified in its own module's docs, not
+silently exempted:
+- `EndpointRateLimiter` (`javai-vector`, shared with `javai-completion`) — a static, cross-instance/
+  cross-module registry keyed by endpoint URL, deliberately: two independently-constructed providers hitting
+  the same base URL must share 429-backoff state, or a per-instance rate limiter would defeat the entire
+  point. See `javai-vector/README.md` and `doc/spec/vector-core.md`/`doc/spec/completion-fabric.md`'s own
+  "Rate limiting" sections.
+- `DirtyTrackingSupport`'s sequence-number generator (`javai-vector`) — one `AtomicLong`, no configure-style
+  API at all, needed for a deadlock-free global lock-acquisition order in the persistence-flush
+  subgraph-locking scheme.
+- Bytecode-weaver installation (`JavAIWeaver`/`SupervisionWeaver`, `javai-substrate`/`javai-supervision`) —
+  inherently JVM/classloader-global; there is no meaningful "instance" of an installed
+  `Instrumentation`-based transformer to hold instead.
+- `MonolithicContainer`'s idempotent-startup flag (`e2e-client-test`) — coordinates a real, singular
+  OS-level Docker container, not conceptually instance/session state; test infrastructure, not library
+  design.
+
+**Known, tracked debt, not yet fixed**: `JavAISupervisionRuntime` (`javai-supervision`) has the same static-
+facade-over-mutable-state shape (`SYNC_LISTENERS`/`ASYNC_LISTENERS` plus `register*`/`unregister*` statics)
+as the two classes fixed above, and is *not* one of the sanctioned exceptions — it's flagged for a future
+refactoring pass, not fixed here, because its dispatch entry points are called directly from ByteBuddy-woven
+advice with no current path to an instance; removing the static there needs its own design (e.g. a
+thread-local or classloader-scoped registry resolution strategy) rather than the same "just take the
+dependency as a constructor argument" fix that worked for `JavAIPI`/`JavAITagging`.

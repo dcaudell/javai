@@ -6,7 +6,6 @@ import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
-import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.junit.jupiter.api.BeforeAll;
@@ -34,9 +33,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * monolithic container's Postgres/Neo4j, plus the separate MongoDB companion container -- see {@code
  * MonolithicContainer}'s own javadoc for why Mongo is a second container rather than a fourth process).
  *
- * <p>A repository proxy is bound to whichever backend was configured at the moment
- * {@link JavAIPI#repository(Class)} created it -- switching {@link JavAIPI#configurePersistence} afterward
- * doesn't retroactively affect an already-created proxy. That's what lets {@code JavAIEnvironment} build a
+ * <p>A repository proxy is bound at creation time to whichever {@code JavAIPersistenceConfig} was passed to
+ * the {@code JavAIPI.repository(Class, JavAIPersistenceConfig)} call that created it -- there's no ambient
+ * "current config" it could be retroactively affected by. That's what lets {@code JavAIEnvironment} build a
  * Postgres-backed, a Neo4j-backed, and a MongoDB-backed {@code ArticleRepository} once, up front, each
  * fully independent, for this test class (and every other) to share.
  */

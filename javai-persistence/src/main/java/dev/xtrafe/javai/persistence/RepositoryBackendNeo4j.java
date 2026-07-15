@@ -271,8 +271,6 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
         Class<?> entityType = entity.getClass();
         String label = label(entityType);
-        JavAIVectorizable vectorizable = (JavAIVectorizable) entity;
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
 
         Map<String, Object> properties = new HashMap<>();
         for (Field field : EntityReflection.allFields(entityType)) {
@@ -286,21 +284,26 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             }
             // else: not graph-shaped but also not a simple type -- documented Phase 0 boundary, skipped.
         }
-        for (String fieldName : vectorizeFields) {
-            EmbeddingVector vector = vectorizable.fieldVector(fieldName);
-            String qualified = qualify(fieldName + "Vector", vector.modelId());
-            properties.put(qualified, vector.values());
-            properties.put(qualified + "ComputedAt", vector.computedAt().toString());
-        }
-        EmbeddingVector combined = vectorizable.vector();
-        String qualifiedCombined = qualify("vector", combined.modelId());
-        properties.put(qualifiedCombined, combined.values());
-        properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+        // Not every persisted @Entity is @JavAIVectorizable -- a @Taggable-only entity (no embedding of its
+        // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets a real node
+        // with its plain properties above, it just has no vector properties to add here.
+        if (entity instanceof JavAIVectorizable vectorizable) {
+            for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+                EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                String qualified = qualify(fieldName + "Vector", vector.modelId());
+                properties.put(qualified, vector.values());
+                properties.put(qualified + "ComputedAt", vector.computedAt().toString());
+            }
+            EmbeddingVector combined = vectorizable.vector();
+            String qualifiedCombined = qualify("vector", combined.modelId());
+            properties.put(qualifiedCombined, combined.values());
+            properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
 
-        EmbeddingVector summary = vectorizable.summaryVector();
-        String qualifiedSummary = qualify("summaryVector", summary.modelId());
-        properties.put(qualifiedSummary, summary.values());
-        properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            EmbeddingVector summary = vectorizable.summaryVector();
+            String qualifiedSummary = qualify("summaryVector", summary.modelId());
+            properties.put(qualifiedSummary, summary.values());
+            properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+        }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
                 Values.parameters("id", id.toString(), "props", properties));

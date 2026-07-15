@@ -111,6 +111,14 @@
       <artifactId>javai-completion</artifactId>
       <version>${javai.version}</version>
     </dependency>
+    <!-- Tagging e2e proof (TaggingE2ETest): Tag/TagSet ship pre-woven from javai-tagging's own build-time
+         weaving, so no additional weaver registration is needed in JavAIWeavingLauncherSessionListener for
+         them, unlike javai-supervision above. -->
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-tagging</artifactId>
+      <version>${javai.version}</version>
+    </dependency>
 
     <!-- Interop proof, not a general convenience dependency this project otherwise avoids: this module's
          domain classes are elsewhere hand-written specifically so their woven behavior is easy to read

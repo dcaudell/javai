@@ -8,8 +8,13 @@ import java.util.Locale;
  * different models are structurally never mixed under the same name (not just a convention to remember).
  * Deterministic: the same {@code modelId} always sanitizes to the same fragment, so table/property
  * resolution is a pure function of which model produced a given {@code EmbeddingVector}.
+ *
+ * <p>Public (not package-private) specifically so {@code javai-tagging}'s own tag-summary-vector index
+ * (see doc/spec/tagging.md's "Tag-summary vector index") reuses the exact same sanitization this module
+ * already established for {@code javai_vectors__<model>}/{@code javai_summary_vectors__<model>}, rather
+ * than duplicating this logic and risking the two drifting apart.
  */
-final class ModelIds {
+public final class ModelIds {
 
     /** Conservative: Postgres identifiers cap at 63 bytes total, and the longest prefix this module uses
      *  ({@code javai_summary_vectors__}) is already 24 of those -- leaves comfortable room either way. */
@@ -18,7 +23,7 @@ final class ModelIds {
     private ModelIds() {
     }
 
-    static String sanitize(String modelId) {
+    public static String sanitize(String modelId) {
         String cleaned = modelId.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", "_");
         cleaned = cleaned.replaceAll("^_+", "").replaceAll("_+$", "");
         if (cleaned.isEmpty()) {

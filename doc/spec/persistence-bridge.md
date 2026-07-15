@@ -10,7 +10,7 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `JavAIPI` | Internal contract | The save/query/re-index contract JavAI objects speak internally |
+| `JavAIPI` | Internal contract | The save/query/re-index contract JavAI objects speak internally; `repository(Class, JavAIPersistenceConfig)` takes its backend config as an explicit argument, no ambient "current config" |
 | `JavAIRepository<T>` | Interface | Spring-Data-style repository base; delegates to existing derived-query-method machinery |
 | `findNearestBy<Field>(EmbeddingVector, int limit)` | Derived query method convention | E.g. `findNearestByBodyVector` — repository-level nearest-neighbor search |
 | Hibernate-based enhancement shim | Mechanism | ByteBuddy enhancement via Hibernate's `EnhancementContext`-style SPI |
@@ -31,17 +31,22 @@ public interface ArticleRepository extends JavAIRepository<Article> {
     List<Article> findNearestByBodyVector(EmbeddingVector reference, int limit);
 }
 
-ArticleRepository repo = JavAIPI.repository(ArticleRepository.class);
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES) // or NEO4J, MONGODB
+        ./* connection settings */.build();
+ArticleRepository repo = JavAIPI.repository(ArticleRepository.class, config);
 
-repo.save(article);   // auto-vectorized on write -- backend picked by javai.persistence.backend
+repo.save(article);   // auto-vectorized on write
 
 List<Article> hits = repo.findNearestByBodyVector(queryVector, 20);
-
-// Swapping the persisted backend is configuration, not code:
-//   javai.persistence.backend=postgres+pgvector   (default, via hibernate-vector)
-//   javai.persistence.backend=neo4j               (native vector index + Cypher traversal)
-//   javai.persistence.backend=mongodb             (Spring Data MongoDB + native $vectorSearch)
 ```
+
+`JavAIPI.repository(Class, JavAIPersistenceConfig)` takes its config explicitly, every call -- there is no
+ambient "current config" pointer anywhere in `JavAIPI`. `JavAIPersistenceConfig.fromSystemProperties()` is a
+pure factory a caller can invoke explicitly (reading `javai.persistence.backend=postgres|neo4j|mongodb` plus
+the matching connection properties) for the old self-contained-default convenience, but it's never
+auto-applied or cached -- swapping the persisted backend is still configuration, not code, it's just an
+explicit argument now rather than a separate setter call.
 
 ## Why MongoDB is a Spring Data MongoDB shim, not a Hibernate one
 
@@ -60,21 +65,22 @@ See `javai-persistence/README.md`'s "MongoDB backend" section for the full mappi
 
 There is no dual-write `save()` -- an entity type persisted to two backends simultaneously means two
 independently-created repository proxies, one per backend, each permanently bound to whichever
-`JavAIPersistenceConfig` was active when `JavAIPI.repository(...)` created it:
+`JavAIPersistenceConfig` was passed to the `JavAIPI.repository(...)` call that created it:
 
 ```java
-JavAIPI.configurePersistence(JavAIPersistenceConfig.builder().backend(Backend.POSTGRES)./* ... */.build());
-ArticleRepository postgresRepo = JavAIPI.repository(ArticleRepository.class);
+JavAIPersistenceConfig postgresConfig = JavAIPersistenceConfig.builder().backend(Backend.POSTGRES)./* ... */.build();
+ArticleRepository postgresRepo = JavAIPI.repository(ArticleRepository.class, postgresConfig);
 
-JavAIPI.configurePersistence(JavAIPersistenceConfig.builder().backend(Backend.MONGODB)./* ... */.build());
-ArticleRepository mongoRepo = JavAIPI.repository(ArticleRepository.class);
+JavAIPersistenceConfig mongoConfig = JavAIPersistenceConfig.builder().backend(Backend.MONGODB)./* ... */.build();
+ArticleRepository mongoRepo = JavAIPI.repository(ArticleRepository.class, mongoConfig);
 
 postgresRepo.save(article); // writes to Postgres only
 mongoRepo.save(article);    // writes to MongoDB only -- the caller owns cross-store consistency
 ```
 
-Both proxies stay independently usable afterward regardless of which config is currently active -- a
-proxy's backend binding is fixed at creation time, not re-resolved on each call.
+Both proxies stay independently usable regardless of what other `repository(...)` calls happen afterward --
+a proxy's backend binding is fixed at creation time from the config argument given to it, not re-resolved on
+each call, and there is no shared ambient state either proxy could be affected by.
 
 ## Embedding-model versioning: expand/contract migration
 
