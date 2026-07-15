@@ -34,7 +34,7 @@ final class TaggingReflection {
                 }
             }
         }
-        throw new IllegalArgumentException(type + " has no @jakarta.persistence.Id field -- JavAITagging requires "
+        throw new IllegalArgumentException(type + " has no @jakarta.persistence.Id field -- JavAITagRepository requires "
                 + "every taggable instance to have one, matching JavAIRepository's own identity convention.");
     }
 }

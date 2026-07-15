@@ -7,16 +7,16 @@ import dev.xtrafe.javai.e2e.domain.Comment;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.fixtures.ArticleFixtures;
-import dev.xtrafe.javai.e2e.tagging.TagRepository;
-import dev.xtrafe.javai.e2e.tagging.TagSetRepository;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import dev.xtrafe.javai.model.JavAILinkedHashSet;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.tagging.ClassificationResult;
-import dev.xtrafe.javai.tagging.JavAITagging;
+import dev.xtrafe.javai.tagging.JavAITagRepository;
 import dev.xtrafe.javai.tagging.Tag;
+import dev.xtrafe.javai.tagging.TagRepository;
 import dev.xtrafe.javai.tagging.TagSet;
+import dev.xtrafe.javai.tagging.TagSetRepository;
 import dev.xtrafe.javai.tagging.TaggableRef;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.BeforeAll;
@@ -41,12 +41,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * real, already-populated multi-entity-type domain, real semantic embeddings, and a real LLM, none of which
  * that module's own tests exercise.
  *
- * <p>Organized in per-backend sections, matching {@link PersistenceE2ETest}'s own convention -- except each
- * tagging test method calls its own backend's {@code JavAIEnvironment.activateXxxTagging()} first: unlike
- * an {@code ArticleRepository} proxy (permanently bound to one backend at creation time), {@code
- * JavAITagging}'s own static facade always resolves against whichever backend was <em>most recently</em>
- * activated, so every method is self-contained regardless of what ran before it in the same JVM (see {@code
- * JavAIEnvironment}'s own javadoc for why).
+ * <p>Organized in per-backend sections, matching {@link PersistenceE2ETest}'s own convention -- each tagging
+ * test method pulls its own backend's permanently-bound {@link JavAITagRepository} off
+ * {@code JavAIEnvironment} (e.g. {@code JavAIEnvironment.postgresTagging()}), the same way it already pulls
+ * an {@code ArticleRepository}. No ambient "current backend" to switch: unlike the old static-facade design
+ * this replaced, each {@code JavAITagRepository} instance is independently and permanently bound to one
+ * backend from construction, so nothing here depends on test execution order.
  *
  * <p>Tag/TagSet content deliberately reuses real, already-proven-distinct real-world topics ({@code
  * ArticleFixtures}' own Cybersecurity/Cooking/Sports/Space, plus the same "zero-day"/"pasta"/"championship"
@@ -123,7 +123,7 @@ class TaggingE2ETest {
 
     @Test
     void postgresAddTagThenTagsOfRoundTripsOnArticleAndComment() {
-        JavAIEnvironment.activatePostgresTagging();
+        JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet tagSet = postgresTagSets.save(new TagSet("postgres-roundtrip"));
         Tag urgent = postgresTags.save(new Tag(tagSet, "en", "Urgent"));
         Tag reviewed = postgresTags.save(new Tag(tagSet, "en", "Reviewed"));
@@ -131,32 +131,32 @@ class TaggingE2ETest {
         Article article = postgresArticles.save(new Article("Postgres tag round-trip article", "Body text."));
         Comment comment = postgresComments.save(new Comment("alice", "Postgres tag round-trip comment."));
 
-        JavAITagging.addTag(article, urgent);
-        JavAITagging.addTag(comment, urgent, 0.8);
+        tagging.addTag(article, urgent);
+        tagging.addTag(comment, urgent, 0.8);
 
-        assertTrue(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent));
-        assertFalse(JavAITagging.hasTag(article, reviewed));
+        assertTrue(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent));
+        assertFalse(tagging.hasTag(article, reviewed));
 
-        // tagsOf(...) already returns a JavAIArrayList<Tag> under the hood (JavAITagging's own return type);
+        // tagsOf(...) already returns a JavAIArrayList<Tag> under the hood (JavAITagRepository's own return type);
         // re-keying it by slug into a JavAILinkedHashMap here composes a second concrete JavAI collection
         // type on top of that result, the same way this project's other collection-type tests do with
         // Comment values instead of Tag values (see CollectionTypesE2ETest).
         JavAILinkedHashMap<String, Tag> bySlug = new JavAILinkedHashMap<>();
-        for (Tag tag : JavAITagging.tagsOf(article)) {
+        for (Tag tag : tagging.tagsOf(article)) {
             bySlug.put(tag.getSlug(), tag);
         }
         assertEquals(1, bySlug.size());
         assertTrue(bySlug.containsKey("urgent"));
 
-        JavAITagging.removeTag(article, urgent);
-        assertFalse(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
+        tagging.removeTag(article, urgent);
+        assertFalse(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
     }
 
     @Test
     void postgresTaggedWithFindsHomogeneousArticleSet() {
-        JavAIEnvironment.activatePostgresTagging();
+        JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet tagSet = postgresTagSets.save(new TagSet("postgres-homogeneous"));
         Tag featured = postgresTags.save(new Tag(tagSet, "en", "Featured"));
 
@@ -164,10 +164,10 @@ class TaggingE2ETest {
         Article second = postgresArticles.save(new Article("Postgres homogeneous second", "Body."));
         Article untagged = postgresArticles.save(new Article("Postgres homogeneous untagged", "Body."));
 
-        JavAITagging.addTag(first, featured);
-        JavAITagging.addTag(second, featured);
+        tagging.addTag(first, featured);
+        tagging.addTag(second, featured);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(featured, List.of(Article.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(featured, List.of(Article.class));
         assertEquals(2, refs.size());
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(first.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(second.getId())));
@@ -176,7 +176,7 @@ class TaggingE2ETest {
 
     @Test
     void postgresTaggedWithFindsHeterogeneousArticleAndCommentSet() {
-        JavAIEnvironment.activatePostgresTagging();
+        JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet tagSet = postgresTagSets.save(new TagSet("postgres-heterogeneous"));
         Tag shared = postgresTags.save(new Tag(tagSet, "en", "Shared"));
 
@@ -184,10 +184,10 @@ class TaggingE2ETest {
         Comment comment = postgresComments.save(new Comment("bob", "Postgres heterogeneous comment."));
         Article untaggedArticle = postgresArticles.save(new Article("Postgres heterogeneous untagged", "Body."));
 
-        JavAITagging.addTag(article, shared);
-        JavAITagging.addTag(comment, shared);
+        tagging.addTag(article, shared);
+        tagging.addTag(comment, shared);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(shared, List.of(Article.class, Comment.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(shared, List.of(Article.class, Comment.class));
         assertEquals(2, refs.size(), "one Article and one Comment sharing a tag must both come back from one query");
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(article.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(comment.getId())));
@@ -196,7 +196,7 @@ class TaggingE2ETest {
 
     @Test
     void postgresTagSimilarityIndexRanksByTagSummaryVectorAndComposesWithJavaiLinkedHashSet() {
-        JavAIEnvironment.activatePostgresTagging();
+        JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet tagSet = postgresTagSets.save(new TagSet("postgres-similarity"));
         Tag cybersecurity = postgresTags.save(new Tag(tagSet, "en", "Cybersecurity and hacking"));
         Tag cooking = postgresTags.save(new Tag(tagSet, "en", "Home cooking and recipes"));
@@ -205,11 +205,11 @@ class TaggingE2ETest {
         Article securityArticle = postgresArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.CYBERSECURITY));
         Article cookingArticle = postgresArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.COOKING));
 
-        JavAITagging.addTag(securityArticle, cybersecurity);
-        JavAITagging.addTag(cookingArticle, cooking);
+        tagging.addTag(securityArticle, cybersecurity);
+        tagging.addTag(cookingArticle, cooking);
 
         EmbeddingVector reference = ((JavAIVectorizable) cybersecurity).summaryVector();
-        VectorIndex<TaggableRef> index = JavAITagging.tagSimilarityIndex();
+        VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();
 
         JavAIList<TaggableRef> nearest = index.nearestN(reference, 1);
         assertEquals(1, nearest.size());
@@ -232,7 +232,7 @@ class TaggingE2ETest {
 
     @Test
     void neo4jAddTagThenTagsOfRoundTripsOnArticleAndComment() {
-        JavAIEnvironment.activateNeo4jTagging();
+        JavAITagRepository tagging = JavAIEnvironment.neo4jTagging();
         TagSet tagSet = neo4jTagSets.save(new TagSet("neo4j-roundtrip"));
         Tag urgent = neo4jTags.save(new Tag(tagSet, "en", "Urgent"));
         Tag reviewed = neo4jTags.save(new Tag(tagSet, "en", "Reviewed"));
@@ -240,28 +240,28 @@ class TaggingE2ETest {
         Article article = neo4jArticles.save(new Article("Neo4j tag round-trip article", "Body text."));
         Comment comment = neo4jComments.save(new Comment("carol", "Neo4j tag round-trip comment."));
 
-        JavAITagging.addTag(article, urgent);
-        JavAITagging.addTag(comment, urgent, 0.8);
+        tagging.addTag(article, urgent);
+        tagging.addTag(comment, urgent, 0.8);
 
-        assertTrue(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent));
-        assertFalse(JavAITagging.hasTag(article, reviewed));
+        assertTrue(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent));
+        assertFalse(tagging.hasTag(article, reviewed));
 
         JavAILinkedHashMap<String, Tag> bySlug = new JavAILinkedHashMap<>();
-        for (Tag tag : JavAITagging.tagsOf(article)) {
+        for (Tag tag : tagging.tagsOf(article)) {
             bySlug.put(tag.getSlug(), tag);
         }
         assertEquals(1, bySlug.size());
         assertTrue(bySlug.containsKey("urgent"));
 
-        JavAITagging.removeTag(article, urgent);
-        assertFalse(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
+        tagging.removeTag(article, urgent);
+        assertFalse(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
     }
 
     @Test
     void neo4jTaggedWithFindsHomogeneousArticleSet() {
-        JavAIEnvironment.activateNeo4jTagging();
+        JavAITagRepository tagging = JavAIEnvironment.neo4jTagging();
         TagSet tagSet = neo4jTagSets.save(new TagSet("neo4j-homogeneous"));
         Tag featured = neo4jTags.save(new Tag(tagSet, "en", "Featured"));
 
@@ -269,10 +269,10 @@ class TaggingE2ETest {
         Article second = neo4jArticles.save(new Article("Neo4j homogeneous second", "Body."));
         Article untagged = neo4jArticles.save(new Article("Neo4j homogeneous untagged", "Body."));
 
-        JavAITagging.addTag(first, featured);
-        JavAITagging.addTag(second, featured);
+        tagging.addTag(first, featured);
+        tagging.addTag(second, featured);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(featured, List.of(Article.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(featured, List.of(Article.class));
         assertEquals(2, refs.size());
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(first.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(second.getId())));
@@ -281,7 +281,7 @@ class TaggingE2ETest {
 
     @Test
     void neo4jTaggedWithFindsHeterogeneousArticleAndCommentSet() {
-        JavAIEnvironment.activateNeo4jTagging();
+        JavAITagRepository tagging = JavAIEnvironment.neo4jTagging();
         TagSet tagSet = neo4jTagSets.save(new TagSet("neo4j-heterogeneous"));
         Tag shared = neo4jTags.save(new Tag(tagSet, "en", "Shared"));
 
@@ -289,10 +289,10 @@ class TaggingE2ETest {
         Comment comment = neo4jComments.save(new Comment("dave", "Neo4j heterogeneous comment."));
         Article untaggedArticle = neo4jArticles.save(new Article("Neo4j heterogeneous untagged", "Body."));
 
-        JavAITagging.addTag(article, shared);
-        JavAITagging.addTag(comment, shared);
+        tagging.addTag(article, shared);
+        tagging.addTag(comment, shared);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(shared, List.of(Article.class, Comment.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(shared, List.of(Article.class, Comment.class));
         assertEquals(2, refs.size(), "one Article and one Comment sharing a tag must both come back from one query");
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(article.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(comment.getId())));
@@ -301,7 +301,7 @@ class TaggingE2ETest {
 
     @Test
     void neo4jTagSimilarityIndexRanksByTagSummaryVectorAndComposesWithJavaiLinkedHashSet() {
-        JavAIEnvironment.activateNeo4jTagging();
+        JavAITagRepository tagging = JavAIEnvironment.neo4jTagging();
         TagSet tagSet = neo4jTagSets.save(new TagSet("neo4j-similarity"));
         Tag cybersecurity = neo4jTags.save(new Tag(tagSet, "en", "Cybersecurity and hacking"));
         Tag cooking = neo4jTags.save(new Tag(tagSet, "en", "Home cooking and recipes"));
@@ -310,11 +310,11 @@ class TaggingE2ETest {
         Article securityArticle = neo4jArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.CYBERSECURITY));
         Article cookingArticle = neo4jArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.COOKING));
 
-        JavAITagging.addTag(securityArticle, cybersecurity);
-        JavAITagging.addTag(cookingArticle, cooking);
+        tagging.addTag(securityArticle, cybersecurity);
+        tagging.addTag(cookingArticle, cooking);
 
         EmbeddingVector reference = ((JavAIVectorizable) cybersecurity).summaryVector();
-        VectorIndex<TaggableRef> index = JavAITagging.tagSimilarityIndex();
+        VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();
 
         JavAIList<TaggableRef> nearest = index.nearestN(reference, 1);
         assertEquals(1, nearest.size());
@@ -332,7 +332,7 @@ class TaggingE2ETest {
 
     @Test
     void mongoAddTagThenTagsOfRoundTripsOnArticleAndComment() {
-        JavAIEnvironment.activateMongoTagging();
+        JavAITagRepository tagging = JavAIEnvironment.mongoTagging();
         TagSet tagSet = mongoTagSets.save(new TagSet("mongo-roundtrip"));
         Tag urgent = mongoTags.save(new Tag(tagSet, "en", "Urgent"));
         Tag reviewed = mongoTags.save(new Tag(tagSet, "en", "Reviewed"));
@@ -340,28 +340,28 @@ class TaggingE2ETest {
         Article article = mongoArticles.save(new Article("Mongo tag round-trip article", "Body text."));
         Comment comment = mongoComments.save(new Comment("erin", "Mongo tag round-trip comment."));
 
-        JavAITagging.addTag(article, urgent);
-        JavAITagging.addTag(comment, urgent, 0.8);
+        tagging.addTag(article, urgent);
+        tagging.addTag(comment, urgent, 0.8);
 
-        assertTrue(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent));
-        assertFalse(JavAITagging.hasTag(article, reviewed));
+        assertTrue(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent));
+        assertFalse(tagging.hasTag(article, reviewed));
 
         JavAILinkedHashMap<String, Tag> bySlug = new JavAILinkedHashMap<>();
-        for (Tag tag : JavAITagging.tagsOf(article)) {
+        for (Tag tag : tagging.tagsOf(article)) {
             bySlug.put(tag.getSlug(), tag);
         }
         assertEquals(1, bySlug.size());
         assertTrue(bySlug.containsKey("urgent"));
 
-        JavAITagging.removeTag(article, urgent);
-        assertFalse(JavAITagging.hasTag(article, urgent));
-        assertTrue(JavAITagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
+        tagging.removeTag(article, urgent);
+        assertFalse(tagging.hasTag(article, urgent));
+        assertTrue(tagging.hasTag(comment, urgent), "removing the article's own tag must not affect the comment's");
     }
 
     @Test
     void mongoTaggedWithFindsHomogeneousArticleSet() {
-        JavAIEnvironment.activateMongoTagging();
+        JavAITagRepository tagging = JavAIEnvironment.mongoTagging();
         TagSet tagSet = mongoTagSets.save(new TagSet("mongo-homogeneous"));
         Tag featured = mongoTags.save(new Tag(tagSet, "en", "Featured"));
 
@@ -369,10 +369,10 @@ class TaggingE2ETest {
         Article second = mongoArticles.save(new Article("Mongo homogeneous second", "Body."));
         Article untagged = mongoArticles.save(new Article("Mongo homogeneous untagged", "Body."));
 
-        JavAITagging.addTag(first, featured);
-        JavAITagging.addTag(second, featured);
+        tagging.addTag(first, featured);
+        tagging.addTag(second, featured);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(featured, List.of(Article.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(featured, List.of(Article.class));
         assertEquals(2, refs.size());
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(first.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(second.getId())));
@@ -381,7 +381,7 @@ class TaggingE2ETest {
 
     @Test
     void mongoTaggedWithFindsHeterogeneousArticleAndCommentSet() {
-        JavAIEnvironment.activateMongoTagging();
+        JavAITagRepository tagging = JavAIEnvironment.mongoTagging();
         TagSet tagSet = mongoTagSets.save(new TagSet("mongo-heterogeneous"));
         Tag shared = mongoTags.save(new Tag(tagSet, "en", "Shared"));
 
@@ -389,10 +389,10 @@ class TaggingE2ETest {
         Comment comment = mongoComments.save(new Comment("frank", "Mongo heterogeneous comment."));
         Article untaggedArticle = mongoArticles.save(new Article("Mongo heterogeneous untagged", "Body."));
 
-        JavAITagging.addTag(article, shared);
-        JavAITagging.addTag(comment, shared);
+        tagging.addTag(article, shared);
+        tagging.addTag(comment, shared);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(shared, List.of(Article.class, Comment.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(shared, List.of(Article.class, Comment.class));
         assertEquals(2, refs.size(), "one Article and one Comment sharing a tag must both come back from one query");
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(article.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(comment.getId())));
@@ -401,7 +401,7 @@ class TaggingE2ETest {
 
     @Test
     void mongoTagSimilarityIndexRanksByTagSummaryVectorAndComposesWithJavaiLinkedHashSet() {
-        JavAIEnvironment.activateMongoTagging();
+        JavAITagRepository tagging = JavAIEnvironment.mongoTagging();
         TagSet tagSet = mongoTagSets.save(new TagSet("mongo-similarity"));
         Tag cybersecurity = mongoTags.save(new Tag(tagSet, "en", "Cybersecurity and hacking"));
         Tag cooking = mongoTags.save(new Tag(tagSet, "en", "Home cooking and recipes"));
@@ -410,11 +410,11 @@ class TaggingE2ETest {
         Article securityArticle = mongoArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.CYBERSECURITY));
         Article cookingArticle = mongoArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.COOKING));
 
-        JavAITagging.addTag(securityArticle, cybersecurity);
-        JavAITagging.addTag(cookingArticle, cooking);
+        tagging.addTag(securityArticle, cybersecurity);
+        tagging.addTag(cookingArticle, cooking);
 
         EmbeddingVector reference = ((JavAIVectorizable) cybersecurity).summaryVector();
-        VectorIndex<TaggableRef> index = JavAITagging.tagSimilarityIndex();
+        VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();
 
         TaggableRef securityRef = new TaggableRef(Article.class.getName(), securityArticle.getId());
         JavAIList<TaggableRef> nearest = awaitContainsRef(() -> index.nearestN(reference, 1), securityRef);
@@ -443,7 +443,7 @@ class TaggingE2ETest {
      */
     @Test
     void classifyAllAppliesCorrectRealWorldTopicTagsUsingTheRealCortex() {
-        JavAIEnvironment.activatePostgresTagging();
+        JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet topics = postgresTagSets.save(new TagSet("real-classification-topics"));
         postgresTags.save(new Tag(topics, "en", "Cybersecurity"));
         postgresTags.save(new Tag(topics, "en", "Cooking"));
@@ -455,7 +455,7 @@ class TaggingE2ETest {
         Article cookingArticle = postgresArticles.save(findByTopic(fixtures, ArticleFixtures.Topic.COOKING));
 
         List<ClassificationResult> results =
-                JavAITagging.classifyAll(List.of(securityArticle, cookingArticle), topics);
+                tagging.classifyAll(List.of(securityArticle, cookingArticle), topics);
         assertEquals(2, results.size());
 
         ClassificationResult securityResult = results.stream()
@@ -473,9 +473,9 @@ class TaggingE2ETest {
         // classify()/classifyAll() persist through the exact same addTag() path the structural tests above
         // exercise directly -- so the result is independently confirmed via hasTag(), not just trusted from
         // the returned ClassificationResult.
-        Tag cybersecurityTag = JavAITagging.tagsOf(securityArticle).stream()
+        Tag cybersecurityTag = tagging.tagsOf(securityArticle).stream()
                 .filter(tag -> tag.getSlug().equals("cybersecurity"))
                 .findFirst().orElseThrow();
-        assertTrue(JavAITagging.hasTag(securityArticle, cybersecurityTag));
+        assertTrue(tagging.hasTag(securityArticle, cybersecurityTag));
     }
 }

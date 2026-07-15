@@ -12,10 +12,10 @@ alongside their ORM.
 
 | Element | Kind | Purpose |
 |---|---|---|
-| `JavAIPI` | Static facade | `repository(Class)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`; `configurePersistence(...)` overrides the self-contained default |
+| `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
 | `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()`, fixed to `UUID` identity |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Derived query convention | The *only* derived queries supported -- validated at repository-creation time, not on first call |
-| `JavAIPersistenceConfig` | Value object | Backend selection + connection settings, self-contained by default (`javai.persistence.*` system properties) but overridable with an externally-built `SessionFactory`/`Driver` |
+| `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
 | `javai_vectors__<model>` / `javai_summary_vectors__<model>` | Postgres tables, owned by this module, one pair per model | Per-field + combined vectors, and `summaryVector()`, respectively -- never the developer's own entity table |
 | `<field>Vector__<model>` / `vector__<model>` / `summaryVector__<model>` | Neo4j node properties, one set per model | Same idea as the Postgres tables, applied to a schemaless node instead |
 | `<field>Vector__<model>` / `vector__<model>` / `summaryVector__<model>` | MongoDB document fields, one set per model | Same idea again -- one collection per entity type, per-model-qualified field names within each document, not a physical collection per model |
@@ -72,7 +72,11 @@ interface ArticleRepository extends JavAIRepository<Article> {
     List<Article> findNearestByBodyVector(EmbeddingVector reference, int limit);
 }
 
-ArticleRepository repo = JavAIPI.repository(ArticleRepository.class);
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        .build();
+ArticleRepository repo = JavAIPI.repository(ArticleRepository.class, config);
 
 repo.save(article);   // auto-vectorized on write -- every @Vectorize/@Summary vector recomputed and persisted
 
@@ -85,11 +89,19 @@ repo.reindexAll();
 // Revert: one step, no reindexing --
 JavAIRuntime.configureEmbeddingProvider(oldProvider);
 
-// Swapping the persisted *backend* (not the model) is also configuration, not code:
-//   javai.persistence.backend=postgres   (default)
-//   javai.persistence.backend=neo4j
-//   javai.persistence.backend=mongodb
+// Swapping the persisted *backend* (not the model) is also configuration, not code -- just a different
+// JavAIPersistenceConfig.Backend value passed to repository(...); JavAIPersistenceConfig.fromSystemProperties()
+// reads javai.persistence.backend=postgres|neo4j|mongodb (plus the matching connection properties) if you
+// want that convenience instead of building the config by hand.
 ```
+
+**No ambient configuration.** `JavAIPI.repository(Class, JavAIPersistenceConfig)` takes its config
+explicitly, every call -- there is no `configurePersistence(...)`-style static setter and no "current
+config" pointer to race or accidentally leave pointed at the wrong backend for an unrelated later call.
+Reuse the *same* `JavAIPersistenceConfig` instance across every `repository(...)` call meant to share one
+backend connection/pool: `JavAIPersistenceConfig` has no `equals()`/`hashCode()` override, so the internal
+per-config backend cache is keyed by reference identity -- a fresh `.builder()...build()` call with
+identical field values on every invocation would silently multiply backends instead of sharing one.
 
 `<Field>` in `findNearestBy<Field>Vector` names the same accessor the weaver already synthesizes in memory
 (`bodyVector()` -> `findNearestByBodyVector`), not the bare field name -- deliberately the same name a

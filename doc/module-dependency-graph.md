@@ -36,7 +36,7 @@ module (`javai-model`) is the physical home for pieces of three different concep
                                           +--------+--------+
                                                    v
                                             javai-tagging
-                                (Tag/TagSet/Tagging, JavAITagging --
+                                (Tag/TagSet/Tagging, JavAITagRepository --
                                  depends on javai-collections AND
                                  javai-persistence AND javai-completion,
                                  plus javai-substrate directly to weave

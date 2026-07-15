@@ -43,8 +43,23 @@ isn't the Phase 0 path.
 | `Tag` | Class (`@JavAIVectorizable @Taggable`) | Slug (vectorized identity), localized display strings (not vectorized), optional description (not vectorized, classifier context only), owning TagSet |
 | `TagSet` | Class (`@JavAIVectorizable`) | A dynamic, persisted collection of Tags — not a compile-time enum. Its own `summaryVector()` is a free, decay-weighted aggregate over its member tags |
 | `Tagging` | Persisted association row | Tag + taggable type/UUID + optional affinity + source (manual/auto) — the join table |
-| `JavAITagging` | Static facade | `addTag`/`removeTag`/`hasTag`/`tagsOf`/`taggedWith`, classification entry points, tag-similarity index access — the `JavAIPI` of this area |
+| `JavAITagRepository` | Instance wrapper (not a static facade) | `addTag`/`removeTag`/`hasTag`/`tagsOf`/`taggedWith`, classification entry points, tag-similarity index access — wraps an already-realized `TagRepository`; one instance per backend, no ambient/global tagging state anywhere |
 | `TaggableRef` | Value type | `(taggableType, taggableId)` — the heterogeneous handle used everywhere a tagged instance is referenced without loading it |
+
+## No global tagging state
+
+`JavAITagRepository` is a plain object, not a static facade -- every field (the wrapped `TagRepository`
+delegate, the resolved per-backend `TaggingBackend`, an optional `Cortex` for classification) is set once,
+at construction, from arguments the caller supplies explicitly. There is no ambient "current backend"
+pointer anywhere for one caller's configuration to silently affect another's.
+
+**Multiple `JavAITagRepository` instances, one per backend/data store, coexist freely** — construct one per
+`JavAIPersistenceConfig` you want tagging maintained against, mirroring the same "two independent proxies,
+no dual-write" posture `javai-persistence` documents for ordinary multi-backend persistence (see
+doc/spec/persistence-bridge.md's own "Persisting one entity type to more than one store at once"). This
+module makes **no attempt to keep tag sets in different backends synchronized with each other** — if an
+application maintains the same taxonomy in two stores, reconciling them is entirely its own responsibility;
+nothing here tries.
 
 ## `@Taggable` and `Taggable`, in full
 
@@ -72,10 +87,11 @@ public class Employee implements Taggable {
 ```
 
 An object is `@Taggable` the same way it's `@JavAIGraphNode`: annotate it, and hand-implement the marker
-interface for type-safe generic use elsewhere (`JavAITagging.taggedWith(Tag, List<Class<? extends
+interface for type-safe generic use elsewhere (`JavAITagRepository.taggedWith(Tag, List<Class<? extends
 Taggable>>)`, etc.). Neither the annotation nor the interface synthesizes any behavior on the class itself
-— there is no `addTag()` method on `Employee`. All tagging operations go through `JavAITagging`, the same
-way persisted state goes through a `JavAIRepository` rather than living as synthesized instance methods.
+— there is no `addTag()` method on `Employee`. All tagging operations go through a `JavAITagRepository`
+instance, the same way persisted state goes through a `JavAIRepository` rather than living as synthesized
+instance methods.
 
 ## `Tag` and `TagSet`
 
@@ -212,19 +228,22 @@ Client-developer-invoked, never automatically triggered by TagSet mutation. Addi
 a TagSet does not, by itself, re-run classification against every instance previously classified against
 that set — the cost of that (an LLM call per already-tagged instance, potentially a very large fan-out from
 a single edit) belongs to whoever owns that tradeoff, not to a side effect the library imposes silently.
-Instead, `JavAITagging` exposes classification as an easy, explicit call the client makes when it decides
-the moment is right:
+Instead, a `JavAITagRepository` instance exposes classification as an easy, explicit call the client makes
+when it decides the moment is right:
 
 ```java
-public final class JavAITagging {
+public final class JavAITagRepository {
     // Single instance, single TagSet -- the unit classification runs at.
-    static ClassificationResult classify(Object instance, TagSet tagSet);
+    public ClassificationResult classify(Object instance, TagSet tagSet);
 
     // Convenience batch form -- still one LLM call per instance internally,
     // not a fan-out the caller has to hand-loop themselves.
-    static List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet);
+    public List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet);
 }
 ```
+
+Instance methods, not static ones -- classification needs a `Cortex`, supplied at construction
+(`new JavAITagRepository(tagRepository, config, cortex)`), never through an ambient "current Cortex" pointer.
 
 One TagSet per classification call — an object carrying tags from several TagSets is classified against
 each set independently, mirroring the sibling implementation's own one-call-per-category shape rather than
@@ -243,7 +262,7 @@ classifier is free to say "this applies" without a strength score.
 `JavAIRepository` deliberately rejects any derived query beyond `findNearestBy<Field>Vector` — it is not a
 general query framework, on purpose. Tag lookups ("every tag on this instance," "every instance across
 these types carrying this tag") are exactly the shape of query that contract was built to exclude, so they
-live on `JavAITagging` instead, as their own, genuinely heterogeneous surface:
+live on a `JavAITagRepository` instance instead, as their own, genuinely heterogeneous surface:
 
 ```java
 JavAIList<Tag> tagsOf(Object instance);
@@ -275,7 +294,7 @@ exactly that, over `TaggableRef` instead of a single entity type:
 public record TaggableRef(String taggableType, UUID taggableId) {
 }
 
-VectorIndex<TaggableRef> index = JavAITagging.tagSimilarityIndex();
+VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();  // tagging: a JavAITagRepository instance
 
 JavAIList<TaggableRef> similar = index.nearestN(referenceVector, 20);
 ```
@@ -283,8 +302,8 @@ JavAIList<TaggableRef> similar = index.nearestN(referenceVector, 20);
 No new collection interface — `nearestN`/`filterByMinSimilarity` (from `JavAISortable`, which `VectorIndex`
 already extends) are exactly the query shape needed. What's new is *how this particular `VectorIndex` is
 populated*: not by the caller's own `add()`/`remove()` calls the way an ordinary in-memory `VectorIndex` is
-built, but automatically, as a side effect of `JavAITagging.addTag()`/`removeTag()` — this realization is
-persistence-backed, maintained by the library itself, read-mostly from the caller's perspective. See
+built, but automatically, as a side effect of `JavAITagRepository.addTag()`/`removeTag()` — this realization
+is persistence-backed, maintained by the library itself, read-mostly from the caller's perspective. See
 "Tag-summary vector index" below for what backs it.
 
 For an ad hoc collection of tags rather than a single reference vector (the original form of this

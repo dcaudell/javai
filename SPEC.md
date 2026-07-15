@@ -189,11 +189,66 @@ by `SupervisionWeavingTest` — PRE/POST/EXCEPTION, sync veto and rewrite rights
 that can't block or mutate the call, and two JVM-imposed asymmetries between methods and constructors
 discovered (not assumed) while building it; see that module's own README for the full detail. `javai-tagging`
 (Tagging) also has a real, tested implementation now: `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`
-against all three persistence backends, LLM-based classification via `JavAITagging.classify`/`classifyAll`
-(a `Cortex`-backed diff against `source = "auto"` associations), and the tag-summary-vector
+against all three persistence backends, LLM-based classification via `JavAITagRepository.classify`/
+`classifyAll` (a `Cortex`-backed diff against `source = "auto"` associations), and the tag-summary-vector
 `VectorIndex<TaggableRef>` (`tagSimilarityIndex()`) — the first module to ship its own pre-woven
 `@JavAIVectorizable` classes inside its own jar, which required adding real build-time (Maven-plugin)
-weaving to `javai-substrate` as a prerequisite (see that module's own README). Don't assume anything beyond
-what's in a given module's actual source and tests reflects working code; check that module's README before
-relying on a claim from this file, `doc/spec/`, or the whitepaper, all three of which describe the design
-and may be ahead of or behind any one module's real implementation state at a given moment.
+weaving to `javai-substrate` as a prerequisite (see that module's own README). `JavAITagRepository` is an
+instance wrapper, not a static facade — see "Coding standard: static/global scope is the exception" below,
+which this module (alongside `javai-persistence`'s own `JavAIPI.repository(Class, JavAIPersistenceConfig)`)
+is the reference example for. Don't assume anything beyond what's in a given module's actual source and
+tests reflects working code; check that module's README before relying on a claim from this file,
+`doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
+module's real implementation state at a given moment.
+
+## Coding standard: static/global scope is the exception, not the default
+
+A recurring anti-pattern surfaced and was removed from this codebase: a `final` class exposing only
+`public static` methods over `private static` mutable state, configured via a `configureXxx(...)`-style
+setter that every other static method implicitly reads. `JavAIPI` used to work this way
+(`configurePersistence(...)` set an ambient "current config" `repository(Class)` read); `javai-tagging`'s
+`JavAITagging` used to work this way too (a `configureTagging(...)`/`configureClassification(...)` pair
+feeding every other static method). Both were replaced: `JavAIPI.repository(Class, JavAIPersistenceConfig)`
+now takes its config as an explicit argument, and `JavAITagging` was deleted outright in favor of
+`JavAITagRepository`, a plain instance constructed from its dependencies.
+
+**The problem with the removed shape**: an ambient "configure once, read anywhere" pointer means any two
+unrelated call sites in the same process can interfere with each other's configuration, the order code runs
+in becomes load-bearing in ways that aren't visible at any single call site, and there is no way to have two
+independently-configured instances of the same capability coexist (e.g. tagging against two different
+backends at once) without inventing an escape hatch (this codebase's own now-removed
+`activatePostgresTagging()`-style methods in `e2e-client-test` were exactly that escape hatch, made
+unnecessary once the underlying facade stopped needing one).
+
+**The standard going forward**: prefer instance-scoped state, constructed explicitly and passed as a
+constructor or method argument, over static/global mutable state. This applies repo-wide, not just to the
+two classes above.
+
+**The one sanctioned exception**: `JavAIRuntime`'s embedding-provider/consistency-mode/concurrency-gate
+configuration (`javai-model`) stays a static, process-wide concern — it is the "most basic vector provider /
+runtime concern" this project treats as a deliberate carve-out, since every `@JavAIVectorizable` object in
+the process needs to resolve the same embedding provider without threading a dependency through every woven
+setter by hand. A narrow additional allow-list, each independently justified in its own module's docs, not
+silently exempted:
+- `EndpointRateLimiter` (`javai-vector`, shared with `javai-completion`) — a static, cross-instance/
+  cross-module registry keyed by endpoint URL, deliberately: two independently-constructed providers hitting
+  the same base URL must share 429-backoff state, or a per-instance rate limiter would defeat the entire
+  point. See `javai-vector/README.md` and `doc/spec/vector-core.md`/`doc/spec/completion-fabric.md`'s own
+  "Rate limiting" sections.
+- `DirtyTrackingSupport`'s sequence-number generator (`javai-vector`) — one `AtomicLong`, no configure-style
+  API at all, needed for a deadlock-free global lock-acquisition order in the persistence-flush
+  subgraph-locking scheme.
+- Bytecode-weaver installation (`JavAIWeaver`/`SupervisionWeaver`, `javai-substrate`/`javai-supervision`) —
+  inherently JVM/classloader-global; there is no meaningful "instance" of an installed
+  `Instrumentation`-based transformer to hold instead.
+- `MonolithicContainer`'s idempotent-startup flag (`e2e-client-test`) — coordinates a real, singular
+  OS-level Docker container, not conceptually instance/session state; test infrastructure, not library
+  design.
+
+**Known, tracked debt, not yet fixed**: `JavAISupervisionRuntime` (`javai-supervision`) has the same static-
+facade-over-mutable-state shape (`SYNC_LISTENERS`/`ASYNC_LISTENERS` plus `register*`/`unregister*` statics)
+as the two classes fixed above, and is *not* one of the sanctioned exceptions — it's flagged for a future
+refactoring pass, not fixed here, because its dispatch entry points are called directly from ByteBuddy-woven
+advice with no current path to an instance; removing the static there needs its own design (e.g. a
+thread-local or classloader-scoped registry resolution strategy) rather than the same "just take the
+dependency as a constructor argument" fix that worked for `JavAIPI`/`JavAITagging`.

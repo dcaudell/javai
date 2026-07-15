@@ -9,6 +9,7 @@ import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.persistence.JavAIRepository;
 import dev.xtrafe.javai.vector.EmbeddingVector;
@@ -28,93 +29,108 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 /**
- * The static facade for tagging -- the {@code JavAIPI} of this area. Structural queries/mutations
- * (this class) plus classification (see the {@code classify}/{@code classifyAll} methods) are the whole
- * public surface; there is no {@code addTag()} method synthesized onto a {@code @Taggable} class itself
- * (see {@code Taggable}'s own javadoc for why).
+ * Wraps an already-realized {@code JavAIRepository<Tag>} with the tagging-association surface (structural
+ * queries/mutations plus classification) that has no equivalent in {@code JavAIRepository}'s own CRUD
+ * contract -- the {@code JavAIPI} of this area, but an ordinary instance, not a static facade. Every field
+ * is set once, at construction, from arguments the caller supplies explicitly: no ambient "current backend"
+ * pointer to switch, race, or accidentally leave misconfigured for a later, unrelated caller.
  *
- * <p><b>Configuration reuses {@code JavAIPersistenceConfig}</b> rather than inventing a parallel config
- * type -- Tagging is persisted data like any other JavAI entity (see {@link Tag}'s own javadoc), so the
- * same backend/connection settings apply. {@link #configureTagging} additionally takes a
- * {@code JavAIRepository<Tag>} the caller already created via {@code JavAIPI.repository(...)}: resolving a
- * {@link Tag} by id for {@link #tagsOf} reuses that repository's own {@code findById}, rather than this
- * module reverse-engineering Hibernate's column layout (or duplicating a second, redundant connection to
- * read data {@code javai-persistence} already knows how to read). This deliberately does *not* call
- * {@code JavAIPI.configurePersistence(...)} as a side effect -- doing so would silently change which
- * backend a *later*, unrelated {@code JavAIPI.repository(...)} call resolves against, since that class's
- * own "current config" is a single ambient pointer with no way to read back non-destructively from outside
- * its own package.
+ * <p><b>Multiple instances, one per backend/data store, coexist freely</b> -- construct one
+ * {@code JavAITagRepository} per {@link JavAIPersistenceConfig} you want tagging maintained against, same
+ * "two independent proxies, no dual-write" posture {@code javai-persistence} itself documents for ordinary
+ * multi-backend persistence (see that module's README). This class makes **no attempt to keep tag sets in
+ * different stores synchronized with each other** -- if you maintain the same taxonomy in two backends, you
+ * own reconciling them; nothing here tries.
  *
- * <p>Like {@code JavAIPI}, a {@link JavAIPersistenceConfig} instance is the key: calling
- * {@link #configureTagging} again with a *different* config instance adds a second, independent backend
- * binding rather than replacing the first, and every method below resolves against whichever config was
- * passed to the *most recent* {@link #configureTagging} call -- mirroring the same "multi-store, no
- * dual-write" pattern {@code javai-persistence} itself already establishes (see
- * {@code javai-persistence/README.md}'s own multi-store section), just without a bound proxy object to
- * carry the binding, since these are plain static calls rather than a {@code JavAIRepository} realized once
- * via {@code Proxy}.
+ * <p>Deliberately does **not** implement {@code JavAIRepository<Tag>}: that interface's own contract is
+ * "realized via {@code JavAIPI.repository(Class, JavAIPersistenceConfig)}, never implemented by hand" (see
+ * its own javadoc), and folding CRUD (save/findById/findAll/deleteById/reindexAll) onto the same type as the
+ * association/classification surface would bloat one object with two genuinely separate responsibilities.
+ * A caller keeps its own {@link TagRepository} reference (the thing this class wraps as {@link #delegate})
+ * for plain {@link Tag} CRUD, and a {@code JavAITagRepository} alongside it for tagging operations --
+ * exactly mirroring how {@link TagSetRepository} stays a plain, unwrapped {@code JavAIRepository<TagSet>}
+ * with no wrapper of its own, since {@link TagSet} never participates in the association machinery either.
  */
-public final class JavAITagging {
+public final class JavAITagRepository {
 
-    private static volatile JavAIPersistenceConfig config;
-    private static volatile JavAIRepository<Tag> tagRepository;
-    private static volatile Cortex cortex;
+    // Pure memoization keyed by an explicit argument (identical shape to JavAIPI's own BACKENDS) -- not a
+    // reintroduction of ambient state. Without this, two instances built from the *same* config (e.g.
+    // create(config) called twice) would each open an independent physical connection/pool (a raw JDBC
+    // Connection, a Neo4j Driver, or a MongoClient -- see each TaggingBackend implementation's own
+    // constructor), a real resource cost with no correctness benefit.
     private static final Map<JavAIPersistenceConfig, TaggingBackend> BACKENDS = new ConcurrentHashMap<>();
     private static final Gson GSON = new Gson();
     private static final Type PARSED_TAGS_TYPE = new TypeToken<List<ParsedTag>>() { }.getType();
 
-    private JavAITagging() {
+    private final JavAIRepository<Tag> delegate;
+    private final TaggingBackend backend;
+    private final Cortex cortex; // nullable -- only classify()/classifyAll() need one
+
+    public JavAITagRepository(JavAIRepository<Tag> tagRepository, JavAIPersistenceConfig config) {
+        this(tagRepository, config, null);
     }
 
-    public static void configureTagging(JavAIPersistenceConfig config, JavAIRepository<Tag> tagRepository) {
-        JavAITagging.config = config;
-        JavAITagging.tagRepository = tagRepository;
+    /** {@code cortex} is constructor-only, not a settable mutator -- a caller using only the structural
+     *  surface (no classification) never needs one, and a {@code final} field set once at construction
+     *  removes any cross-thread-visibility question a later {@code configureClassification(...)}-style
+     *  mutator would otherwise raise. */
+    public JavAITagRepository(JavAIRepository<Tag> tagRepository, JavAIPersistenceConfig config, Cortex cortex) {
+        this.delegate = tagRepository;
+        this.backend = BACKENDS.computeIfAbsent(config, JavAITagRepository::backendFor);
+        this.cortex = cortex;
     }
 
-    /** Independent of {@link #configureTagging} -- a caller using only the structural surface (no
-     *  classification) never needs a {@link Cortex} configured at all. */
-    public static void configureClassification(Cortex cortex) {
-        JavAITagging.cortex = cortex;
+    /** Convenience factory: realizes its own {@link TagRepository} proxy via {@code JavAIPI.repository(...)}
+     *  internally. Builds a *new* proxy every call -- distinct from whatever {@code TagRepository} proxy a
+     *  caller may already hold for this same config -- consistent with {@code javai-persistence}'s own
+     *  "two independent proxies" posture; reuse the {@link #JavAITagRepository(JavAIRepository,
+     *  JavAIPersistenceConfig)} constructor directly if you already have a {@link TagRepository} to wrap. */
+    public static JavAITagRepository create(JavAIPersistenceConfig config) {
+        return new JavAITagRepository(JavAIPI.repository(TagRepository.class, config), config);
+    }
+
+    public static JavAITagRepository create(JavAIPersistenceConfig config, Cortex cortex) {
+        return new JavAITagRepository(JavAIPI.repository(TagRepository.class, config), config, cortex);
     }
 
     /** Every {@link Tag} currently applied to {@code instance}, across every {@link TagSet}. */
-    public static JavAIList<Tag> tagsOf(Object instance) {
+    public JavAIList<Tag> tagsOf(Object instance) {
         JavAIArrayList<Tag> tags = new JavAIArrayList<>();
-        for (UUID tagId : backend().tagIdsOf(refOf(instance))) {
-            tagRepository().findById(tagId).ifPresent(tags::add);
+        for (UUID tagId : backend.tagIdsOf(refOf(instance))) {
+            delegate.findById(tagId).ifPresent(tags::add);
         }
         return tags;
     }
 
     /** Every instance -- of any of {@code candidateTypes} -- currently tagged with {@code tag}. */
-    public static JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes) {
+    public JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes) {
         List<String> typeNames = candidateTypes.stream().map(Class::getName).toList();
         JavAIArrayList<TaggableRef> refs = new JavAIArrayList<>();
-        refs.addAll(backend().taggedWith(tag.getId(), typeNames));
+        refs.addAll(backend.taggedWith(tag.getId(), typeNames));
         return refs;
     }
 
     /** Binary "has the tag" -- affinity left {@code null}. */
-    public static void addTag(Object instance, Tag tag) {
+    public void addTag(Object instance, Tag tag) {
         TaggableRef ref = refOf(instance);
-        backend().addTag(ref, tag.getId(), null, Tagging.SOURCE_MANUAL);
+        backend.addTag(ref, tag.getId(), null, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
     }
 
-    public static void addTag(Object instance, Tag tag, double affinity) {
+    public void addTag(Object instance, Tag tag, double affinity) {
         TaggableRef ref = refOf(instance);
-        backend().addTag(ref, tag.getId(), affinity, Tagging.SOURCE_MANUAL);
+        backend.addTag(ref, tag.getId(), affinity, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
     }
 
-    public static void removeTag(Object instance, Tag tag) {
+    public void removeTag(Object instance, Tag tag) {
         TaggableRef ref = refOf(instance);
-        backend().removeTag(ref, tag.getId());
+        backend.removeTag(ref, tag.getId());
         recomputeTagSummaryVector(ref);
     }
 
-    public static boolean hasTag(Object instance, Tag tag) {
-        return backend().hasTag(refOf(instance), tag.getId());
+    public boolean hasTag(Object instance, Tag tag) {
+        return backend.hasTag(refOf(instance), tag.getId());
     }
 
     /**
@@ -123,8 +139,8 @@ public final class JavAITagging {
      * effect of {@link #addTag}/{@link #removeTag}/{@link #classify}; the returned index's own {@code add}/
      * {@code remove} refuse (see {@link TagSimilarityVectorIndex}'s own javadoc).
      */
-    public static VectorIndex<TaggableRef> tagSimilarityIndex() {
-        return new TagSimilarityVectorIndex(backend());
+    public VectorIndex<TaggableRef> tagSimilarityIndex() {
+        return new TagSimilarityVectorIndex(backend);
     }
 
     /**
@@ -141,8 +157,10 @@ public final class JavAITagging {
      * returns that isn't one of {@code tagSet}'s own candidates is silently ignored (the model hallucinated
      * a tag outside what it was shown -- not an error, just discarded). {@code source = "manual"} taggings
      * on the same instance, including ones for tags in this very set, are never read or touched.
+     *
+     * @throws IllegalStateException if this instance was constructed without a {@link Cortex}
      */
-    public static ClassificationResult classify(Object instance, TagSet tagSet) {
+    public ClassificationResult classify(Object instance, TagSet tagSet) {
         List<Tag> candidates = tagSet.getTags();
         String prompt = buildClassificationPrompt(ClassifierContext.marshal(instance), candidates);
         CompletionResult result = cortex().complete(CompletionRequest.builder().prompt(prompt).build());
@@ -159,7 +177,7 @@ public final class JavAITagging {
 
         TaggableRef ref = refOf(instance);
         Set<UUID> previousAutoIdsInThisSet = new HashSet<>();
-        for (TagAssociation association : backend().associationsOf(ref)) {
+        for (TagAssociation association : backend.associationsOf(ref)) {
             if (Tagging.SOURCE_AUTO.equals(association.source()) && candidateIds.contains(association.tagId())) {
                 previousAutoIdsInThisSet.add(association.tagId());
             }
@@ -173,12 +191,12 @@ public final class JavAITagging {
                 continue; // the model returned a slug outside tagSet's own candidates -- discarded, not an error
             }
             returnedIds.add(matched.getId());
-            backend().addTag(ref, matched.getId(), parsedTag.affinity(), Tagging.SOURCE_AUTO);
+            backend.addTag(ref, matched.getId(), parsedTag.affinity(), Tagging.SOURCE_AUTO);
             applied.add(new ClassificationResult.AppliedTag(matched, parsedTag.affinity(), parsedTag.reasoning()));
         }
         for (UUID previousId : previousAutoIdsInThisSet) {
             if (!returnedIds.contains(previousId)) {
-                backend().removeTag(ref, previousId);
+                backend.removeTag(ref, previousId);
             }
         }
         recomputeTagSummaryVector(ref);
@@ -187,7 +205,7 @@ public final class JavAITagging {
 
     /** Convenience batch form -- still one {@link Cortex} call per instance internally, not a fan-out the
      *  caller has to hand-loop themselves. */
-    public static List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet) {
+    public List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet) {
         List<ClassificationResult> results = new ArrayList<>(instances.size());
         for (Object instance : instances) {
             results.add(classify(instance, tagSet));
@@ -229,17 +247,17 @@ public final class JavAITagging {
      * (eagerly, not lazily -- combining already-cached tag vectors is pure arithmetic, no {@code embed()}
      * call to defer). Deletes the index entry entirely once {@code ref} has zero Taggings left.
      */
-    private static void recomputeTagSummaryVector(TaggableRef ref) {
-        List<TagAssociation> associations = backend().associationsOf(ref);
+    private void recomputeTagSummaryVector(TaggableRef ref) {
+        List<TagAssociation> associations = backend.associationsOf(ref);
         if (associations.isEmpty()) {
-            backend().deleteTagSummaryVector(ref);
+            backend.deleteTagSummaryVector(ref);
             return;
         }
         float[] sum = null;
         String modelId = null;
         int dims = 0;
         for (TagAssociation association : associations) {
-            Tag tag = tagRepository().findById(association.tagId())
+            Tag tag = delegate.findById(association.tagId())
                     .orElseThrow(() -> new IllegalStateException(
                             "Tag " + association.tagId() + " referenced by a Tagging on " + ref + " no longer exists"));
             // Tag doesn't declare `implements JavAIVectorizable` in source -- the weaver adds it at build
@@ -257,41 +275,20 @@ public final class JavAITagging {
             VectorMath.addWeighted(sum, tagSummary.values(), weight);
         }
         EmbeddingVector combined = new EmbeddingVector(VectorMath.normalize(sum), modelId, dims, Instant.now());
-        backend().upsertTagSummaryVector(ref, combined);
+        backend.upsertTagSummaryVector(ref, combined);
     }
 
-    private static Cortex cortex() {
-        Cortex current = cortex;
-        if (current == null) {
+    private Cortex cortex() {
+        if (cortex == null) {
             throw new IllegalStateException(
-                    "JavAITagging.configureClassification(...) must be called before classify(...)/classifyAll(...)");
+                    "This JavAITagRepository was constructed without a Cortex -- classify(...)/classifyAll(...) "
+                            + "need the 3-argument constructor (or create(config, cortex)) to supply one");
         }
-        return current;
+        return cortex;
     }
 
     private static TaggableRef refOf(Object instance) {
         return new TaggableRef(instance.getClass().getName(), TaggingReflection.idOf(instance));
-    }
-
-    private static TaggingBackend backend() {
-        return BACKENDS.computeIfAbsent(currentConfig(), JavAITagging::backendFor);
-    }
-
-    private static JavAIRepository<Tag> tagRepository() {
-        JavAIRepository<Tag> repository = tagRepository;
-        if (repository == null) {
-            throw new IllegalStateException(
-                    "JavAITagging.configureTagging(...) must be called before tagsOf(...) -- no Tag repository configured");
-        }
-        return repository;
-    }
-
-    private static JavAIPersistenceConfig currentConfig() {
-        JavAIPersistenceConfig current = config;
-        if (current == null) {
-            throw new IllegalStateException("JavAITagging.configureTagging(...) must be called before any other method");
-        }
-        return current;
     }
 
     private static TaggingBackend backendFor(JavAIPersistenceConfig config) {

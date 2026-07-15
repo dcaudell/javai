@@ -40,6 +40,7 @@ class JavAITaggingMongoE2ETest {
     private static TagRepository tagRepository;
     private static TagSetRepository tagSetRepository;
     private static TestThingRepository thingRepository;
+    private static JavAITagRepository tagging;
 
     @BeforeAll
     static void configure() {
@@ -49,12 +50,11 @@ class JavAITaggingMongoE2ETest {
                 .mongoUri(mongoUri())
                 .mongoDatabase(DATABASE)
                 .build();
-        JavAIPI.configurePersistence(config);
-        tagRepository = JavAIPI.repository(TagRepository.class);
-        tagSetRepository = JavAIPI.repository(TagSetRepository.class);
-        thingRepository = JavAIPI.repository(TestThingRepository.class);
+        tagRepository = JavAIPI.repository(TagRepository.class, config);
+        tagSetRepository = JavAIPI.repository(TagSetRepository.class, config);
+        thingRepository = JavAIPI.repository(TestThingRepository.class, config);
 
-        JavAITagging.configureTagging(config, tagRepository);
+        tagging = new JavAITagRepository(tagRepository, config);
     }
 
     private static String mongoUri() {
@@ -67,9 +67,9 @@ class JavAITaggingMongoE2ETest {
         Tag urgent = tagRepository.save(new Tag(tagSet, "en", "Urgent"));
         TestThing thing = thingRepository.save(new TestThing("widget"));
 
-        JavAITagging.addTag(thing, urgent);
+        tagging.addTag(thing, urgent);
 
-        JavAIList<Tag> tags = JavAITagging.tagsOf(thing);
+        JavAIList<Tag> tags = tagging.tagsOf(thing);
         assertEquals(1, tags.size());
         assertEquals("urgent", tags.get(0).getSlug());
     }
@@ -80,11 +80,11 @@ class JavAITaggingMongoE2ETest {
         Tag tag = tagRepository.save(new Tag(tagSet, "en", "Widgets"));
         TestThing thing = thingRepository.save(new TestThing("gadget"));
 
-        assertFalse(JavAITagging.hasTag(thing, tag));
-        JavAITagging.addTag(thing, tag);
-        assertTrue(JavAITagging.hasTag(thing, tag));
-        JavAITagging.removeTag(thing, tag);
-        assertFalse(JavAITagging.hasTag(thing, tag));
+        assertFalse(tagging.hasTag(thing, tag));
+        tagging.addTag(thing, tag);
+        assertTrue(tagging.hasTag(thing, tag));
+        tagging.removeTag(thing, tag);
+        assertFalse(tagging.hasTag(thing, tag));
     }
 
     @Test
@@ -93,10 +93,10 @@ class JavAITaggingMongoE2ETest {
         Tag tag = tagRepository.save(new Tag(tagSet, "en", "Repeatable"));
         TestThing thing = thingRepository.save(new TestThing("thingy"));
 
-        JavAITagging.addTag(thing, tag);
-        JavAITagging.addTag(thing, tag, 0.75);
+        tagging.addTag(thing, tag);
+        tagging.addTag(thing, tag, 0.75);
 
-        JavAIList<Tag> tags = JavAITagging.tagsOf(thing);
+        JavAIList<Tag> tags = tagging.tagsOf(thing);
         assertEquals(1, tags.size(), "re-adding the same tag must update, not duplicate, the association");
     }
 
@@ -108,10 +108,10 @@ class JavAITaggingMongoE2ETest {
         TestThing thingB = thingRepository.save(new TestThing("b"));
         TestThing untagged = thingRepository.save(new TestThing("c"));
 
-        JavAITagging.addTag(thingA, tag);
-        JavAITagging.addTag(thingB, tag);
+        tagging.addTag(thingA, tag);
+        tagging.addTag(thingB, tag);
 
-        JavAIList<TaggableRef> refs = JavAITagging.taggedWith(tag, List.of(TestThing.class));
+        JavAIList<TaggableRef> refs = tagging.taggedWith(tag, List.of(TestThing.class));
         assertEquals(2, refs.size());
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(thingA.getId())));
         assertTrue(refs.stream().anyMatch(ref -> ref.taggableId().equals(thingB.getId())));
@@ -124,9 +124,9 @@ class JavAITaggingMongoE2ETest {
         Tag security = tagRepository.save(new Tag(tagSet, "en", "Security"));
         Tag reviewed = tagRepository.save(new Tag(tagSet, "en", "Reviewed"));
 
-        JavAITagging.addTag(security, reviewed);
+        tagging.addTag(security, reviewed);
 
-        JavAIList<Tag> tagsOnSecurity = JavAITagging.tagsOf(security);
+        JavAIList<Tag> tagsOnSecurity = tagging.tagsOf(security);
         assertEquals(1, tagsOnSecurity.size());
         assertEquals("reviewed", tagsOnSecurity.get(0).getSlug());
     }
@@ -139,11 +139,11 @@ class JavAITaggingMongoE2ETest {
         TestThing onlyThing = thingRepository.save(new TestThing("onlyThingMongo"));
         TestThing otherThing = thingRepository.save(new TestThing("otherThingMongo"));
 
-        JavAITagging.addTag(onlyThing, focusTag);
-        JavAITagging.addTag(otherThing, unrelatedTag);
+        tagging.addTag(onlyThing, focusTag);
+        tagging.addTag(otherThing, unrelatedTag);
 
         EmbeddingVector reference = ((JavAIVectorizable) focusTag).summaryVector();
-        VectorIndex<TaggableRef> index = JavAITagging.tagSimilarityIndex();
+        VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();
         // mongot indexes near-real-time, not synchronously with the write -- same eventual-consistency
         // gap RepositoryBackendSpringDataMongoTest's own awaitContainsId works around, for the same reason.
         JavAIList<TaggableRef> nearest = awaitContainsId(() -> index.nearestN(reference, 1), onlyThing.getId());
@@ -156,7 +156,7 @@ class JavAITaggingMongoE2ETest {
         assertTrue(almostIdentical.stream().anyMatch(ref -> ref.taggableId().equals(onlyThing.getId())));
         assertFalse(almostIdentical.stream().anyMatch(ref -> ref.taggableId().equals(otherThing.getId())));
 
-        JavAITagging.removeTag(onlyThing, focusTag);
+        tagging.removeTag(onlyThing, focusTag);
         JavAIList<TaggableRef> afterRemoval = awaitNotContainsId(() -> index.nearestN(reference, 5), onlyThing.getId());
         assertFalse(afterRemoval.stream().anyMatch(ref -> ref.taggableId().equals(onlyThing.getId())),
                 "tag-summary vector must be removed from the index once an instance has zero remaining Taggings");

@@ -16,7 +16,7 @@ import java.util.regex.Pattern;
 /**
  * {@code @JavAIVectorizable @Taggable} -- a Tag needs a vector to participate in tag-similarity search
  * ({@link #slug} is the only vectorized field), and is itself recursively taggable (a Tag can carry Tags,
- * from the same or a different {@link TagSet}, via the same {@code JavAITagging.addTag(tag, otherTag)} call
+ * from the same or a different {@link TagSet}, via the same {@code JavAITagRepository.addTag(tag, otherTag)} call
  * used for any other {@code Taggable} instance -- no separate field or mechanism needed for that).
  *
  * <p>Persisted the same way any other {@code @Entity @JavAIVectorizable} class is -- via
@@ -70,7 +70,7 @@ public class Tag implements dev.xtrafe.javai.tagging.Taggable {
         this.localizedNamesJson = LocalizedNames.encode(names);
         this.slug = slugify(displayName);
         // Keeps the owning TagSet's own @Summary tags list in sync with its ManyToOne back-reference --
-        // without this, tagSet.getTags() (what JavAITagging.classify() reads as candidates) would silently
+        // without this, tagSet.getTags() (what JavAITagRepository.classify() reads as candidates) would silently
         // stay empty for every Tag created after the TagSet itself, since nothing else registers it.
         tagSet.getTags().add(this);
     }

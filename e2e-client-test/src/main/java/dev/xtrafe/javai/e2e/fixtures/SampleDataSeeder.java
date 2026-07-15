@@ -76,9 +76,9 @@ public final class SampleDataSeeder {
      * across runs (see class javadoc).
      *
      * <p>Takes already-built repositories rather than constructing its own: {@code JavAIEnvironment} is now
-     * the single place that calls {@code JavAIPI.configurePersistence}/{@code JavAIPI.repository}, so this
-     * class only needs the raw JDBC/Bolt/Mongo URLs for the truncate/wipe step (not part of the {@code
-     * JavAIRepository} contract) and the three already-realized repositories for the actual seeding.
+     * the single place that calls {@code JavAIPI.repository}, so this class only needs the raw JDBC/Bolt/
+     * Mongo URLs for the truncate/wipe step (not part of the {@code JavAIRepository} contract) and the
+     * three already-realized repositories for the actual seeding.
      */
     public static void resetAndSeed(
             String postgresUrl, String neo4jUri, String mongoUri,

@@ -14,7 +14,7 @@ import java.util.function.Consumer;
 /**
  * Hermetic stand-in for classification tests -- matches this project's established "fake the LLM response
  * itself, not the backend it's persisted through" pattern (see {@code CortexOllamaTest}, javai-completion):
- * {@link JavAITagging#classify}'s own diffing/marshalling logic is what's under test here, not whether a
+ * {@link JavAITagRepository#classify}'s own diffing/marshalling logic is what's under test here, not whether a
  * real model understands the task, which is a separate, lower-value concern for this specific area (unlike
  * vector search, an LLM's classification judgment can't be meaningfully faked either way -- what this
  * fixture controls is only the *shape* of the response, letting the test drive the diff logic precisely).

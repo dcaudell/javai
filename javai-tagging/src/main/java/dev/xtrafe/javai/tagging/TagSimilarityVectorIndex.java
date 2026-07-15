@@ -6,12 +6,12 @@ import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 /**
- * The {@code VectorIndex<TaggableRef>} {@link JavAITagging#tagSimilarityIndex()} returns -- see
+ * The {@code VectorIndex<TaggableRef>} {@link JavAITagRepository#tagSimilarityIndex()} returns -- see
  * doc/spec/tagging.md's "Tag-similarity search". Deliberately read-mostly: unlike {@code JavAIVectorIndex}
  * (a plain, caller-populated in-memory container), this realization is persistence-backed and maintained
- * automatically as a side effect of {@link JavAITagging#addTag}/{@link JavAITagging#removeTag}, so {@link
- * #add}/{@link #remove} -- required by the {@link VectorIndex} contract, but with no legitimate caller here
- * -- simply refuse.
+ * automatically as a side effect of {@link JavAITagRepository#addTag}/{@link JavAITagRepository#removeTag},
+ * so {@link #add}/{@link #remove} -- required by the {@link VectorIndex} contract, but with no legitimate
+ * caller here -- simply refuse.
  */
 final class TagSimilarityVectorIndex implements VectorIndex<TaggableRef> {
 
@@ -24,14 +24,14 @@ final class TagSimilarityVectorIndex implements VectorIndex<TaggableRef> {
     @Override
     public void add(TaggableRef item) {
         throw new UnsupportedOperationException(
-                "tagSimilarityIndex() is maintained automatically by JavAITagging.addTag()/removeTag() -- "
+                "tagSimilarityIndex() is maintained automatically by JavAITagRepository.addTag()/removeTag() -- "
                         + "see doc/spec/tagging.md's Tag-summary vector index");
     }
 
     @Override
     public boolean remove(TaggableRef item) {
         throw new UnsupportedOperationException(
-                "tagSimilarityIndex() is maintained automatically by JavAITagging.addTag()/removeTag() -- "
+                "tagSimilarityIndex() is maintained automatically by JavAITagRepository.addTag()/removeTag() -- "
                         + "see doc/spec/tagging.md's Tag-summary vector index");
     }
 

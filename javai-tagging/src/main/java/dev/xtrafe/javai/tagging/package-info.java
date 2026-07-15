@@ -1,6 +1,6 @@
 /**
  * Tagging: {@code @Taggable} objects, recursive {@code Tag}/{@code TagSet}, LLM-based classification via
- * {@code JavAITagging}, and tag-collection similarity search. See doc/spec/tagging.md for the full design
+ * {@code JavAITagRepository}, and tag-collection similarity search. See doc/spec/tagging.md for the full design
  * -- primitives table, worked examples, the tag-summary-vector index, and the three-backend persistence
  * shape.
  *

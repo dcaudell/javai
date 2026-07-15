@@ -18,9 +18,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Classification's own diff/marshalling logic is what's under test here (see {@link FakeCortex}'s own
- * javadoc) -- a real Postgres container is still needed because {@link JavAITagging#classify} reads and
- * writes real {@code source = "auto"} associations through a real {@link TaggingBackend}, which is exactly
- * the diff logic this test is proving.
+ * javadoc) -- a real Postgres container is still needed because {@link JavAITagRepository#classify} reads
+ * and writes real {@code source = "auto"} associations through a real {@link TaggingBackend}, which is
+ * exactly the diff logic this test is proving.
  */
 @Testcontainers
 class JavAITaggingClassificationE2ETest {
@@ -33,6 +33,7 @@ class JavAITaggingClassificationE2ETest {
     private static TagSetRepository tagSetRepository;
     private static ClassifiableThingRepository thingRepository;
     private static final FakeCortex CORTEX = new FakeCortex();
+    private static JavAITagRepository tagging;
 
     @BeforeAll
     static void configure() {
@@ -43,13 +44,11 @@ class JavAITaggingClassificationE2ETest {
                 .postgresUsername(postgres.getUsername())
                 .postgresPassword(postgres.getPassword())
                 .build();
-        JavAIPI.configurePersistence(config);
-        tagRepository = JavAIPI.repository(TagRepository.class);
-        tagSetRepository = JavAIPI.repository(TagSetRepository.class);
-        thingRepository = JavAIPI.repository(ClassifiableThingRepository.class);
+        tagRepository = JavAIPI.repository(TagRepository.class, config);
+        tagSetRepository = JavAIPI.repository(TagSetRepository.class, config);
+        thingRepository = JavAIPI.repository(ClassifiableThingRepository.class, config);
 
-        JavAITagging.configureTagging(config, tagRepository);
-        JavAITagging.configureClassification(CORTEX);
+        tagging = new JavAITagRepository(tagRepository, config, CORTEX);
     }
 
     @BeforeEach
@@ -67,13 +66,13 @@ class JavAITaggingClassificationE2ETest {
 
         CORTEX.willRespond("[{\"slug\": \"urgent\", \"affinity\": 0.95, \"reasoning\": \"critical outage\"}]");
 
-        ClassificationResult result = JavAITagging.classify(thing, tagSet);
+        ClassificationResult result = tagging.classify(thing, tagSet);
 
         assertEquals(1, result.appliedTags().size());
         assertEquals("urgent", result.appliedTags().get(0).tag().getSlug());
         assertEquals(0.95, result.appliedTags().get(0).affinity());
-        assertTrue(JavAITagging.hasTag(thing, urgent));
-        JavAIList<Tag> tags = JavAITagging.tagsOf(thing);
+        assertTrue(tagging.hasTag(thing, urgent));
+        JavAIList<Tag> tags = tagging.tagsOf(thing);
         assertEquals(1, tags.size());
     }
 
@@ -86,14 +85,14 @@ class JavAITaggingClassificationE2ETest {
                 new TestClassifiableThing("Some issue", "note"));
 
         CORTEX.willRespond("[{\"slug\": \"urgent\"}]");
-        JavAITagging.classify(thing, tagSet);
-        assertTrue(JavAITagging.hasTag(thing, urgent));
+        tagging.classify(thing, tagSet);
+        assertTrue(tagging.hasTag(thing, urgent));
 
         CORTEX.willRespond("[{\"slug\": \"low-priority\"}]");
-        ClassificationResult result = JavAITagging.classify(thing, tagSet);
+        ClassificationResult result = tagging.classify(thing, tagSet);
 
-        assertFalse(JavAITagging.hasTag(thing, urgent), "urgent was auto-applied last time but not returned this time");
-        assertTrue(JavAITagging.hasTag(thing, low));
+        assertFalse(tagging.hasTag(thing, urgent), "urgent was auto-applied last time but not returned this time");
+        assertTrue(tagging.hasTag(thing, low));
         assertEquals(1, result.appliedTags().size());
         assertEquals("low-priority", result.appliedTags().get(0).tag().getSlug());
     }
@@ -106,17 +105,17 @@ class JavAITaggingClassificationE2ETest {
         TestClassifiableThing thing = thingRepository.save(
                 new TestClassifiableThing("Some issue", "note"));
 
-        JavAITagging.addTag(thing, manual);
+        tagging.addTag(thing, manual);
 
         CORTEX.willRespond("[{\"slug\": \"urgent\"}]");
-        JavAITagging.classify(thing, tagSet);
-        assertTrue(JavAITagging.hasTag(thing, manual), "manual tagging must survive a classify() call");
-        assertTrue(JavAITagging.hasTag(thing, urgent));
+        tagging.classify(thing, tagSet);
+        assertTrue(tagging.hasTag(thing, manual), "manual tagging must survive a classify() call");
+        assertTrue(tagging.hasTag(thing, urgent));
 
         CORTEX.willRespond("[]");
-        JavAITagging.classify(thing, tagSet);
-        assertTrue(JavAITagging.hasTag(thing, manual), "manual tagging must survive even when auto tags are all removed");
-        assertFalse(JavAITagging.hasTag(thing, urgent));
+        tagging.classify(thing, tagSet);
+        assertTrue(tagging.hasTag(thing, manual), "manual tagging must survive even when auto tags are all removed");
+        assertFalse(tagging.hasTag(thing, urgent));
     }
 
     @Test
@@ -128,9 +127,9 @@ class JavAITaggingClassificationE2ETest {
 
         CORTEX.willRespond("[{\"slug\": \"not-a-real-candidate\", \"affinity\": 0.5}]");
 
-        ClassificationResult result = JavAITagging.classify(thing, tagSet);
+        ClassificationResult result = tagging.classify(thing, tagSet);
 
         assertTrue(result.appliedTags().isEmpty());
-        assertTrue(JavAITagging.tagsOf(thing).isEmpty());
+        assertTrue(tagging.tagsOf(thing).isEmpty());
     }
 }

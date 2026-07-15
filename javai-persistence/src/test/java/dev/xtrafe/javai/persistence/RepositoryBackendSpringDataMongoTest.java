@@ -61,17 +61,18 @@ class RepositoryBackendSpringDataMongoTest {
                     .withExposedPorts(27017)
                     .withStartupTimeout(Duration.ofMinutes(3));
 
+    private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
-        JavAIPI.configurePersistence(JavAIPersistenceConfig.builder()
+        config = JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.MONGODB)
                 .mongoUri(mongoUri())
                 .mongoDatabase(DATABASE)
-                .build());
-        repository = JavAIPI.repository(TestArticleRepository.class);
+                .build();
+        repository = JavAIPI.repository(TestArticleRepository.class, config);
     }
 
     @BeforeEach
@@ -218,7 +219,7 @@ class RepositoryBackendSpringDataMongoTest {
 
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
-        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class));
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class, config));
     }
 
     /**
@@ -229,8 +230,8 @@ class RepositoryBackendSpringDataMongoTest {
      */
     @Test
     void mapFieldRoundTripsWithKeysPreserved() {
-        JavAIPI.repository(TestTagRepository.class);
-        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class);
+        JavAIPI.repository(TestTagRepository.class, config);
+        TestArticleWithTagsRepository repository = JavAIPI.repository(TestArticleWithTagsRepository.class, config);
 
         TestArticleWithTags article = new TestArticleWithTags("Map field test");
         article.getTagsByCode().put("first", new TestTag("alpha"));

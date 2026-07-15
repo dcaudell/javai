@@ -29,7 +29,7 @@ interface TaggingBackend {
     List<UUID> tagIdsOf(TaggableRef ref);
 
     /** Like {@link #tagIdsOf}, but with each association's {@code affinity}/{@code source} too -- what
-     *  {@link JavAITagging#classify} needs to diff a fresh classification run against what's already there
+     *  {@link JavAITagRepository#classify} needs to diff a fresh classification run against what's already there
      *  without disturbing manually-applied tags. */
     List<TagAssociation> associationsOf(TaggableRef ref);
 
@@ -38,7 +38,7 @@ interface TaggingBackend {
      *  own convention). */
     List<TaggableRef> taggedWith(UUID tagId, List<String> candidateTypeNames);
 
-    /** Writes/overwrites {@code ref}'s tag-summary vector -- called by {@link JavAITagging} after every
+    /** Writes/overwrites {@code ref}'s tag-summary vector -- called by {@link JavAITagRepository} after every
      *  {@code addTag}/{@code removeTag}, per doc/spec/tagging.md's "recomputed eagerly, not lazily" rule.
      *  Never called directly by a caller of this module's public surface. */
     void upsertTagSummaryVector(TaggableRef ref, EmbeddingVector vector);

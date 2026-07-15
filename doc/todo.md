@@ -28,4 +28,15 @@
   persistence-layer-only tag-summary-vector index rather than inventing a new collection type. Required
   adding real build-time (Maven-plugin) weaving to `javai-substrate` as a prerequisite, since this is the
   first module to ship its own pre-woven `@JavAIVectorizable` classes (`Tag`/`TagSet`) inside its own jar.
+- (Done) Remove ambient/global static state from `JavAIPI` and `javai-tagging`: `JavAIPI.repository(Class)`
+  used to resolve against a single ambient "current config" static pointer set by
+  `configurePersistence(...)`; it now takes the `JavAIPersistenceConfig` as an explicit argument
+  (`repository(Class, JavAIPersistenceConfig)`), and `configurePersistence`/the ambient field are gone
+  entirely. `JavAITagging` (a static facade with the same ambient-config shape, plus an ambient `Cortex`)
+  was deleted outright and replaced with `JavAITagRepository`, a plain instance wrapping an already-realized
+  `TagRepository` -- multiple instances (one per backend) now coexist with zero global state and zero
+  attempt at cross-store synchronization. See `SPEC.md`'s new "Coding standard: static/global scope is the
+  exception, not the default" section for the policy this established, and its "known, tracked debt" note on
+  `JavAISupervisionRuntime` (same static-facade shape, not yet fixed -- its dispatch entry points are called
+  directly from woven advice with no current path to an instance, so a fix needs its own design pass).
 - Add recursive MCP microservice fabric to the whitepaper.

@@ -8,7 +8,7 @@ import java.util.UUID;
  * {@code @Entity}/{@code @JavAIVectorizable} class going through {@code JavAIRepository}: its persistence is
  * genuinely backend-specific (a Postgres join table row, a native Neo4j {@code TAGGED_WITH} relationship, a
  * MongoDB reference-pointer array entry -- see doc/spec/tagging.md's "Persistence, across all three
- * backends"), maintained internally by {@code JavAITagging}'s own per-backend code, not by a caller
+ * backends"), maintained internally by {@code JavAITagRepository}'s own per-backend code, not by a caller
  * constructing rows directly for storage. This type exists to give that row shape a name and to hand back
  * to a caller who wants the metadata ({@link #affinity()}, {@link #source()}, {@link #createdAt()}) rather
  * than just the bare {@link Tag}.

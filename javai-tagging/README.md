@@ -15,7 +15,8 @@ tagged instance's aggregate tag vector.
 | `Tag` | `@Entity @JavAIVectorizable @Taggable` | Slug (vectorized identity, derived once at creation), localized display names, description, owning `TagSet` -- recursively `@Taggable` itself |
 | `TagSet` | `@Entity @JavAIVectorizable` | A dynamic, persisted collection of `Tag`s; `@Summary tags` means `summaryVector()` is a free decay-weighted aggregate over every member tag |
 | `TaggableRef` | Record | `(taggableType, taggableId)` -- `taggableType` is a fully-qualified class name, not the simple name (see "TaggableRef.taggableType" below) |
-| `JavAITagging` | Static facade | `configureTagging`/`configureClassification`, `addTag`/`removeTag`/`hasTag`/`tagsOf`/`taggedWith`, `classify`/`classifyAll`, `tagSimilarityIndex()` |
+| `TagRepository` / `TagSetRepository` | Interfaces | Plain `JavAIRepository<Tag>`/`JavAIRepository<TagSet>` marker interfaces, realized via the ordinary `JavAIPI.repository(Class, JavAIPersistenceConfig)` mechanism |
+| `JavAITagRepository` | Instance wrapper (not a static facade) | Wraps an already-realized `TagRepository` with the tagging-association surface: `addTag`/`removeTag`/`hasTag`/`tagsOf`/`taggedWith`, `classify`/`classifyAll`, `tagSimilarityIndex()`. One instance per backend/data store -- see "No global tagging state" below |
 | `ClassificationResult` | Record | What one `classify()` call applied -- `AppliedTag(tag, affinity, reasoning)` per matched candidate |
 | `VectorIndex<TaggableRef>` | Interface realization (`javai-collections`) | `tagSimilarityIndex()`'s return type -- read-mostly, maintained automatically, not caller-populated |
 
@@ -27,10 +28,44 @@ unmodified. Only the *association* (`Tagging`) and the tag-summary-vector index 
 code, since `JavAIRepository`'s CRUD contract has no concept of either.
 
 **`Tag`'s constructor registers itself on its owning `TagSet`'s own `tags` list** (`tagSet.getTags().add(this)`)
--- a real, load-bearing detail, not incidental: `TagSet.getTags()` is what `JavAITagging.classify()` reads
-as a `TagSet`'s current candidate tags, and without this the list would silently stay empty for every `Tag`
-created after its `TagSet`. This also keeps `TagSet`'s own `summaryVector()` a live aggregate over every
-tag actually created against it, with no separate "register the tag" step a caller could forget.
+-- a real, load-bearing detail, not incidental: `TagSet.getTags()` is what `JavAITagRepository.classify()`
+reads as a `TagSet`'s current candidate tags, and without this the list would silently stay empty for every
+`Tag` created after its `TagSet`. This also keeps `TagSet`'s own `summaryVector()` a live aggregate over
+every tag actually created against it, with no separate "register the tag" step a caller could forget.
+
+## No global tagging state -- `JavAITagRepository` is an instance, not a facade
+
+Earlier revisions of this module exposed a `JavAITagging` static facade (`configureTagging(...)` setting an
+ambient "current backend" pointer every other static method read). That design is gone: `JavAITagRepository`
+is a plain object, constructed from a `TagRepository` (already realized via `JavAIPI.repository(...)`) and
+the `JavAIPersistenceConfig` it should use --
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)./* ... */.build();
+TagRepository tagRepository = JavAIPI.repository(TagRepository.class, config);
+JavAITagRepository tagging = new JavAITagRepository(tagRepository, config);
+// or, if you don't already have a TagRepository proxy of your own:
+JavAITagRepository tagging = JavAITagRepository.create(config);
+
+tagging.addTag(article, urgentTag);
+boolean tagged = tagging.hasTag(article, urgentTag);
+```
+
+Every field (the wrapped `TagRepository` delegate, the resolved `TaggingBackend`, an optional `Cortex` for
+classification) is set once, at construction, from arguments the caller supplies -- there is no ambient
+"current backend" anywhere to switch, race, or leave misconfigured for a later, unrelated caller.
+**Multiple `JavAITagRepository` instances, one per backend, coexist freely** -- construct one per
+`JavAIPersistenceConfig` you want tagging maintained against, same "two independent proxies, no dual-write"
+posture `javai-persistence` documents for ordinary multi-backend persistence. This module makes **no attempt
+to keep tag sets in different backends synchronized with each other** -- if you maintain the same taxonomy
+in two stores, reconciling them is entirely the caller's own responsibility.
+
+`Cortex` is supplied at construction too (`new JavAITagRepository(tagRepository, config, cortex)`, or
+`JavAITagRepository.create(config, cortex)`), not via a later settable mutator -- a `final` field removes any
+cross-thread-visibility question a mutator would otherwise raise, and a repository used only for the
+structural surface (no classification) never needs one at all; `classify`/`classifyAll` throw
+`IllegalStateException` if called without one.
 
 ## `Tagging`: the association, per backend
 
@@ -70,7 +105,7 @@ must address a Neo4j label or Mongo collection name rather than store/compare a 
 
 ## Classification via `Cortex`
 
-`JavAITagging.classify(instance, tagSet)` is client-invoked only -- never triggered automatically by a
+`JavAITagRepository.classify(instance, tagSet)` is client-invoked only -- never triggered automatically by a
 `TagSet` edit. It marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones, via the
 small `ClassifierContext` reflection utility -- deliberately not a change to `javai-completion`'s own
 `PromptContext`/`ContextableObject` marshalling, since `@TagIgnore` has no meaning to general RAG
@@ -111,7 +146,7 @@ the same decay weighting Vector Core already defines. **Recomputed eagerly, not 
 `FieldDirty`/`SummaryDirty`. An instance with zero remaining Taggings is removed from the index entirely,
 not left with a stale vector.
 
-`JavAITagging.tagSimilarityIndex()` returns a `VectorIndex<TaggableRef>` (`javai-collections`'s own "bare
+`JavAITagRepository.tagSimilarityIndex()` returns a `VectorIndex<TaggableRef>` (`javai-collections`'s own "bare
 similarity-search container for cases that don't need full graph semantics"), spanning **every**
 `@Taggable` type at once -- `nearestN`/`filterByMinSimilarity` are exactly the query shape needed, with no
 new collection interface. Deliberately read-mostly: its own `add`/`remove` refuse, since it's populated
@@ -153,7 +188,7 @@ see "Classification via `Cortex`" above.
 
 `@Taggable`/`@TagIgnore` (`javai-annotations`); `Taggable` (marker interface), `TaggableRef`, `Tag`,
 `TagSet`, `Tagging`, `LocalizedNames` (JSON-string-backed localized display names -- see below for why not
-a `Map<String, String>` field); `JavAITagging`'s full structural surface (`addTag`/`removeTag`/`hasTag`/
+a `Map<String, String>` field); `JavAITagRepository`'s full structural surface (`addTag`/`removeTag`/`hasTag`/
 `tagsOf`/`taggedWith`) against all three backends; classification via `Cortex` (`classify`/`classifyAll`,
 `ClassifierContext`, `ClassificationResult`); the tag-summary-vector index and `tagSimilarityIndex()`
 against all three backends. Covered by `TagTest` (hermetic unit tests: slug derivation/immutability,
