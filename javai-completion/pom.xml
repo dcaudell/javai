@@ -88,8 +88,11 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "junit-jupiter" in testcontainers 2.x (confirmed against the real testcontainers-bom
+           2.0.5 POM on Maven Central) — see javai-persistence/pom.xml's own postgresql dependency comment
+           for the full "every module artifact is now prefixed testcontainers-" explanation. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

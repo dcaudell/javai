@@ -61,25 +61,31 @@
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "postgresql" in testcontainers 2.x — every module artifact is now prefixed
+           "testcontainers-" (confirmed against the real testcontainers-bom 2.0.5 POM on Maven Central). -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>postgresql</artifactId>
+      <artifactId>testcontainers-postgresql</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "neo4j" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>neo4j</artifactId>
+      <artifactId>testcontainers-neo4j</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
       <!-- Same mongodb/mongodb-atlas-local real container RepositoryBackendSpringDataMongoTest already
-           uses; see that class's own javadoc for why this module's own MongoDBContainer isn't used. -->
+           uses; see that class's own javadoc for why this module's own MongoDBContainer isn't used.
+           Renamed from "mongodb" in testcontainers 2.x — see the postgresql dependency's own comment above. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>mongodb</artifactId>
+      <artifactId>testcontainers-mongodb</artifactId>
       <scope>test</scope>
     </dependency>
     <dependency>
+      <!-- Renamed from "junit-jupiter" in testcontainers 2.x — see the postgresql dependency's own comment
+           above. -->
       <groupId>org.testcontainers</groupId>
-      <artifactId>junit-jupiter</artifactId>
+      <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
   </dependencies>

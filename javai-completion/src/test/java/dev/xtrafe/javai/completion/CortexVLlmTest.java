@@ -42,7 +42,8 @@ class CortexVLlmTest {
         server.createContext("/", exchange -> {
             capturedRequestBody.append(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
             byte[] body = """
-                    {"choices":[{"index":0,"message":{"role":"assistant","content":"self-hosted answer"},"finish_reason":"stop"}]}
+                    {"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"meta-llama/Llama-3.2-3B-Instruct",
+                     "choices":[{"index":0,"message":{"role":"assistant","content":"self-hosted answer"},"finish_reason":"stop"}]}
                     """.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);
@@ -86,7 +87,8 @@ class CortexVLlmTest {
         server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
         server.createContext("/", exchange -> {
             byte[] body = """
-                    {"choices":[{"index":0,"message":{"role":"assistant","content":"concurrent ok"},"finish_reason":"stop"}]}
+                    {"id":"chatcmpl-2","object":"chat.completion","created":1,"model":"meta-llama/Llama-3.2-3B-Instruct",
+                     "choices":[{"index":0,"message":{"role":"assistant","content":"concurrent ok"},"finish_reason":"stop"}]}
                     """.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
             exchange.sendResponseHeaders(200, body.length);

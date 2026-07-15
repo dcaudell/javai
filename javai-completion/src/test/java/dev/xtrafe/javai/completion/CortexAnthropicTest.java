@@ -53,7 +53,8 @@ class CortexAnthropicTest {
         String baseUrl = startFakeServer("""
                 {"id":"msg_1","type":"message","role":"assistant",
                  "content":[{"type":"text","text":"Hello from Claude!"}],
-                 "model":"claude-sonnet-5","stop_reason":"end_turn"}
+                 "model":"claude-sonnet-5","stop_reason":"end_turn",
+                 "usage":{"input_tokens":10,"output_tokens":5}}
                 """);
 
         Cortex cortex = CortexAnthropic.builder().baseUrl(baseUrl).apiKey("test-key").model("claude-sonnet-5").build();
@@ -68,7 +69,8 @@ class CortexAnthropicTest {
     @Test
     void everyRequestCarriesAMaxTokensValueSinceAnthropicRequiresOne() throws IOException {
         startFakeServer("""
-                {"content":[{"type":"text","text":"ok"}]}
+                {"id":"msg_2","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],
+                 "model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}
                 """);
 
         Cortex cortex = CortexAnthropic.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
@@ -82,7 +84,8 @@ class CortexAnthropicTest {
     @Test
     void thinkingBudgetProviderOptionEnablesExtendedThinking() throws IOException {
         startFakeServer("""
-                {"content":[{"type":"text","text":"ok"}]}
+                {"id":"msg_2","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],
+                 "model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}
                 """);
 
         Cortex cortex = CortexAnthropic.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
@@ -111,7 +114,8 @@ class CortexAnthropicTest {
     @Test
     void concurrentCallsAllSucceed() throws IOException, InterruptedException {
         String baseUrl = startFakeServer("""
-                {"content":[{"type":"text","text":"concurrent ok"}]}
+                {"id":"msg_3","type":"message","role":"assistant","content":[{"type":"text","text":"concurrent ok"}],
+                 "model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":2}}
                 """);
 
         Cortex cortex = CortexAnthropic.builder().baseUrl(baseUrl).apiKey("test-key").model("claude-sonnet-5").build();

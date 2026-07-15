@@ -4,6 +4,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.springframework.ai.ollama.api.OllamaApi;
+import org.springframework.ai.ollama.api.ThinkOption;
 import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.images.builder.ImageFromDockerfile;
 import org.testcontainers.junit.jupiter.Container;
@@ -107,7 +108,7 @@ class CortexOllamaRealContainerTest {
         OllamaApi.ChatResponse thinkingResponse = api.chat(OllamaApi.ChatRequest.builder(model)
                 .messages(List.of(OllamaApi.Message.builder(OllamaApi.Message.Role.USER).content(prompt).build()))
                 .stream(false)
-                .think(true)
+                .think(new ThinkOption.ThinkBoolean(true))
                 .options(Map.of("num_predict", 300))
                 .build());
 
