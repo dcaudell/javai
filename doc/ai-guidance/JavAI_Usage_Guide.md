@@ -31,6 +31,7 @@ mutating it. JavAI Extensions makes that a property of the object model itself:
 | **Provider-agnostic RAG completions** | `Cortex` (six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
 | **Grounding a completion in real object-graph data** | `PromptContext`/`Contextable`/`ContextableObject` — a `query()` result, or any `JavAIList`/`Set`/`Map`, renders directly as prompt material, no manual serialization | `javai-model` (lives here, not `javai-completion` — see "Module layout" below) |
 | **Agentic Supervision** | `@SyncSupervision`/`@AsyncSupervision` on a method or constructor — a registered `SupervisionListener` can veto/rewrite a call (blocking) and/or react to it (fire-and-forget), at PRE/POST/EXCEPTION | `javai-supervision` |
+| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), and cross-type tag-similarity search (`tagSimilarityIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
 | **Codegen Guidance** | A *different* annotation family (`@Requires`/`@Intent`/`@AgentWritable`/`@Nondeterministic`/`@Provenance`) that constrains what an AI agent may read/generate/modify in annotated code | `javai-annotations`; see `JavAI_Codegen_Guidance.md` |
 
 **The hard interop rule that shapes all of the above:** every class this library produces — woven or
@@ -45,14 +46,15 @@ below is for understanding what each module actually contributes, not for decidi
 
 | Module | Extension area | What it gives you |
 |---|---|---|
-| `javai-annotations` | Codegen Guidance + shared annotation vocabulary | Every annotation used across all seven areas — every other module depends on it |
+| `javai-annotations` | Codegen Guidance + shared annotation vocabulary | Every annotation used across all eight areas — every other module depends on it |
 | `javai-vector` | Vector Core, part 1 | `EmbeddingVector`, embedding providers, dirty-tracking primitives |
 | `javai-model` | Vector Core part 2, Vector Collections' interfaces, Completion Fabric's RAG primitives | `@JavAIVectorizable`'s contract, `JavAIList`/`Set`/`Map`, `PromptContext`/`Contextable` |
 | `javai-substrate` | Acceleration Substrate | The weaver that actually implements `@JavAIVectorizable` at runtime |
 | `javai-supervision` | Agentic Supervision | `@SyncSupervision`/`@AsyncSupervision` and their weaver |
 | `javai-collections` | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
-| `javai-persistence` | Persistence Bridge | `JavAIPI.repository(...)` against Postgres or Neo4j |
+| `javai-persistence` | Persistence Bridge | `JavAIPI.repository(Class, JavAIPersistenceConfig)` against Postgres, Neo4j, or MongoDB |
 | `javai-completion` | Completion Fabric | `Cortex`/`CompletionRequest` |
+| `javai-tagging` | Tagging | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`, `JavAITagRepository` (tag-based queries, similarity search, LLM classification) |
 
 `javai-model` is a *physical*, not conceptual, module — it exists because `JavAIVectorizable.query()`
 returns `JavAIList<T>` and `JavAIList` implements `JavAIVectorizable` right back, so those types (plus the
@@ -82,6 +84,10 @@ have to live together upstream of everything else. Don't be surprised to find `P
   substitute. `@SyncSupervision`/`@AsyncSupervision`, by contrast, add **no new methods** — they wrap the
   method that's already there via Byte Buddy `Advice`, so nothing about a supervised method's own signature
   changes.
+- `@Taggable`, by contrast again, adds **nothing at all** to the class it annotates — no woven methods, no
+  new interface implementation beyond the marker `Taggable` you hand-implement yourself. There is no
+  `article.addTag(...)` to go looking for. Every tagging operation goes through a separate `JavAITagRepository`
+  instance instead — see "Tagging" below.
 
 ### Every method a woven `@JavAIVectorizable` class gains
 
@@ -137,6 +143,15 @@ through the collection itself), the weaver wires that dependency at **constructo
 | `SupervisionPointcut` | enum value | `PRE` (before the body runs) / `POST` (after a normal return) / `EXCEPTION` (after a throw, including one propagated from a called method, not just a literal `throw` in the annotated method's own body). |
 | `SupervisionListener` (interface, not an annotation) | — | One shape — `onPre`/`onPost`/`onException`(`SupervisionEvent`), all default no-ops, plus `supportedClass()` for coarse scoping — used for **both** the sync and async tiers. Whether a given registration is blocking/read-write or fire-and-forget/observation-only is a property of which `JavAISupervisionRuntime` method it's registered through, not of the listener's type. |
 
+### Tagging — marks participation, weaves nothing
+
+| Annotation | Target | Meaning |
+|---|---|---|
+| `@Taggable` | class | Unwoven marker — same shape as `@JavAIGraphNode`, not the fully-woven shape of `@JavAIVectorizable`. Declares that instances of this class can carry Tags, but synthesizes no methods and no interface implementation; independent of `@JavAIVectorizable`/`@JavAIGraphNode` (a class can carry any subset of all three). Always pair it with hand-implementing the *interface* `Taggable` (empty, marker-only) — the annotation alone doesn't give you that interface, and generic tagging APIs (`taggedWith`'s `candidateTypes` parameter) are bounded by it. **Shares its simple name with that interface** (`dev.xtrafe.javai.annotations.Taggable` the annotation vs. `dev.xtrafe.javai.tagging.Taggable` the interface) — different packages, so `@Taggable class Foo implements Taggable` compiles with one `import` covering both simple names, but write the interface fully-qualified (`implements dev.xtrafe.javai.tagging.Taggable`) if your file already imports something else named `Taggable`, or if you're generating code without import statements at all. |
+| `@TagIgnore` | field | Excludes an otherwise-`@dev.xtrafe.javai.annotations.PromptContext` field from the text a classification prompt sees, without affecting what that field renders as for ordinary RAG completions. A field with no `@PromptContext` to begin with needs no `@TagIgnore` — it was never classifier-visible either way. |
+
+See "Tagging" below for the full instance-based API (`JavAITagRepository`) these two annotations feed into.
+
 ### Codegen Guidance — a distinct feature, see the sibling file
 
 `@Requires`/`@Ensures`/`@Invariant`, `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`,
@@ -144,18 +159,138 @@ through the collection itself), the weaver wires that dependency at **constructo
 what *you*, the AI agent, may read, generate, or modify in code that carries them. Full rules in
 `JavAI_Codegen_Guidance.md`.
 
+## Tagging: `JavAITagRepository`, an instance, not a woven mechanism
+
+Tagging is orthogonal to everything above — a class can be `@Taggable`, `@JavAIVectorizable`, both, or
+neither, and none of Vector Core's woven-method machinery applies here. Every tagging operation goes through
+a `JavAITagRepository` **instance** you construct yourself, never a static call and never a woven method on
+the tagged class. If you find yourself looking for `article.addTag(...)`, stop — it doesn't exist by design;
+you want `tagging.addTag(article, someTag)` instead, where `tagging` is a `JavAITagRepository` you built.
+
+### Making a class taggable
+
+```java
+@Entity
+@Taggable
+public class Employee implements dev.xtrafe.javai.tagging.Taggable {
+    @Id private UUID id;
+    @dev.xtrafe.javai.annotations.PromptContext private String jobTitle;
+    @dev.xtrafe.javai.annotations.PromptContext private String department;
+    @TagIgnore @dev.xtrafe.javai.annotations.PromptContext private String internalNotes; // visible to
+                                                                                           // completions, not the classifier
+    // getters/setters ...
+}
+```
+
+`@Taggable` + the hand-implemented marker interface is the whole story — there is no third piece to add.
+Every taggable instance also needs a `@jakarta.persistence.Id`-annotated `UUID` field (`JavAITagRepository`
+reflects on it to build a `TaggableRef`), matching the same fixed-`UUID`-identity convention
+`JavAIRepository` already requires.
+
+### `Tag` and `TagSet` — ordinary persisted entities, not a special case
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)/* ... */.build();
+TagSetRepository tagSetRepo = JavAIPI.repository(TagSetRepository.class, config);
+TagRepository tagRepo = JavAIPI.repository(TagRepository.class, config);
+
+TagSet securitySet = new TagSet(/* ... */);
+tagSetRepo.save(securitySet);
+
+Tag urgent = new Tag(securitySet, "en", "Urgent");   // slug ("urgent") derived once, here, from "Urgent" --
+                                                       // there is no setSlug; renaming is delete-and-recreate
+tagRepo.save(urgent);
+```
+
+`Tag`/`TagSet` are ordinary `@Entity @JavAIVectorizable` classes persisted through the same
+`JavAIPI.repository(...)` mechanism as any other JavAI entity — `TagRepository`/`TagSetRepository` are
+just plain, empty `JavAIRepository<Tag>`/`JavAIRepository<TagSet>` marker interfaces. A `Tag`'s constructor
+registers itself on its owning `TagSet`'s own tag list automatically (`tagSet.getTags().add(this)`), which is
+also what makes `TagSet.summaryVector()` a live, decay-weighted aggregate over every tag ever created against
+it, and what `classify()` (below) reads as a `TagSet`'s current candidate tags. A `Tag`'s slug is unique
+**within its owning `TagSet` only**, not globally — two different `TagSet`s may each have a tag slugged
+`urgent`.
+
+### Constructing a `JavAITagRepository`
+
+```java
+JavAITagRepository tagging = new JavAITagRepository(tagRepo, config);              // structural surface only
+JavAITagRepository tagging = new JavAITagRepository(tagRepo, config, cortex);      // + classify()/classifyAll()
+JavAITagRepository tagging = JavAITagRepository.create(config);                    // realizes TagRepository for you
+JavAITagRepository tagging = JavAITagRepository.create(config, cortex);            // same, + a Cortex
+```
+
+`Cortex` is supplied only at construction, never via a later setter — a repository built without one still
+works fully for structural queries and similarity search; only `classify`/`classifyAll` need it, and throw
+`IllegalStateException` if called on an instance that wasn't given one. **Construct one `JavAITagRepository`
+per backend/data store you want tagging maintained against** — multiple instances coexist freely (the same
+"independent proxies, no dual-write" posture `javai-persistence` documents for ordinary multi-backend
+persistence), and this library makes **no attempt to keep tag sets in different backends synchronized with
+each other** — reconciling two stores maintaining the same taxonomy is entirely your own responsibility if
+you do that.
+
+### Structural queries and classification
+
+| Method | What it does |
+|---|---|
+| `JavAIList<Tag> tagsOf(Object instance)` | Every tag currently applied to `instance`. |
+| `JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes)` | Every instance, across the given `@Taggable` types, carrying `tag` — genuinely heterogeneous, one query per backend regardless of how many `candidateTypes` you pass. |
+| `void addTag(Object instance, Tag tag)` / `addTag(Object instance, Tag tag, double affinity)` | Applies `tag` to `instance` (`source = "manual"`), optionally with an affinity/match-strength score. Idempotent — a given `(tag, instance)` pair has zero or one association by construction. |
+| `void removeTag(Object instance, Tag tag)` | Removes the association, if present. |
+| `boolean hasTag(Object instance, Tag tag)` | Structural presence check. |
+| `ClassificationResult classify(Object instance, TagSet tagSet)` | One LLM call via the constructor-supplied `Cortex`: marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones), shows the model only `tagSet`'s candidate **slugs**, and diffs the result against `instance`'s existing `source = "auto"` taggings *for this `TagSet` specifically* — adds/updates/removes as needed, never touching `source = "manual"` taggings even for tags in the same set. Client-invoked only; never triggered automatically by a `TagSet` edit. |
+| `List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet)` | Convenience batch form — still one LLM call per instance internally, not a fan-out you hand-loop yourself. |
+| `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. |
+
+`ClassificationResult` is `record ClassificationResult(TaggableRef instance, TagSet tagSet, List<AppliedTag>
+appliedTags)`, where `AppliedTag` is `record AppliedTag(Tag tag, Double affinity, String reasoning)` —
+`affinity`/`reasoning` are nullable, since a classifier is free to say "this applies" without a strength
+score or explanation.
+
+### Tag-similarity search
+
+The other query shape — "find other objects, of any type, whose *whole collection* of applied tags looks
+similar to this one" — has no equivalent in `JavAIRepository`'s per-type `findNearestBy<Field>Vector`
+convention, so it's its own primitive: a maintained, read-mostly `VectorIndex<TaggableRef>` spanning every
+`@Taggable` type at once, populated automatically as a side effect of `addTag()`/`removeTag()`/`classify()`
+(its own `add`/`remove` refuse — you never populate it yourself):
+
+```java
+VectorIndex<TaggableRef> index = tagging.tagSimilarityIndex();
+JavAIList<TaggableRef> similar = index.nearestN(article.summaryVector(), 20);
+
+// For an ad hoc collection of tags rather than a single reference vector:
+EmbeddingVector adHoc = VectorMath.centroid(tags.stream().map(Tag::vector).toList());
+JavAIList<TaggableRef> similarByTags = index.nearestN(adHoc, 20);
+```
+
+`TaggableRef` is `record TaggableRef(String taggableType, UUID taggableId)`, where `taggableType` is the
+tagged instance's **fully-qualified** class name (`instance.getClass().getName()`) — deliberately not the
+simple name, to avoid a real collision this project hit between two unrelated `Tag` classes in the same
+codebase. If you need to resolve a `TaggableRef` back to a loaded instance, load it through the ordinary
+`JavAIRepository` for `Class.forName(ref.taggableType())`, the same way you'd load anything else by id —
+`JavAITagRepository` itself never loads or returns full instances, only `TaggableRef` handles.
+
+The underlying vector is a decay-weighted, affinity-scaled sum over `Tag.summaryVector()` for every tag
+applied to an instance (so a tag's own recursive tags — a `Tag` can itself be `@Taggable` — contribute too),
+recomputed eagerly on every `addTag`/`removeTag`/`classify` call rather than lazily, since combining
+already-cached tag vectors is pure arithmetic with nothing to defer.
+
 ## Installing the library
 
-**Not yet published to Maven Central.** Build from source:
+**Published to Maven Central** — add the dependency coordinates below directly to your own project, no
+extra repository configuration needed. Building from source is only necessary if you want an unreleased
+commit rather than a tagged version:
 
 ```sh
 git clone <this repository>
 cd javai
-mvn install   # builds and installs all 8 modules to the local ~/.m2, in dependency order
+mvn install   # builds and installs all 9 modules to the local ~/.m2, in dependency order
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.1` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.2` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -163,37 +298,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.1</version>
+  <version>0.1.2</version>
+</dependency>
+<dependency>
+  <groupId>io.github.dcaudell</groupId>
+  <artifactId>javai-tagging</artifactId>
+  <version>0.1.2</version>
 </dependency>
 ```
 
@@ -204,13 +344,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.1")
-    implementation("io.github.dcaudell:javai-model:0.1.1")
-    implementation("io.github.dcaudell:javai-substrate:0.1.1")
-    implementation("io.github.dcaudell:javai-supervision:0.1.1")
-    implementation("io.github.dcaudell:javai-collections:0.1.1")
-    implementation("io.github.dcaudell:javai-persistence:0.1.1")
-    implementation("io.github.dcaudell:javai-completion:0.1.1")
+    implementation("io.github.dcaudell:javai-vector:0.1.2")
+    implementation("io.github.dcaudell:javai-model:0.1.2")
+    implementation("io.github.dcaudell:javai-substrate:0.1.2")
+    implementation("io.github.dcaudell:javai-supervision:0.1.2")
+    implementation("io.github.dcaudell:javai-collections:0.1.2")
+    implementation("io.github.dcaudell:javai-persistence:0.1.2")
+    implementation("io.github.dcaudell:javai-completion:0.1.2")
+    implementation("io.github.dcaudell:javai-tagging:0.1.2")
 }
 ```
 
