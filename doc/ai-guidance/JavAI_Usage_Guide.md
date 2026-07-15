@@ -230,6 +230,41 @@ persistence), and this library makes **no attempt to keep tag sets in different 
 each other** — reconciling two stores maintaining the same taxonomy is entirely your own responsibility if
 you do that.
 
+### Applying tags
+
+Continuing the `Article`/`Comment` domain from the "Worked example" section below — assume both are also
+annotated `@Taggable implements dev.xtrafe.javai.tagging.Taggable`, the way this repository's own e2e
+fixtures are:
+
+```java
+TagSetRepository tagSetRepo = JavAIPI.repository(TagSetRepository.class, config);
+TagRepository tagRepo = JavAIPI.repository(TagRepository.class, config);
+JavAITagRepository tagging = JavAITagRepository.create(config);
+
+TagSet topics = tagSetRepo.save(new TagSet("topics"));
+Tag security = tagRepo.save(new Tag(topics, "en", "Security"));
+Tag featured = tagRepo.save(new Tag(topics, "en", "Featured"));
+
+ArticleRepository articles = JavAIPI.repository(ArticleRepository.class, config);
+CommentRepository comments = JavAIPI.repository(CommentRepository.class, config);
+
+Article breach = articles.save(new Article("Anatomy of a breach", "..."));
+Article recipe = articles.save(new Article("Weeknight pasta", "..."));
+Comment reply = comments.save(new Comment("alice", "This matches what we saw last quarter."));
+
+tagging.addTag(breach, security);       // one instance, one tag
+tagging.addTag(breach, featured, 0.9);  // a second, independent tag on the same instance, with an affinity
+tagging.addTag(reply, security);        // a *different* @Taggable type carrying the same tag
+tagging.addTag(recipe, featured);
+
+tagging.hasTag(breach, security);    // true
+tagging.removeTag(recipe, featured); // undoes one association; every other tagging above is untouched
+```
+
+Every `addTag`/`removeTag` call assumes `breach`/`recipe`/`reply` were already saved through their own
+ordinary `JavAIRepository` first — tagging never creates the tagged row/node/document itself, only the
+association on top of it.
+
 ### Structural queries and classification
 
 | Method | What it does |
@@ -248,6 +283,21 @@ appliedTags)`, where `AppliedTag` is `record AppliedTag(Tag tag, Double affinity
 `affinity`/`reasoning` are nullable, since a classifier is free to say "this applies" without a strength
 score or explanation.
 
+**Homogeneous vs. heterogeneous `taggedWith`** — the same method either way; the shape of `candidateTypes`
+is what decides which you get, continuing the `breach`/`recipe`/`reply` example above:
+
+```java
+// Homogeneous: candidateTypes is a single type, so every result is that one type.
+JavAIList<TaggableRef> securityArticles = tagging.taggedWith(security, List.of(Article.class));
+// -> just breach's TaggableRef. recipe was never given this tag; reply carries it too, but Comment
+//    isn't in candidateTypes, so it's excluded from this particular query, not just unmatched.
+
+// Heterogeneous: multiple @Taggable types in one call, no per-type looping or manual union.
+JavAIList<TaggableRef> everythingSecurityRelated =
+        tagging.taggedWith(security, List.of(Article.class, Comment.class));
+// -> both breach (an Article) and reply (a Comment) come back from this single query.
+```
+
 ### Tag-similarity search
 
 The other query shape — "find other objects, of any type, whose *whole collection* of applied tags looks
@@ -263,6 +313,26 @@ JavAIList<TaggableRef> similar = index.nearestN(article.summaryVector(), 20);
 // For an ad hoc collection of tags rather than a single reference vector:
 EmbeddingVector adHoc = VectorMath.centroid(tags.stream().map(Tag::vector).toList());
 JavAIList<TaggableRef> similarByTags = index.nearestN(adHoc, 20);
+```
+
+**Heterogeneous by default, homogeneous by client-side filter** — `tagSimilarityIndex()` takes no type
+parameter (the underlying vector is a property of the *tagging*, not of the tagged type), so a plain
+`nearestN`/`filterByMinSimilarity` call naturally returns a mix of every `@Taggable` type that happens to
+rank close to the reference:
+
+```java
+EmbeddingVector securityVector = ((JavAIVectorizable) security).summaryVector();
+
+// Heterogeneous: breach (an Article) and reply (a Comment) can both come back side by side, ranked purely
+// by how similar each one's whole tag collection is to the reference -- no type restriction at all.
+JavAIList<TaggableRef> similarOfAnyType = index.nearestN(securityVector, 10);
+
+// Homogeneous: filter the same result down to one @Taggable type yourself -- there's no "candidateTypes"
+// parameter here the way taggedWith has one, since ranking is over the aggregate tag vector, not a
+// per-type index.
+List<TaggableRef> similarArticlesOnly = similarOfAnyType.stream()
+        .filter(ref -> ref.taggableType().equals(Article.class.getName()))
+        .toList();
 ```
 
 `TaggableRef` is `record TaggableRef(String taggableType, UUID taggableId)`, where `taggableType` is the
