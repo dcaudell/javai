@@ -6,7 +6,7 @@ account/key setup the automation in `.github/workflows/` depends on but cannot d
 ## The flow, end to end
 
 ```
-feature/my-thing --PR--> Dev --PR--> main --tag v0.1.1--> publish.yml --> Maven Central
+feature/my-thing --PR--> Dev --PR--> main --tag vX.Y.Z--> publish.yml --> Maven Central
                     |             |
                  ci.yml        ci.yml
                 (test)   (test + release-readiness)
@@ -25,8 +25,10 @@ feature/my-thing --PR--> Dev --PR--> main --tag v0.1.1--> publish.yml --> Maven 
    comment or similar release-profile problem before it ever reaches a tag. Neither job needs any secret to
    run.
 3. **Merge the PR.** `main` now has a non-SNAPSHOT version and a clean release-profile build behind it.
-4. **Tag the merge commit**, e.g. `git tag v0.1.1 && git push origin v0.1.1` (locally, or via a GitHub
-   Release UI that creates the tag for you). This triggers `.github/workflows/publish.yml`.
+4. **Tag the merge commit**, matching the version just merged, e.g. `git tag vX.Y.Z && git push origin
+   vX.Y.Z` (locally, or via a GitHub Release UI that creates the tag for you). This triggers
+   `.github/workflows/publish.yml`. See `doc/spec/versioning.md` for exactly where `X.Y.Z` needs to be
+   bumped before this step.
 5. **`publish.yml` pauses for manual approval** (the `maven-central-release` GitHub Environment -- see
    below), then runs the full test suite again, builds every module's jar/sources/javadoc, GPG-signs all of
    them, and uploads a release bundle to the Sonatype Central Portal. It stops there (`autoPublish: false`
@@ -119,16 +121,17 @@ reported" and block merges forever.)
 
 ## Verifying everything works before the first real tag
 
-Once steps 1-4 above are done, it's worth proving the whole pipe end to end once with a throwaway version
-before trusting it with a real one:
+**Already done** -- this flow was proven end to end before the `v0.1.0` release and has published
+successfully since (`v0.1.0`, `v0.1.1`). Kept below as a reference runbook in case the pipeline itself
+changes significantly enough to warrant re-proving it with another throwaway version:
 
-1. Bump the version to something obviously disposable (e.g. `0.1.1-rc1`) on a scratch branch, open a PR to
+1. Bump the version to something obviously disposable (e.g. `X.Y.Z-rc1`) on a scratch branch, open a PR to
    `main`, confirm both CI checks go green.
-2. Merge, tag `v0.1.1-rc1`, push the tag, approve the environment, confirm `publish.yml` succeeds all the
+2. Merge, tag `vX.Y.Z-rc1`, push the tag, approve the environment, confirm `publish.yml` succeeds all the
    way through the Central Portal upload.
 3. In Central's web UI, you can **drop** (not publish) that test deployment once you've confirmed it
    uploaded correctly -- there's no need to actually make a throwaway version public.
-4. Once that's proven out, do the real thing with `0.1.1`.
+4. Once that's proven out, do the real thing with the actual version.
 
 ## Everyday development (no publishing involved)
 

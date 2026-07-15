@@ -129,7 +129,7 @@ see above), each a plain library, each independently buildable in the order belo
 | `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-vector` + `javai-model` | `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
 | `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim + Spring Data MongoDB shim | All three persistence backends real in Phase 0, not aspirational |
 | `javai-completion` (Completion Fabric) | Wraps Spring AI `ChatModel` | Full RAG API — `PromptContext`, `CompletionRequest`/`Result`, `toContext()`, `complete()`/`completeStreaming()` |
-| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagging`, the tag-summary-vector `VectorIndex<TaggableRef>` |
+| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagRepository`, the tag-summary-vector `VectorIndex<TaggableRef>` |
 
 Nothing past Phase 0 (a real `javaic` compiler, `invokedynamic` dispatch, GPU acceleration, an optional
 JavAIVM) adds a capability a Phase 0 developer doesn't already have — each replaces an internal mechanism
