@@ -18,8 +18,6 @@
 - (Done) Export transcripts and rank ability
 - (Done) Spring Data MongoDB support
 - (Deferred) MongoDB Extension for Hibernate ORM support (https://www.mongodb.com/docs/languages/java/mongodb-hibernate/current/)
-
-
 - (Done) Tagging: whitepaper §5.8, `doc/spec/tagging.md`, `javai-tagging` module implemented and tested
   against all three persistence backends. `@Taggable` is an unwoven marker (orthogonal to
   `@JavAIVectorizable`); classification is LLM-based via `javai-completion`, client-invoked only (never
@@ -39,4 +37,6 @@
   exception, not the default" section for the policy this established, and its "known, tracked debt" note on
   `JavAISupervisionRuntime` (same static-facade shape, not yet fixed -- its dispatch entry points are called
   directly from woven advice with no current path to an instance, so a fix needs its own design pass).
+
+- Add a normalized way to get Json->Unmarshalled objects out of a completion response.
 - Add recursive MCP microservice fabric to the whitepaper.
