@@ -1,5 +1,9 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.JavAIEdge;
+import dev.xtrafe.javai.collections.JavAIGraphNode;
+import dev.xtrafe.javai.collections.JavAIKnowledgeGraph;
+import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
@@ -13,15 +17,18 @@ import org.neo4j.driver.Session;
 import org.neo4j.driver.Value;
 import org.neo4j.driver.Values;
 import org.neo4j.driver.types.Node;
+import org.neo4j.driver.types.Relationship;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.RecordComponent;
 import java.lang.reflect.Type;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -314,6 +321,10 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             }
             String fieldName = field.getName();
             Object value = EntityReflection.readField(entity, fieldName);
+            if (value instanceof KnowledgeGraph<?, ?> graph) {
+                saveKnowledgeGraphField(tx, label, id, fieldName, graph, alreadySaved);
+                continue;
+            }
             String relationshipType = relationshipType(fieldName);
             if (value instanceof Map<?, ?> map) {
                 for (Map.Entry<?, ?> mapEntry : map.entrySet()) {
@@ -344,6 +355,93 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 Values.parameters("ownerId", ownerId.toString(), "targetId", targetId.toString(), "mapKey", mapKey));
     }
 
+    /** A {@code KnowledgeGraph}-typed field is neither a {@code Map}/{@code Collection} of related entities
+     *  nor a singular reference -- it owns its own internal node membership and edges, so it needs two
+     *  field-name-scoped relationship types rather than the one {@link #relationshipType} yields: {@code
+     *  <FIELD>_MEMBER} (owner to node, so an isolated node with no edges still round-trips, and so hydration
+     *  can tell which nodes belong to *this* field/owner even if the same node also appears in some other
+     *  KnowledgeGraph field elsewhere) and {@code <FIELD>_EDGE} (node to node, the graph's own edges). See
+     *  {@link #saveGraphEdge} for why edges MERGE on their full property set rather than bare-pattern. */
+    private <N extends JavAIGraphNode, E extends JavAIEdge> void saveKnowledgeGraphField(
+            SimpleQueryRunner tx, String ownerLabel, UUID ownerId, String fieldName,
+            KnowledgeGraph<N, E> graph, Map<Object, UUID> alreadySaved) {
+        String memberType = relationshipType(fieldName) + "_MEMBER";
+        String edgeType = relationshipType(fieldName) + "_EDGE";
+        for (N node : graph.nodes()) {
+            saveNode(tx, node, alreadySaved);
+            UUID nodeId = EntityReflection.readId(node);
+            String nodeLabel = label(node.getClass());
+            tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId}), (n:`" + nodeLabel + "` {id: $nodeId}) "
+                            + "MERGE (owner)-[:`" + memberType + "`]->(n)",
+                    Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString())));
+        }
+        for (N from : graph.nodes()) {
+            for (N to : graph.neighbors(from)) {
+                for (E edge : graph.edges(from, to)) {
+                    saveGraphEdge(tx, from, to, edgeType, edge);
+                }
+            }
+        }
+    }
+
+    /** MERGEs on the edge's own reflected property values as part of the match pattern itself, not via a
+     *  bare-pattern MERGE followed by SET (contrast {@code TaggingBackendNeo4j}'s deliberate "zero or one
+     *  association" bare-pattern MERGE) -- this is what gives {@code Set}-like value-based dedup, matching
+     *  {@code KnowledgeGraph.edges(from, to)}'s {@code Set<E>} contract: two {@code addEdge} calls with
+     *  identical edge property values collapse into one relationship, two calls with different values create
+     *  two distinct relationships. */
+    private void saveGraphEdge(SimpleQueryRunner tx, Object from, Object to, String edgeType, Object edge) {
+        UUID fromId = EntityReflection.readId(from);
+        UUID toId = EntityReflection.readId(to);
+        String fromLabel = label(from.getClass());
+        String toLabel = label(to.getClass());
+        Map<String, Object> properties = edgeProperties(edge);
+        Map<String, Object> params = new HashMap<>();
+        params.put("fromId", fromId.toString());
+        params.put("toId", toId.toString());
+        StringBuilder pattern = new StringBuilder();
+        int i = 0;
+        for (Map.Entry<String, Object> entry : properties.entrySet()) {
+            pattern.append(i == 0 ? " {" : ", ").append('`').append(entry.getKey()).append("`: $p").append(i);
+            params.put("p" + i, entry.getValue());
+            i++;
+        }
+        if (i > 0) {
+            pattern.append('}');
+        }
+        tx.run(new Query("MATCH (a:`" + fromLabel + "` {id: $fromId}), (b:`" + toLabel + "` {id: $toId}) "
+                        + "MERGE (a)-[:`" + edgeType + "`" + pattern + "]->(b)", params));
+    }
+
+    /** An edge's simple-valued fields (or record components), converted for storage as relationship
+     *  properties -- records (the idiomatic edge shape, e.g. {@code record RelatesTo(String reason)}) can't
+     *  be reflectively field-read the way a plain class can, since their state lives behind synthesized
+     *  accessor methods rather than directly reflectable fields in the same shape as an ordinary entity. */
+    private static Map<String, Object> edgeProperties(Object edge) {
+        Map<String, Object> properties = new LinkedHashMap<>();
+        Class<?> edgeType = edge.getClass();
+        if (edgeType.isRecord()) {
+            for (RecordComponent component : edgeType.getRecordComponents()) {
+                try {
+                    Object value = component.getAccessor().invoke(edge);
+                    if (isSimpleValue(value)) {
+                        properties.put(component.getName(), toNeo4jValue(value));
+                    }
+                } catch (ReflectiveOperationException e) {
+                    throw new IllegalStateException("Cannot read record component " + component + " on " + edgeType, e);
+                }
+            }
+        } else {
+            for (Field field : EntityReflection.allFields(edgeType)) {
+                Object value = EntityReflection.readField(edge, field.getName());
+                if (isSimpleValue(value)) {
+                    properties.put(field.getName(), toNeo4jValue(value));
+                }
+            }
+        }
+        return properties;
+    }
+
     // ---- read: reflective hydration back into a plain Java object graph ------------------------
 
     /** {@code hydrated} caches by id within a single call so a cyclic relationship graph terminates. */
@@ -371,7 +469,12 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         }
 
         for (Field field : EntityReflection.allFields(entityType)) {
-            if (isRelationshipField(field)) {
+            if (!isRelationshipField(field)) {
+                continue;
+            }
+            if (KnowledgeGraph.class.isAssignableFrom(field.getType())) {
+                hydrateKnowledgeGraphField(session, entity, field.getName(), hydrated);
+            } else {
                 hydrateRelationshipField(session, entity, field.getName(), hydrated);
             }
         }
@@ -443,6 +546,102 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         return hydrate(session, relatedType, node, hydrated);
     }
 
+    /** Mirrors {@link #saveKnowledgeGraphField}'s two field-name-scoped relationship types: queries {@code
+     *  <FIELD>_MEMBER} to rebuild node membership (including isolated nodes with no edges), then a single
+     *  query for {@code <FIELD>_EDGE} relationships explicitly scoped to both endpoints being members of
+     *  *this* owner's graph -- not "all edges of this type anywhere" -- so two different owners' KnowledgeGraph
+     *  fields sharing the same node/edge types never cross-contaminate. Rebuilds a fresh, plain, in-memory
+     *  {@code JavAIKnowledgeGraph} and writes it onto the field; there is no live/reactive persisted graph. */
+    private void hydrateKnowledgeGraphField(Session session, Object owner, String fieldName, Map<UUID, Object> hydrated) {
+        Field field = EntityReflection.findField(owner.getClass(), fieldName);
+        UUID ownerId = EntityReflection.readId(owner);
+        String ownerLabel = label(owner.getClass());
+        String memberType = relationshipType(fieldName) + "_MEMBER";
+        String edgeType = relationshipType(fieldName) + "_EDGE";
+        Class<?> edgeClass = genericTypeArgument(field, 1);
+        if (edgeClass == null) {
+            throw new IllegalStateException("Cannot resolve KnowledgeGraph edge type for " + field
+                    + " -- declare it as a concrete KnowledgeGraph<NodeType, EdgeType> field");
+        }
+        JavAIKnowledgeGraph<JavAIGraphNode, JavAIEdge> graph = new JavAIKnowledgeGraph<>();
+
+        List<Node> memberNodes = session.executeRead(tx -> {
+            var result = tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[:`" + memberType + "`]->(n) RETURN n",
+                    Map.of("ownerId", ownerId.toString())));
+            List<Node> found = new ArrayList<>();
+            for (Record record : result.list()) {
+                found.add(record.get("n").asNode());
+            }
+            return found;
+        });
+        for (Node node : memberNodes) {
+            graph.addNode((JavAIGraphNode) hydrateRelated(session, node, hydrated));
+        }
+
+        record EdgeTriple(Node from, Relationship edge, Node to) {
+        }
+        List<EdgeTriple> edgeTriples = session.executeRead(tx -> {
+            var result = tx.run(new Query(
+                    "MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[:`" + memberType + "`]->(a)"
+                            + "-[e:`" + edgeType + "`]->(b)<-[:`" + memberType + "`]-(owner) RETURN a, e, b",
+                    Map.of("ownerId", ownerId.toString())));
+            List<EdgeTriple> found = new ArrayList<>();
+            for (Record record : result.list()) {
+                found.add(new EdgeTriple(record.get("a").asNode(), record.get("e").asRelationship(), record.get("b").asNode()));
+            }
+            return found;
+        });
+        for (EdgeTriple triple : edgeTriples) {
+            JavAIGraphNode from = (JavAIGraphNode) hydrateRelated(session, triple.from(), hydrated);
+            JavAIGraphNode to = (JavAIGraphNode) hydrateRelated(session, triple.to(), hydrated);
+            JavAIEdge edge = (JavAIEdge) hydrateEdge(edgeClass, triple.edge());
+            graph.addEdge(from, to, edge);
+        }
+
+        try {
+            field.setAccessible(true);
+            field.set(owner, graph);
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot write field " + field + " on " + owner.getClass(), e);
+        }
+    }
+
+    /** Reconstructs an edge instance from a relationship's stored properties. Records (the idiomatic edge
+     *  shape) can't be field-assigned after construction, so their canonical constructor is invoked directly
+     *  with each {@code RecordComponent}'s converted value; plain classes fall back to the same no-arg-
+     *  constructor + reflective-field-write pattern already used for ordinary entity hydration. */
+    private static Object hydrateEdge(Class<?> edgeType, Relationship relationship) {
+        if (edgeType.isRecord()) {
+            RecordComponent[] components = edgeType.getRecordComponents();
+            Class<?>[] paramTypes = new Class<?>[components.length];
+            Object[] args = new Object[components.length];
+            for (int i = 0; i < components.length; i++) {
+                paramTypes[i] = components[i].getType();
+                args[i] = relationship.containsKey(components[i].getName())
+                        ? convertNeo4jValue(relationship.get(components[i].getName()), paramTypes[i])
+                        : null;
+            }
+            try {
+                return edgeType.getDeclaredConstructor(paramTypes).newInstance(args);
+            } catch (ReflectiveOperationException e) {
+                throw new IllegalStateException("Cannot reconstruct record " + edgeType + " from relationship properties", e);
+            }
+        }
+        Object edge;
+        try {
+            edge = edgeType.getDeclaredConstructor().newInstance();
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException(edgeType + " needs a no-arg constructor, or must be a record, to be "
+                    + "hydrated as a KnowledgeGraph edge from Neo4j", e);
+        }
+        for (Field field : EntityReflection.allFields(edgeType)) {
+            if (relationship.containsKey(field.getName())) {
+                setFieldFromNeo4jValue(edge, field, relationship.get(field.getName()));
+            }
+        }
+        return edge;
+    }
+
     // ---- field <-> Neo4j value conversion --------------------------------------------------------
 
     private static boolean isIdField(Field field) {
@@ -456,7 +655,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     private static boolean isRelationshipField(Field field) {
         Class<?> type = field.getType();
         return Map.class.isAssignableFrom(type) || Collection.class.isAssignableFrom(type)
-                || JavAIVectorizable.class.isAssignableFrom(type);
+                || KnowledgeGraph.class.isAssignableFrom(type) || JavAIVectorizable.class.isAssignableFrom(type);
     }
 
     private static boolean isSimpleValue(Object value) {
@@ -480,32 +679,38 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     private static void setFieldFromNeo4jValue(Object entity, Field field, Value value) {
         try {
             field.setAccessible(true);
-            Class<?> type = field.getType();
-            if (type == String.class) {
-                field.set(entity, value.asString());
-            } else if (type == UUID.class) {
-                field.set(entity, UUID.fromString(value.asString()));
-            } else if (type == Instant.class) {
-                field.set(entity, Instant.parse(value.asString()));
-            } else if (type.isEnum()) {
-                @SuppressWarnings({"unchecked", "rawtypes"})
-                Object enumValue = Enum.valueOf((Class<Enum>) type, value.asString());
-                field.set(entity, enumValue);
-            } else if (type == int.class || type == Integer.class) {
-                field.set(entity, value.asInt());
-            } else if (type == long.class || type == Long.class) {
-                field.set(entity, value.asLong());
-            } else if (type == double.class || type == Double.class) {
-                field.set(entity, value.asDouble());
-            } else if (type == float.class || type == Float.class) {
-                field.set(entity, (float) value.asDouble());
-            } else if (type == boolean.class || type == Boolean.class) {
-                field.set(entity, value.asBoolean());
-            } else {
-                field.set(entity, value.asObject());
-            }
+            field.set(entity, convertNeo4jValue(value, field.getType()));
         } catch (IllegalAccessException e) {
             throw new IllegalStateException("Cannot write field " + field + " on " + entity.getClass(), e);
+        }
+    }
+
+    /** Shared by {@link #setFieldFromNeo4jValue} (field assignment) and {@link #hydrateEdge}'s record path
+     *  (constructor arguments) -- a record's canonical constructor needs converted VALUES, not a field-
+     *  assignment side effect, so the conversion logic lives here rather than only inside a setter. */
+    private static Object convertNeo4jValue(Value value, Class<?> targetType) {
+        if (targetType == String.class) {
+            return value.asString();
+        } else if (targetType == UUID.class) {
+            return UUID.fromString(value.asString());
+        } else if (targetType == Instant.class) {
+            return Instant.parse(value.asString());
+        } else if (targetType.isEnum()) {
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Object enumValue = Enum.valueOf((Class<Enum>) targetType, value.asString());
+            return enumValue;
+        } else if (targetType == int.class || targetType == Integer.class) {
+            return value.asInt();
+        } else if (targetType == long.class || targetType == Long.class) {
+            return value.asLong();
+        } else if (targetType == double.class || targetType == Double.class) {
+            return value.asDouble();
+        } else if (targetType == float.class || targetType == Float.class) {
+            return (float) value.asDouble();
+        } else if (targetType == boolean.class || targetType == Boolean.class) {
+            return value.asBoolean();
+        } else {
+            return value.asObject();
         }
     }
 

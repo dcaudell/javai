@@ -7,6 +7,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
+import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
@@ -121,6 +122,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
         if (registeredEntityTypes.add(entityType)) {
             validateMapKeyTypesAreSupported(entityType);
+            validateNoKnowledgeGraphFields(entityType);
         }
         for (Field field : EntityReflection.allFields(entityType)) {
             Class<?> relatedType = relatedEntityType(field);
@@ -173,6 +175,26 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             }
         }
         return null;
+    }
+
+    /** Fails fast, at registration time, for a {@code KnowledgeGraph}-typed field. Without this guard,
+     *  {@link #relatedEntityType}'s plain {@code JavAIVectorizable} branch would catch it too (since
+     *  {@code KnowledgeGraph extends JavAIVectorizable}) and misidentify it as an ordinary referenceable
+     *  entity -- which has no {@code @Id}, so it would fail confusingly deep in {@code EntityReflection.readId}
+     *  the first time a document actually needed to reference it, instead of failing clearly here.
+     *  {@code KnowledgeGraph} persistence is Neo4j-only in this phase -- see
+     *  {@code RepositoryBackendNeo4j}'s own {@code saveKnowledgeGraphField}/{@code hydrateKnowledgeGraphField}
+     *  and doc/spec/persistence-bridge.md for why (native multi-hop traversal + hybrid similarity/structure
+     *  querying has no efficient equivalent to build here in this phase). */
+    private static void validateNoKnowledgeGraphFields(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (KnowledgeGraph.class.isAssignableFrom(field.getType())) {
+                throw new IllegalArgumentException("MongoDB persistence does not support KnowledgeGraph fields -- "
+                        + entityType.getName() + "." + field.getName() + " is a KnowledgeGraph. KnowledgeGraph "
+                        + "persistence is Neo4j-only in this phase; use JavAIPersistenceConfig.Backend.NEO4J for "
+                        + "any entity type that declares one.");
+            }
+        }
     }
 
     @Override

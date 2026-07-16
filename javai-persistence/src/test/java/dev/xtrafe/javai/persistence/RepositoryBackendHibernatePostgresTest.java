@@ -211,6 +211,26 @@ class RepositoryBackendHibernatePostgresTest {
     }
 
     /**
+     * {@code KnowledgeGraph} persistence is Neo4j-only (see {@link RepositoryBackendNeo4jTest}'s own
+     * KnowledgeGraph round-trip tests) -- proves the Postgres backend rejects a {@code KnowledgeGraph}-typed
+     * field clearly, at registration time, rather than failing confusingly deep inside Hibernate's boot-time
+     * mapping once an unmappable field type is discovered.
+     */
+    @Test
+    void knowledgeGraphFieldFailsFastAtRegistrationInsteadOfConfusingHibernateMappingFailure() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> JavAIPI.repository(TestOwnerWithGraphRepository.class,
+                        JavAIPersistenceConfig.builder()
+                                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+                                .postgresUrl(postgres.getJdbcUrl())
+                                .postgresUsername(postgres.getUsername())
+                                .postgresPassword(postgres.getPassword())
+                                .build()));
+        assertTrue(thrown.getMessage().contains("KnowledgeGraph"));
+        assertTrue(thrown.getMessage().contains("Neo4j"));
+    }
+
+    /**
      * The persistence must-have that doesn't depend on which {@link EmbeddingConsistencyMode} is active:
      * a save() immediately following a mutation, with no intervening explicit read, must still persist the
      * vector matching the field's *final* value -- IMMEDIATE_CONSISTENCY never eagerly computes on mutation

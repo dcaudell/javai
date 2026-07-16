@@ -18,6 +18,7 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 | Neo4j-facing shim | Mechanism | Parallel graph-native persistence backend, same `JavAIPI` contract |
 | MongoDB-facing shim | Mechanism | `RepositoryBackendSpringDataMongo` -- Spring Data MongoDB's `MongoTemplate` for connection/database access, raw driver reads/writes/`$vectorSearch` for the vector-specific work, same `JavAIPI` contract |
 | `embedding_version` side table / expand-contract migration | Pattern | Versioned vector storage across model changes, non-destructive |
+| `KnowledgeGraph<N, E>` field support | Neo4j-only | An ordinary field on any `@Entity`/`@JavAIVectorizable` owner, mapped to two field-scoped relationship types; `RepositoryBackendHibernatePostgres`/`RepositoryBackendSpringDataMongo` reject it clearly at registration time -- see "`KnowledgeGraph` fields: Neo4j-only" below |
 
 ## Reference implementation shape
 
@@ -60,6 +61,57 @@ Data MongoDB, by contrast, has mature `$vectorSearch` support and needs no assoc
 backend stores related/collection-typed fields as `{type, id}` reference pointers it manages itself, the
 same reference-not-embed choice `RepositoryBackendNeo4j` already makes for its own graph relationships).
 See `javai-persistence/README.md`'s "MongoDB backend" section for the full mapping rules.
+
+## `KnowledgeGraph` fields: Neo4j-only
+
+`KnowledgeGraph<N, E>` (`javai-collections`, see `doc/spec/vector-collections.md`) is a plain, in-memory
+collection — like `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap`, it has zero persistence
+awareness of its own; it never accepts a repository or backing store, and never performs I/O from its own
+`addNode`/`addEdge`/`nearestSubgraph` methods. A `KnowledgeGraph`-typed field persists exactly the way any
+other JavAI collection field does: declare it as an ordinary field on an `@Entity`/`@JavAIVectorizable`
+owner, and the backend's existing reflective field mapper picks it up automatically — no ceremony, no
+separate registration call for the field itself.
+
+```java
+@Entity
+class ResearchTopic implements JavAIVectorizable {
+    @Id UUID id;
+    @Vectorize String title;
+    KnowledgeGraph<Concept, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+    // ...
+}
+
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder().backend(Backend.NEO4J)./* ... */.build();
+JavAIPI.repository(ConceptRepository.class, config); // register the node type first, same rule as any
+                                                       // relationship target Neo4j needs to resolve by label
+ResearchTopicRepository repo = JavAIPI.repository(ResearchTopicRepository.class, config);
+
+repo.save(topic);                                     // writes nodes + edges in one shot
+ResearchTopic reloaded = repo.findById(topic.getId()).orElseThrow();
+reloaded.graph.nearestSubgraph(reference, 1, 2);       // works on the rehydrated graph exactly like in-memory
+```
+
+**This is Neo4j-only.** `RepositoryBackendNeo4j` maps a `KnowledgeGraph` field to two field-name-scoped
+relationship types — `<FIELD>_MEMBER` (owner → node, so an isolated node with no edges still round-trips)
+and `<FIELD>_EDGE` (node → node, the graph's own edges, MERGed on their full property set so `Set<E>`'s
+"possibly several distinct edges between the same pair" semantics survive persistence). `save()`/hydration
+never construct a live/reactive graph proxy — every call rebuilds a fresh, plain `JavAIKnowledgeGraph` and
+sets it onto the field, identical in spirit to how every other JavAI collection round-trips. Both
+`RepositoryBackendHibernatePostgres` and `RepositoryBackendSpringDataMongo` reject a `KnowledgeGraph`-typed
+field with a clear `IllegalArgumentException` at registration time (naming the offending field and pointing
+at Neo4j), rather than failing confusingly later — Postgres's own field classifiers would otherwise let it
+fall through to being treated as a plain, unmappable scalar column; Mongo's would misidentify it as a
+referenceable entity (since `KnowledgeGraph extends JavAIVectorizable`), which has no `@Id` and would fail
+deep inside id-reading code the first time a document tried to reference it.
+
+**Why not Postgres or MongoDB too, eventually?** Every other JavAI collection (`List`/`Set`/`Map`) persists
+uniformly across all three backends because "a collection of related entities" has some natural
+representation in each of them — a membership table, a reference-pointer array. `KnowledgeGraph`'s actual
+value proposition is different: native multi-hop traversal combined with similarity search in one query
+(`nearestSubgraph`). Neo4j has this built in (Cypher traversal plus a native vector index). Postgres and
+MongoDB don't — building an equivalent would mean hand-rolling a real graph-traversal engine on top of a
+relational/document store, a substantial undertaking deliberately out of scope for this project's Phase 0
+(proving the design space), not an oversight or a temporary gap.
 
 ## Persisting one entity type to more than one store at once
 

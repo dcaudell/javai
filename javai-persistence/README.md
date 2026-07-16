@@ -186,6 +186,60 @@ correctly implementing a custom `PersistentCollection` is a substantial, easy-to
 a Phase 0 module whose job is proving the design space, not hardening a production ORM integration. Worth
 revisiting if this module graduates past Phase 0.
 
+## `KnowledgeGraph<N, E>` fields -- Neo4j only
+
+`KnowledgeGraph` (`javai-collections`) stays a pure, in-memory collection with zero persistence awareness of
+its own -- no `persisted(...)`-style method, no repository/backing-store argument anywhere on it. A
+`KnowledgeGraph`-typed field persists the same way any other JavAI collection field does: declare it as an
+ordinary field on an `@Entity`/`@JavAIVectorizable` owner, and `RepositoryBackendNeo4j`'s existing reflective
+field mapper picks it up automatically, no separate ceremony for the field itself (though, like any
+relationship target, the node type still needs its own `JavAIPI.repository(...)` call at some point so
+Neo4j's label registry can resolve it).
+
+```java
+class ResearchTopic implements JavAIVectorizable {
+    KnowledgeGraph<Concept, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+    // ...
+}
+```
+
+`RepositoryBackendNeo4j` maps such a field to two field-name-scoped relationship types (derived from the
+field's own name via the same `relationshipType(...)` helper the rest of this backend already uses):
+`<FIELD>_MEMBER` (owner → node, establishing graph membership -- this is what makes an isolated node with no
+edges still round-trip, and what lets hydration tell which nodes belong to *this* field/owner even if the
+same node type is also reachable through some other `KnowledgeGraph` field elsewhere) and `<FIELD>_EDGE`
+(node → node, the graph's own internal edges). Both edges MERGE on their *full* property set as part of the
+match pattern itself, not via a bare-pattern MERGE followed by `SET` -- contrast `TaggingBackendNeo4j`'s
+deliberate "zero or one association" bare-pattern MERGE (`javai-tagging`), which is the wrong shape here:
+`KnowledgeGraph.edges(from, to)` returns a `Set<E>`, so two distinct edges (different property values)
+between the same node pair must persist as two distinct relationships, while re-saving identical edge
+property values must stay idempotent. Edge instances are commonly Java records (`record RelatesTo(String
+reason) implements JavAIEdge {}`); since records can't be reflectively field-assigned after construction,
+hydration reconstructs them via their canonical constructor from each `RecordComponent`'s stored value
+instead, falling back to ordinary no-arg-constructor-plus-field-write for a hand-written (non-record) edge
+class.
+
+`save()`/hydration never construct a live/reactive graph proxy that performs I/O from inside `addNode`/
+`addEdge` -- every `save()` writes the graph's current in-memory contents in one shot, and every hydration
+rebuilds a fresh, plain `JavAIKnowledgeGraph` and sets it onto the field, identical in spirit to how every
+other JavAI collection round-trips. `RepositoryBackendNeo4jTest` proves the full round trip: multi-node/
+multi-edge graphs, an isolated node with no edges, multiple distinct edges between the same pair, an empty
+graph, idempotent re-save, and `nearestSubgraph()` correctness against the rehydrated graph.
+
+**Postgres and MongoDB reject a `KnowledgeGraph`-typed field clearly, at registration time.** Left
+unguarded, Postgres's field classifiers would let it fall through to being handed to Hibernate as an
+ordinary, unmappable field (a confusing boot-time exception); Mongo's `relatedEntityType` would misidentify
+it as a plain referenceable entity (since `KnowledgeGraph extends JavAIVectorizable`), which has no `@Id`
+and would fail deep inside id-reading code instead. Both backends now throw a clear `IllegalArgumentException`
+naming the offending field and class, and pointing at Neo4j, the moment such a field is registered.
+
+**Why Neo4j-only, not eventually all three?** Every other JavAI collection persists uniformly across all
+three backends because "a collection of related entities" has some natural representation in each of them.
+`KnowledgeGraph`'s actual value -- native multi-hop traversal combined with a similarity query in one call
+(`nearestSubgraph`) -- has no efficient equivalent on Postgres or MongoDB; building one would mean hand-
+rolling a real graph-traversal engine on top of a relational/document store, a substantial undertaking
+deliberately out of scope for this project's Phase 0.
+
 ## Where vectors actually live
 
 **Postgres**: `javai_vectors__<model>` (one row per `owner_type`/`owner_id`/`field_name`, `field_name`
