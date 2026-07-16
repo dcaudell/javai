@@ -25,8 +25,11 @@ not the reverse. See `javai-model/README.md` for where the collection-supertype 
 
 ## `KnowledgeGraph<N, E>`, in full
 
-The type every graph-shaped collection in this project (in-memory or persisted, via Persistence Bridge's
-Neo4j shim) ultimately is:
+A plain, in-memory collection type -- as pure as `JavAIList`/`JavAISet`/`JavAIMap`, with zero persistence
+awareness of its own. There is no `persisted(JavAIRepository<N> backing)`-style method, and none is planned:
+`JavAIRepository` belongs to Persistence Bridge (`javai-persistence`), which depends on this module, not the
+reverse, and a `KnowledgeGraph`-typed field turns out to persist perfectly well without the interface needing
+to know anything about a backing store at all -- see "How this actually persists" below.
 
 ```java
 public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
@@ -48,10 +51,6 @@ public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
     // stay queryable, sortable, and narrowable exactly like the graph
     // they came from.
     SubgraphResult<N, E> nearestSubgraph(EmbeddingVector reference, int k, int hops);
-
-    // -- persistence-facing: NOT part of the interface yet. The whitepaper's own signature is
-    // `persisted(JavAIRepository<N> backing)`, but JavAIRepository belongs to Persistence Bridge
-    // (javai-persistence), which depends on this module, not the reverse -- see package-info.
 }
 
 // What nearestSubgraph() actually returns. Because it extends
@@ -68,8 +67,8 @@ The consequence of `SubgraphResult` extending `KnowledgeGraph`: a query result c
 narrowing structure and similarity together across multiple hops, without ever dropping to a plain list:
 
 ```java
-KnowledgeGraph<Article, RelatesTo> graph =
-    JavAIPI.knowledgeGraph(Article.class, RelatesTo.class);
+KnowledgeGraph<Article, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+graph.addEdge(articleA, articleB, new RelatesTo("cites"));
 
 SubgraphResult<Article, RelatesTo> broad =
     graph.nearestSubgraph(queryVector, 50, /* hops */ 3);
@@ -80,6 +79,17 @@ SubgraphResult<Article, RelatesTo> narrowed =
 
 JavAIList<Article> ranked = narrowed.sortByCosineDistance(queryVector);
 ```
+
+### How this actually persists
+
+`KnowledgeGraph` never gained a persistence-facing method -- instead, Persistence Bridge's Neo4j backend
+treats a `KnowledgeGraph`-typed field exactly like any other JavAI collection field (`JavAIArrayList`/
+`JavAILinkedHashSet`/`JavAILinkedHashMap`): declare it as an ordinary field on an owning `@Entity`/
+`@JavAIVectorizable` type, and the backend's existing reflective field mapper picks it up automatically.
+This is Neo4j-only in this phase -- Postgres and MongoDB reject such a field with a clear error at
+registration time rather than failing confusingly later. See `javai-persistence/README.md`'s
+"`KnowledgeGraph<N, E>` fields -- Neo4j only" section and `doc/spec/persistence-bridge.md` for the full
+mapping story.
 
 ## Related interfaces and annotations
 
@@ -122,5 +132,6 @@ propagates dirty up through the graph. `SubgraphResult` gets "narrow again" for 
 `JavAIKnowledgeGraph` rather than reimplementing it. All covered by hermetic tests (`JavAIVectorIndexTest`,
 `JavAIKnowledgeGraphTest`) using a fake embedding provider, no Docker required.
 
-`persisted(JavAIRepository<N> backing)` is not part of the interface yet -- see the code excerpt above and
-package-info for why.
+`KnowledgeGraph` itself gained no persistence-facing method or type -- see "How this actually persists"
+above for how a `KnowledgeGraph`-typed field round-trips through Persistence Bridge's Neo4j backend without
+this module needing to know anything about a backing store.

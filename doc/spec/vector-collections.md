@@ -75,8 +75,9 @@ interface JavAIMap<K, V> extends java.util.Map<K, V>, JavAISortable<V>, JavAIVec
 
 ## `KnowledgeGraph<N, E>`, in full
 
-The type every graph-shaped collection in this document (in-memory or persisted, via Persistence Bridge's
-Neo4j shim) ultimately is:
+A plain, in-memory collection type, exactly as pure as `JavAIList`/`JavAISet`/`JavAIMap` -- it has zero
+persistence awareness of its own, no `persisted(...)`-style method, and never performs I/O from any of its
+own methods:
 
 ```java
 public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
@@ -98,9 +99,6 @@ public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
     // stay queryable, sortable, and narrowable exactly like the graph
     // they came from.
     SubgraphResult<N, E> nearestSubgraph(EmbeddingVector reference, int k, int hops);
-
-    // -- persistence-facing --
-    KnowledgeGraph<N, E> persisted(JavAIRepository<N> backing);
 }
 
 // What nearestSubgraph() actually returns. Because it extends
@@ -113,12 +111,29 @@ public interface SubgraphResult<N extends JavAIGraphNode, E extends JavAIEdge>
 }
 ```
 
+`JavAIKnowledgeGraph<N, E>` is the one concrete, hand-written implementation. It's declared as an ordinary
+field on some owning `@Entity`/`@JavAIVectorizable` type, exactly like any other JavAI collection field --
+never constructed via a repository or persistence-facing factory:
+
+```java
+class ResearchTopic implements JavAIVectorizable {
+    KnowledgeGraph<Article, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+    // ...
+}
+```
+
+Persistence Bridge treats that field the same way it treats a `JavAIArrayList`/`JavAILinkedHashSet`/
+`JavAILinkedHashMap` field: an ordinary field its reflective mapper auto-detects and handles, Neo4j-only in
+this phase (native multi-hop traversal plus a similarity index has no efficient equivalent to build on
+Postgres/MongoDB yet) -- see doc/spec/persistence-bridge.md's "`KnowledgeGraph` fields: Neo4j-only" for the
+full mapping story, including why the other two backends reject such a field clearly rather than silently.
+
 The consequence of `SubgraphResult` extending `KnowledgeGraph`: a query result can be queried again,
 narrowing structure and similarity together across multiple hops, without ever dropping to a plain list:
 
 ```java
-KnowledgeGraph<Article, RelatesTo> graph =
-    JavAIPI.knowledgeGraph(Article.class, RelatesTo.class);
+KnowledgeGraph<Article, RelatesTo> graph = new JavAIKnowledgeGraph<>();
+graph.addEdge(articleA, articleB, new RelatesTo("cites"));
 
 SubgraphResult<Article, RelatesTo> broad =
     graph.nearestSubgraph(queryVector, 50, /* hops */ 3);

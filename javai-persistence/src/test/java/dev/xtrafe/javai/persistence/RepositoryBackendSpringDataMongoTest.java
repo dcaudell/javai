@@ -223,6 +223,26 @@ class RepositoryBackendSpringDataMongoTest {
     }
 
     /**
+     * {@code KnowledgeGraph} persistence is Neo4j-only (see {@link RepositoryBackendNeo4jTest}'s own
+     * KnowledgeGraph round-trip tests) -- proves the MongoDB backend rejects a {@code KnowledgeGraph}-typed
+     * field clearly, at registration time, rather than misidentifying it as an ordinary referenceable entity
+     * (since {@code KnowledgeGraph extends JavAIVectorizable}) and failing confusingly deep inside
+     * {@code EntityReflection.readId} the first time a document needed to reference it.
+     */
+    @Test
+    void knowledgeGraphFieldFailsFastAtRegistrationInsteadOfMisidentifyingItAsAReferenceableEntity() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> JavAIPI.repository(TestOwnerWithGraphRepository.class,
+                        JavAIPersistenceConfig.builder()
+                                .backend(JavAIPersistenceConfig.Backend.MONGODB)
+                                .mongoUri(mongoUri())
+                                .mongoDatabase(DATABASE)
+                                .build()));
+        assertTrue(thrown.getMessage().contains("KnowledgeGraph"));
+        assertTrue(thrown.getMessage().contains("Neo4j"));
+    }
+
+    /**
      * Proves {@code Map}-typed reference fields round-trip both keys and values -- see
      * {@link RepositoryBackendNeo4jTest#mapFieldRoundTripsWithKeysPreserved()} for the equivalent proof
      * against Neo4j, and this backend's own {@code referenceValue}/{@code hydrateReferenceField} for the
