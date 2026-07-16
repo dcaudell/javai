@@ -2,6 +2,7 @@ package dev.xtrafe.javai.e2e.environment;
 
 import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
+import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
@@ -45,6 +46,10 @@ public final class JavAIEnvironment {
     private static final ArticleRepository POSTGRES_ARTICLE_REPOSITORY;
     private static final ArticleRepository NEO4J_ARTICLE_REPOSITORY;
     private static final ArticleRepository MONGO_ARTICLE_REPOSITORY;
+
+    // Neo4j-only: a KnowledgeGraph<Article, RelatesTo> field is Neo4j-only (see ArticleCluster's own
+    // javadoc), so there's no Postgres/Mongo counterpart to build here.
+    private static final ArticleClusterRepository NEO4J_ARTICLE_CLUSTER_REPOSITORY;
 
     private static final CommentRepository POSTGRES_COMMENT_REPOSITORY;
     private static final CommentRepository NEO4J_COMMENT_REPOSITORY;
@@ -95,6 +100,9 @@ public final class JavAIEnvironment {
         NEO4J_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, neo4jConfig);
         JavAIPI.repository(AttachmentRepository.class, neo4jConfig);
         NEO4J_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, neo4jConfig);
+        // Article (a KnowledgeGraph node type) is already registered above -- required before Neo4j's label
+        // registry can resolve nodes reached through ArticleCluster.graph during hydration.
+        NEO4J_ARTICLE_CLUSTER_REPOSITORY = JavAIPI.repository(ArticleClusterRepository.class, neo4jConfig);
         NEO4J_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, neo4jConfig);
         NEO4J_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, neo4jConfig);
 
@@ -141,6 +149,10 @@ public final class JavAIEnvironment {
 
     public static ArticleRepository mongoArticleRepository() {
         return MONGO_ARTICLE_REPOSITORY;
+    }
+
+    public static ArticleClusterRepository neo4jArticleClusterRepository() {
+        return NEO4J_ARTICLE_CLUSTER_REPOSITORY;
     }
 
     public static CommentRepository postgresCommentRepository() {

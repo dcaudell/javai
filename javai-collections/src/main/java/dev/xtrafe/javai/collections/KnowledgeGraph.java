@@ -13,12 +13,16 @@ import java.util.function.Predicate;
  * doc/spec/vector-collections.md for the full contract; {@link JavAIKnowledgeGraph} is the concrete
  * implementation.
  *
- * <p><b>{@code persisted(JavAIRepository<N> backing)} is deliberately not part of this interface yet.</b>
- * The whitepaper's own signature references {@code JavAIRepository}, which belongs to Persistence Bridge
- * (javai-persistence) -- a module that depends on Vector Collections, not the reverse (SPEC.md's
- * dependency graph). Referencing it here would mean either a forward reference to a module that doesn't
- * exist, or moving {@code JavAIRepository} someplace it doesn't belong just to satisfy a type signature
- * that has no implementation behind it yet. Add it when javai-persistence exists to back it for real.
+ * <p><b>{@code persisted(JavAIRepository<N> backing)} is deliberately not, and will not become, part of
+ * this interface.</b> The whitepaper's own signature references {@code JavAIRepository}, which belongs to
+ * Persistence Bridge (javai-persistence) -- a module that depends on Vector Collections, not the reverse
+ * (SPEC.md's dependency graph), so referencing it here directly was never viable without an inverted
+ * dependency. Now that javai-persistence exists, it turns out no such method is needed anyway: a
+ * {@code KnowledgeGraph}-typed field on an owning {@code @Entity}/{@code JavAIVectorizable} type persists
+ * (Neo4j-only) exactly like any other JavAI collection field, handled entirely by the backend's reflective
+ * field mapper -- this interface stays exactly as pure as {@link JavAIList}/{@link JavAISet}/
+ * {@code JavAIMap}. See {@code RepositoryBackendNeo4j}'s {@code saveKnowledgeGraphField}/
+ * {@code hydrateKnowledgeGraphField} and doc/spec/persistence-bridge.md for the full mapping story.
  */
 public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
         extends JavAIVectorizable, JavAISortable<N> {

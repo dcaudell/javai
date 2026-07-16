@@ -1,5 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.KnowledgeGraph;
+import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
@@ -42,6 +44,7 @@ class RepositoryBackendNeo4jTest {
 
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
+    private static TestOwnerWithGraphRepository graphOwnerRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -53,6 +56,8 @@ class RepositoryBackendNeo4jTest {
                 .neo4jPassword(NEO4J_PASSWORD)
                 .build();
         repository = JavAIPI.repository(TestArticleRepository.class, config);
+        JavAIPI.repository(TestGraphNodeRepository.class, config);
+        graphOwnerRepository = JavAIPI.repository(TestOwnerWithGraphRepository.class, config);
     }
 
     @BeforeEach
@@ -279,6 +284,134 @@ class RepositoryBackendNeo4jTest {
                 "EVENTUAL_CONSISTENCY's slow background dispatch must never be allowed to leave a stale "
                         + "vector in the database -- the flush itself must have forced an accurate, "
                         + "blocking recompute");
+    }
+
+    /**
+     * The core round-trip: a {@code KnowledgeGraph}-typed field with several nodes and edges, plus one
+     * isolated node with no edges at all -- proving the {@code <FIELD>_MEMBER} relationship (not just
+     * {@code <FIELD>_EDGE}) is what makes an edge-less node still round-trip, per
+     * {@code RepositoryBackendNeo4j#saveKnowledgeGraphField}'s javadoc.
+     */
+    @Test
+    void knowledgeGraphFieldRoundTripsNodesAndEdges() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Graph owner");
+        TestGraphNode a = new TestGraphNode("node A");
+        TestGraphNode b = new TestGraphNode("node B");
+        TestGraphNode c = new TestGraphNode("node C");
+        TestGraphNode isolated = new TestGraphNode("isolated node");
+        owner.getGraph().addNode(isolated);
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("A connects to B"));
+        owner.getGraph().addEdge(b, c, new TestGraphEdge("B connects to C"));
+
+        TestOwnerWithGraph saved = graphOwnerRepository.save(owner);
+        TestOwnerWithGraph reloaded = graphOwnerRepository.findById(saved.getId()).orElseThrow();
+
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> graph = reloaded.getGraph();
+        assertEquals(4, graph.nodes().size());
+        assertTrue(graph.nodes().stream().anyMatch(n -> n.getName().equals("isolated node")),
+                "an isolated node with no edges must still round-trip via the graph's MEMBER relationship");
+
+        TestGraphNode reloadedA = findByName(graph, "node A");
+        TestGraphNode reloadedB = findByName(graph, "node B");
+        TestGraphNode reloadedC = findByName(graph, "node C");
+        assertEquals(1, graph.neighbors(reloadedA).size());
+        assertTrue(graph.neighbors(reloadedA).contains(reloadedB));
+        assertEquals(1, graph.edges(reloadedA, reloadedB).size());
+        assertEquals("A connects to B", graph.edges(reloadedA, reloadedB).iterator().next().reason());
+        assertEquals(1, graph.edges(reloadedB, reloadedC).size());
+        assertEquals("B connects to C", graph.edges(reloadedB, reloadedC).iterator().next().reason());
+    }
+
+    /**
+     * Proves the {@code Set<E> edges(from, to)} contract survives persistence: two distinct edges (different
+     * property values) between the same node pair must MERGE into two distinct relationships, not collapse
+     * into one -- contrast {@code TaggingBackendNeo4j}'s deliberate "zero or one" bare-pattern MERGE, which
+     * is the wrong shape for a {@code KnowledgeGraph} edge (see {@code RepositoryBackendNeo4j#saveGraphEdge}'s
+     * javadoc).
+     */
+    @Test
+    void multipleDistinctEdgesBetweenTheSamePairAllPersist() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Multi-edge owner");
+        TestGraphNode a = new TestGraphNode("multi A");
+        TestGraphNode b = new TestGraphNode("multi B");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("reason one"));
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("reason two"));
+
+        TestOwnerWithGraph saved = graphOwnerRepository.save(owner);
+        TestOwnerWithGraph reloaded = graphOwnerRepository.findById(saved.getId()).orElseThrow();
+
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> graph = reloaded.getGraph();
+        TestGraphNode reloadedA = findByName(graph, "multi A");
+        TestGraphNode reloadedB = findByName(graph, "multi B");
+        var reasons = graph.edges(reloadedA, reloadedB).stream().map(TestGraphEdge::reason).toList();
+        assertEquals(2, reasons.size());
+        assertTrue(reasons.contains("reason one"));
+        assertTrue(reasons.contains("reason two"));
+    }
+
+    /**
+     * Proves the full-property MERGE is idempotent: saving the same owner twice (e.g. an ordinary re-save of
+     * an already-persisted entity) must not duplicate relationships.
+     */
+    @Test
+    void savingTheSameGraphTwiceDoesNotDuplicateRelationships() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Resave owner");
+        TestGraphNode a = new TestGraphNode("resave A");
+        TestGraphNode b = new TestGraphNode("resave B");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("stable reason"));
+
+        TestOwnerWithGraph saved = graphOwnerRepository.save(owner);
+        graphOwnerRepository.save(saved); // deliberate re-save of the same graph contents
+
+        TestOwnerWithGraph reloaded = graphOwnerRepository.findById(saved.getId()).orElseThrow();
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> graph = reloaded.getGraph();
+        assertEquals(2, graph.nodes().size());
+        TestGraphNode reloadedA = findByName(graph, "resave A");
+        TestGraphNode reloadedB = findByName(graph, "resave B");
+        assertEquals(1, graph.edges(reloadedA, reloadedB).size(),
+                "re-saving the same owner must not duplicate the relationship -- MERGE must be idempotent");
+    }
+
+    /** An owner whose graph has no nodes at all must still round-trip cleanly (no error, empty graph back). */
+    @Test
+    void emptyKnowledgeGraphFieldRoundTrips() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Empty graph owner");
+
+        TestOwnerWithGraph saved = graphOwnerRepository.save(owner);
+        TestOwnerWithGraph reloaded = graphOwnerRepository.findById(saved.getId()).orElseThrow();
+
+        assertTrue(reloaded.getGraph().nodes().isEmpty());
+    }
+
+    /** {@code nearestSubgraph()} must work correctly on the graph as rehydrated from Neo4j, not just in-memory. */
+    @Test
+    void nearestSubgraphWorksOnARehydratedGraph() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Subgraph owner");
+        TestGraphNode security = new TestGraphNode("zero-day vulnerability disclosed");
+        TestGraphNode cooking = new TestGraphNode("weeknight pasta recipes");
+        TestGraphNode sports = new TestGraphNode("championship game recap");
+        owner.getGraph().addEdge(security, cooking, new TestGraphEdge("published same day"));
+        owner.getGraph().addNode(sports);
+
+        TestOwnerWithGraph saved = graphOwnerRepository.save(owner);
+        TestOwnerWithGraph reloaded = graphOwnerRepository.findById(saved.getId()).orElseThrow();
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> graph = reloaded.getGraph();
+        TestGraphNode reloadedSecurity = findByName(graph, "zero-day vulnerability disclosed");
+
+        SubgraphResult<TestGraphNode, TestGraphEdge> subgraph =
+                graph.nearestSubgraph(reloadedSecurity.fieldVector("name"), 1, 1);
+
+        assertEquals(1.0, subgraph.scoreOf(reloadedSecurity), 1e-6,
+                "the node whose own field produced the reference vector must score as an exact match to itself");
+        assertTrue(subgraph.nodes().stream().anyMatch(n -> n.getName().equals("weeknight pasta recipes")),
+                "the 1-hop neighbor reached via the graph's own edge must be included in the subgraph");
+        assertTrue(subgraph.nodes().stream().noneMatch(n -> n.getName().equals("championship game recap")),
+                "a node with no edge to the origin must not appear in a 1-hop subgraph");
+    }
+
+    private static TestGraphNode findByName(KnowledgeGraph<TestGraphNode, TestGraphEdge> graph, String name) {
+        return graph.nodes().stream().filter(n -> n.getName().equals(name)).findFirst()
+                .orElseThrow(() -> new AssertionError("expected a node named '" + name + "' in " + graph.nodes()));
     }
 
     private static float[] readVectorProperty(UUID id, String property) {

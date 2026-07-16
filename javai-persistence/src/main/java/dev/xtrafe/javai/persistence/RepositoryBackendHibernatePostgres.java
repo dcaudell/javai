@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.model.JavAIRuntime;
@@ -162,6 +163,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             return;
         }
         validateMapKeyTypesAreSupported(entityType);
+        validateNoKnowledgeGraphFields(entityType);
         registeredEntityTypes.add(entityType);
         for (Field field : EntityReflection.allFields(entityType)) {
             Class<?> relatedType = relatedEntityType(field);
@@ -231,6 +233,26 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 throw new IllegalArgumentException("Postgres persistence only supports String-keyed JavAI map "
                         + "fields in this phase -- " + entityType.getName() + "." + field.getName() + " is keyed "
                         + "by " + (keyType == null ? "an unresolvable type" : keyType.getName()));
+            }
+        }
+    }
+
+    /** Fails fast, at registration time, for a {@code KnowledgeGraph}-typed field -- it's neither
+     *  {@code @Entity}-annotated (so {@link #relatedEntityType} never routes it to auto-registration) nor
+     *  {@code Collection}/{@code Map}-shaped (so {@link #isJavAICollectionField} never routes it to this
+     *  backend's own reflective membership table either); left unguarded, it would fall through to being
+     *  handed to Hibernate as an ordinary field and fail with a confusing boot-time mapping exception
+     *  instead. {@code KnowledgeGraph} persistence is Neo4j-only in this phase -- see
+     *  {@code RepositoryBackendNeo4j}'s own {@code saveKnowledgeGraphField}/{@code hydrateKnowledgeGraphField}
+     *  and doc/spec/persistence-bridge.md for why (native multi-hop traversal + hybrid similarity/structure
+     *  querying has no efficient equivalent to build here in this phase). */
+    private static void validateNoKnowledgeGraphFields(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (KnowledgeGraph.class.isAssignableFrom(field.getType())) {
+                throw new IllegalArgumentException("Postgres persistence does not support KnowledgeGraph fields -- "
+                        + entityType.getName() + "." + field.getName() + " is a KnowledgeGraph. KnowledgeGraph "
+                        + "persistence is Neo4j-only in this phase; use JavAIPersistenceConfig.Backend.NEO4J for "
+                        + "any entity type that declares one.");
             }
         }
     }
