@@ -6,6 +6,7 @@ import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.domain.PlaceRepository;
 import dev.xtrafe.javai.e2e.fixtures.SampleDataSeeder;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.persistence.JavAIPI;
@@ -55,6 +56,11 @@ public final class JavAIEnvironment {
     private static final CommentRepository NEO4J_COMMENT_REPOSITORY;
     private static final CommentRepository MONGO_COMMENT_REPOSITORY;
 
+    // OMI-141: a non-vectorized entity with a geo Point, one repository per backend (see DerivedFinderE2ETest).
+    private static final PlaceRepository POSTGRES_PLACE_REPOSITORY;
+    private static final PlaceRepository NEO4J_PLACE_REPOSITORY;
+    private static final PlaceRepository MONGO_PLACE_REPOSITORY;
+
     private static final TagRepository POSTGRES_TAG_REPOSITORY;
     private static final TagRepository NEO4J_TAG_REPOSITORY;
     private static final TagRepository MONGO_TAG_REPOSITORY;
@@ -85,6 +91,7 @@ public final class JavAIEnvironment {
                 .postgresPassword(MonolithicContainer.POSTGRES_PASSWORD)
                 .build();
         POSTGRES_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, postgresConfig);
+        POSTGRES_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, postgresConfig);
         POSTGRES_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, postgresConfig);
         POSTGRES_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, postgresConfig);
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
@@ -100,6 +107,7 @@ public final class JavAIEnvironment {
         NEO4J_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, neo4jConfig);
         JavAIPI.repository(AttachmentRepository.class, neo4jConfig);
         NEO4J_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, neo4jConfig);
+        NEO4J_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, neo4jConfig);
         // Article (a KnowledgeGraph node type) is already registered above -- required before Neo4j's label
         // registry can resolve nodes reached through ArticleCluster.graph during hydration.
         NEO4J_ARTICLE_CLUSTER_REPOSITORY = JavAIPI.repository(ArticleClusterRepository.class, neo4jConfig);
@@ -115,6 +123,7 @@ public final class JavAIEnvironment {
                 .mongoDatabase("javai")
                 .build();
         MONGO_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, mongoConfig);
+        MONGO_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, mongoConfig);
         MONGO_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, mongoConfig);
         MONGO_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, mongoConfig);
         MONGO_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, mongoConfig);
@@ -153,6 +162,18 @@ public final class JavAIEnvironment {
 
     public static ArticleClusterRepository neo4jArticleClusterRepository() {
         return NEO4J_ARTICLE_CLUSTER_REPOSITORY;
+    }
+
+    public static PlaceRepository postgresPlaceRepository() {
+        return POSTGRES_PLACE_REPOSITORY;
+    }
+
+    public static PlaceRepository neo4jPlaceRepository() {
+        return NEO4J_PLACE_REPOSITORY;
+    }
+
+    public static PlaceRepository mongoPlaceRepository() {
+        return MONGO_PLACE_REPOSITORY;
     }
 
     public static CommentRepository postgresCommentRepository() {

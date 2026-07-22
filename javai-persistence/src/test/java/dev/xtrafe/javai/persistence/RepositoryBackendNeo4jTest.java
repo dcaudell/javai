@@ -47,6 +47,7 @@ class RepositoryBackendNeo4jTest {
     private static TestOwnerWithGraphRepository graphOwnerRepository;
     private static TestAccountRepository accountRepository;
     private static TestAccountNestedRepository nestedAccountRepository;
+    private static TestVenueRepository venueRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -62,9 +63,11 @@ class RepositoryBackendNeo4jTest {
         graphOwnerRepository = JavAIPI.repository(TestOwnerWithGraphRepository.class, config);
         accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
         nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
-        // Neo4j's registerEntityType doesn't recurse into related types, so TestProfile's label must be
-        // registered explicitly before an account->profile relationship traversal needs to resolve it.
+        // Neo4j's registerEntityType doesn't recurse into related types, so a related node's label must be
+        // registered explicitly before a relationship traversal needs to resolve it.
         JavAIPI.repository(TestProfileRepository.class, config);
+        venueRepository = JavAIPI.repository(TestVenueRepository.class, config);
+        JavAIPI.repository(TestReviewRepository.class, config);
     }
 
     @BeforeEach
@@ -433,6 +436,12 @@ class RepositoryBackendNeo4jTest {
     @Test
     void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
+    }
+
+    @Test
+    void nestedToManyEmptinessRegexAndGeoFindersWork() {
+        DerivedFinderTestSupport.seedVenues(venueRepository);
+        DerivedFinderTestSupport.assertNestedToManyEmptinessRegexAndGeoFinders(venueRepository);
     }
 
     private static TestGraphNode findByName(KnowledgeGraph<TestGraphNode, TestGraphEdge> graph, String name) {

@@ -44,6 +44,7 @@ class RepositoryBackendHibernatePostgresTest {
     private static TestArticleRepository repository;
     private static TestAccountRepository accountRepository;
     private static TestAccountNestedRepository nestedAccountRepository;
+    private static TestVenueRepository venueRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -59,6 +60,8 @@ class RepositoryBackendHibernatePostgresTest {
         // auto-registered via TestAccount's @OneToOne, so it needs no explicit repository call here).
         accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
         nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
+        // TestReview is auto-registered via TestVenue's reviews collection element type.
+        venueRepository = JavAIPI.repository(TestVenueRepository.class, config);
     }
 
     @BeforeEach
@@ -233,6 +236,12 @@ class RepositoryBackendHibernatePostgresTest {
     @Test
     void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
+    }
+
+    @Test
+    void nestedToManyEmptinessRegexAndGeoFindersWork() {
+        DerivedFinderTestSupport.seedVenues(venueRepository);
+        DerivedFinderTestSupport.assertNestedToManyEmptinessRegexAndGeoFinders(venueRepository);
     }
 
     /**

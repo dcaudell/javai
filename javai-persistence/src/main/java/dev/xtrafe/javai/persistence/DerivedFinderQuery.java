@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import org.springframework.data.core.PropertyPath;
+import org.springframework.data.core.PropertyReferenceException;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -8,16 +9,18 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.data.domain.Slice;
 import org.springframework.data.domain.SliceImpl;
 import org.springframework.data.domain.Sort;
-import org.springframework.data.core.PropertyReferenceException;
+import org.springframework.data.geo.Circle;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.Metrics;
+import org.springframework.data.geo.Point;
 import org.springframework.data.repository.query.parser.Part;
 import org.springframework.data.repository.query.parser.PartTree;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
-import java.util.EnumSet;
 import java.util.List;
 import java.util.Optional;
-import java.util.Set;
 import java.util.stream.Stream;
 
 /**
@@ -144,7 +147,7 @@ final class DerivedFinderQuery {
         int demanded = 0;
         for (PartTree.OrPart orPart : partTree) {
             for (Part part : orPart) {
-                demanded += part.getNumberOfArguments();
+                demanded += effectiveArgumentCount(part);
             }
         }
         if (bindableCount != demanded) {
@@ -217,29 +220,6 @@ final class DerivedFinderQuery {
         return type == long.class || type == Long.class || type == int.class || type == Integer.class;
     }
 
-    /** Operators no backend translates in this phase: geo ({@code Near}/{@code Within}), raw {@code Regex}
-     *  (each store spells it differently), and the collection-emptiness family ({@code IsEmpty}/{@code IsNotEmpty}/
-     *  {@code Exists}) -- the latter would filter on a to-many association, which every backend stores
-     *  out-of-band (Postgres {@code javai_collection_members}, Neo4j relationships, Mongo reference pointers)
-     *  rather than as a filterable column, tied to the same collection-membership follow-up as nested
-     *  collection traversal. */
-    private static final Set<Part.Type> UNSUPPORTED_TYPES = EnumSet.of(
-            Part.Type.NEAR, Part.Type.WITHIN, Part.Type.REGEX,
-            Part.Type.IS_EMPTY, Part.Type.IS_NOT_EMPTY, Part.Type.EXISTS);
-
-    /** Shared feasibility guard every backend calls from its own {@link RepositoryBackend#validateDerivedQuery}:
-     *  rejects any operator not translatable on any backend in this phase (see {@link #UNSUPPORTED_TYPES}),
-     *  at repository-creation time. Backends layer their own store-specific path checks on top. */
-    void assertCoreOperatorsOnly() {
-        for (Part part : partTree.getParts()) {
-            if (UNSUPPORTED_TYPES.contains(part.getType())) {
-                throw new IllegalArgumentException("Derived finder " + method + " uses the '" + part.getType()
-                        + "' operator, which JavAIRepository does not support in this phase (geo/regex/collection-"
-                        + "emptiness operators). Property: " + part.getProperty().toDotPath() + ".");
-            }
-        }
-    }
-
     PartTree partTree() {
         return partTree;
     }
@@ -258,7 +238,7 @@ final class DerivedFinderQuery {
         for (PartTree.OrPart orPart : partTree) {
             List<BoundPart> group = new ArrayList<>();
             for (Part part : orPart) {
-                int n = part.getNumberOfArguments();
+                int n = effectiveArgumentCount(part);
                 List<Object> partArgs = new ArrayList<>(n);
                 for (int i = 0; i < n; i++) {
                     partArgs.add(bindables[cursor++]);
@@ -269,6 +249,94 @@ final class DerivedFinderQuery {
             groups.add(group);
         }
         return groups;
+    }
+
+    /** How many method parameters a part actually binds. Matches {@link Part#getNumberOfArguments()} for
+     *  everything except geo {@code Near}: PartTree counts only the {@code Point} (1), but the supported
+     *  {@code findByLocationNear(Point, Distance)} convention also binds a trailing {@code Distance}, so it
+     *  consumes 2. {@code Within} takes a single {@code Circle} (center + radius), so it stays at 1. */
+    private static int effectiveArgumentCount(Part part) {
+        return part.getType() == Part.Type.NEAR ? 2 : part.getNumberOfArguments();
+    }
+
+    /** A geo predicate reduced to a center + radius the backends translate uniformly: {@code Near} binds a
+     *  {@code Point} + {@code Distance}, {@code Within} a {@code Circle} (its own center + radius). Longitude
+     *  is {@code Point.getX()}, latitude {@code Point.getY()} (Spring's convention); radius is normalized to
+     *  meters. */
+    record GeoCircle(double longitude, double latitude, double radiusMeters) {
+    }
+
+    static GeoCircle geoCircle(BoundPart part) {
+        if (part.type() == Part.Type.NEAR) {
+            Point center = (Point) part.arguments().get(0);
+            Distance distance = (Distance) part.arguments().get(1);
+            return new GeoCircle(center.getX(), center.getY(), toMeters(distance));
+        }
+        if (part.type() == Part.Type.WITHIN) {
+            Circle circle = (Circle) part.arguments().get(0);
+            Point center = circle.getCenter();
+            return new GeoCircle(center.getX(), center.getY(), toMeters(circle.getRadius()));
+        }
+        throw new IllegalArgumentException("Not a geo part: " + part.type());
+    }
+
+    private static double toMeters(Distance distance) {
+        double value = distance.getValue();
+        if (distance.getMetric() == Metrics.KILOMETERS) {
+            return value * 1000.0;
+        }
+        if (distance.getMetric() == Metrics.MILES) {
+            return value * 1609.344;
+        }
+        return value; // NEUTRAL or any custom metric: treat the value as already in meters.
+    }
+
+    /** Decomposition of a (possibly nested) property path at its first <em>to-many</em> segment -- the pivot
+     *  the id-set-resolving backends (Postgres, Mongo) split on. {@code singularPrefix} is the dot-path of
+     *  singular hops from the root down to {@code ownerType} (empty when the to-many is on the root itself);
+     *  {@code collectionField} is the to-many field on {@code ownerType}; {@code memberType} its element/value
+     *  type; {@code suffix} the remaining dot-path within a member (empty when the to-many field is the leaf,
+     *  e.g. a {@code Collection}-typed {@code IsEmpty}). */
+    record ToManySplit(String singularPrefix, Class<?> ownerType, String collectionField, Class<?> memberType,
+            String suffix) {
+    }
+
+    /** Finds the first to-many segment in {@code dotPath} (walking singular hops from {@code rootType}), or
+     *  empty if the whole path is singular -- letting a backend choose native navigation for a pure-singular
+     *  path and id-set resolution for a to-many one. */
+    static Optional<ToManySplit> firstToManySplit(Class<?> rootType, String dotPath) {
+        String[] segments = dotPath.split("\\.");
+        Class<?> owner = rootType;
+        StringBuilder prefix = new StringBuilder();
+        for (int i = 0; i < segments.length; i++) {
+            Field field = EntityReflection.findField(owner, segments[i]);
+            if (isToMany(field)) {
+                String suffix = String.join(".", java.util.Arrays.asList(segments).subList(i + 1, segments.length));
+                return Optional.of(new ToManySplit(
+                        prefix.toString(), owner, segments[i], collectionMemberType(field), suffix));
+            }
+            prefix.append(prefix.length() == 0 ? "" : ".").append(segments[i]);
+            owner = field.getType();
+        }
+        return Optional.empty();
+    }
+
+    static boolean isToMany(Field field) {
+        Class<?> type = field.getType();
+        return java.util.Collection.class.isAssignableFrom(type) || java.util.Map.class.isAssignableFrom(type);
+    }
+
+    /** The element type of a {@code Collection} field, or the value type of a {@code Map} field. */
+    static Class<?> collectionMemberType(Field field) {
+        Class<?> type = field.getType();
+        int index = java.util.Map.class.isAssignableFrom(type) ? 1 : 0;
+        if (field.getGenericType() instanceof java.lang.reflect.ParameterizedType parameterized) {
+            java.lang.reflect.Type[] args = parameterized.getActualTypeArguments();
+            if (index < args.length && args[index] instanceof Class<?> clazz) {
+                return clazz;
+            }
+        }
+        throw new IllegalArgumentException("Cannot resolve the element/value type of collection field " + field);
     }
 
     private Object[] bindableArguments(Object[] args) {

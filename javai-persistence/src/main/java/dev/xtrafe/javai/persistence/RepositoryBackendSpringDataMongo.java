@@ -17,6 +17,7 @@ import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.geo.Point;
 import org.springframework.data.mongodb.MongoDatabaseFactory;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.SimpleMongoClientDatabaseFactory;
@@ -32,6 +33,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -379,33 +381,81 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     // ---- ordinary derived finders (OMI-138): MongoDB filter translation ------------------------
 
-    /** Rejects, at repository-creation time, a derived finder this backend can't translate: an unsupported
-     *  operator (shared guard), or a nested path / reference-field filter. Related entities are stored as
-     *  {@code {type, id}} reference pointers (never embedded), so filtering through them would need a
-     *  {@code $lookup} join -- deliberately out of scope for this pass and tracked as the OMI-138 follow-up.
-     *  This backend therefore supports filtering/sorting only on the entity's own simple document fields. */
+    /** Rejects, at repository-creation time, a derived finder this backend can't translate. Nested filter
+     *  paths are supported now (OMI-141): since related entities are stored as {@code {type, id}} reference
+     *  pointers, a nested predicate is resolved by matching the referenced entities first and then matching
+     *  owners whose {@code <field>.id} points at one of them -- so an intermediate segment must be a reference
+     *  field of an entity. Leaf rules depend on the operator: emptiness ({@code IsEmpty}/{@code IsNotEmpty})
+     *  needs a collection reference field; geo ({@code Near}/{@code Within}) needs a {@code Point} field;
+     *  every other operator needs a plain document field. Sort stays limited to a root plain field. */
     @Override
     public void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
-        query.assertCoreOperatorsOnly();
         for (Part part : query.partTree().getParts()) {
-            validateSimpleFieldPath(entityType, part.getProperty().toDotPath());
+            validatePartPath(entityType, part.getProperty().toDotPath(), part.getType());
         }
         for (Sort.Order order : query.partTree().getSort()) {
-            validateSimpleFieldPath(entityType, order.getProperty());
+            validateSortPath(entityType, order.getProperty());
         }
     }
 
-    private static void validateSimpleFieldPath(Class<?> entityType, String dotPath) {
+    private static void validatePartPath(Class<?> entityType, String dotPath, Part.Type type) {
+        Class<?> owner = entityType;
+        String[] segments = dotPath.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            Field field = EntityReflection.findField(owner, segments[i]);
+            if (i < segments.length - 1) {
+                Class<?> related = relatedEntityType(field);
+                if (related == null || !isReferenceField(field)) {
+                    throw new IllegalArgumentException("MongoDB derived finder cannot traverse '" + segments[i]
+                            + "' on " + owner.getName() + " -- an intermediate segment must be a reference field "
+                            + "(singular reference, or a Collection/Map of entities).");
+                }
+                owner = related;
+            } else {
+                validateLeaf(owner, field, type);
+            }
+        }
+    }
+
+    private static void validateLeaf(Class<?> owner, Field field, Part.Type type) {
+        boolean collectionReference = isReferenceField(field)
+                && (Map.class.isAssignableFrom(field.getType()) || Collection.class.isAssignableFrom(field.getType()));
+        switch (type) {
+            case IS_EMPTY, IS_NOT_EMPTY -> {
+                if (!collectionReference) {
+                    throw new IllegalArgumentException("MongoDB IsEmpty/IsNotEmpty needs a collection reference field "
+                            + "-- '" + field.getName() + "' on " + owner.getName() + " is not one.");
+                }
+            }
+            case NEAR, WITHIN -> {
+                if (!Point.class.isAssignableFrom(field.getType())) {
+                    throw new IllegalArgumentException("MongoDB Near/Within needs a Point field -- '"
+                            + field.getName() + "' on " + owner.getName() + " is "
+                            + field.getType().getSimpleName() + ".");
+                }
+            }
+            case EXISTS -> {
+                // $exists: valid on any field.
+            }
+            default -> {
+                if (isReferenceField(field) || Point.class.isAssignableFrom(field.getType())) {
+                    throw new IllegalArgumentException("MongoDB derived finder cannot filter on '" + field.getName()
+                            + "' of " + owner.getName() + " with " + type + " -- it's a reference/geo field, not a "
+                            + "plain document field.");
+                }
+            }
+        }
+    }
+
+    private static void validateSortPath(Class<?> entityType, String dotPath) {
         if (dotPath.contains(".")) {
-            throw new IllegalArgumentException("MongoDB derived finder cannot filter/sort through the nested path '"
-                    + dotPath + "' on " + entityType.getName() + " -- related entities are stored as {type, id} "
-                    + "reference pointers, not embedded, so a nested filter would need a $lookup join. That's the "
-                    + "OMI-138 follow-up; filter on the entity's own fields for now.");
+            throw new IllegalArgumentException("MongoDB derived finder can only sort by a root plain field, not the "
+                    + "nested path '" + dotPath + "' on " + entityType.getName() + " (references aren't embedded).");
         }
         Field field = EntityReflection.findField(entityType, dotPath);
-        if (isReferenceField(field)) {
-            throw new IllegalArgumentException("MongoDB derived finder cannot filter/sort on '" + dotPath + "' of "
-                    + entityType.getName() + " -- it's stored as a {type, id} reference pointer, not a plain field.");
+        if (isReferenceField(field) || Point.class.isAssignableFrom(field.getType())) {
+            throw new IllegalArgumentException("MongoDB derived finder cannot sort by '" + dotPath + "' of "
+                    + entityType.getName() + " -- it's a reference/geo field, not a plain document field.");
         }
     }
 
@@ -470,7 +520,39 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     }
 
     private Bson toFilter(Class<?> entityType, DerivedFinderQuery.BoundPart part) {
-        String field = mongoField(entityType, part.property().toDotPath());
+        String dotPath = part.property().toDotPath();
+        // A nested path can't be matched in one document (references aren't embedded): resolve the matching
+        // root ids first, then match on _id. Root-level geo/emptiness, by contrast, are on the document itself.
+        if (dotPath.contains(".")) {
+            Set<UUID> ids = rootIdsMatching(entityType, part);
+            List<String> idStrings = new ArrayList<>(ids.size());
+            for (UUID id : ids) {
+                idStrings.add(id.toString());
+            }
+            return Filters.in("_id", idStrings);
+        }
+        Field field = EntityReflection.findField(entityType, dotPath);
+        String mongoField = mongoField(entityType, dotPath);
+        Part.Type type = part.type();
+        if (type == Part.Type.NEAR || type == Part.Type.WITHIN) {
+            return geoFilter(mongoField, DerivedFinderQuery.geoCircle(part));
+        }
+        if (type == Part.Type.IS_EMPTY) {
+            return Filters.not(Filters.exists(mongoField + ".0"));
+        }
+        if (type == Part.Type.IS_NOT_EMPTY) {
+            return Filters.exists(mongoField + ".0");
+        }
+        if (type == Part.Type.EXISTS) {
+            return isReferenceField(field) && (Map.class.isAssignableFrom(field.getType())
+                    || Collection.class.isAssignableFrom(field.getType()))
+                    ? Filters.exists(mongoField + ".0")
+                    : Filters.exists(mongoField);
+        }
+        return scalarFilter(mongoField, part);
+    }
+
+    private static Bson scalarFilter(String field, DerivedFinderQuery.BoundPart part) {
         List<Object> a = part.arguments();
         boolean ic = part.ignoreCase();
         String caseOption = ic ? "i" : "";
@@ -495,6 +577,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             case ENDING_WITH -> Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))) + "$", caseOption);
             case CONTAINING -> Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))), caseOption);
             case NOT_CONTAINING -> Filters.not(Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))), caseOption));
+            case REGEX -> Filters.regex(field, String.valueOf(a.get(0)), caseOption);
             case IN -> Filters.in(field, mongoValues(a.get(0)));
             case NOT_IN -> Filters.nin(field, mongoValues(a.get(0)));
             case TRUE -> Filters.eq(field, true);
@@ -502,6 +585,65 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             default -> throw new IllegalArgumentException(
                     "Unsupported derived-query operator " + part.type() + " for the MongoDB backend.");
         };
+    }
+
+    /** {@code $geoWithin} + {@code $centerSphere} (radius in radians = meters / earth radius). Works on a
+     *  GeoJSON point field with no geospatial index required, unlike {@code $near}. */
+    private static Bson geoFilter(String field, DerivedFinderQuery.GeoCircle geo) {
+        double radiusRadians = geo.radiusMeters() / 6_378_137.0;
+        return Filters.geoWithinCenterSphere(field, geo.longitude(), geo.latitude(), radiusRadians);
+    }
+
+    // ---- id-set resolution for nested paths (references aren't embedded) -----------------------
+
+    /** Resolves the {@code entityType} ids matching a nested {@code part} predicate: match the leaf's owning
+     *  entities first, then walk the path back to the root, at each hop matching owners whose {@code <field>.id}
+     *  reference points at one of the ids resolved so far. */
+    private Set<UUID> rootIdsMatching(Class<?> entityType, DerivedFinderQuery.BoundPart part) {
+        String[] segments = part.property().toDotPath().split("\\.");
+        Class<?>[] ownerTypes = new Class<?>[segments.length];
+        Class<?> type = entityType;
+        for (int i = 0; i < segments.length; i++) {
+            ownerTypes[i] = type;
+            type = relatedEntityType(EntityReflection.findField(type, segments[i]));
+        }
+        Class<?> leafOwnerType = ownerTypes[segments.length - 1];
+        Set<UUID> ids = queryIds(leafOwnerType, leafFilter(leafOwnerType, segments[segments.length - 1], part));
+        for (int i = segments.length - 2; i >= 0; i--) {
+            ids = ownersReferencing(ownerTypes[i], segments[i], ids);
+        }
+        return ids;
+    }
+
+    private Bson leafFilter(Class<?> type, String field, DerivedFinderQuery.BoundPart part) {
+        String mongoField = mongoField(type, field);
+        return switch (part.type()) {
+            case NEAR, WITHIN -> geoFilter(mongoField, DerivedFinderQuery.geoCircle(part));
+            case IS_NOT_EMPTY, EXISTS -> Filters.exists(mongoField + ".0");
+            case IS_EMPTY -> Filters.not(Filters.exists(mongoField + ".0"));
+            default -> scalarFilter(mongoField, part);
+        };
+    }
+
+    private Set<UUID> ownersReferencing(Class<?> ownerType, String field, Set<UUID> memberIds) {
+        if (memberIds.isEmpty()) {
+            return new LinkedHashSet<>();
+        }
+        List<String> memberIdStrings = new ArrayList<>(memberIds.size());
+        for (UUID id : memberIds) {
+            memberIdStrings.add(id.toString());
+        }
+        // A reference stores its target's id under "<field>.id" (singular) or in an array of such subdocuments
+        // (collection); $in matches into arrays too, so one filter covers both cardinalities.
+        return queryIds(ownerType, Filters.in(field + ".id", memberIdStrings));
+    }
+
+    private Set<UUID> queryIds(Class<?> type, Bson filter) {
+        Set<UUID> ids = new LinkedHashSet<>();
+        for (Document doc : collectionFor(type).find(filter).projection(new Document("_id", 1))) {
+            ids.add(UUID.fromString(doc.getString("_id")));
+        }
+        return ids;
     }
 
     private static List<Object> mongoValues(Object raw) {
@@ -591,7 +733,11 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 continue;
             }
             Object value = EntityReflection.readField(entity, fieldName);
-            if (isSimpleValue(value)) {
+            if (value instanceof Point point) {
+                // GeoJSON Point ([longitude, latitude]) so $geoWithin geo finders (Near/Within) work against it.
+                updates.put(fieldName, new Document("type", "Point")
+                        .append("coordinates", List.of(point.getX(), point.getY())));
+            } else if (isSimpleValue(value)) {
                 updates.put(fieldName, toMongoValue(value));
             }
             // else: not reference-shaped but also not a simple type -- documented Phase 0 boundary, skipped.
@@ -794,7 +940,12 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 return;
             }
             Class<?> type = field.getType();
-            if (type == String.class) {
+            if (Point.class.isAssignableFrom(type)) {
+                Document geo = (Document) value;
+                List<?> coordinates = (List<?>) geo.get("coordinates");
+                field.set(entity, new Point(
+                        ((Number) coordinates.get(0)).doubleValue(), ((Number) coordinates.get(1)).doubleValue()));
+            } else if (type == String.class) {
                 field.set(entity, (String) value);
             } else if (type == UUID.class) {
                 field.set(entity, UUID.fromString((String) value));

@@ -19,6 +19,7 @@ import org.neo4j.driver.Values;
 import org.neo4j.driver.types.Node;
 import org.neo4j.driver.types.Relationship;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.geo.Point;
 import org.springframework.data.repository.query.parser.Part;
 
 import java.lang.reflect.Field;
@@ -264,51 +265,87 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     // ---- ordinary derived finders (OMI-138): Cypher translation --------------------------------
 
-    /** Rejects, at repository-creation time, a derived finder this backend can't translate: an unsupported
-     *  operator (shared guard), or a filter/sort path that isn't traversable as node properties +
-     *  singular relationships. Nested paths are supported through singular relationship fields (a
-     *  JavAIVectorizable-typed field maps to one relationship); collection/map/KnowledgeGraph traversal is
-     *  the OMI-138 follow-up. */
+    /** Rejects, at repository-creation time, a derived finder this backend can't translate. Nested filter
+     *  paths traverse relationships of <em>any</em> cardinality now (singular or to-many, via {@code EXISTS {}}
+     *  subqueries), so the only intermediate rejection is a {@code KnowledgeGraph} field (its two-relationship
+     *  encoding isn't a plain traversal). Leaf rules depend on the operator: emptiness ({@code IsEmpty}/
+     *  {@code IsNotEmpty}) needs a collection/map field; geo ({@code Near}/{@code Within}) needs a
+     *  {@code Point} field; every other operator needs a scalar property. Sort is limited to a root scalar
+     *  property (an {@code EXISTS}-scoped var can't drive {@code ORDER BY}). */
     @Override
     public void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
-        query.assertCoreOperatorsOnly();
         for (Part part : query.partTree().getParts()) {
-            validateDotPathTraversable(entityType, part.getProperty().toDotPath());
+            validatePartPath(entityType, part.getProperty().toDotPath(), part.getType());
         }
         for (Sort.Order order : query.partTree().getSort()) {
-            validateDotPathTraversable(entityType, order.getProperty());
+            validateSortPath(entityType, order.getProperty());
         }
     }
 
-    private static void validateDotPathTraversable(Class<?> entityType, String dotPath) {
+    private static void validatePartPath(Class<?> entityType, String dotPath, Part.Type type) {
         Class<?> owner = entityType;
         String[] segments = dotPath.split("\\.");
         for (int i = 0; i < segments.length; i++) {
             Field field = EntityReflection.findField(owner, segments[i]);
             boolean leaf = i == segments.length - 1;
             if (!leaf) {
-                Class<?> type = field.getType();
-                boolean singularRelationship = JavAIVectorizable.class.isAssignableFrom(type)
-                        && !Map.class.isAssignableFrom(type) && !Collection.class.isAssignableFrom(type)
-                        && !KnowledgeGraph.class.isAssignableFrom(type);
-                if (!singularRelationship) {
+                if (KnowledgeGraph.class.isAssignableFrom(field.getType()) || !isRelationshipField(field)) {
                     throw new IllegalArgumentException("Neo4j derived finder cannot traverse '" + segments[i]
-                            + "' on " + owner.getName() + " -- nested filter/sort paths are only supported through "
-                            + "singular relationship fields (a JavAIVectorizable-typed field) in this phase; "
-                            + "collection/map/KnowledgeGraph traversal is the OMI-138 follow-up.");
+                            + "' on " + owner.getName() + " -- an intermediate path segment must be a relationship "
+                            + "field (singular, Collection, or Map), and not a KnowledgeGraph.");
                 }
-                owner = type;
-            } else if (isRelationshipField(field)) {
-                throw new IllegalArgumentException("Neo4j derived finder cannot filter/sort on '" + segments[i]
-                        + "' of " + owner.getName() + " -- it maps to a relationship, not a scalar node property.");
+                owner = DerivedFinderQuery.isToMany(field)
+                        ? DerivedFinderQuery.collectionMemberType(field) : field.getType();
+            } else {
+                validateLeaf(owner, field, type);
             }
+        }
+    }
+
+    private static void validateLeaf(Class<?> owner, Field field, Part.Type type) {
+        boolean collection = DerivedFinderQuery.isToMany(field);
+        switch (type) {
+            case IS_EMPTY, IS_NOT_EMPTY -> {
+                if (!collection) {
+                    throw new IllegalArgumentException("Neo4j IsEmpty/IsNotEmpty needs a Collection/Map field -- '"
+                            + field.getName() + "' on " + owner.getName() + " is not one.");
+                }
+            }
+            case NEAR, WITHIN -> {
+                if (!Point.class.isAssignableFrom(field.getType())) {
+                    throw new IllegalArgumentException("Neo4j Near/Within needs a Point field -- '" + field.getName()
+                            + "' on " + owner.getName() + " is " + field.getType().getSimpleName() + ".");
+                }
+            }
+            case EXISTS -> {
+                // Property presence: valid on any field (scalar -> IS NOT NULL, relationship -> non-empty).
+            }
+            default -> {
+                if (isRelationshipField(field)) {
+                    throw new IllegalArgumentException("Neo4j derived finder cannot filter on '" + field.getName()
+                            + "' of " + owner.getName() + " with " + type + " -- it maps to a relationship, not a "
+                            + "scalar node property.");
+                }
+            }
+        }
+    }
+
+    private static void validateSortPath(Class<?> entityType, String dotPath) {
+        if (dotPath.contains(".")) {
+            throw new IllegalArgumentException("Neo4j derived finder can only sort by a root scalar property, not the "
+                    + "nested path '" + dotPath + "' on " + entityType.getName() + ".");
+        }
+        Field field = EntityReflection.findField(entityType, dotPath);
+        if (isRelationshipField(field)) {
+            throw new IllegalArgumentException("Neo4j derived finder cannot sort by '" + dotPath + "' of "
+                    + entityType.getName() + " -- it maps to a relationship, not a scalar node property.");
         }
     }
 
     @Override
     public List<Object> findByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args,
             DerivedFinderQuery.Constraints constraints) {
-        Cypher cypher = new Cypher(label(entityType));
+        Cypher cypher = new Cypher(label(entityType), entityType);
         String where = cypher.buildWhere(query.boundOrGroups(args));
         List<String> orderBy = cypher.buildOrderBy(constraints.sort());
         StringBuilder sql = new StringBuilder(cypher.matchClause());
@@ -345,7 +382,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     @Override
     public long countByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
-        Cypher cypher = new Cypher(label(entityType));
+        Cypher cypher = new Cypher(label(entityType), entityType);
         String where = cypher.buildWhere(query.boundOrGroups(args));
         StringBuilder sql = new StringBuilder(cypher.matchClause());
         if (where != null) {
@@ -359,7 +396,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     @Override
     public boolean existsByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
-        Cypher cypher = new Cypher(label(entityType));
+        Cypher cypher = new Cypher(label(entityType), entityType);
         String where = cypher.buildWhere(query.boundOrGroups(args));
         StringBuilder sql = new StringBuilder(cypher.matchClause());
         if (where != null) {
@@ -374,7 +411,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     @Override
     public long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
         long matched = countByDerivedQuery(entityType, query, args);
-        Cypher cypher = new Cypher(label(entityType));
+        Cypher cypher = new Cypher(label(entityType), entityType);
         String where = cypher.buildWhere(query.boundOrGroups(args));
         StringBuilder sql = new StringBuilder(cypher.matchClause());
         if (where != null) {
@@ -392,32 +429,27 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         return matched;
     }
 
-    /** One resolved property reference: the Cypher variable holding the leaf's owning node and the leaf
-     *  property name. {@code n} for a root property, or a generated {@code rN} bound by a relationship
-     *  {@code MATCH} segment for a nested one. */
-    private record PathRef(String variable, String property) {
-    }
-
-    /** Builds a Cypher WHERE/ORDER BY (plus any relationship {@code MATCH} segments nested paths need, and
-     *  the parameter map) from a {@link DerivedFinderQuery}'s bound predicate. Every bound value is routed
-     *  through {@link RepositoryBackendNeo4j#toNeo4jValue} so a {@code UUID}/{@code Instant}/{@code Enum}
-     *  argument is compared against the same string form it was stored as -- without this, e.g.
-     *  {@code findByOwnerId(uuid)} would silently never match (a raw UUID param vs. a stored string). */
+    /** Builds a Cypher WHERE/ORDER BY (and its parameter map) from a {@link DerivedFinderQuery}'s bound
+     *  predicate. Nested paths become self-contained {@code EXISTS { MATCH (n)-[:REL]->(x) WHERE ... }}
+     *  subqueries -- correct through relationships of any cardinality and composing safely under
+     *  {@code AND}/{@code OR}, unlike a shared top-level {@code MATCH} pattern would. Every bound value is
+     *  routed through {@link RepositoryBackendNeo4j#toNeo4jValue}, so a {@code UUID}/{@code Instant}/
+     *  {@code Enum} argument is compared against the same string form it was stored as. */
     private static final class Cypher {
 
         private final String label;
-        private final StringBuilder extraMatch = new StringBuilder();
+        private final Class<?> rootType;
         private final Map<String, Object> params = new HashMap<>();
-        private final Map<String, String> prefixVariable = new HashMap<>();
         private int variableCounter;
         private int parameterCounter;
 
-        Cypher(String label) {
+        Cypher(String label, Class<?> rootType) {
             this.label = label;
+            this.rootType = rootType;
         }
 
         String matchClause() {
-            return "MATCH (n:`" + label + "`)" + extraMatch;
+            return "MATCH (n:`" + label + "`)";
         }
 
         Map<String, Object> params() {
@@ -444,8 +476,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 return orders;
             }
             for (Sort.Order order : sort) {
-                PathRef ref = resolve(order.getProperty());
-                String expression = ref.variable() + ".`" + ref.property() + "`";
+                String expression = "n.`" + order.getProperty() + "`"; // validated: root scalar only
                 if (order.isIgnoreCase()) {
                     expression = "toLower(" + expression + ")";
                 }
@@ -454,9 +485,59 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             return orders;
         }
 
+        /** The relationship-hop pattern from {@code n} down to (but not including) the leaf segment, plus the
+         *  variable + entity type of the node the leaf lives on. */
+        private record Hops(String pattern, String ownerVariable, Class<?> ownerType) {
+        }
+
+        private Hops walkHops(String[] segments) {
+            StringBuilder pattern = new StringBuilder();
+            String variable = "n";
+            Class<?> type = rootType;
+            for (int i = 0; i < segments.length - 1; i++) {
+                Field field = EntityReflection.findField(type, segments[i]);
+                String next = "e" + (variableCounter++);
+                pattern.append("-[:`").append(relationshipType(segments[i])).append("`]->(").append(next).append(")");
+                variable = next;
+                type = DerivedFinderQuery.isToMany(field)
+                        ? DerivedFinderQuery.collectionMemberType(field) : field.getType();
+            }
+            return new Hops(pattern.toString(), variable, type);
+        }
+
         private String condition(DerivedFinderQuery.BoundPart part) {
-            PathRef ref = resolve(part.property().toDotPath());
-            String raw = ref.variable() + ".`" + ref.property() + "`";
+            String[] segments = part.property().toDotPath().split("\\.");
+            Hops hops = walkHops(segments);
+            boolean nested = segments.length > 1;
+            String leaf = segments[segments.length - 1];
+            Part.Type type = part.type();
+
+            // Collection-shaped leaves: emptiness (and EXISTS on a collection) test a final relationship hop.
+            boolean collectionLeaf = DerivedFinderQuery.isToMany(EntityReflection.findField(hops.ownerType(), leaf));
+            if (type == Part.Type.IS_EMPTY || type == Part.Type.IS_NOT_EMPTY
+                    || (type == Part.Type.EXISTS && collectionLeaf)) {
+                String exists = "EXISTS { MATCH (n)" + hops.pattern()
+                        + "-[:`" + relationshipType(leaf) + "`]->() }";
+                return type == Part.Type.IS_EMPTY ? "NOT " + exists : exists;
+            }
+            if (type == Part.Type.NEAR || type == Part.Type.WITHIN) {
+                DerivedFinderQuery.GeoCircle geo = DerivedFinderQuery.geoCircle(part);
+                String cond = "point.distance(" + hops.ownerVariable() + ".`" + leaf + "`, "
+                        + "point({longitude: " + param(geo.longitude()) + ", latitude: " + param(geo.latitude())
+                        + "})) <= " + param(geo.radiusMeters());
+                return wrap(nested, hops, cond);
+            }
+            return wrap(nested, hops, scalarCondition(hops.ownerVariable(), leaf, part));
+        }
+
+        /** Wraps a leaf condition in an {@code EXISTS { MATCH ... WHERE cond }} when the path is nested; a
+         *  root-level condition needs no wrapper. */
+        private String wrap(boolean nested, Hops hops, String cond) {
+            return nested ? "EXISTS { MATCH (n)" + hops.pattern() + " WHERE " + cond + " }" : cond;
+        }
+
+        private String scalarCondition(String ownerVariable, String leaf, DerivedFinderQuery.BoundPart part) {
+            String raw = ownerVariable + ".`" + leaf + "`";
             boolean ic = part.ignoreCase();
             String lhs = ic ? "toLower(" + raw + ")" : raw;
             List<Object> a = part.arguments();
@@ -470,13 +551,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 case BETWEEN -> "(" + lhs + " >= " + param(value(a.get(0), ic))
                         + " AND " + lhs + " <= " + param(value(a.get(1), ic)) + ")";
                 case IS_NULL -> raw + " IS NULL";
-                case IS_NOT_NULL -> raw + " IS NOT NULL";
+                case IS_NOT_NULL, EXISTS -> raw + " IS NOT NULL";
                 case STARTING_WITH -> lhs + " STARTS WITH " + param(stringValue(a.get(0), ic));
                 case ENDING_WITH -> lhs + " ENDS WITH " + param(stringValue(a.get(0), ic));
                 case CONTAINING -> lhs + " CONTAINS " + param(stringValue(a.get(0), ic));
                 case NOT_CONTAINING -> "NOT (" + lhs + " CONTAINS " + param(stringValue(a.get(0), ic)) + ")";
                 case LIKE -> lhs + " =~ " + param(likeToRegex(String.valueOf(a.get(0)), ic));
                 case NOT_LIKE -> "NOT (" + lhs + " =~ " + param(likeToRegex(String.valueOf(a.get(0)), ic)) + ")";
+                case REGEX -> lhs + " =~ " + param((ic ? "(?i)" : "") + String.valueOf(a.get(0)));
                 case IN -> lhs + " IN " + param(listValue(a.get(0), ic));
                 case NOT_IN -> "NOT (" + lhs + " IN " + param(listValue(a.get(0), ic)) + ")";
                 case TRUE -> raw + " = true";
@@ -484,26 +566,6 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 default -> throw new IllegalArgumentException(
                         "Unsupported derived-query operator " + part.type() + " for the Neo4j backend.");
             };
-        }
-
-        /** Walks a dot path, emitting one relationship {@code MATCH} segment per (deduplicated) non-leaf
-         *  segment, and returns the variable + leaf property to compare against. */
-        private PathRef resolve(String dotPath) {
-            String[] segments = dotPath.split("\\.");
-            String variable = "n";
-            StringBuilder prefix = new StringBuilder();
-            for (int i = 0; i < segments.length - 1; i++) {
-                prefix.append(prefix.length() == 0 ? "" : ".").append(segments[i]);
-                String existing = prefixVariable.get(prefix.toString());
-                if (existing == null) {
-                    existing = "r" + (variableCounter++);
-                    extraMatch.append(", (").append(variable).append(")-[:`")
-                            .append(relationshipType(segments[i])).append("`]->(").append(existing).append(")");
-                    prefixVariable.put(prefix.toString(), existing);
-                }
-                variable = existing;
-            }
-            return new PathRef(variable, segments[segments.length - 1]);
         }
 
         private String param(Object value) {
@@ -533,7 +595,8 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         }
 
         /** SQL-LIKE ({@code %}/{@code _}) to a Cypher regex ({@code =~}), escaping other regex metacharacters
-         *  so a literal dot or bracket in the pattern stays literal. */
+         *  so a literal dot or bracket in the pattern stays literal. (The {@code Regex} operator, by contrast,
+         *  binds its argument as an already-formed regex.) */
         private static String likeToRegex(String pattern, boolean ignoreCase) {
             StringBuilder regex = new StringBuilder(ignoreCase ? "(?i)" : "");
             for (int i = 0; i < pattern.length(); i++) {
@@ -578,7 +641,11 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 continue; // id is the MERGE key, handled separately; relationships handled in the pass below
             }
             Object value = EntityReflection.readField(entity, fieldName);
-            if (isSimpleValue(value)) {
+            if (value instanceof Point point) {
+                // A geo Point stores as a native Neo4j WGS-84 point property, so point.distance(...) geo
+                // finders (Near/Within) work against it directly. srid 4326: x = longitude, y = latitude.
+                properties.put(fieldName, Values.point(4326, point.getX(), point.getY()));
+            } else if (isSimpleValue(value)) {
                 properties.put(fieldName, toNeo4jValue(value));
             }
             // else: not graph-shaped but also not a simple type -- documented Phase 0 boundary, skipped.
@@ -981,6 +1048,10 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
      *  (constructor arguments) -- a record's canonical constructor needs converted VALUES, not a field-
      *  assignment side effect, so the conversion logic lives here rather than only inside a setter. */
     private static Object convertNeo4jValue(Value value, Class<?> targetType) {
+        if (Point.class.isAssignableFrom(targetType)) {
+            org.neo4j.driver.types.Point point = value.asPoint();
+            return new Point(point.x(), point.y()); // x = longitude, y = latitude (WGS-84)
+        }
         if (targetType == String.class) {
             return value.asString();
         } else if (targetType == UUID.class) {

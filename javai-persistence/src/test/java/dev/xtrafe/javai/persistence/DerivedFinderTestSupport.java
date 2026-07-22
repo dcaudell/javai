@@ -3,6 +3,10 @@ package dev.xtrafe.javai.persistence;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Sort;
+import org.springframework.data.geo.Circle;
+import org.springframework.data.geo.Distance;
+import org.springframework.data.geo.Metrics;
+import org.springframework.data.geo.Point;
 
 import java.util.List;
 import java.util.Optional;
@@ -108,6 +112,55 @@ final class DerivedFinderTestSupport {
         assertEquals(List.of("alice", "carol"),
                 repository.findByProfileCityOrderByUsernameAsc("Portland").stream()
                         .map(TestAccount::getUsername).toList());
+    }
+
+    // Three real cities (x = longitude, y = latitude): Portland -> Seattle is ~233 km, Portland -> SF ~860 km,
+    // so the distance thresholds below (50/400/100 km) partition them unambiguously on every backend.
+    private static final Point PORTLAND = new Point(-122.6765, 45.5231);
+    private static final Point SEATTLE = new Point(-122.3321, 47.6062);
+    private static final Point SAN_FRANCISCO = new Point(-122.4194, 37.7749);
+
+    /** Clears and re-inserts the canonical three venues the OMI-141 assertions are written against: two with
+     *  reviews (one nearby, one ~233 km away) and one review-less venue ~860 km away. */
+    static void seedVenues(TestVenueRepository repository) {
+        for (TestVenue existing : repository.findAll()) {
+            repository.deleteById(existing.getId());
+        }
+        repository.save(new TestVenue("Blue Fin Sushi", PORTLAND,
+                List.of(new TestReview("alice", 5), new TestReview("bob", 3))));
+        repository.save(new TestVenue("Red Robin", SEATTLE, List.of(new TestReview("carol", 4))));
+        repository.save(new TestVenue("Green Cafe", SAN_FRANCISCO, List.of()));
+    }
+
+    /** Exercises the OMI-141 additions -- nested-to-many traversal, collection emptiness, the Regex/Matches
+     *  operator, and geo Near/Within -- identically across all three backends. Assumes {@link #seedVenues} ran. */
+    static void assertNestedToManyEmptinessRegexAndGeoFinders(TestVenueRepository repository) {
+        // Nested traversal through the to-many reviews collection.
+        assertEquals(List.of("Blue Fin Sushi"), venueNames(repository.findByReviewsReviewer("alice")));
+        assertTrue(repository.findByReviewsReviewer("nobody").isEmpty());
+        assertEquals(List.of("Blue Fin Sushi", "Red Robin"),
+                venueNames(repository.findByReviewsRatingGreaterThanEqual(4)));
+
+        // Collection emptiness.
+        assertEquals(List.of("Green Cafe"), venueNames(repository.findByReviewsIsEmpty()));
+        assertEquals(List.of("Blue Fin Sushi", "Red Robin"), venueNames(repository.findByReviewsIsNotEmpty()));
+        assertEquals(1, repository.countByReviewsIsEmpty());
+
+        // Regex / Matches (the argument is a raw regex, not a SQL-LIKE pattern).
+        assertEquals(List.of("Blue Fin Sushi"), venueNames(repository.findByNameRegex("^Blue.*")));
+        assertEquals(List.of("Red Robin"), venueNames(repository.findByNameMatches(".*Robin$")));
+
+        // Geo Near/Within.
+        assertEquals(List.of("Blue Fin Sushi"),
+                venueNames(repository.findByLocationNear(PORTLAND, new Distance(50, Metrics.KILOMETERS))));
+        assertEquals(List.of("Blue Fin Sushi", "Red Robin"),
+                venueNames(repository.findByLocationNear(PORTLAND, new Distance(400, Metrics.KILOMETERS))));
+        assertEquals(List.of("Blue Fin Sushi"),
+                venueNames(repository.findByLocationWithin(new Circle(PORTLAND, new Distance(100, Metrics.KILOMETERS)))));
+    }
+
+    private static List<String> venueNames(List<TestVenue> venues) {
+        return venues.stream().map(TestVenue::getName).sorted().toList();
     }
 
     private static List<String> usernames(String... names) {

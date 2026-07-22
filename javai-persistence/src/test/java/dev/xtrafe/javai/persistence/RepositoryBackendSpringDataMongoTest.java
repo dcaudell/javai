@@ -64,6 +64,8 @@ class RepositoryBackendSpringDataMongoTest {
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
     private static TestAccountRepository accountRepository;
+    private static TestAccountNestedRepository nestedAccountRepository;
+    private static TestVenueRepository venueRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -75,6 +77,8 @@ class RepositoryBackendSpringDataMongoTest {
                 .build();
         repository = JavAIPI.repository(TestArticleRepository.class, config);
         accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
+        nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
+        venueRepository = JavAIPI.repository(TestVenueRepository.class, config);
     }
 
     @BeforeEach
@@ -348,12 +352,17 @@ class RepositoryBackendSpringDataMongoTest {
     }
 
     @Test
-    void nestedAssociationDerivedFinderIsRejectedAtRepositoryCreation() {
-        // References are {type, id} pointers, not embedded, so filtering through them would need a $lookup --
-        // the OMI-138 follow-up. Until then this must fail fast, at creation, with a clear message.
-        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
-                () -> JavAIPI.repository(TestAccountNestedRepository.class, config));
-        assertTrue(thrown.getMessage().contains("nested"));
+    void nestedAssociationDerivedFindersResolveThroughReferencePointers() {
+        // References are {type, id} pointers, not embedded; OMI-141 resolves a nested predicate by matching
+        // the referenced entities first, then owners whose <field>.id points at one of them.
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertNestedDerivedFinders(nestedAccountRepository);
+    }
+
+    @Test
+    void nestedToManyEmptinessRegexAndGeoFindersWork() {
+        DerivedFinderTestSupport.seedVenues(venueRepository);
+        DerivedFinderTestSupport.assertNestedToManyEmptinessRegexAndGeoFinders(venueRepository);
     }
 
     @Test
