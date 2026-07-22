@@ -7,7 +7,7 @@ import java.util.UUID;
 /**
  * Spring-Data-style repository base, per doc/spec/persistence-bridge.md. A repository interface extends
  * this with one type parameter -- {@code interface ArticleRepository extends JavAIRepository<Article>} --
- * and is realized via {@link JavAIPI#repository(Class)}, never implemented by hand.
+ * and is realized via {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}, never implemented by hand.
  *
  * <p>Identity is fixed to {@link UUID} for every persistable entity, recognized via a plain {@code @Id}
  * ({@code jakarta.persistence.Id}, already a transitive dependency through {@code hibernate-core}) field --

@@ -22,7 +22,7 @@ interface RepositoryBackend {
 
     /**
      * Registers {@code entityType} as one this backend must be able to persist. Called for every
-     * repository interface {@link JavAIPI#repository(Class)} creates, before any method is actually
+     * repository interface {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} creates, before any method is actually
      * invoked -- see {@code RepositoryBackendHibernatePostgres}'s javadoc for why registration and first
      * use are different moments (Hibernate's {@code SessionFactory} metadata is immutable once built).
      */

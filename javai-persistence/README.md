@@ -182,16 +182,10 @@ the same way `RepositoryBackendNeo4jTest`'s equivalent test does.
 referenced document simply becomes unreferenced, not deleted. Documented as a known Phase 0 boundary in
 `RepositoryBackendSpringDataMongo`'s own javadoc, not an oversight.
 
-**Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
-Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
-implementation stand in for `PersistentBag`/`PersistentSet`/`PersistentMap` and could in principle preserve
-JavAI's vector/dirty-tracking behavior *while* being a real, natively Hibernate-managed association -- is
-deliberately not pursued yet. It's Postgres/Hibernate-only (Neo4j has no equivalent concept and would remain
-on its own reflective mechanism regardless, breaking the symmetry the two backends otherwise share), and
-correctly implementing a custom `PersistentCollection` is a substantial, easy-to-get-subtly-wrong undertaking
-(dirty-checking snapshot semantics, session attachment/detachment, lazy-initialization) disproportionate to
-a Phase 0 module whose job is proving the design space, not hardening a production ORM integration. Worth
-revisiting if this module graduates past Phase 0.
+**On Postgres, `UserCollectionType` makes interface-typed JavAI collections native JPA associations** --
+see "JavAI collections as native JPA associations (OMI-142)" under "What's actually implemented" below for
+the mechanism and for how the two shapes (native association vs. side table) coexist. Neo4j and MongoDB have no equivalent concept and stay on the
+reflective, declared-type classification described above.
 
 ## `KnowledgeGraph<N, E>` fields -- Neo4j only
 
@@ -409,8 +403,10 @@ express.
 - No dual-write/transactional multi-backend `save()` -- persisting one entity type to more than one store
   simultaneously means two independently-created repository proxies, one per backend (see
   `doc/spec/persistence-bridge.md`'s own section on this).
-- The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
-  not started.
+- Native JPA associations (`UserCollectionType`) are Postgres-only. Neo4j and MongoDB classify collection
+  fields by declared type and have no equivalent, so an interface-typed JavAI collection field behaves the
+  same as a concrete-typed one there -- an asymmetry by necessity, not an omission (neither store has a
+  Hibernate provider that could serve JPA associations).
 
 `e2e-client-test` now exercises this module directly: `PersistenceE2ETest`/`ArticleFixtureVolumeE2ETest`
 save/query this project's own real `Article`/`Comment`/`Attachment` domain (not this module's own flat test
