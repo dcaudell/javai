@@ -57,6 +57,14 @@
       <artifactId>spring-data-mongodb</artifactId>
     </dependency>
     <dependency>
+      <!-- PartTree, the Spring-Data derived-query name parser, is used directly by DerivedFinderQuery to
+           realize standard relational finders (findBy/existsBy/countBy/deleteBy...) on JavAIRepository
+           across all three backends (OMI-138). Present transitively via spring-data-mongodb already, but
+           named explicitly since it's now a first-class dependency of this module's own code. -->
+      <groupId>org.springframework.data</groupId>
+      <artifactId>spring-data-commons</artifactId>
+    </dependency>
+    <dependency>
       <!-- Not pulled in transitively by spring-data-mongodb; confirmed via dependency:tree that it only
            brings mongodb-driver-core. This is what actually provides MongoClient/MongoCollection/
            MongoDatabase, used directly for vector read/write/search (see RepositoryBackendSpringDataMongo's

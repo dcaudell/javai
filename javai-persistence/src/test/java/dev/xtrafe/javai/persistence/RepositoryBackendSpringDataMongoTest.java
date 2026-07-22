@@ -63,6 +63,7 @@ class RepositoryBackendSpringDataMongoTest {
 
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
+    private static TestAccountRepository accountRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -73,6 +74,7 @@ class RepositoryBackendSpringDataMongoTest {
                 .mongoDatabase(DATABASE)
                 .build();
         repository = JavAIPI.repository(TestArticleRepository.class, config);
+        accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
     }
 
     @BeforeEach
@@ -335,6 +337,28 @@ class RepositoryBackendSpringDataMongoTest {
                 return result;
             }
         }
+    }
+
+    // ---- ordinary (non-vector) derived finders, OMI-138 ----------------------------------------
+
+    @Test
+    void ordinaryDerivedFindersWorkAcrossOperatorsProjectionsAndPaging() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertSimpleDerivedFinders(accountRepository);
+    }
+
+    @Test
+    void nestedAssociationDerivedFinderIsRejectedAtRepositoryCreation() {
+        // References are {type, id} pointers, not embedded, so filtering through them would need a $lookup --
+        // the OMI-138 follow-up. Until then this must fail fast, at creation, with a clear message.
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> JavAIPI.repository(TestAccountNestedRepository.class, config));
+        assertTrue(thrown.getMessage().contains("nested"));
+    }
+
+    @Test
+    void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
     }
 
     private static String mongoUri() {

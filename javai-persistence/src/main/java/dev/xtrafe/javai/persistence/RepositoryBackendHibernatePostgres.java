@@ -6,14 +6,22 @@ import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import jakarta.persistence.Entity;
+import jakarta.persistence.criteria.Expression;
+import jakarta.persistence.criteria.Order;
+import jakarta.persistence.criteria.Path;
+import jakarta.persistence.criteria.Predicate;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
 import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.query.criteria.HibernateCriteriaBuilder;
 import org.hibernate.query.criteria.JpaCriteriaQuery;
 import org.hibernate.query.criteria.JpaRoot;
+import org.springframework.data.core.PropertyPath;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.repository.query.parser.Part;
 
 import java.io.ByteArrayInputStream;
 import java.lang.reflect.Field;
@@ -31,6 +39,7 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -375,6 +384,211 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             });
         }
         return hydrate(factory, entityType, rankedIds);
+    }
+
+    // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
+
+    /** Rejects, at repository-creation time, a derived finder this backend can't translate: an unsupported
+     *  operator (shared guard), or a filter/sort path that isn't reachable as a Hibernate-mapped column.
+     *  Nested filtering is supported through singular {@code @Entity} associations (Criteria auto-joins
+     *  them), but not through a to-many/JavAI-collection field -- those are stored out-of-band in
+     *  {@code javai_collection_members}, so there's no column to filter/sort on. That gap (and the
+     *  collection-membership join that would close it) is the OMI-138 follow-up. */
+    @Override
+    public void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
+        query.assertCoreOperatorsOnly();
+        for (Part part : query.partTree().getParts()) {
+            validateDotPathMappable(entityType, part.getProperty().toDotPath());
+        }
+        for (Sort.Order order : query.partTree().getSort()) {
+            validateDotPathMappable(entityType, order.getProperty());
+        }
+    }
+
+    /** Walks {@code dotPath} segment by segment against the entity's fields: every non-leaf segment must be
+     *  a singular {@code @Entity} association (so Criteria can navigate/join it), and the leaf must not be a
+     *  JavAI collection field (no mapped column). */
+    private static void validateDotPathMappable(Class<?> entityType, String dotPath) {
+        Class<?> owner = entityType;
+        String[] segments = dotPath.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            Field field = EntityReflection.findField(owner, segments[i]);
+            boolean leaf = i == segments.length - 1;
+            if (!leaf) {
+                if (!field.getType().isAnnotationPresent(Entity.class)) {
+                    throw new IllegalArgumentException("Postgres derived finder cannot filter/sort through '"
+                            + segments[i] + "' on " + owner.getName() + " -- nested paths are only supported "
+                            + "through singular @Entity associations in this phase; this field is a "
+                            + "collection/map/scalar. (OMI-138 follow-up: collection-membership join.)");
+                }
+                owner = field.getType();
+            } else if (isJavAICollectionField(field)) {
+                throw new IllegalArgumentException("Postgres derived finder cannot filter/sort on '" + segments[i]
+                        + "' of " + owner.getName() + " -- it's a JavAI collection field stored out-of-band in "
+                        + "javai_collection_members, not a Hibernate-mapped column. (OMI-138 follow-up.)");
+            }
+        }
+    }
+
+    @Override
+    public List<Object> findByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        return findByDerivedTyped(entityType, query, args, constraints);
+    }
+
+    private <T> List<Object> findByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        SessionFactory factory = sessionFactory();
+        try (Session session = factory.openSession()) {
+            HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
+            JpaCriteriaQuery<T> cq = cb.createQuery(entityType);
+            JpaRoot<T> root = cq.from(entityType);
+            cq.select(root);
+            if (query.partTree().isDistinct()) {
+                cq.distinct(true);
+            }
+            Predicate where = buildWhere(cb, root, query.boundOrGroups(args));
+            if (where != null) {
+                cq.where(where);
+            }
+            applySort(cb, cq, root, constraints.sort());
+            var typed = session.createQuery(cq);
+            if (constraints.skip() != null) {
+                typed.setFirstResult(constraints.skip());
+            }
+            if (constraints.maxResults() != null) {
+                typed.setMaxResults(constraints.maxResults());
+            }
+            List<T> results = typed.list();
+            List<Object> out = new ArrayList<>(results.size());
+            for (T entity : results) {
+                hydrateCollectionMembers(session, entity);
+                out.add(entity);
+            }
+            return out;
+        }
+    }
+
+    @Override
+    public long countByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        return countByDerivedTyped(entityType, query, args);
+    }
+
+    private <T> long countByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args) {
+        SessionFactory factory = sessionFactory();
+        try (Session session = factory.openSession()) {
+            HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
+            JpaCriteriaQuery<Long> cq = cb.createQuery(Long.class);
+            JpaRoot<T> root = cq.from(entityType);
+            cq.select(query.partTree().isDistinct() ? cb.countDistinct(root) : cb.count(root));
+            Predicate where = buildWhere(cb, root, query.boundOrGroups(args));
+            if (where != null) {
+                cq.where(where);
+            }
+            return session.createQuery(cq).getSingleResult();
+        }
+    }
+
+    @Override
+    public boolean existsByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        return countByDerivedQuery(entityType, query, args) > 0;
+    }
+
+    @Override
+    public long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        // Resolve matches, then delete each through the existing deleteById path so the entity's vector rows
+        // and collection-membership rows are cleaned up too -- a bulk Criteria delete would bypass both and
+        // leave orphaned javai_vectors__*/javai_collection_members rows behind.
+        List<Object> matches =
+                findByDerivedQuery(entityType, query, args, new DerivedFinderQuery.Constraints(Sort.unsorted(), null, null));
+        for (Object entity : matches) {
+            deleteById(entityType, EntityReflection.readId(entity));
+        }
+        return matches.size();
+    }
+
+    private static Predicate buildWhere(
+            HibernateCriteriaBuilder cb, JpaRoot<?> root, List<List<DerivedFinderQuery.BoundPart>> orGroups) {
+        List<Predicate> orPredicates = new ArrayList<>();
+        for (List<DerivedFinderQuery.BoundPart> group : orGroups) {
+            List<Predicate> andPredicates = new ArrayList<>();
+            for (DerivedFinderQuery.BoundPart part : group) {
+                andPredicates.add(toPredicate(cb, root, part));
+            }
+            if (!andPredicates.isEmpty()) {
+                orPredicates.add(cb.and(andPredicates.toArray(new Predicate[0])));
+            }
+        }
+        return orPredicates.isEmpty() ? null : cb.or(orPredicates.toArray(new Predicate[0]));
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Predicate toPredicate(
+            HibernateCriteriaBuilder cb, JpaRoot<?> root, DerivedFinderQuery.BoundPart part) {
+        Path path = resolvePath(root, part.property().toDotPath());
+        List<Object> a = part.arguments();
+        boolean ic = part.ignoreCase();
+        return switch (part.type()) {
+            case SIMPLE_PROPERTY -> equalPredicate(cb, path, a.get(0), ic);
+            case NEGATING_SIMPLE_PROPERTY -> cb.not(equalPredicate(cb, path, a.get(0), ic));
+            case GREATER_THAN, AFTER -> cb.greaterThan(path, (Comparable) a.get(0));
+            case GREATER_THAN_EQUAL -> cb.greaterThanOrEqualTo(path, (Comparable) a.get(0));
+            case LESS_THAN, BEFORE -> cb.lessThan(path, (Comparable) a.get(0));
+            case LESS_THAN_EQUAL -> cb.lessThanOrEqualTo(path, (Comparable) a.get(0));
+            case BETWEEN -> cb.between(path, (Comparable) a.get(0), (Comparable) a.get(1));
+            case IS_NULL -> cb.isNull(path);
+            case IS_NOT_NULL -> cb.isNotNull(path);
+            case LIKE -> likePredicate(cb, path, String.valueOf(a.get(0)), ic);
+            case NOT_LIKE -> cb.not(likePredicate(cb, path, String.valueOf(a.get(0)), ic));
+            case STARTING_WITH -> likePredicate(cb, path, a.get(0) + "%", ic);
+            case ENDING_WITH -> likePredicate(cb, path, "%" + a.get(0), ic);
+            case CONTAINING -> likePredicate(cb, path, "%" + a.get(0) + "%", ic);
+            case NOT_CONTAINING -> cb.not(likePredicate(cb, path, "%" + a.get(0) + "%", ic));
+            case IN -> path.in((Collection<?>) a.get(0));
+            case NOT_IN -> cb.not(path.in((Collection<?>) a.get(0)));
+            case TRUE -> cb.isTrue(path);
+            case FALSE -> cb.isFalse(path);
+            default -> throw new IllegalArgumentException(
+                    "Unsupported derived-query operator " + part.type() + " for the Postgres backend.");
+        };
+    }
+
+    private static Predicate equalPredicate(HibernateCriteriaBuilder cb, Path<?> path, Object value, boolean ignoreCase) {
+        if (ignoreCase && value instanceof String s) {
+            return cb.equal(cb.lower(path.as(String.class)), s.toLowerCase(Locale.ROOT));
+        }
+        return cb.equal(path, value);
+    }
+
+    private static Predicate likePredicate(HibernateCriteriaBuilder cb, Path<?> path, String pattern, boolean ignoreCase) {
+        Expression<String> asString = path.as(String.class);
+        return ignoreCase
+                ? cb.like(cb.lower(asString), pattern.toLowerCase(Locale.ROOT))
+                : cb.like(asString, pattern);
+    }
+
+    private static void applySort(
+            HibernateCriteriaBuilder cb, JpaCriteriaQuery<?> cq, JpaRoot<?> root, Sort sort) {
+        if (sort == null || sort.isUnsorted()) {
+            return;
+        }
+        List<Order> orders = new ArrayList<>();
+        for (Sort.Order order : sort) {
+            Path<?> path = resolvePath(root, order.getProperty());
+            Expression<?> expression = order.isIgnoreCase() ? cb.lower(path.as(String.class)) : path;
+            orders.add(order.isAscending() ? cb.asc(expression) : cb.desc(expression));
+        }
+        cq.orderBy(orders);
+    }
+
+    /** Navigates a (possibly nested, dot-separated) property path from {@code root}. For a singular
+     *  {@code @Entity} association segment, Criteria navigation implies the inner join automatically. */
+    private static Path<?> resolvePath(JpaRoot<?> root, String dotPath) {
+        Path<?> path = root;
+        for (String segment : dotPath.split("\\.")) {
+            path = path.get(segment);
+        }
+        return path;
     }
 
     // ---- vector read/write -------------------------------------------------------------------
