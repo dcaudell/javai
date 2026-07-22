@@ -42,6 +42,8 @@ class RepositoryBackendHibernatePostgresTest {
 
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
+    private static TestAccountRepository accountRepository;
+    private static TestAccountNestedRepository nestedAccountRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -53,6 +55,10 @@ class RepositoryBackendHibernatePostgresTest {
                 .postgresPassword(postgres.getPassword())
                 .build();
         repository = JavAIPI.repository(TestArticleRepository.class, config);
+        // Registered before first use, like every repository this SessionFactory must cover (TestProfile is
+        // auto-registered via TestAccount's @OneToOne, so it needs no explicit repository call here).
+        accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
+        nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
     }
 
     @BeforeEach
@@ -208,6 +214,25 @@ class RepositoryBackendHibernatePostgresTest {
     @Test
     void bogusDerivedQueryMethodFailsFastAtRepositoryCreation() {
         assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(BogusTestArticleRepository.class, config));
+    }
+
+    // ---- ordinary (non-vector) derived finders, OMI-138 ----------------------------------------
+
+    @Test
+    void ordinaryDerivedFindersWorkAcrossOperatorsProjectionsAndPaging() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertSimpleDerivedFinders(accountRepository);
+    }
+
+    @Test
+    void nestedAssociationDerivedFindersTraverseTheSingularOneToOne() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertNestedDerivedFinders(nestedAccountRepository);
+    }
+
+    @Test
+    void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
     }
 
     /**

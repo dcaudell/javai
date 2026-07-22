@@ -14,11 +14,17 @@ import java.util.UUID;
  * reused, not reinvented, specifically so the same annotation marks identity on both the Postgres and
  * Neo4j backends without requiring full JPA {@code @Entity} semantics on the Neo4j path.
  *
- * <p>Beyond this base CRUD contract, a repository interface may declare exactly one convention:
- * {@code findNearestBy<Field>Vector(EmbeddingVector reference, int limit)} (or the whole-object
- * {@code findNearestByVector}/{@code findNearestBySummaryVector} variants) -- see {@link JavAIPI}'s javadoc
- * for the full naming rule. Arbitrary Spring-Data-style derived queries (e.g. {@code findByTitle}) are not
- * part of Persistence Bridge's contract and fail fast at repository-creation time, not on first call.
+ * <p>Beyond this base CRUD contract, a repository interface may declare two kinds of derived query. First,
+ * the vector convention {@code findNearestBy<Field>Vector(EmbeddingVector reference, int limit)} (or the
+ * whole-object {@code findNearestByVector}/{@code findNearestBySummaryVector} variants) -- see {@link JavAIPI}'s
+ * javadoc for the full naming rule. Second (OMI-138), ordinary Spring-Data-style relational finders --
+ * {@code findBy<Field>}/{@code existsBy…}/{@code countBy…}/{@code deleteBy…} with the full {@code And}/{@code Or}
+ * + operator + {@code OrderBy} + {@code Top}/{@code First} grammar, dynamic {@code Sort}/{@code Pageable}/
+ * {@code Limit}, and {@code List}/{@code Optional}/single/{@code Stream}/{@code Page}/{@code Slice}/{@code long}/
+ * {@code boolean} return adapters -- resolved against the entity's own mapped columns, so one repository serves
+ * both an entity's relational access and its vector search (see {@link DerivedFinderQuery}). A non-vectorized
+ * {@code @Entity} is served by exactly this same path. Either kind is validated, and anything matching neither
+ * is rejected, at repository-creation time -- never on first call.
  */
 public interface JavAIRepository<T> {
 

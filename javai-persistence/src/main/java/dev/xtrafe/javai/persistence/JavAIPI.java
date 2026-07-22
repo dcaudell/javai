@@ -40,8 +40,11 @@ import java.util.concurrent.ConcurrentHashMap;
  * weaver already synthesizes in memory (e.g. {@code bodyVector()} -> {@code findNearestByBodyVector}) --
  * {@code <Field>} must be a real {@code @Vectorize} field. Two whole-object variants are also recognized:
  * {@code findNearestByVector} (the object's own combined {@code vector()}) and
- * {@code findNearestBySummaryVector} ({@code summaryVector()}). Anything else -- including any other
- * Spring-Data-style derived query -- is rejected here, at repository-creation time, not on first call.
+ * {@code findNearestBySummaryVector} ({@code summaryVector()}). <b>Ordinary Spring-Data-style relational
+ * finders</b> ({@code findBy…}/{@code existsBy…}/{@code countBy…}/{@code deleteBy…}, OMI-138) are recognized
+ * too -- parsed and validated via {@link DerivedFinderQuery}, then checked for backend feasibility -- and
+ * resolved against the entity's own mapped columns. Only a name matching neither convention is rejected
+ * here, at repository-creation time, not on first call.
  *
  * <p><b>Registration-before-use</b>: call {@link #repository(Class, JavAIPersistenceConfig)} for every
  * repository interface an application needs *before* invoking methods on any of them. The Postgres
@@ -59,30 +62,45 @@ public final class JavAIPI {
     @SuppressWarnings("unchecked")
     public static <R extends JavAIRepository<?>> R repository(Class<R> repositoryInterface, JavAIPersistenceConfig config) {
         Class<?> entityType = resolveEntityType(repositoryInterface);
-        // Validated before touching any backend state, deliberately: this check must fail the same way
-        // (IllegalArgumentException) regardless of whether the backend has already been bootstrapped by an
-        // earlier repository() call -- registerEntityType's own "already built" guard is a different,
-        // backend-lifecycle error and must never mask an invalid repository interface.
-        validateDerivedQueryMethods(repositoryInterface, entityType);
         RepositoryBackend backend = backendFor(config);
+        // Validated after the backend exists but before registerEntityType touches its state: an invalid
+        // repository interface must fail the same way (IllegalArgumentException) regardless of whether the
+        // backend was already bootstrapped by an earlier repository() call, and -- for ordinary derived
+        // finders (OMI-138) -- the check is now partly backend-specific (a nested path one store can filter
+        // through, another can't), so it needs the resolved backend in hand. registerEntityType's own
+        // "already built" guard is a different, backend-lifecycle error that must never mask this one.
+        validateRepositoryMethods(repositoryInterface, entityType, backend);
         backend.registerEntityType(entityType);
         InvocationHandler handler = new RepositoryInvocationHandler(backend, entityType);
         return (R) Proxy.newProxyInstance(
                 repositoryInterface.getClassLoader(), new Class<?>[] {repositoryInterface}, handler);
     }
 
-    private static void validateDerivedQueryMethods(Class<?> repositoryInterface, Class<?> entityType) {
+    /** Validates every method a repository interface declares beyond the base CRUD contract, at
+     *  repository-creation time (never on first call). Three method families are legal, checked in order:
+     *  the vector-specific {@code findNearestBy*} convention ({@link DerivedQueryMethods}); ordinary
+     *  Spring-Data-style derived finders ({@link DerivedFinderQuery}, OMI-138), which must also pass the
+     *  backend's own feasibility check; anything else is rejected with a clear message. */
+    private static void validateRepositoryMethods(Class<?> repositoryInterface, Class<?> entityType,
+            RepositoryBackend backend) {
         for (Method method : repositoryInterface.getMethods()) {
             if (method.getDeclaringClass() == JavAIRepository.class || method.getDeclaringClass() == Object.class) {
                 continue; // the base CRUD contract itself, always fine
             }
-            if (!DerivedQueryMethods.isDerivedQueryMethod(method)) {
-                throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
-                        + entityType.getName() + " -- JavAIRepository only supports the base CRUD contract plus "
-                        + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector(EmbeddingVector, int); "
-                        + "arbitrary derived queries aren't part of Persistence Bridge's contract.");
+            if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
+                DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
+                continue;
             }
-            DerivedQueryMethods.parse(method, entityType); // throws with a clear message if invalid
+            if (DerivedFinderQuery.looksLikeDerivedFinder(method)) {
+                DerivedFinderQuery query = DerivedFinderQuery.parse(method, entityType); // throws if invalid
+                backend.validateDerivedQuery(entityType, query); // store-specific feasibility; throws if not
+                continue;
+            }
+            throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
+                    + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, the "
+                    + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector(EmbeddingVector, int) "
+                    + "vector convention, and ordinary Spring-Data-style derived finders "
+                    + "(findBy/existsBy/countBy/deleteBy...); this name matches none of them.");
         }
     }
 

@@ -1,9 +1,12 @@
 package dev.xtrafe.javai.persistence;
 
 import com.mongodb.MongoCommandException;
+import com.mongodb.client.FindIterable;
 import com.mongodb.client.MongoClient;
 import com.mongodb.client.MongoClients;
 import com.mongodb.client.MongoCollection;
+import com.mongodb.client.model.Collation;
+import com.mongodb.client.model.CollationStrength;
 import com.mongodb.client.model.Filters;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
@@ -13,9 +16,11 @@ import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import org.bson.Document;
 import org.bson.conversions.Bson;
+import org.springframework.data.domain.Sort;
 import org.springframework.data.mongodb.MongoDatabaseFactory;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.SimpleMongoClientDatabaseFactory;
+import org.springframework.data.repository.query.parser.Part;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
@@ -34,6 +39,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.regex.Pattern;
 
 /**
  * MongoDB backend built on Spring Data MongoDB: {@link MongoTemplate} is used purely as the configured
@@ -369,6 +375,190 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     private static String qualify(String basePropertyName, String modelId) {
         return basePropertyName + "__" + ModelIds.sanitize(modelId);
+    }
+
+    // ---- ordinary derived finders (OMI-138): MongoDB filter translation ------------------------
+
+    /** Rejects, at repository-creation time, a derived finder this backend can't translate: an unsupported
+     *  operator (shared guard), or a nested path / reference-field filter. Related entities are stored as
+     *  {@code {type, id}} reference pointers (never embedded), so filtering through them would need a
+     *  {@code $lookup} join -- deliberately out of scope for this pass and tracked as the OMI-138 follow-up.
+     *  This backend therefore supports filtering/sorting only on the entity's own simple document fields. */
+    @Override
+    public void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
+        query.assertCoreOperatorsOnly();
+        for (Part part : query.partTree().getParts()) {
+            validateSimpleFieldPath(entityType, part.getProperty().toDotPath());
+        }
+        for (Sort.Order order : query.partTree().getSort()) {
+            validateSimpleFieldPath(entityType, order.getProperty());
+        }
+    }
+
+    private static void validateSimpleFieldPath(Class<?> entityType, String dotPath) {
+        if (dotPath.contains(".")) {
+            throw new IllegalArgumentException("MongoDB derived finder cannot filter/sort through the nested path '"
+                    + dotPath + "' on " + entityType.getName() + " -- related entities are stored as {type, id} "
+                    + "reference pointers, not embedded, so a nested filter would need a $lookup join. That's the "
+                    + "OMI-138 follow-up; filter on the entity's own fields for now.");
+        }
+        Field field = EntityReflection.findField(entityType, dotPath);
+        if (isReferenceField(field)) {
+            throw new IllegalArgumentException("MongoDB derived finder cannot filter/sort on '" + dotPath + "' of "
+                    + entityType.getName() + " -- it's stored as a {type, id} reference pointer, not a plain field.");
+        }
+    }
+
+    @Override
+    public List<Object> findByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        FindIterable<Document> cursor = collectionFor(entityType).find(buildFilter(entityType, query.boundOrGroups(args)));
+        Document sort = sortDocument(entityType, constraints.sort());
+        if (sort != null) {
+            cursor = cursor.sort(sort);
+            if (needsCaseInsensitiveCollation(constraints.sort())) {
+                cursor = cursor.collation(
+                        Collation.builder().locale("en").collationStrength(CollationStrength.SECONDARY).build());
+            }
+        }
+        if (constraints.skip() != null) {
+            cursor = cursor.skip(constraints.skip());
+        }
+        if (constraints.maxResults() != null) {
+            cursor = cursor.limit(constraints.maxResults());
+        }
+        Map<UUID, Object> hydrated = new HashMap<>();
+        List<Object> results = new ArrayList<>();
+        for (Document doc : cursor) {
+            results.add(hydrate(entityType, doc, hydrated));
+        }
+        return results;
+    }
+
+    @Override
+    public long countByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        return collectionFor(entityType).countDocuments(buildFilter(entityType, query.boundOrGroups(args)));
+    }
+
+    @Override
+    public boolean existsByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        return collectionFor(entityType).find(buildFilter(entityType, query.boundOrGroups(args))).limit(1).first() != null;
+    }
+
+    @Override
+    public long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
+        // deleteMany, mirroring deleteById -- removes the matched documents but not the documents they
+        // reference, the same documented Mongo non-cascade boundary.
+        return collectionFor(entityType).deleteMany(buildFilter(entityType, query.boundOrGroups(args))).getDeletedCount();
+    }
+
+    private Bson buildFilter(Class<?> entityType, List<List<DerivedFinderQuery.BoundPart>> orGroups) {
+        List<Bson> orFilters = new ArrayList<>();
+        for (List<DerivedFinderQuery.BoundPart> group : orGroups) {
+            List<Bson> andFilters = new ArrayList<>();
+            for (DerivedFinderQuery.BoundPart part : group) {
+                andFilters.add(toFilter(entityType, part));
+            }
+            if (!andFilters.isEmpty()) {
+                orFilters.add(andFilters.size() == 1 ? andFilters.get(0) : Filters.and(andFilters));
+            }
+        }
+        if (orFilters.isEmpty()) {
+            return Filters.empty();
+        }
+        return orFilters.size() == 1 ? orFilters.get(0) : Filters.or(orFilters);
+    }
+
+    private Bson toFilter(Class<?> entityType, DerivedFinderQuery.BoundPart part) {
+        String field = mongoField(entityType, part.property().toDotPath());
+        List<Object> a = part.arguments();
+        boolean ic = part.ignoreCase();
+        String caseOption = ic ? "i" : "";
+        return switch (part.type()) {
+            case SIMPLE_PROPERTY -> ic && a.get(0) instanceof String s
+                    ? Filters.regex(field, "^" + Pattern.quote(s) + "$", "i")
+                    : Filters.eq(field, toMongoValue(a.get(0)));
+            case NEGATING_SIMPLE_PROPERTY -> ic && a.get(0) instanceof String s
+                    ? Filters.not(Filters.regex(field, "^" + Pattern.quote(s) + "$", "i"))
+                    : Filters.ne(field, toMongoValue(a.get(0)));
+            case GREATER_THAN, AFTER -> Filters.gt(field, toMongoValue(a.get(0)));
+            case GREATER_THAN_EQUAL -> Filters.gte(field, toMongoValue(a.get(0)));
+            case LESS_THAN, BEFORE -> Filters.lt(field, toMongoValue(a.get(0)));
+            case LESS_THAN_EQUAL -> Filters.lte(field, toMongoValue(a.get(0)));
+            case BETWEEN -> Filters.and(
+                    Filters.gte(field, toMongoValue(a.get(0))), Filters.lte(field, toMongoValue(a.get(1))));
+            case IS_NULL -> Filters.eq(field, null);
+            case IS_NOT_NULL -> Filters.ne(field, null);
+            case LIKE -> Filters.regex(field, likeToRegex(String.valueOf(a.get(0))), caseOption);
+            case NOT_LIKE -> Filters.not(Filters.regex(field, likeToRegex(String.valueOf(a.get(0))), caseOption));
+            case STARTING_WITH -> Filters.regex(field, "^" + Pattern.quote(String.valueOf(a.get(0))), caseOption);
+            case ENDING_WITH -> Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))) + "$", caseOption);
+            case CONTAINING -> Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))), caseOption);
+            case NOT_CONTAINING -> Filters.not(Filters.regex(field, Pattern.quote(String.valueOf(a.get(0))), caseOption));
+            case IN -> Filters.in(field, mongoValues(a.get(0)));
+            case NOT_IN -> Filters.nin(field, mongoValues(a.get(0)));
+            case TRUE -> Filters.eq(field, true);
+            case FALSE -> Filters.eq(field, false);
+            default -> throw new IllegalArgumentException(
+                    "Unsupported derived-query operator " + part.type() + " for the MongoDB backend.");
+        };
+    }
+
+    private static List<Object> mongoValues(Object raw) {
+        List<Object> converted = new ArrayList<>();
+        if (raw instanceof Collection<?> collection) {
+            for (Object element : collection) {
+                converted.add(toMongoValue(element));
+            }
+        }
+        return converted;
+    }
+
+    /** SQL-LIKE ({@code %}/{@code _}) to a MongoDB {@code $regex}, escaping other regex metacharacters. */
+    private static String likeToRegex(String pattern) {
+        StringBuilder regex = new StringBuilder();
+        for (int i = 0; i < pattern.length(); i++) {
+            char c = pattern.charAt(i);
+            if (c == '%') {
+                regex.append(".*");
+            } else if (c == '_') {
+                regex.append('.');
+            } else if ("\\.[]{}()*+-?^$|".indexOf(c) >= 0) {
+                regex.append('\\').append(c);
+            } else {
+                regex.append(c);
+            }
+        }
+        return regex.toString();
+    }
+
+    private Document sortDocument(Class<?> entityType, Sort sort) {
+        if (sort == null || sort.isUnsorted()) {
+            return null;
+        }
+        Document document = new Document();
+        for (Sort.Order order : sort) {
+            document.append(mongoField(entityType, order.getProperty()), order.isAscending() ? 1 : -1);
+        }
+        return document;
+    }
+
+    private static boolean needsCaseInsensitiveCollation(Sort sort) {
+        if (sort == null || sort.isUnsorted()) {
+            return false;
+        }
+        for (Sort.Order order : sort) {
+            if (order.isIgnoreCase()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** The document field name for a property: the {@code @Id} field maps to Mongo's {@code _id} (matching
+     *  {@link #saveDocument}/{@link #findById}); every other field is stored under its own name. */
+    private static String mongoField(Class<?> entityType, String fieldName) {
+        return fieldName.equals(EntityReflection.idField(entityType).getName()) ? "_id" : fieldName;
     }
 
     // ---- save: reflective document + reference mapping -----------------------------------------

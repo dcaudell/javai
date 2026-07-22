@@ -40,4 +40,31 @@ interface RepositoryBackend {
     List<Object> findNearestByFieldVector(Class<?> entityType, String fieldName, EmbeddingVector reference, int limit);
 
     List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit);
+
+    // ---- ordinary Spring-Data-style derived finders (OMI-138) --------------------------------------
+    // These four primitives + validation are all a backend implements; DerivedFinderQuery owns the method
+    // name grammar, return-type adaptation, and Pageable/Sort/Limit handling. A backend only translates the
+    // BoundPart predicate tree into its native query language and applies the resolved Constraints.
+
+    /** Rejects, at repository-creation time, any derived finder this specific backend structurally cannot
+     *  serve -- e.g. a nested property path reaching through a relationship the backend doesn't map for
+     *  filtering. The default accepts everything {@link DerivedFinderQuery#parse} already validated;
+     *  backends override to add their own store-specific feasibility checks. Must throw
+     *  {@code IllegalArgumentException} with a clear, field-naming message, never fail later on first call. */
+    default void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
+    }
+
+    /** Runs the derived finder's predicate under the given {@code constraints} (ordering + windowing) and
+     *  returns the matching entities, already hydrated the same way {@link #findAll} hydrates. */
+    List<Object> findByDerivedQuery(
+            Class<?> entityType, DerivedFinderQuery query, Object[] args, DerivedFinderQuery.Constraints constraints);
+
+    /** Counts entities matching the derived finder's predicate (ordering/windowing intentionally ignored). */
+    long countByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    /** Whether any entity matches the derived finder's predicate. */
+    boolean existsByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    /** Deletes every entity matching the derived finder's predicate, returning how many were removed. */
+    long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
 }

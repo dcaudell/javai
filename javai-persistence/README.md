@@ -14,7 +14,8 @@ alongside their ORM.
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
 | `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()`, fixed to `UUID` identity |
-| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Derived query convention | The *only* derived queries supported -- validated at repository-creation time, not on first call |
+| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call |
+| `findBy…` / `existsBy…` / `countBy…` / `deleteBy…` | Ordinary relational derived finders | Full Spring-Data-style finders (parsed via `PartTree`) resolved against the entity's own mapped columns, so one repository serves both an entity's relational access and its vector search; also validated at creation time -- see "Ordinary relational derived finders" below |
 | `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
 | `javai_vectors__<model>` / `javai_summary_vectors__<model>` | Postgres tables, owned by this module, one pair per model | Per-field + combined vectors, and `summaryVector()`, respectively -- never the developer's own entity table |
 | `<field>Vector__<model>` / `vector__<model>` / `summaryVector__<model>` | Neo4j node properties, one set per model | Same idea as the Postgres tables, applied to a schemaless node instead |
@@ -299,7 +300,35 @@ avoids connection-unwrapping uncertainty through Hibernate's layer.
 backends' save/findById/findAll/deleteById/reindexAll plus the three `findNearestBy*` variants, described
 above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
 `RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
-methods. Covered by `RepositoryBackendHibernatePostgresTest`/`RepositoryBackendNeo4jTest`/
+methods.
+
+**Ordinary relational derived finders (OMI-138), on all three backends.** A repository interface may
+declare Spring-Data-style finders -- `findBy`/`existsBy`/`countBy`/`deleteBy` with `And`/`Or`, the full
+operator set (`GreaterThan`/`Between`/`Like`/`Containing`/`In`/`IsNull`/`True`/`IgnoreCase`/...), static
+`OrderBy`, `Top`/`First`, `Distinct`, dynamic `Sort`/`Pageable`/`Limit`, and the
+`List`/`Optional`/single/`Stream`/`Page`/`Slice`/`long`/`boolean` return adapters -- alongside the
+`findNearestBy…` vector convention. The name grammar is delegated to Spring Data's own `PartTree`
+(`spring-data-commons`, already present transitively via `spring-data-mongodb`; now declared explicitly
+since it's used directly), which validates every referenced property against the entity type *by field*
+(no JavaBean accessors required), so an unknown property or a bad parameter count fails fast at
+repository-creation time -- the same guarantee the vector convention already gives. `DerivedFinderQuery`
+owns that parse plus all return-type/`Pageable` adaptation; each backend implements only four primitives
+(`findByDerivedQuery`/`countByDerivedQuery`/`existsByDerivedQuery`/`deleteByDerivedQuery`) plus a
+`validateDerivedQuery` feasibility check, translating the parsed predicate into JPA Criteria (Postgres),
+Cypher (Neo4j), or a driver filter (MongoDB). A **non-`@JavAIVectorizable`** `@Entity` is served by exactly
+the same path (it simply writes no vectors) -- proven by `TestAccount`/`TestAccountRepository` across all
+three backend test classes. Two backend-specific points worth calling out:
+
+- **Nested-association finders** (`findByProfileHandle` -- filter by a field of a *singular* related entity)
+  are implemented on Postgres (Criteria auto-joins the `@OneToOne`) and Neo4j (a relationship traversal).
+  Filtering *through* a to-many/JavAI-collection field, or through MongoDB's `{type, id}` reference pointers
+  (which would need a `$lookup`), is rejected clearly at creation time and is the planned follow-up
+  (collection-membership join / Criteria-join deepening).
+- **Value-conversion parity** on the reflective backends: Neo4j and MongoDB store `UUID`/`Instant`/`enum`
+  scalars in converted (string) form, so a finder's bound arguments are run through the same conversion
+  before hitting the query -- otherwise `findByUserId(uuid)` would compare a raw `UUID` against a stored
+  string and silently match nothing. Postgres needs no such step (Hibernate binds Java types natively).
+  See `doc/spec/persistence-bridge.md`'s "Ordinary relational derived finders" for the full note. Covered by `RepositoryBackendHibernatePostgresTest`/`RepositoryBackendNeo4jTest`/
 `RepositoryBackendSpringDataMongoTest` against real `pgvector/pgvector:pg16`/`neo4j:5.26-community`/
 `mongodb/mongodb-atlas-local:8.2` containers (Testcontainers) -- there's no meaningful way to hermetically
 fake whether a real similarity search actually ranks correctly, or whether two models' data really stay
@@ -344,9 +373,11 @@ express.
 - No automatic *detection* of a model change that triggers `reindexAll()` on its own -- it's an explicit
   call the developer makes after swapping providers, by design (see doc/spec/persistence-bridge.md's own
   framing: "a runtime configuration concern," triggered deliberately, not implicitly).
-- Arbitrary Spring-Data-style derived queries (`findByTitle` and friends) -- only the `findNearestBy*`
-  family above is supported, and anything else fails fast, with a clear message, at repository-creation
-  time.
+- Nested-association derived finders through a *to-many*/JavAI-collection field (Postgres/Neo4j) or through
+  a MongoDB `{type, id}` reference pointer -- rejected clearly at creation time for now; the
+  collection-membership join (Postgres) / relationship-pattern deepening (Neo4j) / `$lookup` (MongoDB) that
+  would close this is the tracked OMI-138 follow-up. Nested filtering through a *singular* association is
+  already supported on Postgres and Neo4j (see "Ordinary relational derived finders" above).
 - `JavAILinkedHashMap`/any `Map` relationship field with a non-`String` key type, on any backend -- see
   "Collections" above.
 - Neo4j's `registerEntityType` doesn't (yet) recursively auto-register related entity types reachable
