@@ -447,10 +447,13 @@ class RepositoryBackendHibernatePostgresTest {
                             "a natively-mapped JavAI collection must not be claimed by the side table");
                 }
             }
-            // Hibernate's own join table for the association exists and holds the row.
+            // Hibernate's own join table for the association exists and holds the row. Named
+            // test_crew_test_member, not testcrew_testmember, since OMI-145 made
+            // CamelCaseToUnderscoresNamingStrategy the default -- the join table's name is derived from the
+            // two entity table names, so it moves with them.
             try (PreparedStatement statement = connection.prepareStatement(
                     "SELECT count(*) FROM information_schema.tables WHERE table_schema = current_schema() "
-                            + "AND table_name = 'testcrew_testmember'");
+                            + "AND table_name = 'test_crew_test_member'");
                     ResultSet resultSet = statement.executeQuery()) {
                 resultSet.next();
                 assertEquals(1, resultSet.getInt(1), "Hibernate must have created its own join table");

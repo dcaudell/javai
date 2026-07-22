@@ -1,10 +1,14 @@
 package dev.xtrafe.javai.persistence;
 
 import org.hibernate.SessionFactory;
+import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.neo4j.driver.Driver;
 import org.springframework.data.mongodb.core.MongoTemplate;
 
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Locale;
+import java.util.Map;
 
 /**
  * Backend selection + connection settings for {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}. Self-contained by
@@ -32,6 +36,8 @@ public final class JavAIPersistenceConfig {
     private final String postgresUsername;
     private final String postgresPassword;
     private final SessionFactory externalSessionFactory;
+    private final PhysicalNamingStrategy physicalNamingStrategy;
+    private final Map<String, Object> hibernateProperties;
     private final String neo4jUri;
     private final String neo4jUsername;
     private final String neo4jPassword;
@@ -46,6 +52,8 @@ public final class JavAIPersistenceConfig {
         this.postgresUsername = builder.postgresUsername;
         this.postgresPassword = builder.postgresPassword;
         this.externalSessionFactory = builder.externalSessionFactory;
+        this.physicalNamingStrategy = builder.physicalNamingStrategy;
+        this.hibernateProperties = Collections.unmodifiableMap(new LinkedHashMap<>(builder.hibernateProperties));
         this.neo4jUri = builder.neo4jUri;
         this.neo4jUsername = builder.neo4jUsername;
         this.neo4jPassword = builder.neo4jPassword;
@@ -110,6 +118,18 @@ public final class JavAIPersistenceConfig {
         return externalSessionFactory;
     }
 
+    /** The explicit physical naming strategy, or {@code null} to use the default -- see
+     *  {@link Builder#physicalNamingStrategy(PhysicalNamingStrategy)}. Postgres/Hibernate only. */
+    public PhysicalNamingStrategy physicalNamingStrategy() {
+        return physicalNamingStrategy;
+    }
+
+    /** Extra Hibernate settings applied on top of the ones this module sets itself, in declaration order --
+     *  see {@link Builder#hibernateProperty(String, Object)}. Never {@code null}; empty by default. */
+    public Map<String, Object> hibernateProperties() {
+        return hibernateProperties;
+    }
+
     public String neo4jUri() {
         return neo4jUri;
     }
@@ -144,6 +164,8 @@ public final class JavAIPersistenceConfig {
         private String postgresUsername;
         private String postgresPassword;
         private SessionFactory externalSessionFactory;
+        private PhysicalNamingStrategy physicalNamingStrategy;
+        private final Map<String, Object> hibernateProperties = new LinkedHashMap<>();
         private String neo4jUri;
         private String neo4jUsername;
         private String neo4jPassword;
@@ -178,6 +200,45 @@ public final class JavAIPersistenceConfig {
         /** Supplies a {@code SessionFactory} the calling app already built -- skips self-contained bootstrap. */
         public Builder sessionFactory(SessionFactory sessionFactory) {
             this.externalSessionFactory = sessionFactory;
+            return this;
+        }
+
+        /**
+         * Overrides the physical naming strategy applied to the {@code SessionFactory} this module builds.
+         * Postgres/Hibernate only -- the Neo4j and MongoDB backends classify by declared field type and have
+         * no equivalent of JPA column naming, so this is inert for them.
+         *
+         * <p>The default is {@code CamelCaseToUnderscoresNamingStrategy}: {@code emailVerified} becomes the
+         * column {@code email_verified}, matching Spring Boot's own default and ordinary SQL convention. Pass
+         * {@code new PhysicalNamingStrategyStandardImpl()} to pin Hibernate's bare default instead
+         * ({@code emailverified}) -- which is what releases before 0.1.5 produced, so this is the supported
+         * way for an existing schema to keep its current column names rather than migrate.
+         *
+         * <p>Takes precedence over a {@code hibernate.physical_naming_strategy} value passed to
+         * {@link #hibernateProperty(String, Object)}.
+         */
+        public Builder physicalNamingStrategy(PhysicalNamingStrategy physicalNamingStrategy) {
+            this.physicalNamingStrategy = physicalNamingStrategy;
+            return this;
+        }
+
+        /**
+         * Applies one arbitrary Hibernate setting to the {@code SessionFactory} this module builds -- the
+         * general escape hatch for anything this builder doesn't expose a typed method for. Applied
+         * <em>after</em> the settings this module sets itself ({@code jakarta.persistence.jdbc.url}/
+         * {@code .user}/{@code .password} and {@code hibernate.hbm2ddl.auto}), so a key that collides with
+         * one of those wins -- deliberate, since the caller naming a setting explicitly is the more specific
+         * instruction. Postgres/Hibernate only, and inert when
+         * {@link #sessionFactory(SessionFactory)} supplies a factory this module didn't build.
+         */
+        public Builder hibernateProperty(String key, Object value) {
+            this.hibernateProperties.put(key, value);
+            return this;
+        }
+
+        /** Bulk form of {@link #hibernateProperty(String, Object)}, applied in the map's own iteration order. */
+        public Builder hibernateProperties(Map<String, ?> properties) {
+            this.hibernateProperties.putAll(properties);
             return this;
         }
 

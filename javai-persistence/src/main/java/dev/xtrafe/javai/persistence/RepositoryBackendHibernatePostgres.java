@@ -22,9 +22,13 @@ import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
 import org.hibernate.boot.Metadata;
+import org.hibernate.boot.MetadataBuilder;
 import org.hibernate.boot.MetadataSources;
+import org.hibernate.boot.model.naming.CamelCaseToUnderscoresNamingStrategy;
+import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
 import org.hibernate.event.service.spi.EventListenerRegistry;
 import org.hibernate.event.spi.EventType;
@@ -143,6 +147,22 @@ import java.util.concurrent.ConcurrentHashMap;
  * fields at all; detection is 100%-confidence from the field's declared type alone, since a
  * {@code JavAIDirtyTracking}-implementing collection can never be validly Hibernate-mapped natively
  * regardless of context.
+ *
+ * <p><b>Physical naming: snake_case by default, and configurable (OMI-145).</b> The {@code SessionFactory}
+ * this class builds applies {@link CamelCaseToUnderscoresNamingStrategy}, so {@code emailVerified} maps to
+ * the column {@code email_verified} and an entity {@code TestCrew} to the table {@code test_crew} -- matching
+ * Spring Boot's default and ordinary SQL convention rather than Hibernate's bare default
+ * ({@code emailverified}). This is not cosmetic: pointed at a table another tool already created under the
+ * conventional naming, the bare default made {@code hbm2ddl=update} add a second, differently-cased set of
+ * columns beside the existing ones instead of recognizing them, and the following insert then populated
+ * JavAI's copy while leaving the original {@code NOT NULL} column null. Override via
+ * {@link JavAIPersistenceConfig.Builder#physicalNamingStrategy} (including pinning the pre-0.1.5 behavior
+ * with {@code PhysicalNamingStrategyStandardImpl}) or the general
+ * {@link JavAIPersistenceConfig.Builder#hibernateProperty} passthrough -- see
+ * {@link #resolvePhysicalNamingStrategy} for the precedence between those two. None of this affects the
+ * tables this backend owns itself ({@code javai_vectors__*}, {@code javai_collection_members},
+ * {@code javai_geo_points}): their names and columns are literals in this class, never derived from a
+ * naming strategy.
  *
  * <p><b>Related entity types are auto-registered too.</b> {@link #registerEntityType} also walks each
  * registered type's fields recursively: a singular {@code @Entity}-typed field, or a {@code Collection}/
@@ -1810,12 +1830,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     private SessionFactory buildSessionFactory() {
-        StandardServiceRegistry registry = new StandardServiceRegistryBuilder()
+        StandardServiceRegistryBuilder registryBuilder = new StandardServiceRegistryBuilder()
                 .applySetting("jakarta.persistence.jdbc.url", config.postgresUrl())
                 .applySetting("jakarta.persistence.jdbc.user", config.postgresUsername())
                 .applySetting("jakarta.persistence.jdbc.password", config.postgresPassword())
-                .applySetting("hibernate.hbm2ddl.auto", "update")
-                .build();
+                .applySetting("hibernate.hbm2ddl.auto", "update");
+        config.hibernateProperties().forEach(registryBuilder::applySetting);
+        StandardServiceRegistry registry = registryBuilder.build();
         MetadataSources sources = new MetadataSources(registry);
         for (Class<?> entityType : registeredEntityTypes) {
             sources.addAnnotatedClass(entityType);
@@ -1824,9 +1845,40 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         if (autoTransientOverrideXml != null) {
             sources.addInputStream(new ByteArrayInputStream(autoTransientOverrideXml.getBytes(StandardCharsets.UTF_8)));
         }
-        Metadata metadata = sources.buildMetadata();
+        MetadataBuilder metadataBuilder = sources.getMetadataBuilder();
+        PhysicalNamingStrategy namingStrategy = resolvePhysicalNamingStrategy();
+        if (namingStrategy != null) {
+            metadataBuilder.applyPhysicalNamingStrategy(namingStrategy);
+        }
+        Metadata metadata = metadataBuilder.build();
         attachJavAICollectionTypes(metadata);
         return metadata.buildSessionFactory();
+    }
+
+    /**
+     * The physical naming strategy to apply, or {@code null} to leave whatever the service registry already
+     * resolved from settings. Three-way precedence, most specific first:
+     *
+     * <ol>
+     *   <li>{@link JavAIPersistenceConfig.Builder#physicalNamingStrategy} -- an explicit, typed instance.</li>
+     *   <li>A {@code hibernate.physical_naming_strategy} key passed through
+     *       {@link JavAIPersistenceConfig.Builder#hibernateProperty} -- returns {@code null} here so
+     *       Hibernate resolves that setting itself, exactly as it would in any other application.</li>
+     *   <li>Neither: {@link CamelCaseToUnderscoresNamingStrategy}, so {@code emailVerified} maps to the
+     *       column {@code email_verified} rather than Hibernate's bare-default {@code emailverified}. This
+     *       matches Spring Boot's own default, which matters concretely: a JavAI repository pointed at a
+     *       table some other tool already created under that convention now sees the same columns instead of
+     *       silently adding a second, differently-cased set alongside them (OMI-145).</li>
+     * </ol>
+     */
+    private PhysicalNamingStrategy resolvePhysicalNamingStrategy() {
+        if (config.physicalNamingStrategy() != null) {
+            return config.physicalNamingStrategy();
+        }
+        if (config.hibernateProperties().containsKey(AvailableSettings.PHYSICAL_NAMING_STRATEGY)) {
+            return null;
+        }
+        return new CamelCaseToUnderscoresNamingStrategy();
     }
 
     /**

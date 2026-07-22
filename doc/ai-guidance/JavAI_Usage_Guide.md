@@ -544,6 +544,7 @@ run in production — each backend is configured independently:
 |---|---|
 | Embedding provider | `javai-vector`'s `LocalEmbeddingDefaults` picks Ollama or Hugging Face TEI per host platform, or supply your own `JavAIEmbeddingProvider` |
 | Postgres/Neo4j | `javai-persistence/README.md`; connection settings default to `javai.persistence.*` system properties |
+| Postgres schema naming | snake_case by default (`emailVerified` → `email_verified`); override with `JavAIPersistenceConfig.Builder.physicalNamingStrategy(...)` or the general `.hibernateProperty(key, value)` passthrough — see below |
 | Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
 
 **Embedding provider, in detail** — registered once, globally, before anything calls `vector()`:
@@ -568,6 +569,28 @@ Groq's API has no embeddings endpoint). `EmbeddingProviderReplicate` is also a d
 other four: Replicate has no vendor-wide embeddings contract, so it defaults to one popular model and input
 field name that you should verify against whatever model you actually run — see `javai-vector/README.md`'s
 "Hosted-vendor providers" section for the full detail.
+
+**Postgres schema naming, in detail** — since **0.1.5**, the `SessionFactory` JavAI builds applies
+`CamelCaseToUnderscoresNamingStrategy`, so `emailVerified` maps to the column `email_verified` and an entity
+`OrderLine` to the table `order_line`, exactly as Spring Boot would. Two things follow:
+
+- **If your schema was created by JavAI 0.1.4 or earlier** and has any multi-word field or class name, its
+  columns are the old all-lowercase form (`emailverified`). `hbm2ddl=update` never renames — it would *add*
+  the new columns beside the old ones — so either rename them yourself, or pin the previous behavior:
+  ```java
+  JavAIPersistenceConfig.builder()
+      .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+      .physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())   // pre-0.1.5 naming
+      .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+      .build();
+  ```
+- **Any other Hibernate setting** goes through `.hibernateProperty(key, value)` (or `.hibernateProperties(map)`),
+  applied after JavAI's own settings, so it wins on a key collision. This is the supported way to influence
+  the factory JavAI builds without supplying your own `SessionFactory` — which you generally shouldn't, since
+  a factory JavAI didn't build skips the mapping-time hooks that JavAI collection fields depend on.
+
+Neo4j and MongoDB are unaffected either way: they classify fields by declared type and have no JPA column
+naming to configure.
 
 **Completion provider, in detail** — no global registration; construct whichever `Cortex` you want, wherever
 you use it:
