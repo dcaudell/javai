@@ -36,7 +36,7 @@ Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupporte
 | `@GeneratedValue` | ❌ | ❌ | ❌ | Identity is always an app-assigned `UUID`. Don't use it. |
 | `@MappedSuperclass` | ✅ | ⚠️ | ⚠️ | Postgres needs it for an inherited field to be mapped. Neo4j/Mongo walk the full class hierarchy regardless, so inherited fields round-trip either way. |
 | `@OneToOne` / `@ManyToOne` | ✅ | ⚠️ | ⚠️ | Postgres maps a **singular** association through Hibernate (use `cascade = CascadeType.ALL` so it saves with the owner). Neo4j/Mongo infer a singular relationship/reference from the field's declared type (a `JavAIVectorizable`-typed field) — the annotation is inert. |
-| `@OneToMany` / `@ManyToMany` | ❌ | ❌ | ❌ | To-many is **not** modeled with JPA collection mappings. Declare the field as a **JavAI collection** (see Table 3); the backend maps it out-of-band. A JPA collection mapping on such a field is overridden/ignored. |
+| `@OneToMany` / `@ManyToMany` | ✅ on a plain JDK collection **and** on an interface-typed JavAI collection<br>❌ on a *concrete*-typed JavAI collection | ⚠️ | ⚠️ | **Postgres:** a normal Hibernate association — FK/join table, cascade, `orphanRemoval`, `mappedBy`, lazy loading — whether the field is a plain JDK collection **or** declared by a JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`). In both cases `@JavAIVectorizable` members get their vectors persisted automatically; for the JavAI-interface case the instance Hibernate substitutes is still a real JavAI collection (vectors + dirty-tracking intact), with **no `@CollectionType` or other JavAI-specific annotation required**. A *concrete*-typed field (`JavAIArrayList<X>`) is rejected at registration, because Hibernate must be able to substitute its own instance — declare it by the interface and make it non-final. Neo4j/Mongo: inert, to-many works by declared type. |
 | `@Transient` | ✅ | ⚠️ | ⚠️ | Postgres honors it (and auto-adds it for JavAI-collection and `Point` fields). Neo4j/Mongo don't skip `@Transient` fields — a simple-typed one would still be persisted. |
 | `@Column`, `@Table`, `@Basic`, `@Enumerated`, `@Temporal`, `@Lob`, `@Version` | ✅ | ⚠️ | ⚠️ | Postgres: honored by Hibernate as usual. Neo4j/Mongo: ignored — scalar conversion is fixed (`enum`→`name()`, `Instant`/`UUID`→string, etc.), column/table names don't apply. |
 | `@Embedded` / `@Embeddable` | ✅ | ❌ | ❌ | Postgres maps an embeddable's columns (and Criteria can navigate into them). Neo4j/Mongo have no embeddable concept — such a field is skipped. |
@@ -55,7 +55,8 @@ hand-implemented.
 | Capability | Postgres | Neo4j | MongoDB | Notes |
 |---|:--:|:--:|:--:|---|
 | `save` / `findById` / `findAll` / `deleteById` | ✅ | ✅ | ✅ | Base CRUD, `UUID` identity. |
-| `reindexAll()` | ✅ | ✅ | ✅ | Re-embeds every entity under the currently-configured model. |
+| `reindexAll()` | ✅ | ✅ | ✅ | Re-indexes the **whole datastore** — every *registered* entity type, not just the repository's own — under the currently-configured model. Takes no argument, because no single type scopes it. Postgres also validates afterwards and throws if anything that had a vector under the previous model didn't get one under the new model. |
+| `reindex()` | ✅ | ✅ | ✅ | Re-embeds **only this repository's own type**, leaving others on whatever model they were last written under. The narrow counterpart; performs no completeness validation, since it is deliberately partial. Prefer `reindexAll()` when swapping models. |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | ✅ | ✅ | ✅ | Vector search: pgvector HNSW / Neo4j native vector index / MongoDB `$vectorSearch`. |
 | Equality, `Not`, `In`/`NotIn`, `IsNull`/`IsNotNull`, `True`/`False` | ✅ | ✅ | ✅ | |
 | Comparison `GreaterThan(Equal)`/`LessThan(Equal)`/`Before`/`After`, `Between` | ✅ | ✅ | ✅ | On a value stored as an ISO-8601 string (`Instant`), ordering is lexicographic — correct for ISO-8601. |
@@ -66,7 +67,7 @@ hand-implemented.
 | `Exists` (property present) | ✅ | ✅ | ✅ | Scalar → not-null; collection → non-empty; Mongo → `$exists`. |
 | **Geo** `Near(Point, Distance)` / `Within(Circle)` (on a `Point` field) | ✅ | ✅ | ✅ | Requires an `org.springframework.data.geo.Point` field. PG `earth_distance`/`earthdistance` · Neo4j `point.distance` · Mongo `$geoWithin`+`$centerSphere`. Great-circle point-distance (not full PostGIS/GeoJSON polygon geometry). |
 | **Nested path — singular** (`findByProfileHandle`) | ✅ | ✅ | ✅ | PG: native Criteria join. Neo4j: `EXISTS {}` traversal. Mongo: resolve referenced ids, match `field.id IN (…)`. |
-| **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | Same mechanisms; the to-many hop uses the collection's storage (Table 3). Resolved via id-set materialization (a query per hop) — a Phase-0 choice, correct but not single-statement. |
+| **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | Same mechanisms; the to-many hop uses the collection's storage (Table 3). **Postgres:** a natively-mapped collection (plain JDK or interface-typed JavAI) resolves as a single **Criteria JOIN**; only a *concrete*-typed JavAI collection still uses id-set materialization (a query per hop). Mongo still uses id-set (references are `{type, id}` pointers); Neo4j composes `EXISTS {}` subqueries. |
 | `countBy…` / `existsBy…` | ✅ | ✅ | ✅ | Return `long`/`int` and `boolean` respectively. |
 | `deleteBy…` | ✅ | ✅ | ✅ | PG deletes per-id (cascades vectors + collection members) · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). |
 | `OrderBy…` / dynamic `Sort` — **root scalar** | ✅ | ✅ | ✅ | |
@@ -93,6 +94,10 @@ registration).
 | `JavAILinkedHashSet<E>` | ✅ `javai_collection_members` | ✅ relationship | ✅ reference array | ✅ P·N·M | ✅ P·N·M |
 | `JavAILinkedHashMap<String,V>` | ✅ (String key only) | ✅ key on the relationship | ✅ reference array + key | ✅ P·N·M (by the value's field; key-agnostic) | ✅ P·N·M |
 | `KnowledgeGraph<N,E>` | ❌ rejected at registration | ✅ **Neo4j-only** (two rel. types) | ❌ rejected at registration | ❌ (not a derived-finder path) | ❌ |
+| *plain* `List`/`Set`/`Map` (not a JavAI type) | ✅ native Hibernate association — **requires** `@OneToMany`/`@ManyToMany`/`@ElementCollection` | ✅ relationship (annotation inert) | ✅ reference array (annotation inert) | ✅ P·N·M | ✅ P·N·M |
+| **interface-typed** `JavAIList`/`JavAISet`/`JavAIMap` + `@OneToMany`/`@ManyToMany` | ✅ **native Hibernate association** (own join table/FK), JavAI collection instance preserved | ✅ relationship | ✅ reference array | ✅ P·N·M | ✅ P·N·M |
+
+**Which JavAI collection shape should I use on Postgres?** Declare the field by the **interface**, non-final, with the ordinary JPA annotation — `@OneToMany(cascade = ALL) private JavAIList<Comment> comments = new JavAIArrayList<>();`. You get real JPA semantics *and* a real JavAI collection. Declaring it by the **concrete** class (`private final JavAIArrayList<Comment> …`, no annotation) keeps JavAI's own side-table storage instead — still supported, but without FK/join-table/lazy-loading semantics. Hibernate substitutes its own instance into a mapped collection field, which is why the native path needs an interface type and a non-final field.
 
 Notes:
 - **Element/value type** of the collection must itself be a persistable entity (its own `@Id`), and it keeps

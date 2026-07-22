@@ -30,6 +30,30 @@ interface RepositoryBackend {
 
     Object save(Class<?> entityType, Object entity);
 
+    /**
+     * Re-embeds and re-persists <em>every registered entity type</em> under the currently-configured model.
+     * A datastore is re-indexed as a whole: an {@code Article}'s {@code Comment}s must be re-embedded too, or
+     * the store is left straddling two models. Takes no argument precisely because no single type scopes it.
+     *
+     * <p>Intentionally abstract: "everything I know about" is backend-specific (which types are registered,
+     * and how), so a new backend must answer it deliberately rather than inherit a wrong default.
+     */
+    void reindexAll();
+
+    /**
+     * Re-embeds and re-persists just {@code entityType}. The narrow counterpart to {@link #reindexAll()},
+     * for when a caller knowingly wants one type re-embedded and accepts that other types stay on whatever
+     * model they were last written under.
+     *
+     * <p>Backend-agnostic by construction -- {@code save()} always writes under whichever provider is
+     * currently configured -- so no backend needs to override this.
+     */
+    default void reindex(Class<?> entityType) {
+        for (Object entity : findAll(entityType)) {
+            save(entityType, entity);
+        }
+    }
+
     Optional<Object> findById(Class<?> entityType, UUID id);
 
     List<Object> findAll(Class<?> entityType);

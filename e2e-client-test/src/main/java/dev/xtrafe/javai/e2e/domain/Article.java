@@ -8,10 +8,12 @@ import dev.xtrafe.javai.annotations.Taggable;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 
 import java.util.UUID;
@@ -50,7 +52,7 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code draftComment}/
  * {@code attachment} are real {@code @OneToOne(cascade = CascadeType.ALL)} associations -- ordinary
  * Hibernate relational mapping, since a *singular* reference field never collides with Hibernate's own
- * collection-proxy substitution. {@code comments}/{@code relatedComments} are the fields that would: a
+ * collection-proxy substitution. {@code relatedComments} is the field that would: a
  * concrete JavAI collection class ({@code JavAIArrayList}/{@code JavAILinkedHashMap}) can never be a native
  * Hibernate-mapped collection field (confirmed empirically -- a {@code ClassCastException} the moment
  * Hibernate tries to substitute its own {@code PersistentBag}/{@code PersistentMap} into a field statically
@@ -83,8 +85,17 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
     @Summary
     private Comment featuredComment;
 
+    /**
+     * OMI-142: declared by the JavAI <em>interface</em> and non-final, with an ordinary JPA
+     * {@code @OneToMany} -- so Hibernate owns this association natively (its own join table, cascade, lazy
+     * loading) while the instance it substitutes into the field is still a real JavAI collection with
+     * vectors and dirty-tracking. Nothing JavAI-specific is written here: the collection type is attached by
+     * {@code RepositoryBackendHibernatePostgres} at mapping time. Contrast {@link #relatedComments} below,
+     * which stays on JavAI's own side-table storage -- the two shapes coexist deliberately.
+     */
+    @OneToMany(cascade = CascadeType.ALL)
     @Summary
-    private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
+    private JavAIList<Comment> comments = new JavAIArrayList<>();
 
     // Not @Summary -- purely exercises JavAILinkedHashMap persistence (String-keyed, per
     // RepositoryBackendHibernatePostgres's own documented Phase 0 limitation) alongside comments'
@@ -134,7 +145,7 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
         this.featuredComment = featuredComment;
     }
 
-    public JavAIArrayList<Comment> getComments() {
+    public JavAIList<Comment> getComments() {
         return comments;
     }
 
