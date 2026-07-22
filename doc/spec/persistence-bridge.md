@@ -196,19 +196,36 @@ The method-name grammar is delegated to Spring Data's own `PartTree` (a self-con
 Spring context or Spring Data JPA runtime is involved), so the full derived-query vocabulary is available:
 `findBy`/`readBy`/`getBy`/`queryBy`/`countBy`/`existsBy`/`deleteBy`, `And`/`Or`, the operator set
 (`GreaterThan`/`LessThan`/`Between`/`Like`/`Containing`/`StartingWith`/`In`/`IsNull`/`True`/`IgnoreCase`/…),
-static `OrderBy`, `Top`/`First` limiting, `Distinct`, and the return-type adapters `List`/`Optional`/single/
+static `OrderBy`, `Top`/`First` limiting, `Distinct`, `Regex`/`Matches`, the collection-emptiness operators
+(`IsEmpty`/`IsNotEmpty`/`Exists`), geo `Near`/`Within`, and the return-type adapters `List`/`Optional`/single/
 `Stream`/`Page`/`Slice`/`long`(count)/`boolean`(exists). Dynamic `Sort`/`Pageable`/`Limit` parameters are
 honored too. `PartTree` validates every referenced property against the entity type **by field, not requiring
 JavaBean accessors**, so — like an invalid `findNearestBy…` — an unknown property or a mismatched parameter
 count fails fast at repository-creation time, never on first call.
 
-**Backend support and nested traversal.** All three backends translate finders into their native query
-language (Postgres → JPA Criteria, Neo4j → Cypher, MongoDB → a driver filter). **Nested-association paths**
-(`findByProfileHandle` — filtering an entity by a field of its *singular* related entity) are supported on
-**Postgres** (Criteria auto-joins the `@OneToOne`) and **Neo4j** (a relationship traversal). They are not yet
-supported through a to-many/JavAI-collection field on any backend, nor through MongoDB's `{type, id}`
-reference pointers (which would need a `$lookup`); those cases are rejected clearly at repository-creation
-time and are the subject of a planned follow-up (collection-membership join / Criteria-join deepening).
+**Backend support and nested traversal (OMI-141).** All three backends translate finders into their native
+query language (Postgres → JPA Criteria, Neo4j → Cypher, MongoDB → a driver filter). **Nested-association
+paths** are supported through *both* singular associations *and* to-many/collection relationships
+(`findByReviewsReviewer` — an entity by a field of its collection members). Each backend uses the mechanism
+that fits its storage: Neo4j composes a self-contained `EXISTS { MATCH (n)-[:REL]->(x) WHERE … }` subquery
+(correct through any cardinality and under `And`/`Or`); Postgres and MongoDB, whose related entities live
+out-of-band (Postgres `javai_collection_members`; Mongo `{type, id}` reference pointers, not embedded),
+resolve the matching related ids first and then match owners referencing them, expressed as `root.id IN (…)`.
+Pure single-or-nested-*singular* scalar predicates stay a native Criteria join on Postgres. **Collection
+emptiness** (`findByReviewsIsEmpty`) rides the same side tables/relationships. *Sort* is still limited to a
+singular scalar path (a to-many sort is ambiguous). The id-set resolution materializes intermediate id sets
+and issues a query per hop — fine for the Phase-0 goal of proving the design space; a single-statement
+rewrite (a mapped membership entity for Criteria subqueries; `$lookup` for Mongo) is a natural later
+optimization.
+
+**Geo (`Near`/`Within`).** A `Point` field (Spring Data's `org.springframework.data.geo.Point`) round-trips
+per backend — a Neo4j native `point`, a MongoDB GeoJSON `Point`, and (Postgres) two columns in a
+`javai_geo_points` side table — and `findByLocationNear(Point, Distance)`/`findByLocationWithin(Circle)`
+translate to `point.distance(…)` (Neo4j), `$geoWithin`+`$centerSphere` (MongoDB), and
+`earth_distance(ll_to_earth(…))` (Postgres). The Postgres path uses the `cube`+`earthdistance` contrib
+extensions — bundled with the official Postgres base image the pgvector image builds on — rather than PostGIS
++ `hibernate-spatial`, so geo needs no extra dependency and no test-container image swap; both give equivalent
+great-circle point-distance. `Distance` is normalized to meters (kilometres/miles recognized).
 
 **Value-conversion parity (Neo4j / MongoDB).** Both the Neo4j and MongoDB backends store non-primitive
 scalars — `UUID`, `Instant`, `enum` — in a converted form (a `UUID`/`Instant` as its string form, an enum as

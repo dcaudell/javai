@@ -319,11 +319,16 @@ Cypher (Neo4j), or a driver filter (MongoDB). A **non-`@JavAIVectorizable`** `@E
 the same path (it simply writes no vectors) -- proven by `TestAccount`/`TestAccountRepository` across all
 three backend test classes. Two backend-specific points worth calling out:
 
-- **Nested-association finders** (`findByProfileHandle` -- filter by a field of a *singular* related entity)
-  are implemented on Postgres (Criteria auto-joins the `@OneToOne`) and Neo4j (a relationship traversal).
-  Filtering *through* a to-many/JavAI-collection field, or through MongoDB's `{type, id}` reference pointers
-  (which would need a `$lookup`), is rejected clearly at creation time and is the planned follow-up
-  (collection-membership join / Criteria-join deepening).
+- **Nested-association finders** work through *both* singular associations (`findByProfileHandle`) and
+  to-many collections (`findByReviewsReviewer`), on all three backends (OMI-141). Neo4j uses a self-contained
+  `EXISTS { MATCH (n)-[:REL]->(x) WHERE … }` subquery; Postgres and MongoDB, whose related entities are
+  out-of-band (`javai_collection_members` / `{type, id}` reference pointers), resolve matching related ids and
+  express the predicate as `root.id IN (…)`, keeping a native Criteria join for the pure-singular Postgres
+  case. Collection emptiness (`findByReviewsIsEmpty`) and `Regex`/`Matches` ride the same paths.
+- **Geo `Near`/`Within`** over a `Point` field: a Neo4j native `point` + `point.distance`, a MongoDB GeoJSON
+  point + `$geoWithin`/`$centerSphere`, and (Postgres) a `javai_geo_points` side table +
+  `earth_distance(ll_to_earth(…))` via the `cube`+`earthdistance` contrib extensions (bundled with the
+  official Postgres base image, so no PostGIS/`hibernate-spatial` dependency and no container-image swap).
 - **Value-conversion parity** on the reflective backends: Neo4j and MongoDB store `UUID`/`Instant`/`enum`
   scalars in converted (string) form, so a finder's bound arguments are run through the same conversion
   before hitting the query -- otherwise `findByUserId(uuid)` would compare a raw `UUID` against a stored
@@ -373,11 +378,10 @@ express.
 - No automatic *detection* of a model change that triggers `reindexAll()` on its own -- it's an explicit
   call the developer makes after swapping providers, by design (see doc/spec/persistence-bridge.md's own
   framing: "a runtime configuration concern," triggered deliberately, not implicitly).
-- Nested-association derived finders through a *to-many*/JavAI-collection field (Postgres/Neo4j) or through
-  a MongoDB `{type, id}` reference pointer -- rejected clearly at creation time for now; the
-  collection-membership join (Postgres) / relationship-pattern deepening (Neo4j) / `$lookup` (MongoDB) that
-  would close this is the tracked OMI-138 follow-up. Nested filtering through a *singular* association is
-  already supported on Postgres and Neo4j (see "Ordinary relational derived finders" above).
+- Single-statement nested-to-many/geo/emptiness resolution. These work on all three backends (OMI-141) but
+  via id-set materialization (a query per hop), not one SQL/aggregation statement -- a mapped membership
+  entity for Criteria subqueries (Postgres) and a `$lookup` aggregation (MongoDB) are the natural later
+  optimizations. Geo uses `earthdistance` point-distance, not full PostGIS/`hibernate-spatial` geometry.
 - `JavAILinkedHashMap`/any `Map` relationship field with a non-`String` key type, on any backend -- see
   "Collections" above.
 - Neo4j's `registerEntityType` doesn't (yet) recursively auto-register related entity types reachable
