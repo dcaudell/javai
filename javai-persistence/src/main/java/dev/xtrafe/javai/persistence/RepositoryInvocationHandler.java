@@ -9,11 +9,11 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * The {@code InvocationHandler} behind every proxy {@link JavAIPI#repository(Class)} creates. Dispatches
+ * The {@code InvocationHandler} behind every proxy {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} creates. Dispatches
  * the base CRUD contract straight to {@link RepositoryBackend} -- including {@code reindexAll}, expressed
  * purely as a {@code findAll()} + {@code save(...)} loop over the existing backend methods, needing no
  * backend-specific support of its own; anything named {@code findNearestBy*} is parsed once (cached per
- * {@link Method}, since {@link JavAIPI#repository(Class)} already validated it at creation time) via
+ * {@link Method}, since {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} already validated it at creation time) via
  * {@link DerivedQueryMethods} and dispatched to whichever backend method matches its
  * {@link DerivedQueryMethods.Kind}.
  */

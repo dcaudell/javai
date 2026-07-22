@@ -111,7 +111,9 @@ conventional `setXxx(...)` setter for a `@Vectorize`/`@Summary` field gets its *
 original assignment is untouched; dirty-marking and dependency-registration calls are added around it) —
 and if a `@Summary` field is initialized inline in a field initializer rather than via a setter (a
 `final JavAIArrayList<Comment> comments = new JavAIArrayList<>();`-style field, elements added to later
-through the collection itself), the weaver wires that dependency at **constructor exit** instead.
+through the collection itself), the weaver wires that dependency at **constructor exit** instead. That
+concrete-typed declaration is one of two supported shapes for a collection field on a *persisted* entity —
+see "Collection fields on a persisted `@Entity`" below before choosing one.
 
 ## Annotation reference
 
@@ -126,6 +128,48 @@ through the collection itself), the weaver wires that dependency at **constructo
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
+
+### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
+
+When a class is both `@JavAIVectorizable` and a JPA `@Entity` persisted through `JavAIRepository` on
+**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides how it is
+stored. Both shapes are fully supported, and one entity can carry both.
+
+**1. Interface-typed + an ordinary JPA association → a native Hibernate association.** The recommended shape:
+
+```java
+@OneToMany(cascade = CascadeType.ALL)
+@Summary
+private JavAIList<Comment> comments = new JavAIArrayList<>();   // interface-typed, and NOT final
+```
+
+This is a real JPA association in every respect — its own join table with foreign keys, `mappedBy`,
+cascade/`orphanRemoval`, lazy loading, `@ManyToMany` shared ownership. What Hibernate substitutes into the
+field is a `PersistentJavAIList`/`PersistentJavAISet`/`PersistentJavAIMap`, i.e. still a real JavAI
+collection, so vectors and dirty-tracking survive the load. You write **nothing** JavAI-specific to get
+this — no `@CollectionType`; the backend attaches it at mapping time. Two requirements, both mechanical:
+declare the field by the JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), and don't make it `final`,
+since Hibernate assigns the field its own instance.
+
+**2. Concrete-typed with no association annotation → JavAI's own side-table storage.**
+
+```java
+private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+```
+
+Stored in `javai_collection_members`, a shared side table the persistence backend owns, and hydrated
+reflectively back into the instance your own constructor created — so `final` is fine here. No join table and
+no FK integrity; `Map` keys must be `String` in this phase.
+
+**The one combination that fails fast:** a *concrete*-typed field carrying `@OneToMany`/`@ManyToMany` is
+rejected with an `IllegalArgumentException` at repository-registration time, naming the interface-typed fix.
+It can't be honored — you'd silently get JavAI's own "owner owns its members" cascade instead of the JPA
+semantics you asked for, which is actively unsafe for `@ManyToMany`.
+
+**Backend caveat:** native associations are **Postgres-only**. Neo4j and MongoDB classify collection fields by
+declared type and store both shapes their own way, so an interface-typed field buys you nothing there. Check
+[`persistence-support-matrix.md`](persistence-support-matrix.md) — it has the per-backend tables for JPA
+annotations, derived-finder capabilities, and collection types — before relying on any of this.
 
 ### Completion Fabric — grounding a completion in real data
 
@@ -546,9 +590,17 @@ from):
 import dev.xtrafe.javai.annotations.*;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAILinkedHashMap;
+import jakarta.persistence.*;
+import java.util.UUID;
 
+@Entity
 @JavAIVectorizable
 public class Article implements JavAIGraphNode {   // implements is required -- @JavAIGraphNode alone is not
+
+    @Id
+    private UUID id;
 
     @Vectorize
     @PromptContext
@@ -558,14 +610,26 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
     @PromptContext
     private String body;
 
+    // Shape 1: interface-typed + @OneToMany -> a native Hibernate association (Postgres).
+    // Non-final, because Hibernate substitutes its own PersistentJavAIList into the field.
+    @OneToMany(cascade = CascadeType.ALL)
     @Summary
-    private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
+    private JavAIList<Comment> comments = new JavAIArrayList<>();
+
+    // Shape 2: concrete-typed, unannotated -> JavAI's own javai_collection_members side table.
+    // final is fine here: this instance is hydrated into, never replaced.
+    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     public void setTitle(String title) { this.title = title; }   // re-vectorizes lazily on next vector() read
     public void setBody(String body) { this.body = body; }
-    public JavAIArrayList<Comment> getComments() { return comments; }
+    public JavAIList<Comment> getComments() { return comments; }
 }
 ```
+
+Both collection shapes appear here deliberately — see "Collection fields on a persisted `@Entity`" above.
+Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments` can just as well be a plain
+`final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()` don't depend on persistence
+at all.
 
 Using it — every call below is a woven method, not something declared in `Article.java`
 (imports for `EmbeddingVector`/`JavAIList`/`Cortex`/`CompletionRequest`/`CompletionResult`/`PromptContext`/

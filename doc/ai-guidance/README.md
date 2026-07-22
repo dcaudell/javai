@@ -5,7 +5,7 @@ or similar) helping a developer in a project that depends on **JavAI Extensions*
 an ordinary Maven library. It is written for that downstream consumer, not for a contributor working inside
 *this* repository — contributors should read this repo's own root `SPEC.md`/`CLAUDE.md` instead.
 
-Two files, read for different reasons:
+Three files, read for different reasons:
 
 | File | Read this... | Covers |
 |---|---|---|
@@ -14,8 +14,11 @@ Two files, read for different reasons:
 | [`persistence-support-matrix.md`](persistence-support-matrix.md) | When writing a `JavAIRepository` or entity and you need to know **what works on which backend** (Postgres/Neo4j/MongoDB) | Per-backend support tables: JPA annotations, query/derived-finder capabilities, and JavAI collection field types |
 
 They're kept separate deliberately: the first is "what can this library do and how do I call it," the
-second is "what am I, the agent, allowed to touch in code that happens to use one specific feature of it."
-Most sessions only need the first.
+second is "what am I, the agent, allowed to touch in code that happens to use one specific feature of it,"
+and the third is "will the thing I'm about to write actually work on the backend this project uses." Most
+sessions need the first; any session touching persistence needs the third, since backend support is genuinely
+uneven (JPA associations over JavAI collections are Postgres-only, `KnowledgeGraph` fields are Neo4j-only)
+and the matrix is the only place those differences are stated per-backend in one view.
 
 ## Installing this package in a project that consumes JavAI Extensions
 
@@ -23,7 +26,7 @@ There's no fully-automatic way to pull a markdown file across independent git re
 you, on their behalf) has to place it once. The straightforward version:
 
 1. **Copy this whole directory** into the consuming project, e.g. to `docs/javai-guidance/` or
-   `.claude/javai-guidance/`. Keep the two files together — they're meant to travel as a pair.
+   `.claude/javai-guidance/`. Keep all three files together — they're meant to travel as a set.
 2. **If the project uses Claude Code**, add one line near the top of its own `CLAUDE.md` (create one if it
    doesn't have one yet):
 
@@ -32,7 +35,7 @@ you, on their behalf) has to place it once. The straightforward version:
    ```
 
    Claude Code resolves `@path` lines in `CLAUDE.md` as file imports and loads the referenced file — and,
-   transitively, the two files this one points to — into context automatically. No further action needed
+   transitively, the three files this one points to — into context automatically. No further action needed
    after that line is in place.
 3. **If the project's AI tool doesn't support that import syntax** (e.g. a plain `AGENTS.md`, or a tool
    that only reads its own instructions file literally), add a plain sentence instead, near the top of

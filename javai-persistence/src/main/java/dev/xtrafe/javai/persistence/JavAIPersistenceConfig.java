@@ -7,7 +7,7 @@ import org.springframework.data.mongodb.core.MongoTemplate;
 import java.util.Locale;
 
 /**
- * Backend selection + connection settings for {@link JavAIPI#repository(Class)}. Self-contained by
+ * Backend selection + connection settings for {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}. Self-contained by
  * default -- {@link #fromSystemProperties()} mirrors {@code JavAIRuntime.configureEmbeddingProvider}'s own
  * {@code javai.embedding.*} pattern -- but fully overridable: {@link Builder#sessionFactory(SessionFactory)}
  * / {@link Builder#neo4jDriver(Driver)} / {@link Builder#mongoTemplate(MongoTemplate)} accept a
