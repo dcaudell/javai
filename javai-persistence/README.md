@@ -13,7 +13,7 @@ alongside their ORM.
 | Element | Kind | Purpose |
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
-| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()`, fixed to `UUID` identity |
+| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call |
 | `findBy…` / `existsBy…` / `countBy…` / `deleteBy…` | Ordinary relational derived finders | Full Spring-Data-style finders (parsed via `PartTree`) resolved against the entity's own mapped columns, so one repository serves both an entity's relational access and its vector search; also validated at creation time -- see "Ordinary relational derived finders" below |
 | `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
@@ -42,9 +42,15 @@ way:**
    directly: `differentDimensionModelSwapWorksTheSameAsASameDimensionSwap` in both backends' test suites
    exercises exactly this and asserts it behaves like any other swap, not a special case.
 2. `repository.reindexAll()` -- the explicit trigger for "now go re-embed everything that already exists."
-   It re-saves every entity found via `findAll()`; since `save()` always writes under whichever provider is
-   *currently* configured, this populates the new model's table/properties for every existing entity, in
-   one call, without the developer hand-writing a re-save loop themselves.
+   It re-saves every entity of **every registered entity type**, not just the type whose repository you
+   called it through: re-indexing one type in isolation would leave the store straddling two models (an
+   `Article` on the new one while its `Comment`s are still on the old). Since `save()` always writes under
+   whichever provider is *currently* configured, one call populates the new model's tables/properties for
+   the whole datastore. The Postgres backend then **validates**: it snapshots the `(owner_type, owner_id)`
+   manifest from the previously-newest vector table (located by `max(computed_at)`), re-reads after the pass,
+   and throws -- naming the offenders -- if anything was left behind. A split-model store is a loud failure,
+   not a silent one. (`repository.reindex()` is the narrow counterpart -- this repository's type only, no
+   validation -- for when a deliberately partial re-embed is what you want.)
 3. `findNearestBy*` immediately starts returning results ranked against the new model, because it resolves
    which table/property/index to query from the *reference vector's own* `modelId()` -- which is whatever
    the currently-configured provider just produced.
@@ -301,6 +307,17 @@ backends' save/findById/findAll/deleteById/reindexAll plus the three `findNeares
 above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
 `RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
 methods.
+
+**JavAI collections as native JPA associations (OMI-142), Postgres.** A collection field declared by a JavAI
+*interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with an ordinary `@OneToMany`/`@ManyToMany`, is now
+a genuine Hibernate association -- its own join table/FK, cascade, `orphanRemoval`, lazy loading -- while the
+instance Hibernate substitutes into the field is a real JavAI collection (`PersistentJavAIList` and friends,
+extending Hibernate's `PersistentBag`/`PersistentSet`/`PersistentMap`), so vectors and dirty-tracking survive.
+**No JavAI-specific annotation is required**: the backend attaches the `UserCollectionType` itself between
+`buildMetadata()` and `buildSessionFactory()`. A *concrete*-typed field (`JavAIArrayList<X>`) keeps JavAI's own
+`javai_collection_members` storage instead -- both shapes coexist, and `Article` in `e2e-client-test`
+deliberately carries one of each. Nested finders over a natively-mapped collection resolve as a single Criteria
+JOIN rather than the id-set-per-hop path the side table needs. `KnowledgeGraph` remains Neo4j-only.
 
 **Ordinary relational derived finders (OMI-138), on all three backends.** A repository interface may
 declare Spring-Data-style finders -- `findBy`/`existsBy`/`countBy`/`deleteBy` with `And`/`Or`, the full

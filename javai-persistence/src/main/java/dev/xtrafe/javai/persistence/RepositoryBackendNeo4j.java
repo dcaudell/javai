@@ -156,6 +156,17 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         return entity;
     }
 
+    /** Re-embeds every registered entity type, not just the repository's own -- see
+     *  {@link RepositoryBackend#reindexAll} for why a datastore is re-indexed as a whole. */
+    @Override
+    public void reindexAll() {
+        for (Class<?> registered : typesByLabel.values()) {
+            for (Object entity : findAll(registered)) {
+                save(registered, entity);
+            }
+        }
+    }
+
     @Override
     public Optional<Object> findById(Class<?> entityType, UUID id) {
         try (Session session = driver().session()) {

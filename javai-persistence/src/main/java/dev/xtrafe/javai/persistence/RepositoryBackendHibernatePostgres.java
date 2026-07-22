@@ -3,9 +3,17 @@ package dev.xtrafe.javai.persistence;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIMap;
+import dev.xtrafe.javai.model.JavAISet;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import jakarta.persistence.CascadeType;
+import jakarta.persistence.ElementCollection;
 import jakarta.persistence.Entity;
+import jakarta.persistence.ManyToMany;
+import jakarta.persistence.OneToMany;
+import jakarta.persistence.Transient;
 import jakarta.persistence.criteria.Expression;
 import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Path;
@@ -13,9 +21,13 @@ import jakarta.persistence.criteria.Predicate;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
+import org.hibernate.boot.Metadata;
 import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.engine.spi.SessionFactoryImplementor;
+import org.hibernate.event.service.spi.EventListenerRegistry;
+import org.hibernate.event.spi.EventType;
 import org.hibernate.query.criteria.HibernateCriteriaBuilder;
 import org.hibernate.query.criteria.JpaCriteriaQuery;
 import org.hibernate.query.criteria.JpaRoot;
@@ -36,6 +48,7 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
@@ -45,6 +58,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -174,6 +188,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
         validateMapKeyTypesAreSupported(entityType);
         validateNoKnowledgeGraphFields(entityType);
+        validateCollectionFieldMapping(entityType);
         registeredEntityTypes.add(entityType);
         for (Field field : EntityReflection.allFields(entityType)) {
             Class<?> relatedType = relatedEntityType(field);
@@ -227,6 +242,109 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         Class<?> type = field.getType();
         boolean collectionShaped = Collection.class.isAssignableFrom(type) || Map.class.isAssignableFrom(type);
         return collectionShaped && JavAIDirtyTracking.class.isAssignableFrom(type);
+    }
+
+    /**
+     * Fails fast, at registration time, for the two collection-mapping shapes this backend can't serve
+     * correctly yet. Deliberately Postgres-scoped: the reflective backends classify collections purely by
+     * declared type and legitimately accept both shapes.
+     *
+     * <p><b>1. A JPA association annotation on a JavAI collection field.</b> A JavAI collection is mapped
+     * out-of-band through {@code javai_collection_members}, so {@code @OneToMany}/{@code @ManyToMany} on one
+     * is silently ignored today -- the developer would get JavAI's own storage and its hardcoded
+     * "owner owns its members" cascade instead of the JPA semantics they asked for. That's actively unsafe for
+     * {@code @ManyToMany}, where deleting one owner would delete members still referenced by other owners.
+     * Rejected until OMI-142 makes JavAI collections genuine Hibernate associations.
+     *
+     * <p><b>2. A plain collection with no mapping annotation.</b> Hibernate can't map a bare
+     * {@code Collection}/{@code Map} and would fail deep in boot with a considerably less obvious message.
+     */
+    private static void validateCollectionFieldMapping(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            Class<?> type = field.getType();
+            boolean collectionShaped = Collection.class.isAssignableFrom(type) || Map.class.isAssignableFrom(type);
+            if (!collectionShaped || KnowledgeGraph.class.isAssignableFrom(type)) {
+                continue;
+            }
+            boolean association = field.isAnnotationPresent(OneToMany.class)
+                    || field.isAnnotationPresent(ManyToMany.class);
+            if (isJavAICollectionField(field)) {
+                if (association) {
+                    throw new IllegalArgumentException("Cannot honor @OneToMany/@ManyToMany on "
+                            + entityType.getName() + "." + field.getName() + ": the field is declared as the "
+                            + "CONCRETE type " + field.getType().getSimpleName() + ", which Hibernate can never "
+                            + "manage (it substitutes its own collection instance into the field). Declare it by "
+                            + "the JavAI INTERFACE instead -- e.g. 'private JavAIList<X> " + field.getName()
+                            + " = new JavAIArrayList<>();' (non-final) -- and the association becomes a native "
+                            + "Hibernate one, with vectors and dirty-tracking preserved. Leave the field concrete "
+                            + "and drop the annotation to keep JavAI's own side-table collection storage.");
+                }
+                continue; // plain JavAI collection field: mapped by this backend's own side table
+            }
+            if (!association && !field.isAnnotationPresent(ElementCollection.class)
+                    && !field.isAnnotationPresent(Transient.class)) {
+                throw new IllegalArgumentException("Postgres persistence cannot map the collection field "
+                        + entityType.getName() + "." + field.getName() + " -- a plain JDK collection needs a JPA "
+                        + "mapping annotation (@OneToMany/@ManyToMany for entities, @ElementCollection for "
+                        + "basic/embeddable values), or @Transient to exclude it. Use a JavAI collection type "
+                        + "(JavAIArrayList/JavAILinkedHashSet/JavAILinkedHashMap) if you want JavAI's own "
+                        + "vector-aware collection storage instead.");
+            }
+        }
+    }
+
+    /** Whether removing the owner should also remove this (Hibernate-owned) association's members --
+     *  {@code cascade = ALL/REMOVE}, or {@code orphanRemoval}. Drives vector/geo cleanup for members Hibernate
+     *  is about to cascade-delete; without it their side-table rows would be orphaned. */
+    private static boolean cascadesRemove(Field field) {
+        OneToMany oneToMany = field.getAnnotation(OneToMany.class);
+        if (oneToMany != null) {
+            return oneToMany.orphanRemoval() || cascadeIncludesRemove(oneToMany.cascade());
+        }
+        ManyToMany manyToMany = field.getAnnotation(ManyToMany.class);
+        return manyToMany != null && cascadeIncludesRemove(manyToMany.cascade());
+    }
+
+    private static boolean cascadeIncludesRemove(CascadeType[] cascades) {
+        for (CascadeType cascade : cascades) {
+            if (cascade == CascadeType.ALL || cascade == CascadeType.REMOVE) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Deletes the vector/geo rows of members Hibernate is about to cascade-delete along with {@code entity}.
+     *  The JavAI-collection equivalent lives in {@link #cascadeDeleteCollectionMembers}, which is driven off
+     *  membership rows -- rows a natively-mapped association doesn't have. */
+    private void deleteVectorsForCascadedCollectionMembers(Session session, Object entity) {
+        for (Field field : EntityReflection.allFields(entity.getClass())) {
+            if (isJavAICollectionField(field) || !cascadesRemove(field)) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object value;
+            try {
+                value = field.get(entity);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read field " + field + " on " + entity.getClass(), e);
+            }
+            Collection<?> members = value instanceof Map<?, ?> map ? map.values()
+                    : value instanceof Collection<?> collection ? collection : null;
+            if (members == null) {
+                continue;
+            }
+            for (Object member : members) {
+                if (member == null || !member.getClass().isAnnotationPresent(Entity.class)) {
+                    continue;
+                }
+                UUID memberId = EntityReflection.readId(member);
+                if (memberId != null) {
+                    deleteVectors(session, member.getClass().getName(), memberId);
+                    deleteGeoPoints(session, member.getClass().getName(), memberId);
+                }
+            }
+        }
     }
 
     /** A field this backend maps itself rather than letting Hibernate map it -- either a JavAI collection
@@ -286,6 +404,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             SessionFactory factory = sessionFactory();
             try (Session session = factory.openSession()) {
                 Transaction tx = session.beginTransaction();
+                JavAIFlushVectorListener.begin();
                 try {
                     // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
                     // element this backend persists itself) needs its own id set before Hibernate/this backend
@@ -303,6 +422,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     // Same reason as syncCollectionMembers: a Point field is @Transient (mapped by this
                     // backend, not Hibernate), so its value lives only on the original `entity`, not `managed`.
                     syncGeoPoints(session, entity, new IdentityHashMap<>());
+                    // Last, after every write above has been flushed: covers anything Hibernate persisted by
+                    // cascading that the explicit walks never reach (a related entity two or more hops away).
+                    session.flush();
+                    writeVectorsForFlushedEntities(session);
                     tx.commit();
                     // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
                     // @Transient collection fields are left empty by merge(), so returning it would hand the
@@ -313,10 +436,93 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 } catch (RuntimeException e) {
                     tx.rollback();
                     throw e;
+                } finally {
+                    JavAIFlushVectorListener.end();
                 }
             }
         });
         return result[0];
+    }
+
+    /**
+     * Re-embeds <b>every registered entity type</b>, not just the repository's own -- re-indexing a datastore
+     * against a new model has to cover the whole store, or it is left straddling two models (an
+     * {@code Article} re-embedded while its {@code Comment}s are not). Then validates the result: every
+     * entity that had a vector under the previously-newest model must have one under the new model, and any
+     * that don't are reported by type/id rather than silently left stale.
+     *
+     * <p>Iterating the registered types (rather than driving the loop from the old vector table) is both
+     * simpler and equally complete: an entity type has to be registered/mapped for this backend to be able to
+     * load it at all, so the old table can never name a type the registry doesn't already have. The old table
+     * earns its keep as the <em>manifest to validate against</em>.
+     */
+    @Override
+    public void reindexAll() {
+        SessionFactory factory = sessionFactory();
+        Set<String> manifest;
+        try (Session session = factory.openSession()) {
+            manifest = session.doReturningWork(connection -> {
+                String newest = newestVectorTable(connection);
+                return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+            });
+        }
+
+        for (Class<?> registered : registeredEntityTypes) {
+            for (Object entity : findAll(registered)) {
+                save(registered, entity);
+            }
+        }
+
+        try (Session session = factory.openSession()) {
+            List<String> missing = session.doReturningWork(connection -> {
+                String newest = newestVectorTable(connection);
+                Set<String> reindexed = newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+                return manifest.stream().filter(key -> !reindexed.contains(key)).limit(10).toList();
+            });
+            if (!missing.isEmpty()) {
+                throw new IllegalStateException("reindexAll() left " + missing.size() + " or more entities "
+                        + "un-reindexed under the newly configured model -- the store is now split across two "
+                        + "models. Unreindexed (up to 10, as owner_type/owner_id): " + missing
+                        + ". This usually means an entity type holding vectors was never registered via "
+                        + "JavAIPI.repository(...) in this process.");
+            }
+        }
+    }
+
+    /** The {@code javai_vectors__<model>} table most recently written to, by {@code max(computed_at)} --
+     *  i.e. whichever model the store was last indexed under. {@code null} if nothing has been vectorized. */
+    private static String newestVectorTable(Connection connection) throws SQLException {
+        String newest = null;
+        Timestamp newestAt = null;
+        for (String table : findAllVectorTables(connection)) {
+            if (!table.startsWith(FIELD_VECTOR_TABLE_PREFIX)) {
+                continue; // summary tables mirror the field tables; one family is enough to compare
+            }
+            try (Statement statement = connection.createStatement();
+                    ResultSet resultSet = statement.executeQuery("SELECT max(computed_at) FROM " + table)) {
+                if (resultSet.next()) {
+                    Timestamp at = resultSet.getTimestamp(1);
+                    if (at != null && (newestAt == null || at.after(newestAt))) {
+                        newestAt = at;
+                        newest = table;
+                    }
+                }
+            }
+        }
+        return newest;
+    }
+
+    /** {@code owner_type/owner_id} keys present in a vector table -- the manifest of what was indexed. */
+    private static Set<String> ownerKeys(Connection connection, String table) throws SQLException {
+        Set<String> keys = new LinkedHashSet<>();
+        try (Statement statement = connection.createStatement();
+                ResultSet resultSet = statement.executeQuery(
+                        "SELECT DISTINCT owner_type, owner_id FROM " + table)) {
+            while (resultSet.next()) {
+                keys.add(resultSet.getString(1) + "/" + resultSet.getString(2));
+            }
+        }
+        return keys;
     }
 
     @Override
@@ -358,18 +564,31 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         SessionFactory factory = sessionFactory();
         try (Session session = factory.openSession()) {
             Transaction tx = session.beginTransaction();
+            JavAIFlushVectorListener.begin();
             try {
                 Object entity = session.find(entityType, id);
                 if (entity != null) {
                     cascadeDeleteCollectionMembers(session, entityType.getName(), id);
+                    // Members of a natively-mapped association have no membership rows, so their vector/geo
+                    // rows need clearing here, before Hibernate cascades the removal itself.
+                    deleteVectorsForCascadedCollectionMembers(session, entity);
                     session.remove(entity);
                 }
                 deleteVectors(session, entityType.getName(), id);
                 deleteGeoPoints(session, entityType.getName(), id);
+                // Flush the removal so Hibernate reports everything it actually cascade-deleted, then clear
+                // those rows too -- catches entities removed at a depth the explicit walk above never sees.
+                session.flush();
+                for (JavAIFlushVectorListener.DeletedRef deleted : JavAIFlushVectorListener.current().deleted()) {
+                    deleteVectors(session, deleted.ownerType(), deleted.id());
+                    deleteGeoPoints(session, deleted.ownerType(), deleted.id());
+                }
                 tx.commit();
             } catch (RuntimeException e) {
                 tx.rollback();
                 throw e;
+            } finally {
+                JavAIFlushVectorListener.end();
             }
         }
     }
@@ -501,7 +720,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             JpaCriteriaQuery<T> cq = cb.createQuery(entityType);
             JpaRoot<T> root = cq.from(entityType);
             cq.select(root);
-            if (query.partTree().isDistinct()) {
+            // A to-many join multiplies root rows, so DISTINCT is required for correctness, not just for an
+            // explicit Distinct keyword.
+            if (query.partTree().isDistinct() || joinsToMany(entityType, query)) {
                 cq.distinct(true);
             }
             Predicate where = buildWhere(session, cb, root, entityType, query.boundOrGroups(args));
@@ -538,7 +759,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
             JpaCriteriaQuery<Long> cq = cb.createQuery(Long.class);
             JpaRoot<T> root = cq.from(entityType);
-            cq.select(query.partTree().isDistinct() ? cb.countDistinct(root) : cb.count(root));
+            boolean distinct = query.partTree().isDistinct() || joinsToMany(entityType, query);
+            cq.select(distinct ? cb.countDistinct(root) : cb.count(root));
             Predicate where = buildWhere(session, cb, root, entityType, query.boundOrGroups(args));
             if (where != null) {
                 cq.where(where);
@@ -593,17 +815,89 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         boolean geo = type == Part.Type.NEAR || type == Part.Type.WITHIN;
         boolean emptiness = type == Part.Type.IS_EMPTY || type == Part.Type.IS_NOT_EMPTY
                 || (type == Part.Type.EXISTS && collectionLeaf);
-        boolean hasToMany = DerivedFinderQuery.firstToManySplit(rootType, dotPath).isPresent();
-        if (geo || emptiness || hasToMany) {
+
+        // Geo always lives in javai_geo_points, and a side-table-backed (concrete JavAI) collection has no
+        // Hibernate association to join -- both still resolve to an id set. Everything else is now a real
+        // Criteria query: a natively-mapped collection is a genuine association, so a join is both correct and
+        // a single statement, retiring the id-set-per-hop round trips for it (OMI-142 Phase 3).
+        if (geo || hasSideTableToMany(rootType, dotPath, emptiness)) {
             Set<UUID> ids = rootIdsMatching(session, rootType, part);
             Path<?> idPath = root.get(EntityReflection.idField(rootType).getName());
             return ids.isEmpty() ? cb.disjunction() : idPath.in(ids);
         }
-        Path<?> path = resolvePath(root, dotPath);
+        if (emptiness) {
+            // A natively-mapped collection answers emptiness directly, with no side table involved. The leaf
+            // IS the collection here, so resolveJoinedPath stops at it rather than joining through it.
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            Expression<Collection<?>> collectionPath =
+                    (Expression) resolveJoinedPath(root, rootType, dotPath);
+            return type == Part.Type.IS_EMPTY ? cb.isEmpty(collectionPath) : cb.isNotEmpty(collectionPath);
+        }
+        Path<?> path = resolveJoinedPath(root, rootType, dotPath);
         if (type == Part.Type.EXISTS) {
             return cb.isNotNull(path);
         }
         return scalarPredicate(cb, path, part);
+    }
+
+    /** Whether any hop this predicate needs is a <em>side-table-backed</em> (concrete JavAI) collection, which
+     *  Hibernate doesn't map and therefore can't join. Natively-mapped collections -- plain JDK ones and
+     *  interface-typed JavAI ones alike -- return false and take the Criteria-join path instead.
+     *  {@code includeLeaf} is set for emptiness, where the collection under test <em>is</em> the leaf. */
+    private static boolean hasSideTableToMany(Class<?> rootType, String dotPath, boolean includeLeaf) {
+        Class<?> owner = rootType;
+        String[] segments = dotPath.split("\\.");
+        for (int i = 0; i < segments.length; i++) {
+            Field field = EntityReflection.findField(owner, segments[i]);
+            boolean leaf = i == segments.length - 1;
+            if ((!leaf || includeLeaf) && DerivedFinderQuery.isToMany(field) && isJavAICollectionField(field)) {
+                return true;
+            }
+            if (leaf) {
+                return false;
+            }
+            owner = DerivedFinderQuery.isToMany(field)
+                    ? DerivedFinderQuery.collectionMemberType(field) : field.getType();
+        }
+        return false;
+    }
+
+    /** Navigates a dot path by {@code join()}ing each intermediate hop. A plural attribute cannot be
+     *  dereferenced with {@code get()} at all, and for a singular one an explicit join is the same inner join
+     *  {@code get()} navigation would have produced -- so joining uniformly keeps the chain simple and leaves
+     *  singular-path behavior unchanged. */
+    private static Path<?> resolveJoinedPath(JpaRoot<?> root, Class<?> rootType, String dotPath) {
+        String[] segments = dotPath.split("\\.");
+        jakarta.persistence.criteria.From<?, ?> from = root;
+        Class<?> owner = rootType;
+        for (int i = 0; i < segments.length - 1; i++) {
+            Field field = EntityReflection.findField(owner, segments[i]);
+            from = from.join(segments[i]);
+            owner = DerivedFinderQuery.isToMany(field)
+                    ? DerivedFinderQuery.collectionMemberType(field) : field.getType();
+        }
+        return from.get(segments[segments.length - 1]);
+    }
+
+    /** Whether any of this query's predicates joins a to-many association, which multiplies root rows and so
+     *  requires {@code DISTINCT} to keep one row per matching entity. */
+    private static boolean joinsToMany(Class<?> rootType, DerivedFinderQuery query) {
+        for (Part part : query.partTree().getParts()) {
+            String dotPath = part.getProperty().toDotPath();
+            if (hasSideTableToMany(rootType, dotPath, false)) {
+                continue; // resolved as an id set, no join
+            }
+            Class<?> owner = rootType;
+            String[] segments = dotPath.split("\\.");
+            for (int i = 0; i < segments.length - 1; i++) {
+                Field field = EntityReflection.findField(owner, segments[i]);
+                if (DerivedFinderQuery.isToMany(field)) {
+                    return true;
+                }
+                owner = field.getType();
+            }
+        }
+        return false;
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -1025,11 +1319,30 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             } catch (IllegalAccessException e) {
                 throw new IllegalStateException("Cannot read field " + field + " on " + entity.getClass(), e);
             }
-            if (value instanceof Collection<?> || value instanceof Map<?, ?>) {
-                continue;
+            if (isJavAICollectionField(field)) {
+                continue; // syncCollectionMembers writes these members' vectors as it persists them
             }
-            if (value instanceof JavAIVectorizable vectorizable) {
+            if (value instanceof Map<?, ?> map) {
+                writeVectorsForCollectionMembers(session, map.values());
+            } else if (value instanceof Collection<?> collection) {
+                writeVectorsForCollectionMembers(session, collection);
+            } else if (value instanceof JavAIVectorizable vectorizable) {
                 writeVectors(session, value.getClass(), vectorizable);
+            }
+        }
+    }
+
+    /** Writes vectors for the members of a <em>Hibernate-owned</em> (plain, natively-mapped) collection.
+     *  Hibernate's own cascade INSERTs those members, but it has no idea this project's vector tables exist,
+     *  so without this the members of a plain {@code @OneToMany}/{@code @ManyToMany} would persist relationally
+     *  yet never get a vector row -- silently breaking the "every {@code @JavAIVectorizable} written through a
+     *  repository has an up-to-date, persisted vector" guarantee. JavAI collection fields are excluded by the
+     *  caller because {@link #syncCollectionMembers} already does this for them. */
+    private void writeVectorsForCollectionMembers(Session session, Collection<?> members) {
+        for (Object member : members) {
+            if (member instanceof JavAIVectorizable vectorizable
+                    && member.getClass().isAnnotationPresent(Entity.class)) {
+                writeVectors(session, member.getClass(), vectorizable);
             }
         }
     }
@@ -1044,6 +1357,15 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         UUID ownerId = EntityReflection.readId(entity);
         String ownerType = entityType.getName();
         for (Field field : EntityReflection.allFields(entityType)) {
+            // ONLY JavAI collection fields belong to this side table. A plain JDK collection is mapped
+            // natively by Hibernate (it isn't marked <transient>, see buildAutoTransientOverrideXml), so
+            // claiming it here too would persist the same association twice and -- because
+            // hydrateCollectionMembers would then add the members back onto an already-Hibernate-populated
+            // collection -- silently double every element on read. Confirmed empirically before this guard
+            // existed: a plain @OneToMany with 2 children reloaded as 4. See OMI-142.
+            if (!isJavAICollectionField(field)) {
+                continue;
+            }
             field.setAccessible(true);
             Object value;
             try {
@@ -1127,6 +1449,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         UUID ownerId = EntityReflection.readId(entity);
         String ownerType = entityType.getName();
         for (Field field : EntityReflection.allFields(entityType)) {
+            // Mirrors syncCollectionMembers: only JavAI collection fields are hydrated from the side table.
+            // Hibernate has already populated a natively-mapped collection by the time we get here, so adding
+            // its members again would duplicate every element. See OMI-142.
+            if (!isJavAICollectionField(field)) {
+                continue;
+            }
             field.setAccessible(true);
             Object value;
             try {
@@ -1414,9 +1742,46 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 sessionFactory = config.externalSessionFactory() != null
                         ? config.externalSessionFactory()
                         : buildSessionFactory();
+                registerFlushVectorListener(sessionFactory);
                 initializeSchema(sessionFactory);
             }
             return sessionFactory;
+        }
+    }
+
+    /** SessionFactories this listener is already attached to. Identity-keyed and weak, because an
+     *  externally-supplied factory may be shared by several backends (or outlive this one) and must never be
+     *  double-registered, nor kept alive by us. */
+    private static final Set<SessionFactory> FLUSH_LISTENER_REGISTERED =
+            Collections.newSetFromMap(new WeakHashMap<>());
+
+    /** Attaches {@link JavAIFlushVectorListener} so vector writes can cover every entity Hibernate actually
+     *  persists -- including ones reached only by cascading, at any depth. Works on a factory this backend
+     *  built and, equally, on one the application supplied (proven in {@code PhaseZeroSpikeTest}'s Gate 2);
+     *  the listener stays inert outside this backend's own save/delete calls, so a shared factory is safe. */
+    private static void registerFlushVectorListener(SessionFactory factory) {
+        synchronized (FLUSH_LISTENER_REGISTERED) {
+            if (!FLUSH_LISTENER_REGISTERED.add(factory)) {
+                return;
+            }
+        }
+        EventListenerRegistry listeners = ((SessionFactoryImplementor) factory)
+                .getServiceRegistry().getService(EventListenerRegistry.class);
+        JavAIFlushVectorListener listener = new JavAIFlushVectorListener();
+        listeners.appendListeners(EventType.PRE_INSERT, listener);
+        listeners.appendListeners(EventType.PRE_UPDATE, listener);
+        listeners.appendListeners(EventType.POST_DELETE, listener);
+    }
+
+    /** Writes vectors for every {@code @JavAIVectorizable} Hibernate reported persisting in this flush.
+     *  Complements -- never replaces -- the explicit walk above: an entity whose mapped columns didn't change
+     *  produces no Hibernate event at all, which is exactly the case {@code reindexAll()} relies on. */
+    private void writeVectorsForFlushedEntities(Session session) {
+        for (Object entity : JavAIFlushVectorListener.current().persisted()) {
+            if (entity instanceof JavAIVectorizable vectorizable
+                    && entity.getClass().isAnnotationPresent(Entity.class)) {
+                writeVectors(session, entity.getClass(), vectorizable);
+            }
         }
     }
 
@@ -1435,7 +1800,52 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         if (autoTransientOverrideXml != null) {
             sources.addInputStream(new ByteArrayInputStream(autoTransientOverrideXml.getBytes(StandardCharsets.UTF_8)));
         }
-        return sources.buildMetadata().buildSessionFactory();
+        Metadata metadata = sources.buildMetadata();
+        attachJavAICollectionTypes(metadata);
+        return metadata.buildSessionFactory();
+    }
+
+    /**
+     * Makes an ordinary JPA association whose field is declared by a JavAI collection <em>interface</em>
+     * (e.g. {@code @OneToMany JavAIList<Comment> comments}) use JavAI's own persistent collection, so the
+     * instance Hibernate substitutes into the field keeps its vector/dirty-tracking behavior. Applied here,
+     * between {@code buildMetadata()} and {@code buildSessionFactory()}, so the <b>consumer writes nothing
+     * JavAI-specific</b> -- no {@code @CollectionType}, just the JPA annotation they'd write anyway.
+     *
+     * <p>Deliberately per-collection rather than Hibernate's {@code @CollectionTypeRegistration}, which is
+     * keyed by {@code CollectionClassification} and would therefore capture <em>every</em> bag/set/map in the
+     * persistence unit, including plain JDK ones that must stay exactly as Hibernate maps them.
+     */
+    private static void attachJavAICollectionTypes(Metadata metadata) {
+        for (org.hibernate.mapping.Collection binding : metadata.getCollectionBindings()) {
+            Class<?> fieldType = collectionFieldType(binding);
+            if (fieldType == null) {
+                continue;
+            }
+            if (JavAIList.class.isAssignableFrom(fieldType)) {
+                binding.setTypeName(JavAIListType.class.getName());
+            } else if (JavAISet.class.isAssignableFrom(fieldType)) {
+                binding.setTypeName(JavAISetType.class.getName());
+            } else if (JavAIMap.class.isAssignableFrom(fieldType)) {
+                binding.setTypeName(JavAIMapType.class.getName());
+            }
+        }
+    }
+
+    /** The declared type of the field behind a collection binding, or {@code null} if it can't be resolved
+     *  (an embedded/component path, or a role this backend doesn't own). */
+    private static Class<?> collectionFieldType(org.hibernate.mapping.Collection binding) {
+        Class<?> ownerClass = binding.getOwner() == null ? null : binding.getOwner().getMappedClass();
+        if (ownerClass == null) {
+            return null;
+        }
+        String role = binding.getRole();
+        String property = role.substring(role.lastIndexOf('.') + 1);
+        try {
+            return EntityReflection.findField(ownerClass, property).getType();
+        } catch (RuntimeException e) {
+            return null; // not a plain field on the owner (component path, synthetic role, ...)
+        }
     }
 
     /** Generates an in-memory JPA {@code orm.xml}-equivalent mapping document marking every JavAI collection

@@ -39,7 +39,16 @@ public interface JavAIRepository<T> {
     void deleteById(UUID id);
 
     /**
-     * Re-embeds and re-persists every existing entity of this type under whichever
+     * <b>Re-indexes the whole datastore</b>, not just this repository's own type: every entity type
+     * registered with the backing {@code JavAIPersistenceConfig} is re-embedded under the currently
+     * configured model. Re-indexing one type in isolation would leave the store straddling two embedding
+     * models -- an {@code Article} on the new one while its {@code Comment}s are still on the old -- which is
+     * exactly the state a re-index exists to prevent, so the repository you happen to call this through
+     * doesn't scope the work. The Postgres backend additionally <em>validates</em> the result afterwards,
+     * throwing (and naming the offenders) if any entity that held a vector under the previous model didn't
+     * get one under the new model.
+     *
+     * <p>Historically this re-embedded every existing entity of this type under whichever
      * {@code JavAIEmbeddingProvider}/model is *currently* configured -- the explicit trigger for
      * "I swapped providers, now go re-vectorize everything." Since both backends store each model's
      * vectors under a name qualified by that model (a per-model Postgres table; a per-model-qualified
@@ -49,4 +58,17 @@ public interface JavAIRepository<T> {
      * never overwritten in the first place.
      */
     void reindexAll();
+
+    /**
+     * Re-embeds and re-persists just <b>this</b> repository's own entity type, leaving every other type on
+     * whatever model it was last written under -- the narrow counterpart to {@link #reindexAll()}, and the
+     * behavior {@code reindexAll()} used to have before it was corrected to match its name.
+     *
+     * <p>Prefer {@link #reindexAll()} when swapping the configured embedding model: re-embedding one type in
+     * isolation leaves the datastore straddling two models, which is usually a bug rather than an intent.
+     * Reach for this only when that partial state is genuinely what you want -- e.g. re-embedding one type
+     * after a targeted data repair. Because it is deliberately partial, it performs none of
+     * {@code reindexAll()}'s completeness validation.
+     */
+    void reindex();
 }

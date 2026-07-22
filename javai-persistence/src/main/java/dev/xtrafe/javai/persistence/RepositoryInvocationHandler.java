@@ -42,9 +42,10 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 backend.deleteById(entityType, (UUID) args[0]);
                 return null;
             case "reindexAll":
-                for (Object entity : backend.findAll(entityType)) {
-                    backend.save(entityType, entity);
-                }
+                backend.reindexAll();
+                return null;
+            case "reindex":
+                backend.reindex(entityType);
                 return null;
             case "toString":
                 return "JavAIRepository<" + entityType.getSimpleName() + ">";
