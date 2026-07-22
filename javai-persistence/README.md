@@ -125,6 +125,41 @@ an already-registered type's own fields are discovered and registered automatica
 need to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and
 independently* (Neo4j is the exception here -- see below).
 
+## Physical naming, and configuring the `SessionFactory` JavAI builds (Postgres)
+
+**Columns and tables are snake_cased by default** (OMI-145, 0.1.5): a field `emailVerified` maps to
+`email_verified` and an entity `TestCrew` to `test_crew`, matching Spring Boot's own default and ordinary SQL
+convention. Up to 0.1.4 this backend set no naming strategy at all, so Hibernate's bare default produced
+`emailverified` -- which broke the case that matters most in practice: pointed at a table another tool had
+already created conventionally, `hbm2ddl=update` **added a second, differently-cased set of columns** beside
+the existing ones, and the following insert populated JavAI's copy while leaving the original `NOT NULL`
+column null. See `CHANGELOG.md` for the migration note; this is a breaking change for any pre-0.1.5 schema
+with a multi-word field or class name.
+
+Two knobs, both on `JavAIPersistenceConfig.Builder`:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        // 1. Typed override -- e.g. pin the pre-0.1.5 naming instead of migrating an existing schema:
+        .physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())
+        // 2. General passthrough -- any Hibernate setting with no typed method of its own:
+        .hibernateProperty("hibernate.jdbc.batch_size", 50)
+        .build();
+```
+
+The passthrough is applied **after** the settings this module sets itself (`jakarta.persistence.jdbc.url`/
+`.user`/`.password`, `hibernate.hbm2ddl.auto`), so an explicitly-named key beats JavAI's own default --
+deliberate, since naming a setting outright is the more specific instruction. Between the two knobs,
+`physicalNamingStrategy(...)` wins over a `hibernate.physical_naming_strategy` passed as a raw property.
+
+Both are inert when `Builder.sessionFactory(...)` supplies a factory JavAI didn't build, and inert on Neo4j
+and MongoDB, which classify fields by declared type and have no equivalent of JPA column naming. Note that
+supplying your own `SessionFactory` still skips the two mapping-time hooks (`attachJavAICollectionTypes`,
+`buildAutoTransientOverrideXml`) that JavAI collection fields depend on -- these knobs exist so that needing
+particular Hibernate settings no longer forces that trade-off.
+
 ## Collections: `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` fields
 
 A field typed as one of `javai-model`'s concrete vector-aware collections can never be a *native*
@@ -301,6 +336,11 @@ backends' save/findById/findAll/deleteById/reindexAll plus the three `findNeares
 above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
 `RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
 methods.
+
+**Configurable physical naming (OMI-145), Postgres.** snake_case by default, overridable via
+`Builder.physicalNamingStrategy(...)`, plus a general `Builder.hibernateProperty(...)`/`.hibernateProperties(...)`
+passthrough for any other Hibernate setting -- see "Physical naming" above. `PhysicalNamingStrategyTest`
+asserts the generated DDL for each case, including the precedence between the two knobs.
 
 **JavAI collections as native JPA associations (OMI-142), Postgres.** A collection field declared by a JavAI
 *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with an ordinary `@OneToMany`/`@ManyToMany`, is now
