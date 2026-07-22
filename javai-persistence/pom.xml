@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.3</version>
+    <version>0.1.4</version>
   </parent>
 
   <artifactId>javai-persistence</artifactId>
@@ -55,6 +55,14 @@
       <!-- MongoTemplate as the configured connection holder for RepositoryBackendSpringDataMongo. -->
       <groupId>org.springframework.data</groupId>
       <artifactId>spring-data-mongodb</artifactId>
+    </dependency>
+    <dependency>
+      <!-- PartTree, the Spring-Data derived-query name parser, is used directly by DerivedFinderQuery to
+           realize standard relational finders (findBy/existsBy/countBy/deleteBy...) on JavAIRepository
+           across all three backends (OMI-138). Present transitively via spring-data-mongodb already, but
+           named explicitly since it's now a first-class dependency of this module's own code. -->
+      <groupId>org.springframework.data</groupId>
+      <artifactId>spring-data-commons</artifactId>
     </dependency>
     <dependency>
       <!-- Not pulled in transitively by spring-data-mongodb; confirmed via dependency:tree that it only

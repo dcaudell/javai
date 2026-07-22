@@ -30,6 +30,30 @@ interface RepositoryBackend {
 
     Object save(Class<?> entityType, Object entity);
 
+    /**
+     * Re-embeds and re-persists <em>every registered entity type</em> under the currently-configured model.
+     * A datastore is re-indexed as a whole: an {@code Article}'s {@code Comment}s must be re-embedded too, or
+     * the store is left straddling two models. Takes no argument precisely because no single type scopes it.
+     *
+     * <p>Intentionally abstract: "everything I know about" is backend-specific (which types are registered,
+     * and how), so a new backend must answer it deliberately rather than inherit a wrong default.
+     */
+    void reindexAll();
+
+    /**
+     * Re-embeds and re-persists just {@code entityType}. The narrow counterpart to {@link #reindexAll()},
+     * for when a caller knowingly wants one type re-embedded and accepts that other types stay on whatever
+     * model they were last written under.
+     *
+     * <p>Backend-agnostic by construction -- {@code save()} always writes under whichever provider is
+     * currently configured -- so no backend needs to override this.
+     */
+    default void reindex(Class<?> entityType) {
+        for (Object entity : findAll(entityType)) {
+            save(entityType, entity);
+        }
+    }
+
     Optional<Object> findById(Class<?> entityType, UUID id);
 
     List<Object> findAll(Class<?> entityType);
@@ -40,4 +64,31 @@ interface RepositoryBackend {
     List<Object> findNearestByFieldVector(Class<?> entityType, String fieldName, EmbeddingVector reference, int limit);
 
     List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit);
+
+    // ---- ordinary Spring-Data-style derived finders (OMI-138) --------------------------------------
+    // These four primitives + validation are all a backend implements; DerivedFinderQuery owns the method
+    // name grammar, return-type adaptation, and Pageable/Sort/Limit handling. A backend only translates the
+    // BoundPart predicate tree into its native query language and applies the resolved Constraints.
+
+    /** Rejects, at repository-creation time, any derived finder this specific backend structurally cannot
+     *  serve -- e.g. a nested property path reaching through a relationship the backend doesn't map for
+     *  filtering. The default accepts everything {@link DerivedFinderQuery#parse} already validated;
+     *  backends override to add their own store-specific feasibility checks. Must throw
+     *  {@code IllegalArgumentException} with a clear, field-naming message, never fail later on first call. */
+    default void validateDerivedQuery(Class<?> entityType, DerivedFinderQuery query) {
+    }
+
+    /** Runs the derived finder's predicate under the given {@code constraints} (ordering + windowing) and
+     *  returns the matching entities, already hydrated the same way {@link #findAll} hydrates. */
+    List<Object> findByDerivedQuery(
+            Class<?> entityType, DerivedFinderQuery query, Object[] args, DerivedFinderQuery.Constraints constraints);
+
+    /** Counts entities matching the derived finder's predicate (ordering/windowing intentionally ignored). */
+    long countByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    /** Whether any entity matches the derived finder's predicate. */
+    boolean existsByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    /** Deletes every entity matching the derived finder's predicate, returning how many were removed. */
+    long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
 }

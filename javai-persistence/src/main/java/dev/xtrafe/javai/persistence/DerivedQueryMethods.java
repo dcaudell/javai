@@ -13,9 +13,11 @@ import java.util.Set;
  * accessor the weaver already synthesizes in-memory (e.g. {@code bodyVector()} ->
  * {@code findNearestByBodyVector}), not the bare field name -- deliberately mirroring what a developer
  * would already call directly on a woven object, per doc/spec/persistence-bridge.md's own
- * {@code findNearestByBodyVector} example. Anything else fails fast, at repository-creation time (see
- * {@link JavAIPI#repository(Class)}), not on first call -- Persistence Bridge is not a general
- * derived-query framework.
+ * {@code findNearestByBodyVector} example. This class handles ONLY the vector convention; ordinary
+ * Spring-Data-style relational finders ({@code findBy…}/{@code countBy…}/... , OMI-138) are a separate
+ * concern handled by {@link DerivedFinderQuery}, and {@link JavAIPI} routes each method name to whichever
+ * of the two applies. A name matching neither fails fast, at repository-creation time (see
+ * {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}), not on first call.
  */
 final class DerivedQueryMethods {
 

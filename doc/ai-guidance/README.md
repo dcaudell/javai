@@ -11,6 +11,7 @@ Two files, read for different reasons:
 |---|---|---|
 | [`JavAI_Usage_Guide.md`](JavAI_Usage_Guide.md) | **Always**, before writing or editing any code that uses `io.github.dcaudell:*` | What the library does, the full annotation vocabulary, every method a woven class gains at runtime that isn't in its source, and how to install/build/activate it |
 | [`JavAI_Codegen_Guidance.md`](JavAI_Codegen_Guidance.md) | **Only** when the code you're touching carries `@Requires`/`@Ensures`/`@Invariant`, `@Intent`, `@AgentWritable`/`@Frozen`/`@HumanOnly`, `@Nondeterministic`/`@Costly`, or `@Provenance` | A separate, narrower feature: annotations a *human* puts on their own code to constrain what an AI agent is allowed to read, generate, or modify — not a general usage guide |
+| [`persistence-support-matrix.md`](persistence-support-matrix.md) | When writing a `JavAIRepository` or entity and you need to know **what works on which backend** (Postgres/Neo4j/MongoDB) | Per-backend support tables: JPA annotations, query/derived-finder capabilities, and JavAI collection field types |
 
 They're kept separate deliberately: the first is "what can this library do and how do I call it," the
 second is "what am I, the agent, allowed to touch in code that happens to use one specific feature of it."

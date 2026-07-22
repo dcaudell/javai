@@ -6,7 +6,7 @@
 
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai</artifactId>
-  <version>0.1.3</version>
+  <version>0.1.4</version>
   <packaging>pom</packaging>
 
   <name>JavAI Extensions</name>
@@ -133,6 +133,13 @@
          spring-data-mongodb (confirmed via `mvn dependency:tree`: it only brings mongodb-driver-core —
          BSON/wire-protocol types), so it needs its own explicit dependency below regardless. -->
     <spring-data-mongodb.version>5.1.0</spring-data-mongodb.version>
+    <!-- Pinned to exactly what spring-data-mongodb 5.1.0 already brings transitively (its own
+         `${springdata.commons}`, confirmed 4.1.0 via the resolved dependency), declared explicitly here
+         only because javai-persistence now uses spring-data-commons' PartTree derived-query parser directly
+         (the standard relational finders on all three backends, OMI-138); a direct use shouldn't rely on a
+         transitive it doesn't name. Must stay equal to whatever spring-data-mongodb.version above resolves
+         to; bumping one without the other risks two spring-data-commons lines on one classpath. -->
+    <spring-data-commons.version>4.1.0</spring-data-commons.version>
     <mongodb-driver.version>5.9.0</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
@@ -274,6 +281,11 @@
         <groupId>org.springframework.data</groupId>
         <artifactId>spring-data-mongodb</artifactId>
         <version>${spring-data-mongodb.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.data</groupId>
+        <artifactId>spring-data-commons</artifactId>
+        <version>${spring-data-commons.version}</version>
       </dependency>
       <dependency>
         <groupId>org.mongodb</groupId>

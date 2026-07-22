@@ -45,6 +45,9 @@ class RepositoryBackendNeo4jTest {
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
     private static TestOwnerWithGraphRepository graphOwnerRepository;
+    private static TestAccountRepository accountRepository;
+    private static TestAccountNestedRepository nestedAccountRepository;
+    private static TestVenueRepository venueRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -58,6 +61,13 @@ class RepositoryBackendNeo4jTest {
         repository = JavAIPI.repository(TestArticleRepository.class, config);
         JavAIPI.repository(TestGraphNodeRepository.class, config);
         graphOwnerRepository = JavAIPI.repository(TestOwnerWithGraphRepository.class, config);
+        accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
+        nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
+        // Neo4j's registerEntityType doesn't recurse into related types, so a related node's label must be
+        // registered explicitly before a relationship traversal needs to resolve it.
+        JavAIPI.repository(TestProfileRepository.class, config);
+        venueRepository = JavAIPI.repository(TestVenueRepository.class, config);
+        JavAIPI.repository(TestReviewRepository.class, config);
     }
 
     @BeforeEach
@@ -407,6 +417,31 @@ class RepositoryBackendNeo4jTest {
                 "the 1-hop neighbor reached via the graph's own edge must be included in the subgraph");
         assertTrue(subgraph.nodes().stream().noneMatch(n -> n.getName().equals("championship game recap")),
                 "a node with no edge to the origin must not appear in a 1-hop subgraph");
+    }
+
+    // ---- ordinary (non-vector) derived finders, OMI-138 ----------------------------------------
+
+    @Test
+    void ordinaryDerivedFindersWorkAcrossOperatorsProjectionsAndPaging() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertSimpleDerivedFinders(accountRepository);
+    }
+
+    @Test
+    void nestedAssociationDerivedFindersTraverseTheSingularRelationship() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertNestedDerivedFinders(nestedAccountRepository);
+    }
+
+    @Test
+    void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
+    }
+
+    @Test
+    void nestedToManyEmptinessRegexAndGeoFindersWork() {
+        DerivedFinderTestSupport.seedVenues(venueRepository);
+        DerivedFinderTestSupport.assertNestedToManyEmptinessRegexAndGeoFinders(venueRepository);
     }
 
     private static TestGraphNode findByName(KnowledgeGraph<TestGraphNode, TestGraphEdge> graph, String name) {

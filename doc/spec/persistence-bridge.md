@@ -13,6 +13,7 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 | `JavAIPI` | Internal contract | The save/query/re-index contract JavAI objects speak internally; `repository(Class, JavAIPersistenceConfig)` takes its backend config as an explicit argument, no ambient "current config" |
 | `JavAIRepository<T>` | Interface | Spring-Data-style repository base; delegates to existing derived-query-method machinery |
 | `findNearestBy<Field>(EmbeddingVector, int limit)` | Derived query method convention | E.g. `findNearestByBodyVector` — repository-level nearest-neighbor search |
+| `findBy<Field>`/`existsBy…`/`countBy…`/`deleteBy…` | Ordinary derived finders | Full Spring-Data-style relational finders (parsed via `PartTree`), resolved against the entity's own mapped columns — so one repository serves both an entity's relational access and its vector search. See "Ordinary relational derived finders" below |
 | Hibernate-based enhancement shim | Mechanism | ByteBuddy enhancement via Hibernate's `EnhancementContext`-style SPI |
 | `hibernate-vector` module | Dependency | Native pgvector column mapping (`@JdbcTypeCode(SqlTypes.VECTOR)`) |
 | Neo4j-facing shim | Mechanism | Parallel graph-native persistence backend, same `JavAIPI` contract |
@@ -171,6 +172,71 @@ that thread and that call. Because every setter, under every mode, briefly takes
 own bookkeeping, the subgraph is genuinely frozen against mutation for the duration too -- not just
 protected on the read side. See `javai-persistence/README.md`'s own "What's actually implemented" section
 for the tests proving this holds under all three modes.
+
+## Ordinary relational derived finders
+
+A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the
+`findNearestBy…Vector` convention, so a single repository serves both an entity's relational access paths
+*and* its vector search — no parallel Spring Data JPA repository over the same table, and no `findAll()` +
+in-memory filtering. This matters most for an entity that needs both: e.g. an `Identity` that is
+`@JavAIVectorizable` (so it joins the semantic graph) yet is also looked up by `findByUserId`/`findByHandle`.
+A **non-`@JavAIVectorizable`** `@Entity` is a first-class citizen of the same mechanism too — it just writes
+no vectors on save; its finders resolve exactly like any other entity's.
+
+```java
+public interface IdentityRepository extends JavAIRepository<Identity> {
+    List<Identity> findByUserId(UUID userId);          // ordinary relational finder
+    Optional<Identity> findByHandle(String handle);
+    boolean existsByHandle(String handle);
+    List<Identity> findNearestBySummaryVector(EmbeddingVector reference, int limit); // vector convention
+}
+```
+
+The method-name grammar is delegated to Spring Data's own `PartTree` (a self-contained name parser; no
+Spring context or Spring Data JPA runtime is involved), so the full derived-query vocabulary is available:
+`findBy`/`readBy`/`getBy`/`queryBy`/`countBy`/`existsBy`/`deleteBy`, `And`/`Or`, the operator set
+(`GreaterThan`/`LessThan`/`Between`/`Like`/`Containing`/`StartingWith`/`In`/`IsNull`/`True`/`IgnoreCase`/…),
+static `OrderBy`, `Top`/`First` limiting, `Distinct`, `Regex`/`Matches`, the collection-emptiness operators
+(`IsEmpty`/`IsNotEmpty`/`Exists`), geo `Near`/`Within`, and the return-type adapters `List`/`Optional`/single/
+`Stream`/`Page`/`Slice`/`long`(count)/`boolean`(exists). Dynamic `Sort`/`Pageable`/`Limit` parameters are
+honored too. `PartTree` validates every referenced property against the entity type **by field, not requiring
+JavaBean accessors**, so — like an invalid `findNearestBy…` — an unknown property or a mismatched parameter
+count fails fast at repository-creation time, never on first call.
+
+**Backend support and nested traversal (OMI-141).** All three backends translate finders into their native
+query language (Postgres → JPA Criteria, Neo4j → Cypher, MongoDB → a driver filter). **Nested-association
+paths** are supported through *both* singular associations *and* to-many/collection relationships
+(`findByReviewsReviewer` — an entity by a field of its collection members). Each backend uses the mechanism
+that fits its storage: Neo4j composes a self-contained `EXISTS { MATCH (n)-[:REL]->(x) WHERE … }` subquery
+(correct through any cardinality and under `And`/`Or`); Postgres and MongoDB, whose related entities live
+out-of-band (Postgres `javai_collection_members`; Mongo `{type, id}` reference pointers, not embedded),
+resolve the matching related ids first and then match owners referencing them, expressed as `root.id IN (…)`.
+Pure single-or-nested-*singular* scalar predicates stay a native Criteria join on Postgres. **Collection
+emptiness** (`findByReviewsIsEmpty`) rides the same side tables/relationships. *Sort* is still limited to a
+singular scalar path (a to-many sort is ambiguous). The id-set resolution materializes intermediate id sets
+and issues a query per hop — fine for the Phase-0 goal of proving the design space; a single-statement
+rewrite (a mapped membership entity for Criteria subqueries; `$lookup` for Mongo) is a natural later
+optimization.
+
+**Geo (`Near`/`Within`).** A `Point` field (Spring Data's `org.springframework.data.geo.Point`) round-trips
+per backend — a Neo4j native `point`, a MongoDB GeoJSON `Point`, and (Postgres) two columns in a
+`javai_geo_points` side table — and `findByLocationNear(Point, Distance)`/`findByLocationWithin(Circle)`
+translate to `point.distance(…)` (Neo4j), `$geoWithin`+`$centerSphere` (MongoDB), and
+`earth_distance(ll_to_earth(…))` (Postgres). The Postgres path uses the `cube`+`earthdistance` contrib
+extensions — bundled with the official Postgres base image the pgvector image builds on — rather than PostGIS
++ `hibernate-spatial`, so geo needs no extra dependency and no test-container image swap; both give equivalent
+great-circle point-distance. `Distance` is normalized to meters (kilometres/miles recognized).
+
+**Value-conversion parity (Neo4j / MongoDB).** Both the Neo4j and MongoDB backends store non-primitive
+scalars — `UUID`, `Instant`, `enum` — in a converted form (a `UUID`/`Instant` as its string form, an enum as
+its `name()`), because that's what those stores hold natively for a JavAI field. A derived finder's bound
+arguments are therefore run through the **same** conversion before they reach the query, so a comparison is
+made against the identical stored form. This is a correctness requirement, not a nicety: without it,
+`findByUserId(someUuid)` would bind a raw `UUID` against a column/property holding that UUID's *string* and
+silently match nothing. The Postgres backend needs no such step — Hibernate binds Java types natively — which
+is why the note is specific to the two reflective backends. (Range comparisons on a value stored as an
+ISO-8601 string, e.g. an `Instant`, remain correct because ISO-8601 sorts lexicographically; comparisons that
+are meaningless on a converted value, e.g. `>` on a UUID string, are permitted but not meaningful.)
 
 ## A JPA-style query, contrasted with an object-level query
 

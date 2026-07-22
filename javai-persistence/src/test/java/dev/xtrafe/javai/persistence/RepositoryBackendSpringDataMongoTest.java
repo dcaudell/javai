@@ -63,6 +63,9 @@ class RepositoryBackendSpringDataMongoTest {
 
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
+    private static TestAccountRepository accountRepository;
+    private static TestAccountNestedRepository nestedAccountRepository;
+    private static TestVenueRepository venueRepository;
 
     @BeforeAll
     static void configurePersistenceAndProvider() {
@@ -73,6 +76,9 @@ class RepositoryBackendSpringDataMongoTest {
                 .mongoDatabase(DATABASE)
                 .build();
         repository = JavAIPI.repository(TestArticleRepository.class, config);
+        accountRepository = JavAIPI.repository(TestAccountRepository.class, config);
+        nestedAccountRepository = JavAIPI.repository(TestAccountNestedRepository.class, config);
+        venueRepository = JavAIPI.repository(TestVenueRepository.class, config);
     }
 
     @BeforeEach
@@ -335,6 +341,33 @@ class RepositoryBackendSpringDataMongoTest {
                 return result;
             }
         }
+    }
+
+    // ---- ordinary (non-vector) derived finders, OMI-138 ----------------------------------------
+
+    @Test
+    void ordinaryDerivedFindersWorkAcrossOperatorsProjectionsAndPaging() {
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertSimpleDerivedFinders(accountRepository);
+    }
+
+    @Test
+    void nestedAssociationDerivedFindersResolveThroughReferencePointers() {
+        // References are {type, id} pointers, not embedded; OMI-141 resolves a nested predicate by matching
+        // the referenced entities first, then owners whose <field>.id points at one of them.
+        DerivedFinderTestSupport.seed(accountRepository);
+        DerivedFinderTestSupport.assertNestedDerivedFinders(nestedAccountRepository);
+    }
+
+    @Test
+    void nestedToManyEmptinessRegexAndGeoFindersWork() {
+        DerivedFinderTestSupport.seedVenues(venueRepository);
+        DerivedFinderTestSupport.assertNestedToManyEmptinessRegexAndGeoFinders(venueRepository);
+    }
+
+    @Test
+    void unknownPropertyDerivedFinderFailsFastAtRepositoryCreation() {
+        assertThrows(IllegalArgumentException.class, () -> JavAIPI.repository(TestBadPropertyRepository.class, config));
     }
 
     private static String mongoUri() {

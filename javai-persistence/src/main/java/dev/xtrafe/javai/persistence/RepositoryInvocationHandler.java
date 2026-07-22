@@ -22,6 +22,7 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     private final RepositoryBackend backend;
     private final Class<?> entityType;
     private final Map<Method, DerivedQueryMethods.ParsedQuery> parsedQueries = new ConcurrentHashMap<>();
+    private final Map<Method, DerivedFinderQuery> derivedFinders = new ConcurrentHashMap<>();
 
     RepositoryInvocationHandler(RepositoryBackend backend, Class<?> entityType) {
         this.backend = backend;
@@ -41,9 +42,10 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 backend.deleteById(entityType, (UUID) args[0]);
                 return null;
             case "reindexAll":
-                for (Object entity : backend.findAll(entityType)) {
-                    backend.save(entityType, entity);
-                }
+                backend.reindexAll();
+                return null;
+            case "reindex":
+                backend.reindex(entityType);
                 return null;
             case "toString":
                 return "JavAIRepository<" + entityType.getSimpleName() + ">";
@@ -63,6 +65,14 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 case FIELD, COMBINED -> backend.findNearestByFieldVector(entityType, parsed.fieldName(), reference, limit);
                 case SUMMARY -> backend.findNearestBySummaryVector(entityType, reference, limit);
             };
+        }
+        // Ordinary Spring-Data-style derived finder (OMI-138) -- checked after findNearestBy* since the two
+        // prefixes are disjoint (findNearestBy never startsWith findBy). Parsing was already validated at
+        // repository-creation time in JavAIPI; cached per Method here exactly like the vector queries above.
+        if (DerivedFinderQuery.looksLikeDerivedFinder(method)) {
+            DerivedFinderQuery query =
+                    derivedFinders.computeIfAbsent(method, m -> DerivedFinderQuery.parse(m, entityType));
+            return query.execute(backend, entityType, args);
         }
         throw new UnsupportedOperationException("Unsupported repository method " + method);
     }
