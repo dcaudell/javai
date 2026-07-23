@@ -14,7 +14,7 @@ import java.time.Instant;
  */
 final class FakeEmbeddingProvider implements JavAIEmbeddingProvider {
 
-    private static final String MODEL_ID = "fake-test-model";
+    static final String MODEL_ID = "fake-test-model";
     private static final int DIMS = 8;
 
     @Override

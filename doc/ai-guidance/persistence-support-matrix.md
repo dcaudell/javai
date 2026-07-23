@@ -123,3 +123,45 @@ Notes:
   `@OneToMany`. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
 - **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Embedded`, and nested/ to-many *sort*)
   if the same entity must run on more than one backend.
+
+---
+
+## Two traps that look like JavAI bugs and aren't
+
+### A convenience getter can break a nested finder (OMI-161)
+
+Derived finder names are parsed with Spring Data's `PartTree`, which discovers properties from **getters as
+well as fields**. Adding a convenience getter whose name collides with a nested path therefore *changes how
+that path is split*:
+
+```java
+@Entity @JavAIVectorizable
+public class Profile {
+    @OneToOne private Identity identity;
+
+    public UUID getIdentityId() { return identity.getId(); }   // <-- innocuous-looking
+}
+```
+
+`findByIdentityId` previously split into the nested path `identity.id`. With that getter present, `PartTree`
+sees a real `identityId` property and binds it as a **single segment** instead — and since JavAI resolves the
+path against *fields*, execution then fails with:
+
+```
+IllegalStateException: Expected field identityId on class ...Profile or one of its superclasses
+```
+
+The getter that "helps" is what breaks it. **Fix:** rename the getter (`identityIdOrNull()`,
+`resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
+JavAI reads fields.
+
+### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
+
+`summaryVector()` has to read each `@Summary` child's own summary. If that child is a still-uninitialized
+lazy association on a **detached** entity (anything returned from a repository), computing the summary throws
+`LazyInitializationException`, exactly like any other lazy dereference.
+
+This is deliberate, not an oversight: silently treating an unloadable child as contributing nothing would
+make `summaryVector()` depend on session state, so the identical object graph would summarize differently
+depending on how it happened to be loaded. **Fix:** fetch that association eagerly, or read the summary while
+the entity is still managed. Saving is unaffected — only reading a summary off a detached instance.
