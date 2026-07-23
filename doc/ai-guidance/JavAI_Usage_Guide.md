@@ -570,6 +570,26 @@ other four: Replicate has no vendor-wide embeddings contract, so it defaults to 
 field name that you should verify against whatever model you actually run — see `javai-vector/README.md`'s
 "Hosted-vendor providers" section for the full detail.
 
+**Transactions, in detail** — since **0.1.5** (Postgres), a `JavAIRepository` call joins a transaction that is
+already in progress instead of always opening its own:
+
+- **In a Spring application**, write ordinary `@Transactional` code and nothing else. Several repository
+  calls in one such method commit or roll back together, later calls see earlier ones' uncommitted writes,
+  and the annotation's attributes (`isolation`, `readOnly`, `rollbackFor`/`noRollbackFor`, `propagation`,
+  `timeout`) govern JavAI's writes because they run on the caller's own session and connection. **One wiring
+  requirement**: JavAI must share the application's factory, or it has nothing to join —
+  `.sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))` on the config builder.
+- **Outside Spring**, wrap the calls: `JavAIPI.inTransaction(config, () -> { repoA.save(a); repoB.save(b); })`.
+  One commit, or one rollback if the body throws. Nesting joins the outer body rather than starting a second
+  transaction, and the scope is thread-bound.
+- **With neither**, each call is its own transaction, exactly as before 0.1.5.
+
+Two edges worth knowing: a write inside `readOnly = true` fails loudly (Postgres rejects the INSERT), and
+`PROPAGATION_NESTED` is unavailable under `JpaTransactionManager` — Spring's Hibernate JPA dialect has no
+savepoint manager, so Spring refuses it before JavAI is reached. **Neo4j and MongoDB have no equivalent**:
+every call is its own unit of work there, and `JavAIPI.inTransaction` throws rather than pretending, so
+multi-call flows against those backends must be designed to be safely retryable.
+
 **Postgres schema naming, in detail** — since **0.1.5**, the `SessionFactory` JavAI builds applies
 `CamelCaseToUnderscoresNamingStrategy`, so `emailVerified` maps to the column `email_verified` and an entity
 `OrderLine` to the table `order_line`, exactly as Spring Boot would. Two things follow:

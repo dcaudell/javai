@@ -72,6 +72,17 @@
       <groupId>org.mongodb</groupId>
       <artifactId>mongodb-driver-sync</artifactId>
     </dependency>
+    <dependency>
+      <!-- OMI-146: lets a JavAIRepository call join a caller's Spring @Transactional unit of work rather
+           than always opening its own session. <optional> deliberately: only SpringManagedSessions touches
+           it, and only after a runtime presence check, so a non-Spring consumer never loads that class and
+           never needs this on their classpath. Being optional it is also not transitive: a Spring consumer
+           already has spring-orm via spring-data-jpa/spring-boot-starter-data-jpa, and one that doesn't is
+           by definition not the consumer this bridges to. -->
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-orm</artifactId>
+      <optional>true</optional>
+    </dependency>
 
     <dependency>
       <groupId>org.testcontainers</groupId>
