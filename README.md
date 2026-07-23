@@ -129,42 +129,42 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-vector</artifactId>
-     <version>0.1.4</version> <!-- match the current release -->
+     <version>0.1.5</version> <!-- match the current release -->
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-model</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-substrate</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-supervision</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-collections</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-persistence</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-completion</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-tagging</artifactId>
-     <version>0.1.4</version>
+     <version>0.1.5</version>
    </dependency>
    ```
 
@@ -174,14 +174,14 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
    ```kotlin
    dependencies {
-       implementation("io.github.dcaudell:javai-vector:0.1.4")
-       implementation("io.github.dcaudell:javai-model:0.1.4")
-       implementation("io.github.dcaudell:javai-substrate:0.1.4")
-       implementation("io.github.dcaudell:javai-supervision:0.1.4")
-       implementation("io.github.dcaudell:javai-collections:0.1.4")
-       implementation("io.github.dcaudell:javai-persistence:0.1.4")
-       implementation("io.github.dcaudell:javai-completion:0.1.4")
-       implementation("io.github.dcaudell:javai-tagging:0.1.4")
+       implementation("io.github.dcaudell:javai-vector:0.1.5")
+       implementation("io.github.dcaudell:javai-model:0.1.5")
+       implementation("io.github.dcaudell:javai-substrate:0.1.5")
+       implementation("io.github.dcaudell:javai-supervision:0.1.5")
+       implementation("io.github.dcaudell:javai-collections:0.1.5")
+       implementation("io.github.dcaudell:javai-persistence:0.1.5")
+       implementation("io.github.dcaudell:javai-completion:0.1.5")
+       implementation("io.github.dcaudell:javai-tagging:0.1.5")
    }
    ```
 
