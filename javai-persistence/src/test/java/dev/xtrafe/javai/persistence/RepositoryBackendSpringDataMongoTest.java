@@ -13,6 +13,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
@@ -49,6 +50,20 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * {@link RepositoryBackendSpringDataMongo#awaitIndexQueryable} already handles). {@link #awaitContainsId}
  * polls past this specific propagation lag wherever a test writes then immediately queries for that same
  * document -- a real difference from Postgres's/Neo4j's synchronous index updates, not a flake to paper over.
+ *
+ * <p><b>{@code Wait.forHealthcheck()} is load-bearing, not decoration (OMI-148).</b> This image restarts
+ * {@code mongod} <em>twice</em> while coming up -- confirmed empirically by watching a real container's
+ * logs, not assumed: it boots once to initialize the replica set, is {@code SIGTERM}'d, and restarts with
+ * the {@code mongotHost}/{@code searchIndexManagementHostAndPort} parameters set, then repeats. Testcontainers'
+ * default wait strategy is "the exposed port accepts a connection," which the *first* of those mongods
+ * already satisfies, so without an explicit strategy the test JVM connects to a deployment that is about to
+ * be torn down underneath it. Any Search-Index-Management command in flight across one of those restarts
+ * comes back as {@code error 90 (CallbackCanceled): 'onInvoke :: caused by :: Callback was canceled'},
+ * because {@code mongod}'s shutdown sequence cancels pending search-executor callbacks
+ * ({@code shutDownSearchTaskExecutors}). That produced a genuinely intermittent CI failure -- the same test
+ * passing on a re-run with no change -- until this strategy was added. The image ships its own
+ * {@code HEALTHCHECK}, which only reports healthy after the final restart, so waiting on it is both the
+ * correct readiness signal and cheap (~6s observed, versus the ~0s the port check returns in).
  */
 @Testcontainers
 class RepositoryBackendSpringDataMongoTest {
@@ -59,6 +74,7 @@ class RepositoryBackendSpringDataMongoTest {
     static final GenericContainer<?> mongo =
             new GenericContainer<>(DockerImageName.parse("mongodb/mongodb-atlas-local:8.2"))
                     .withExposedPorts(27017)
+                    .waitingFor(Wait.forHealthcheck())
                     .withStartupTimeout(Duration.ofMinutes(3));
 
     private static JavAIPersistenceConfig config;

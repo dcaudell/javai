@@ -14,6 +14,77 @@ version -- a given release usually changes only one or two of them.
 
 Nothing yet.
 
+## [0.1.6] - 2026-07-23
+
+### Fixed
+
+- **`javai-persistence` (Postgres): saving a `@JavAIVectorizable` entity with a *lazy* singular association
+  to another `@JavAIVectorizable` entity no longer fails (OMI-161).** It died with
+  `null value in column "owner_id" of relation "javai_vectors__<model>" violates not-null constraint`.
+
+  **Mechanism:** `save()` merges the caller's detached instance, and Hibernate's merged copy holds an
+  *uninitialized proxy* for a `FetchType.LAZY` singular association rather than loading the target. That
+  proxy subclasses the real entity, so it satisfied `instanceof JavAIVectorizable` and the related-entity
+  walk tried to write vectors for it -- but a proxy holds no field state, so reading its `@Id` reflectively
+  produced `null`. `getClass()` was wrong for the same reason (`Target$HibernateProxy$xyz`), so even a
+  correct id would have been filed under an `owner_type` no later lookup could match.
+
+  **Who was affected:** any Postgres entity with `@ManyToOne(fetch = LAZY)` or `@OneToOne(fetch = LAZY)`
+  pointing at another `@JavAIVectorizable`. Eager associations were never affected, which is why this went
+  unnoticed for so long -- both `@ManyToOne` and `@OneToOne` default to `EAGER`, and every singular
+  association in this project's own fixtures (and in `javai-tagging`'s shipped `Tag -> TagSet`) is eager, so
+  there was no lazy singular association to a vectorizable anywhere in the suite. Neo4j and MongoDB are
+  unaffected: neither has Hibernate proxies.
+
+  **Behavior now:** an *uninitialized* proxy is skipped -- an untouched association means nothing changed,
+  and its vectors were already written when it was saved through its own repository; initializing it would
+  cost a SELECT, and potentially a real embedding call, per association per save. An *initialized* proxy is
+  unwrapped and written under its real entity class, so touching a related entity
+  (`owner.getTarget().setLabel(...)`) still updates its vector rather than silently going stale.
+
+### Added
+
+- **`javai-persistence`: `JavAIPI.sessionFactory(JavAIPersistenceConfig)` (OMI-160).** Returns the Hibernate
+  `SessionFactory` this module built for that config -- the same instance every repository sharing it runs
+  on. Postgres only; the other backends throw rather than return null.
+
+  **Why:** a `JavAIRepository` call joins a Spring `@Transactional` unit of work only when Spring's
+  transaction manager and JavAI hold the *same* `SessionFactory` instance (the match is by identity). Until
+  now the only way to arrange that was `JavAIPersistenceConfig.Builder.sessionFactory(...)`, i.e. Spring
+  builds the factory and hands it over -- which skips the mapping-time hooks JavAI can only apply to a
+  factory it builds itself, so an interface-typed `@OneToMany JavAIList<T>` maps as a plain Hibernate bag.
+  Applications had to choose between working JavAI collections and working transactions. They no longer do:
+  let JavAI own the factory, ask for it, and wire a transaction manager onto it.
+
+  ```java
+  @Bean SessionFactory javAiSessionFactory(JavAIPersistenceConfig config) {
+      return JavAIPI.sessionFactory(config);
+  }
+  @Bean PlatformTransactionManager transactionManager(SessionFactory factory) {
+      return new JpaTransactionManager(factory);
+  }
+  ```
+
+  Two things to know, both now covered by tests rather than only prose. Use **`JpaTransactionManager`**, not
+  `HibernateTransactionManager`: the latter's `(SessionFactory)` constructor eagerly unwraps a
+  `javax.sql.DataSource` to share connections with plain JDBC, and a JavAI-built factory configures
+  Hibernate's own connection provider from raw `jakarta.persistence.jdbc.*` settings, so it throws
+  `UnknownUnwrapTypeException`. And asking for the factory **builds** it, which freezes the entity set --
+  call `JavAIPI.repository(...)` for every repository the application needs before this bean is created,
+  the same registration-before-use rule that already applies to invoking a repository method.
+
+### Documentation
+
+- **`doc/ai-guidance/JavAI_Usage_Guide.md`** now covers both ownership directions for the `SessionFactory`
+  and which to prefer, rather than presenting `Builder.sessionFactory(...)` as the only route to Spring
+  transactions.
+- **`doc/ai-guidance/persistence-support-matrix.md`** gains "Two traps that look like JavAI bugs and
+  aren't": a convenience getter colliding with a nested derived-finder path (Spring Data's `PartTree`
+  discovers properties from getters, so `getIdentityId()` makes `findByIdentityId` bind as one segment
+  instead of `identity.id`), and `@Summary` on a `FetchType.LAZY` association only summarizing inside a
+  session. Both are documented rather than changed -- the second deliberately, since silently dropping an
+  unloadable `@Summary` child would make `summaryVector()` depend on session state.
+
 ## [0.1.5] - 2026-07-23
 
 ### Changed -- BREAKING
@@ -95,5 +166,6 @@ Nothing yet.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/dcaudell/javai/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dcaudell/javai/compare/v0.1.4...v0.1.5

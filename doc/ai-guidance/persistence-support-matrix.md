@@ -70,7 +70,7 @@ hand-implemented.
 | **Nested path — singular** (`findByProfileHandle`) | ✅ | ✅ | ✅ | PG: native Criteria join. Neo4j: `EXISTS {}` traversal. Mongo: resolve referenced ids, match `field.id IN (…)`. |
 | **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | Same mechanisms; the to-many hop uses the collection's storage (Table 3). **Postgres:** a natively-mapped collection (plain JDK or interface-typed JavAI) resolves as a single **Criteria JOIN**; only a *concrete*-typed JavAI collection still uses id-set materialization (a query per hop). Mongo still uses id-set (references are `{type, id}` pointers); Neo4j composes `EXISTS {}` subqueries. |
 | `countBy…` / `existsBy…` | ✅ | ✅ | ✅ | Return `long`/`int` and `boolean` respectively. |
-| **Joining a caller's transaction** (Spring `@Transactional`, or `JavAIPI.inTransaction`) | ✅ | ❌ | ❌ | **Postgres, since 0.1.5 (OMI-146):** a repository call runs on the caller's session when one is active — a Spring `@Transactional` method (needs `Builder.sessionFactory(...)` sharing the app's own factory; works with `JpaTransactionManager` and `HibernateTransactionManager`, class- or method-level) or a `JavAIPI.inTransaction(config, body)` block — and opens its own session only when there is none. Vector rows commit/roll back with the caller. Neo4j/Mongo: every call is still its own unit of work, and `inTransaction` throws rather than pretending; design multi-call flows there to be idempotent. |
+| **Joining a caller's transaction** (Spring `@Transactional`, or `JavAIPI.inTransaction`) | ✅ | ❌ | ❌ | **Postgres, since 0.1.5 (OMI-146):** a repository call runs on the caller's session when one is active — a Spring `@Transactional` method or a `JavAIPI.inTransaction(config, body)` block — and opens its own session only when there is none. `@Transactional` needs Spring's transaction manager and JavAI to hold the *same* `SessionFactory` (matched by identity), which since **0.1.6 (OMI-160)** you can get either way round: let JavAI own the factory and ask for it with `JavAIPI.sessionFactory(config)` (**preferred** — keeps the mapping hooks that make an interface-typed `@OneToMany JavAIList<T>` a real JavAI collection; wire it to `JpaTransactionManager`, *not* `HibernateTransactionManager`, which can't unwrap a `DataSource` from it), or let Spring own it and hand it over with `Builder.sessionFactory(...)` (works with either manager, but loses those hooks). Vector rows commit/roll back with the caller. Neo4j/Mongo: every call is still its own unit of work, and `inTransaction` throws rather than pretending; design multi-call flows there to be idempotent. |
 | `deleteBy…` | ✅ | ✅ | ✅ | PG deletes per-id (cascades vectors + collection members) · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). |
 | `OrderBy…` / dynamic `Sort` — **root scalar** | ✅ | ✅ | ✅ | |
 | `OrderBy…` / `Sort` — **nested singular path** | ✅ | ❌ | ❌ | Neo4j/Mongo sort only by a root scalar; a nested/to-many sort is rejected at creation. |
@@ -123,3 +123,45 @@ Notes:
   `@OneToMany`. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
 - **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Embedded`, and nested/ to-many *sort*)
   if the same entity must run on more than one backend.
+
+---
+
+## Two traps that look like JavAI bugs and aren't
+
+### A convenience getter can break a nested finder (OMI-161)
+
+Derived finder names are parsed with Spring Data's `PartTree`, which discovers properties from **getters as
+well as fields**. Adding a convenience getter whose name collides with a nested path therefore *changes how
+that path is split*:
+
+```java
+@Entity @JavAIVectorizable
+public class Profile {
+    @OneToOne private Identity identity;
+
+    public UUID getIdentityId() { return identity.getId(); }   // <-- innocuous-looking
+}
+```
+
+`findByIdentityId` previously split into the nested path `identity.id`. With that getter present, `PartTree`
+sees a real `identityId` property and binds it as a **single segment** instead — and since JavAI resolves the
+path against *fields*, execution then fails with:
+
+```
+IllegalStateException: Expected field identityId on class ...Profile or one of its superclasses
+```
+
+The getter that "helps" is what breaks it. **Fix:** rename the getter (`identityIdOrNull()`,
+`resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
+JavAI reads fields.
+
+### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
+
+`summaryVector()` has to read each `@Summary` child's own summary. If that child is a still-uninitialized
+lazy association on a **detached** entity (anything returned from a repository), computing the summary throws
+`LazyInitializationException`, exactly like any other lazy dereference.
+
+This is deliberate, not an oversight: silently treating an unloadable child as contributing nothing would
+make `summaryVector()` depend on session state, so the identical object graph would summarize differently
+depending on how it happened to be loaded. **Fix:** fetch that association eagerly, or read the summary while
+the entity is still managed. Saving is unaffected — only reading a summary off a detached instance.

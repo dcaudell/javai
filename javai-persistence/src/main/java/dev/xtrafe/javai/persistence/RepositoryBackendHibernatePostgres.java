@@ -18,6 +18,7 @@ import jakarta.persistence.criteria.Expression;
 import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Path;
 import jakarta.persistence.criteria.Predicate;
+import org.hibernate.Hibernate;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
@@ -1354,9 +1355,45 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 writeVectorsForCollectionMembers(session, map.values());
             } else if (value instanceof Collection<?> collection) {
                 writeVectorsForCollectionMembers(session, collection);
-            } else if (value instanceof JavAIVectorizable vectorizable) {
-                writeVectors(session, value.getClass(), vectorizable);
+            } else {
+                writeVectorsForRelatedEntity(session, value);
             }
+        }
+    }
+
+    /**
+     * Writes one related entity's vectors, resolving a Hibernate proxy first (OMI-161).
+     *
+     * <p><b>Why this can't just be {@code value instanceof JavAIVectorizable}.</b> {@code save()} merges the
+     * caller's detached instance, and Hibernate's merged copy holds an <em>uninitialized proxy</em> for a
+     * {@code FetchType.LAZY} singular association rather than loading the target. That proxy is a generated
+     * subclass of the real entity, so it satisfies {@code instanceof JavAIVectorizable} perfectly well --
+     * but its {@code @Id} field is never populated (a proxy delegates through an interceptor rather than
+     * holding state), so {@code EntityReflection.readId} read {@code null} from it and the vector INSERT
+     * died on {@code owner_id}'s NOT NULL constraint. {@code getClass()} would have been wrong too:
+     * {@code Target$HibernateProxy$xyz}, not {@code Target}, so even a correct id would have been filed
+     * under an {@code owner_type} nothing could ever look up again.
+     *
+     * <p><b>Uninitialized proxies are skipped, not initialized.</b> An untouched lazy association means the
+     * caller never looked at that entity, so nothing about it changed and its vectors were already written
+     * when it was saved through its own repository. Forcing initialization to "be safe" would cost a SELECT
+     * per association per save, and -- because a freshly-loaded entity recomputes lazily -- potentially a
+     * real embedding call for an entity nobody touched.
+     *
+     * <p><b>Initialized proxies are unwrapped and written.</b> Touching the association (say
+     * {@code owner.getTarget().setLabel(...)}) initializes it, and that mutation genuinely does need a new
+     * vector row -- so those resolve to the real instance and its real entity class. Skipping every proxy
+     * indiscriminately would have traded this bug for a quieter one: a modified related entity whose vector
+     * silently went stale.
+     */
+    private void writeVectorsForRelatedEntity(Session session, Object value) {
+        if (value == null || !Hibernate.isInitialized(value)) {
+            return;
+        }
+        Object related = Hibernate.unproxy(value);
+        if (related instanceof JavAIVectorizable vectorizable
+                && related.getClass().isAnnotationPresent(Entity.class)) {
+            writeVectors(session, related.getClass(), vectorizable);
         }
     }
 
@@ -1368,10 +1405,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  caller because {@link #syncCollectionMembers} already does this for them. */
     private void writeVectorsForCollectionMembers(Session session, Collection<?> members) {
         for (Object member : members) {
-            if (member instanceof JavAIVectorizable vectorizable
-                    && member.getClass().isAnnotationPresent(Entity.class)) {
-                writeVectors(session, member.getClass(), vectorizable);
-            }
+            // Same proxy resolution as a singular association -- a lazily-mapped element can be a proxy
+            // here just as readily (OMI-161). This used to rely on `@Entity` not being inherited by the
+            // generated proxy subclass to skip them, which happened to avoid the crash but also silently
+            // dropped *initialized* proxies whose entity the caller had genuinely modified.
+            writeVectorsForRelatedEntity(session, member);
         }
     }
 
@@ -1760,7 +1798,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
-    private SessionFactory sessionFactory() {
+    /** Package-private rather than private so {@link JavAIPI#sessionFactory(JavAIPersistenceConfig)} can
+     *  hand this exact instance to a caller wiring their own Spring transaction manager (OMI-160). */
+    SessionFactory sessionFactory() {
         SessionFactory factory = sessionFactory;
         if (factory != null) {
             return factory;
@@ -1806,10 +1846,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  produces no Hibernate event at all, which is exactly the case {@code reindexAll()} relies on. */
     private void writeVectorsForFlushedEntities(Session session) {
         for (Object entity : JavAIFlushVectorListener.current().persisted()) {
-            if (entity instanceof JavAIVectorizable vectorizable
-                    && entity.getClass().isAnnotationPresent(Entity.class)) {
-                writeVectors(session, entity.getClass(), vectorizable);
-            }
+            // Proxy-resolving, for consistency with the two explicit walks above (OMI-161).
+            writeVectorsForRelatedEntity(session, entity);
         }
     }
 

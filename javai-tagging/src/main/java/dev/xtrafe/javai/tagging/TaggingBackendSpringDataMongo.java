@@ -57,6 +57,9 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
      *  {@code @Taggable} type at once, the same goal Neo4j's shared {@code JavAITagged} label serves there. */
     private static final String TAG_SUMMARY_VECTORS_COLLECTION = "_javaiTagSummaryVectors";
 
+    /** MongoDB's {@code CallbackCanceled} -- see {@link #isTransientSearchServiceError}. */
+    private static final int CALLBACK_CANCELED_ERROR_CODE = 90;
+
     private final JavAIPersistenceConfig config;
     private final Set<String> tagSummaryVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean tagSummaryVectorsUniqueIndexEnsured = new AtomicBoolean();
@@ -217,7 +220,7 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
                 if (isDuplicateIndexError(e)) {
                     return;
                 }
-                if (!isSearchServiceNotYetReadyError(e) || Instant.now().isAfter(deadline)) {
+                if (!isTransientSearchServiceError(e) || Instant.now().isAfter(deadline)) {
                     throw e;
                 }
                 try {
@@ -240,7 +243,7 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
                     }
                 }
             } catch (MongoCommandException e) {
-                if (!isSearchServiceNotYetReadyError(e)) {
+                if (!isTransientSearchServiceError(e)) {
                     throw e;
                 }
             }
@@ -261,7 +264,14 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         return message != null && message.toLowerCase(Locale.ROOT).contains("already exist");
     }
 
-    private static boolean isSearchServiceNotYetReadyError(MongoCommandException e) {
+    /** See {@code RepositoryBackendSpringDataMongo.isTransientSearchServiceError}'s own javadoc -- same two
+     *  transient causes ({@code mongot} not reachable yet, and {@code CallbackCanceled} when a command is in
+     *  flight across one of {@code mongodb-atlas-local}'s two startup restarts, OMI-148), same reasoning for
+     *  retrying rather than surfacing both. */
+    private static boolean isTransientSearchServiceError(MongoCommandException e) {
+        if (e.getErrorCode() == CALLBACK_CANCELED_ERROR_CODE) {
+            return true;
+        }
         String message = e.getErrorMessage();
         return message != null && message.toLowerCase(Locale.ROOT).contains("search index management service");
     }
