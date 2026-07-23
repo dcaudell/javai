@@ -5,6 +5,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.function.Supplier;
 
 /**
  * The backend-agnostic contract {@link RepositoryInvocationHandler} dispatches to --
@@ -22,7 +23,7 @@ interface RepositoryBackend {
 
     /**
      * Registers {@code entityType} as one this backend must be able to persist. Called for every
-     * repository interface {@link JavAIPI#repository(Class)} creates, before any method is actually
+     * repository interface {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} creates, before any method is actually
      * invoked -- see {@code RepositoryBackendHibernatePostgres}'s javadoc for why registration and first
      * use are different moments (Hibernate's {@code SessionFactory} metadata is immutable once built).
      */
@@ -52,6 +53,23 @@ interface RepositoryBackend {
         for (Object entity : findAll(entityType)) {
             save(entityType, entity);
         }
+    }
+
+    /**
+     * Runs {@code body} so that every repository call it makes against this backend commits, or rolls back,
+     * as one unit of work -- {@link JavAIPI#inTransaction}'s SPI half (OMI-146).
+     *
+     * <p>Refuses by default rather than silently running the body without any transaction at all: a caller
+     * reaching for this method is asking for atomicity across several calls, and quietly giving them the
+     * per-call behavior they were trying to escape would be worse than telling them the backend can't. Only
+     * the Postgres/Hibernate backend overrides it; Neo4j's driver-level transactions and MongoDB's
+     * multi-document ones are real but are not wired through this SPI in this phase.
+     */
+    default <T> T inTransaction(Supplier<T> body) {
+        throw new UnsupportedOperationException("JavAIPI.inTransaction(...) is supported on the Postgres "
+                + "backend only in this phase -- " + getClass().getSimpleName() + " runs each repository call "
+                + "as its own unit of work. Compose the calls so each is independently safe to retry, or use "
+                + "the store's own driver/template transaction API directly for this sequence.");
     }
 
     Optional<Object> findById(Class<?> entityType, UUID id);

@@ -44,7 +44,18 @@ duplicate every module's coordinate + version:
   promising the number is current -- update it anyway when you bump, but that sentence is why a stale
   number here is a *documentation* bug, not a silent-trust bug.
 
-### 4. `doc/release-process.md` -- deliberately version-agnostic, not a bump target
+### 4. `CHANGELOG.md` -- not a version *string* to replace, but a bump-time edit
+
+The root [`CHANGELOG.md`](../../CHANGELOG.md) carries an `## [Unreleased]` section that accumulates entries
+as work lands. A bump turns that heading into the version being released (`## [0.1.5] - YYYY-MM-DD`), adds a
+fresh empty `## [Unreleased]` above it, and updates the link definitions at the bottom (`[Unreleased]` to
+compare against the new tag, plus a new `[X.Y.Z]` compare link). Unlike every other location here, a stale
+version number isn't the failure mode -- a *missing entry* is, so the real check is whether everything
+user-visible since the last release is described, not whether a number was replaced.
+
+Started at 0.1.5; releases before that are deliberately not reconstructed (see the file's own header).
+
+### 5. `doc/release-process.md` -- deliberately version-agnostic, not a bump target
 
 Uses a generic `vX.Y.Z` placeholder in its flow diagram and tag-commands rather than a real version number,
 specifically so this file never needs touching on a routine bump. If you ever find a real version number
@@ -80,20 +91,26 @@ creep back into it, that's a regression -- replace it with the placeholder rathe
    shipped in the reactor for a full session before anyone noticed it was missing from both files' install
    instructions).
 
-4. **Do not touch `doc/release-process.md`** -- its `vX.Y.Z` placeholders are intentionally generic (see
-   "Location 4" above).
+4. **`CHANGELOG.md`, by hand** (see "Location 4" above): rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`,
+   open a fresh empty `## [Unreleased]` above it, and fix the compare links at the bottom of the file. Read
+   the entries while you're there -- an empty or thin section on a release that clearly changed behavior means
+   the entry was never written, which is the failure this file actually guards against.
 
-5. **Verify nothing was missed:**
+5. **Do not touch `doc/release-process.md`** -- its `vX.Y.Z` placeholders are intentionally generic (see
+   "Location 5" above).
+
+6. **Verify nothing was missed:**
 
    ```bash
    grep -rn "OLD.VERSION.HERE" . --include="*.xml" --include="*.md" 2>/dev/null | grep -v "/target/"
    ```
 
    Expect zero hits outside of deliberate historical/narrative mentions (e.g. `doc/release-process.md`'s own
-   "already done" note citing real past tags by their real version, or a changelog-style sentence
-   describing what a past release did).
+   "already done" note citing real past tags by their real version, `CHANGELOG.md`'s entries for past
+   releases, which cite their own versions by design, or a changelog-style sentence describing what a past
+   release did).
 
-6. **Rebuild to confirm the new version actually resolves:**
+7. **Rebuild to confirm the new version actually resolves:**
 
    ```bash
    mvn -q install -DskipTests          # from the repo root -- 9-module reactor

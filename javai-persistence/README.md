@@ -125,6 +125,98 @@ an already-registered type's own fields are discovered and registered automatica
 need to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and
 independently* (Neo4j is the exception here -- see below).
 
+## Transactions: joining a caller's unit of work (Postgres)
+
+Up to 0.1.4 every repository call opened its own session and committed on its own, so several calls could
+never be one atomic unit -- a `@Transactional` service method composing four repositories got four
+transactions, and a failure on the last left the first three permanently committed. Since 0.1.5 (OMI-146) a
+call **joins a transaction that already exists** and only opens its own when there is none:
+
+| Situation | What a repository call does |
+|---|---|
+| Inside a Spring `@Transactional` method, JavAI configured with that application's own `SessionFactory` | Joins it. Commits/rolls back with the caller, never separately. |
+| Inside `JavAIPI.inTransaction(config, ...)` | Joins that body's session; the whole body commits once. |
+| Anywhere else | Opens a session, commits, closes -- exactly the pre-0.1.5 behavior. |
+
+**Spring consumers need no JavAI-specific API at all**, provided JavAI shares the application's factory:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))   // the app's own factory
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        .build();
+
+@Transactional                       // ordinary Spring; nothing below knows about JavAI
+public void recordEntry(...) {
+    channels.save(channel);          // all three
+    participants.save(participant);  //   share one
+    entries.save(entry);             //     transaction
+}
+```
+
+This works for `JpaTransactionManager` and `HibernateTransactionManager` alike, for class-level and
+method-level `@Transactional`, and it honors the annotation's attributes because JavAI is writing through the
+caller's own session and connection -- `isolation` reaches JavAI's writes, `readOnly` makes them fail loudly
+(Postgres rejects the INSERT), `rollbackFor`/`noRollbackFor` decide JavAI's rows along with everything else,
+and `REQUIRES_NEW`/`NOT_SUPPORTED` correctly *don't* get joined, since the caller has stepped outside the
+transaction. `SpringTransactionalIntegrationTest` asserts each of these against a real Postgres.
+
+Two things this does **not** do. Vector rows are written before the caller's commit, on the caller's own
+connection, so they roll back with it -- but a *read-only* transaction therefore can't write them either.
+And `PROPAGATION_NESTED` is unavailable under `JpaTransactionManager`: Spring's Hibernate JPA dialect exposes
+no savepoint manager, so Spring refuses the call before JavAI is involved (it works under
+`HibernateTransactionManager`, and both cases are pinned by tests).
+
+**Non-Spring callers** get the same atomicity explicitly:
+
+```java
+JavAIPI.inTransaction(config, () -> {
+    Channel channel = channels.save(findOrCreateChannel(platform));
+    entries.save(new ConversationEntry(channel, text));
+});   // one commit; any exception rolls back both
+```
+
+Nesting joins rather than nests (Spring's `PROPAGATION_REQUIRED` semantics), so two methods that each wrap
+their own work this way stay composable. It is thread-bound, like Spring's own transaction management: work
+handed to another thread inside the body is not part of the transaction. Postgres only -- Neo4j and MongoDB
+throw a message saying so rather than pretending to be atomic.
+
+## Physical naming, and configuring the `SessionFactory` JavAI builds (Postgres)
+
+**Columns and tables are snake_cased by default** (OMI-145, 0.1.5): a field `emailVerified` maps to
+`email_verified` and an entity `TestCrew` to `test_crew`, matching Spring Boot's own default and ordinary SQL
+convention. Up to 0.1.4 this backend set no naming strategy at all, so Hibernate's bare default produced
+`emailverified` -- which broke the case that matters most in practice: pointed at a table another tool had
+already created conventionally, `hbm2ddl=update` **added a second, differently-cased set of columns** beside
+the existing ones, and the following insert populated JavAI's copy while leaving the original `NOT NULL`
+column null. See `CHANGELOG.md` for the migration note; this is a breaking change for any pre-0.1.5 schema
+with a multi-word field or class name.
+
+Two knobs, both on `JavAIPersistenceConfig.Builder`:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        // 1. Typed override -- e.g. pin the pre-0.1.5 naming instead of migrating an existing schema:
+        .physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())
+        // 2. General passthrough -- any Hibernate setting with no typed method of its own:
+        .hibernateProperty("hibernate.jdbc.batch_size", 50)
+        .build();
+```
+
+The passthrough is applied **after** the settings this module sets itself (`jakarta.persistence.jdbc.url`/
+`.user`/`.password`, `hibernate.hbm2ddl.auto`), so an explicitly-named key beats JavAI's own default --
+deliberate, since naming a setting outright is the more specific instruction. Between the two knobs,
+`physicalNamingStrategy(...)` wins over a `hibernate.physical_naming_strategy` passed as a raw property.
+
+Both are inert when `Builder.sessionFactory(...)` supplies a factory JavAI didn't build, and inert on Neo4j
+and MongoDB, which classify fields by declared type and have no equivalent of JPA column naming. Note that
+supplying your own `SessionFactory` still skips the two mapping-time hooks (`attachJavAICollectionTypes`,
+`buildAutoTransientOverrideXml`) that JavAI collection fields depend on -- these knobs exist so that needing
+particular Hibernate settings no longer forces that trade-off.
+
 ## Collections: `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap` fields
 
 A field typed as one of `javai-model`'s concrete vector-aware collections can never be a *native*
@@ -182,16 +274,10 @@ the same way `RepositoryBackendNeo4jTest`'s equivalent test does.
 referenced document simply becomes unreferenced, not deleted. Documented as a known Phase 0 boundary in
 `RepositoryBackendSpringDataMongo`'s own javadoc, not an oversight.
 
-**Future direction: `UserCollectionType`.** A more ambitious fix -- letting these fields map *natively* via
-Hibernate's `org.hibernate.usertype.UserCollectionType` SPI, which lets a custom `PersistentCollection`
-implementation stand in for `PersistentBag`/`PersistentSet`/`PersistentMap` and could in principle preserve
-JavAI's vector/dirty-tracking behavior *while* being a real, natively Hibernate-managed association -- is
-deliberately not pursued yet. It's Postgres/Hibernate-only (Neo4j has no equivalent concept and would remain
-on its own reflective mechanism regardless, breaking the symmetry the two backends otherwise share), and
-correctly implementing a custom `PersistentCollection` is a substantial, easy-to-get-subtly-wrong undertaking
-(dirty-checking snapshot semantics, session attachment/detachment, lazy-initialization) disproportionate to
-a Phase 0 module whose job is proving the design space, not hardening a production ORM integration. Worth
-revisiting if this module graduates past Phase 0.
+**On Postgres, `UserCollectionType` makes interface-typed JavAI collections native JPA associations** --
+see "JavAI collections as native JPA associations (OMI-142)" under "What's actually implemented" below for
+the mechanism and for how the two shapes (native association vs. side table) coexist. Neo4j and MongoDB have no equivalent concept and stay on the
+reflective, declared-type classification described above.
 
 ## `KnowledgeGraph<N, E>` fields -- Neo4j only
 
@@ -308,6 +394,16 @@ above. `reindexAll()` needed no backend-specific code at all -- it's dispatched 
 `RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
 methods.
 
+**Transaction participation (OMI-146), Postgres.** A repository call joins a Spring `@Transactional` unit of
+work or a `JavAIPI.inTransaction(...)` body when one is active, and opens its own session only when there
+isn't -- see "Transactions" above. `SpringTransactionalIntegrationTest` (19 tests, real Spring contexts over a
+real Postgres) and `JavAIProgrammaticTransactionTest` (5) cover both paths.
+
+**Configurable physical naming (OMI-145), Postgres.** snake_case by default, overridable via
+`Builder.physicalNamingStrategy(...)`, plus a general `Builder.hibernateProperty(...)`/`.hibernateProperties(...)`
+passthrough for any other Hibernate setting -- see "Physical naming" above. `PhysicalNamingStrategyTest`
+asserts the generated DDL for each case, including the precedence between the two knobs.
+
 **JavAI collections as native JPA associations (OMI-142), Postgres.** A collection field declared by a JavAI
 *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with an ordinary `@OneToMany`/`@ManyToMany`, is now
 a genuine Hibernate association -- its own join table/FK, cascade, `orphanRemoval`, lazy loading -- while the
@@ -409,8 +505,10 @@ express.
 - No dual-write/transactional multi-backend `save()` -- persisting one entity type to more than one store
   simultaneously means two independently-created repository proxies, one per backend (see
   `doc/spec/persistence-bridge.md`'s own section on this).
-- The `UserCollectionType`-based native mapping described above -- documented as a real future direction,
-  not started.
+- Native JPA associations (`UserCollectionType`) are Postgres-only. Neo4j and MongoDB classify collection
+  fields by declared type and have no equivalent, so an interface-typed JavAI collection field behaves the
+  same as a concrete-typed one there -- an asymmetry by necessity, not an omission (neither store has a
+  Hibernate provider that could serve JPA associations).
 
 `e2e-client-test` now exercises this module directly: `PersistenceE2ETest`/`ArticleFixtureVolumeE2ETest`
 save/query this project's own real `Article`/`Comment`/`Attachment` domain (not this module's own flat test

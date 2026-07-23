@@ -55,11 +55,14 @@ class SchemaDdlE2ETest {
         assertTrue(tables.containsAll(Set.of("article", "comment", "attachment", "place")),
                 "each @Entity must get its own table; found: " + tables);
 
-        // Singular @OneToOne associations are ordinary FK columns on the owning table.
+        // Singular @OneToOne associations are ordinary FK columns on the owning table. Snake-cased
+        // (featured_comment_id, not featuredcomment_id) since OMI-145 made
+        // CamelCaseToUnderscoresNamingStrategy this backend's default physical naming -- a client that
+        // needs the old names pins them back via JavAIPersistenceConfig.Builder.physicalNamingStrategy.
         Set<String> articleColumns = columns("article");
-        assertTrue(articleColumns.containsAll(Set.of("featuredcomment_id", "draftcomment_id", "attachment_id")),
+        assertTrue(articleColumns.containsAll(Set.of("featured_comment_id", "draft_comment_id", "attachment_id")),
                 "singular associations must be FK columns on article; found: " + articleColumns);
-        assertTrue(foreignKeys("article").contains("featuredcomment_id -> comment"));
+        assertTrue(foreignKeys("article").contains("featured_comment_id -> comment"));
     }
 
     /** The Phase 2 payoff, in DDL: a JavAI collection that is a real Hibernate association. */
@@ -99,7 +102,7 @@ class SchemaDdlE2ETest {
     void collectionFieldsNeverBecomeColumnsOnTheOwningTable() throws Exception {
         Set<String> articleColumns = columns("article");
         assertFalse(articleColumns.contains("comments"), "a collection is never a column: " + articleColumns);
-        assertFalse(articleColumns.contains("relatedcomments"), "a collection is never a column: " + articleColumns);
+        assertFalse(articleColumns.contains("related_comments"), "a collection is never a column: " + articleColumns);
     }
 
     /** Vectors live in per-model side tables -- never on the developer's own entity table. */

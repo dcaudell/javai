@@ -22,9 +22,13 @@ import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
 import org.hibernate.boot.Metadata;
+import org.hibernate.boot.MetadataBuilder;
 import org.hibernate.boot.MetadataSources;
+import org.hibernate.boot.model.naming.CamelCaseToUnderscoresNamingStrategy;
+import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
 import org.hibernate.event.service.spi.EventListenerRegistry;
 import org.hibernate.event.spi.EventType;
@@ -58,6 +62,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -96,21 +102,39 @@ import java.util.concurrent.ConcurrentHashMap;
  * (e.g. a {@code @OneToOne}) is ordinary Hibernate mapping -- no conflict, since Hibernate never needs to
  * substitute anything for a non-collection field. A {@code Collection}/{@code Map}-typed field is
  * different: Hibernate always substitutes its own {@code PersistentBag}/{@code PersistentSet}/
- * {@code PersistentMap} the instant the field is persisted, which fails outright (a
- * {@code ClassCastException}, confirmed empirically) if the field is statically typed as a concrete JavAI
- * collection class ({@code JavAIArrayList}/{@code JavAILinkedHashSet}/{@code JavAILinkedHashMap}) rather
- * than a plain {@code List}/{@code Set}/{@code Map} interface -- and even declaring the field by interface
- * type wouldn't help, since Hibernate would then silently replace the real instance with its own wrapper,
- * permanently discarding the JavAI object's vector/dirty-tracking behavior with no error at all. Rather than
- * force every JavAI collection field to give up its real type (or its behavior) for Hibernate's sake, such
- * fields are excluded from Hibernate's mapping entirely and instead round-trip through
- * {@code javai_collection_members} -- a single, shared (not per-model) table this backend owns
- * (owner/field/member identity, an optional string key for {@code Map} fields, and an ordinal for order),
- * populated by {@link #syncCollectionMembers} on save and read back by {@link #hydrateCollectionMembers} on
- * load. Being reflective rather than proxy-based, hydration adds members into whatever collection instance
- * the entity's own no-arg constructor already created (a real {@code JavAIArrayList}, full dirty-tracking
- * intact) instead of replacing it -- the same trick {@code RepositoryBackendNeo4j} already relies on for
- * its own relationship hydration, applied here for symmetry across both backends.
+ * {@code PersistentMap} the instant the field is persisted. A JavAI collection field therefore takes one of
+ * two supported shapes, decided entirely by its <em>declared type</em> (see {@link #isJavAICollectionField},
+ * which is why the classification is 100%-confidence rather than a heuristic):
+ *
+ * <p><b>1. Declared by the interface, carrying a JPA annotation -- a native Hibernate association.</b>
+ * {@code @OneToMany private JavAIList<Comment> comments = new JavAIArrayList<>();} -- interface-typed, and
+ * non-final, since Hibernate assigns the field its own instance -- maps exactly like any other JPA
+ * association: a real join table with foreign keys both ways, lazy loading, {@code mappedBy}, cascades,
+ * {@code @ManyToMany} shared ownership. What Hibernate substitutes in is {@link PersistentJavAIList}/
+ * {@link PersistentJavAISet}/{@link PersistentJavAIMap} -- JavAI's own {@code PersistentCollection}
+ * implementations -- rather than {@code PersistentBag}/{@code PersistentSet}/{@code PersistentMap}, so the
+ * field keeps its vector and dirty-tracking behavior across the substitution instead of losing it. The
+ * consumer writes nothing JavAI-specific to get this; see {@link #attachJavAICollectionTypes} below.
+ * Nothing about such a field touches {@code javai_collection_members}.
+ *
+ * <p><b>2. Declared by the concrete class, unannotated -- JavAI's own side-table storage.</b> A field
+ * statically typed as a concrete JavAI collection class ({@code JavAIArrayList}/{@code JavAILinkedHashSet}/
+ * {@code JavAILinkedHashMap}) can never be Hibernate-managed -- the substitution fails outright with a
+ * {@code ClassCastException}, confirmed empirically. Such fields are excluded from Hibernate's mapping
+ * entirely and instead round-trip through {@code javai_collection_members} -- a single, shared (not
+ * per-model) table this backend owns (owner/field/member identity, an optional string key for {@code Map}
+ * fields, and an ordinal for order), populated by {@link #syncCollectionMembers} on save and read back by
+ * {@link #hydrateCollectionMembers} on load. Being reflective rather than proxy-based, hydration adds
+ * members into whatever collection instance the entity's own no-arg constructor already created (a real
+ * {@code JavAIArrayList}, full dirty-tracking intact) instead of replacing it -- the same trick
+ * {@code RepositoryBackendNeo4j} already relies on for its own relationship hydration, applied here for
+ * symmetry across both backends.
+ *
+ * <p>Both shapes are fully supported and can coexist in the same entity, field by field. The one
+ * combination that cannot work -- a concrete-typed field carrying {@code @OneToMany}/{@code @ManyToMany} --
+ * is rejected eagerly by {@link #validateCollectionFieldMapping} with a message naming the interface-typed
+ * fix. Note this is a Postgres-only distinction: the Neo4j and MongoDB backends classify collections purely
+ * by declared type and have no equivalent of a native JPA association.
  *
  * <p><b>No manual {@code @Transient} required.</b> {@link #registerEntityType} reflectively detects, for
  * every registered entity type, which fields are shaped like a JavAI collection (a {@code Collection}/
@@ -126,6 +150,32 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code JavAIDirtyTracking}-implementing collection can never be validly Hibernate-mapped natively
  * regardless of context.
  *
+ * <p><b>Transactions: joins the caller's, or opens its own (OMI-146).</b> Every operation resolves its
+ * session through {@link #ambientSession()} rather than calling {@code openSession()} directly. When the
+ * caller already owns a unit of work -- a Spring {@code @Transactional} method (shared-{@code SessionFactory}
+ * mode; see {@link SpringManagedSessions}) or a {@link JavAIPI#inTransaction} body (see
+ * {@link JavAITransactionScope}) -- the call runs on that session and neither commits nor closes it, so
+ * several repository calls compose into one atomic unit and this backend's vector/collection/geo writes land
+ * or roll back with everything else the caller did. With no ambient transaction the behavior is exactly what
+ * it was before: open a session, commit, close. The distinction matters most for the write path, where
+ * vectors used to be committed by a transaction of this backend's own that the caller could not roll back.
+ *
+ * <p><b>Physical naming: snake_case by default, and configurable (OMI-145).</b> The {@code SessionFactory}
+ * this class builds applies {@link CamelCaseToUnderscoresNamingStrategy}, so {@code emailVerified} maps to
+ * the column {@code email_verified} and an entity {@code TestCrew} to the table {@code test_crew} -- matching
+ * Spring Boot's default and ordinary SQL convention rather than Hibernate's bare default
+ * ({@code emailverified}). This is not cosmetic: pointed at a table another tool already created under the
+ * conventional naming, the bare default made {@code hbm2ddl=update} add a second, differently-cased set of
+ * columns beside the existing ones instead of recognizing them, and the following insert then populated
+ * JavAI's copy while leaving the original {@code NOT NULL} column null. Override via
+ * {@link JavAIPersistenceConfig.Builder#physicalNamingStrategy} (including pinning the pre-0.1.5 behavior
+ * with {@code PhysicalNamingStrategyStandardImpl}) or the general
+ * {@link JavAIPersistenceConfig.Builder#hibernateProperty} passthrough -- see
+ * {@link #resolvePhysicalNamingStrategy} for the precedence between those two. None of this affects the
+ * tables this backend owns itself ({@code javai_vectors__*}, {@code javai_collection_members},
+ * {@code javai_geo_points}): their names and columns are literals in this class, never derived from a
+ * naming strategy.
+ *
  * <p><b>Related entity types are auto-registered too.</b> {@link #registerEntityType} also walks each
  * registered type's fields recursively: a singular {@code @Entity}-typed field, or a {@code Collection}/
  * {@code Map} field whose element/value type is {@code @Entity}-annotated, is registered automatically.
@@ -139,17 +189,21 @@ import java.util.concurrent.ConcurrentHashMap;
  * registration time, and throws a clear {@code IllegalArgumentException} for any other key type rather than
  * silently storing a stringified key that could never correctly round-trip back to its original type.
  *
- * <p><b>Future direction.</b> A more ambitious fix -- letting these fields map <em>natively</em> via
- * Hibernate's {@code org.hibernate.usertype.UserCollectionType} SPI, which lets a custom
- * {@code PersistentCollection} implementation stand in for {@code PersistentBag}/{@code PersistentSet}/
- * {@code PersistentMap} and could in principle preserve JavAI's vector/dirty-tracking behavior *while*
- * being a real, natively Hibernate-managed association -- is deliberately not pursued here. It's
- * Postgres/Hibernate-only (Neo4j has no equivalent concept and would remain on its own reflective
- * mechanism regardless, breaking the symmetry the two backends otherwise share), and correctly
- * implementing a custom {@code PersistentCollection} is a substantial, easy-to-get-subtly-wrong undertaking
- * (dirty-checking snapshot semantics, session attachment/detachment, lazy-initialization) disproportionate
- * to a Phase 0 module whose job is proving the design space, not hardening a production ORM integration.
- * See {@code javai-persistence/README.md} for the same note in context.
+ * <p><b>How the native mapping is attached.</b> Shape 1 above is delivered by Hibernate's
+ * {@code org.hibernate.usertype.UserCollectionType} SPI, which lets a custom {@code PersistentCollection}
+ * implementation stand in for {@code PersistentBag}/{@code PersistentSet}/{@code PersistentMap}. JavAI
+ * ships three ({@link JavAIListType}/{@link JavAISetType}/{@link JavAIMapType}, producing the three
+ * {@code PersistentJavAI*} collections), and {@link #attachJavAICollectionTypes} binds them by walking
+ * {@code metadata.getCollectionBindings()} in the window between {@code buildMetadata()} and
+ * {@code buildSessionFactory()} -- the only point at which the mapping model is both fully built and still
+ * mutable -- setting the type name on exactly those bindings whose field is declared by a JavAI collection
+ * interface. That per-binding walk is deliberate: Hibernate's declarative
+ * {@code @CollectionTypeRegistration} is keyed by {@code CollectionClassification} and would capture
+ * <em>every</em> bag/set/map in the persistence unit, including plain JDK ones that must stay exactly as
+ * Hibernate maps them. Doing it here rather than at the consumer's source also means the consumer writes
+ * only the JPA annotation they'd write anyway -- no {@code @CollectionType}, nothing JavAI-specific.
+ * See {@code javai-persistence/README.md} for the same note in context, and
+ * {@code doc/ai-guidance/persistence-support-matrix.md} for the per-backend support tables.
  */
 final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
@@ -246,15 +300,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     /**
      * Fails fast, at registration time, for the two collection-mapping shapes this backend can't serve
-     * correctly yet. Deliberately Postgres-scoped: the reflective backends classify collections purely by
+     * correctly. Deliberately Postgres-scoped: the reflective backends classify collections purely by
      * declared type and legitimately accept both shapes.
      *
-     * <p><b>1. A JPA association annotation on a JavAI collection field.</b> A JavAI collection is mapped
-     * out-of-band through {@code javai_collection_members}, so {@code @OneToMany}/{@code @ManyToMany} on one
-     * is silently ignored today -- the developer would get JavAI's own storage and its hardcoded
-     * "owner owns its members" cascade instead of the JPA semantics they asked for. That's actively unsafe for
-     * {@code @ManyToMany}, where deleting one owner would delete members still referenced by other owners.
-     * Rejected until OMI-142 makes JavAI collections genuine Hibernate associations.
+     * <p><b>1. A JPA association annotation on a <em>concrete-typed</em> JavAI collection field.</b> A
+     * concrete-typed JavAI collection is mapped out-of-band through {@code javai_collection_members}, so
+     * {@code @OneToMany}/{@code @ManyToMany} on one could only be silently ignored -- the developer would get
+     * JavAI's own storage and its hardcoded "owner owns its members" cascade instead of the JPA semantics
+     * they asked for. That's actively unsafe for {@code @ManyToMany}, where deleting one owner would delete
+     * members still referenced by other owners. The fix is to declare the field by the JavAI
+     * <em>interface</em> ({@code JavAIList}/{@code JavAISet}/{@code JavAIMap}), which routes it to the native
+     * association path instead (see this class's own javadoc); the thrown message says exactly that.
      *
      * <p><b>2. A plain collection with no mapping annotation.</b> Hibernate can't map a bare
      * {@code Collection}/{@code Map} and would fail deep in boot with a considerably less obvious message.
@@ -400,47 +456,42 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // below can never persist a vector that's stale relative to the field value committed in this same
         // transaction, regardless of the ambient EmbeddingConsistencyMode.
         Object[] result = new Object[1];
-        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> {
-            SessionFactory factory = sessionFactory();
-            try (Session session = factory.openSession()) {
-                Transaction tx = session.beginTransaction();
-                JavAIFlushVectorListener.begin();
-                try {
-                    // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
-                    // element this backend persists itself) needs its own id set before Hibernate/this backend
-                    // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
-                    ensureIdsAssigned(entity, new IdentityHashMap<>());
-                    Object managed = session.merge(entity);
-                    session.flush();
-                    writeVectors(session, entityType, managed);
-                    writeVectorsForRelatedEntities(session, managed);
-                    // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
-                    // merge() never copies its contents onto the managed instance (transient state isn't part
-                    // of what merge() reconciles) -- managed.comments would still be the empty list its own
-                    // no-arg constructor produced. entity's id was already assigned above, so it matches.
-                    syncCollectionMembers(session, entityType, entity);
-                    // Same reason as syncCollectionMembers: a Point field is @Transient (mapped by this
-                    // backend, not Hibernate), so its value lives only on the original `entity`, not `managed`.
-                    syncGeoPoints(session, entity, new IdentityHashMap<>());
-                    // Last, after every write above has been flushed: covers anything Hibernate persisted by
-                    // cascading that the explicit walks never reach (a related entity two or more hops away).
-                    session.flush();
-                    writeVectorsForFlushedEntities(session);
-                    tx.commit();
-                    // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
-                    // @Transient collection fields are left empty by merge(), so returning it would hand the
-                    // caller back an Article whose in-memory `comments` looks wrong immediately after save().
-                    // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
-                    // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
-                    result[0] = entity;
-                } catch (RuntimeException e) {
-                    tx.rollback();
-                    throw e;
-                } finally {
-                    JavAIFlushVectorListener.end();
-                }
+        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> result[0] = inTransactionalSession(session -> {
+            JavAIFlushVectorListener.begin();
+            try {
+                // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
+                // element this backend persists itself) needs its own id set before Hibernate/this backend
+                // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
+                ensureIdsAssigned(entity, new IdentityHashMap<>());
+                Object managed = session.merge(entity);
+                session.flush();
+                writeVectors(session, entityType, managed);
+                writeVectorsForRelatedEntities(session, managed);
+                // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
+                // merge() never copies its contents onto the managed instance (transient state isn't part
+                // of what merge() reconciles) -- managed.comments would still be the empty list its own
+                // no-arg constructor produced. entity's id was already assigned above, so it matches.
+                syncCollectionMembers(session, entityType, entity);
+                // Same reason as syncCollectionMembers: a Point field is @Transient (mapped by this
+                // backend, not Hibernate), so its value lives only on the original `entity`, not `managed`.
+                syncGeoPoints(session, entity, new IdentityHashMap<>());
+                // Last, after every write above has been flushed: covers anything Hibernate persisted by
+                // cascading that the explicit walks never reach (a related entity two or more hops away).
+                // Flushed, not committed: when this call joined a caller's transaction (OMI-146) the commit
+                // is theirs to make, and these vector rows must land or roll back with everything else they
+                // did -- which they do, since this is the caller's own session and connection.
+                session.flush();
+                writeVectorsForFlushedEntities(session);
+                // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
+                // @Transient collection fields are left empty by merge(), so returning it would hand the
+                // caller back an Article whose in-memory `comments` looks wrong immediately after save().
+                // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
+                // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
+                return entity;
+            } finally {
+                JavAIFlushVectorListener.end();
             }
-        });
+        }));
         return result[0];
     }
 
@@ -458,14 +509,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      */
     @Override
     public void reindexAll() {
-        SessionFactory factory = sessionFactory();
-        Set<String> manifest;
-        try (Session session = factory.openSession()) {
-            manifest = session.doReturningWork(connection -> {
-                String newest = newestVectorTable(connection);
-                return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
-            });
-        }
+        Set<String> manifest = inSession(session -> session.doReturningWork(connection -> {
+            String newest = newestVectorTable(connection);
+            return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+        }));
 
         for (Class<?> registered : registeredEntityTypes) {
             for (Object entity : findAll(registered)) {
@@ -473,19 +520,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
         }
 
-        try (Session session = factory.openSession()) {
-            List<String> missing = session.doReturningWork(connection -> {
-                String newest = newestVectorTable(connection);
-                Set<String> reindexed = newest == null ? Set.<String>of() : ownerKeys(connection, newest);
-                return manifest.stream().filter(key -> !reindexed.contains(key)).limit(10).toList();
-            });
-            if (!missing.isEmpty()) {
-                throw new IllegalStateException("reindexAll() left " + missing.size() + " or more entities "
-                        + "un-reindexed under the newly configured model -- the store is now split across two "
-                        + "models. Unreindexed (up to 10, as owner_type/owner_id): " + missing
-                        + ". This usually means an entity type holding vectors was never registered via "
-                        + "JavAIPI.repository(...) in this process.");
-            }
+        List<String> missing = inSession(session -> session.doReturningWork(connection -> {
+            String newest = newestVectorTable(connection);
+            Set<String> reindexed = newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+            return manifest.stream().filter(key -> !reindexed.contains(key)).limit(10).toList();
+        }));
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException("reindexAll() left " + missing.size() + " or more entities "
+                    + "un-reindexed under the newly configured model -- the store is now split across two "
+                    + "models. Unreindexed (up to 10, as owner_type/owner_id): " + missing
+                    + ". This usually means an entity type holding vectors was never registered via "
+                    + "JavAIPI.repository(...) in this process.");
         }
     }
 
@@ -527,15 +572,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public Optional<Object> findById(Class<?> entityType, UUID id) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             Object entity = session.find(entityType, id);
             if (entity != null) {
                 hydrateCollectionMembers(session, entity);
                 hydrateGeoPoints(session, entity, new IdentityHashMap<>());
             }
             return Optional.ofNullable(entity);
-        }
+        });
     }
 
     @Override
@@ -545,8 +589,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @SuppressWarnings("unchecked")
     private <T> List<Object> findAllTyped(Class<T> entityType) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             JpaCriteriaQuery<T> query = session.getCriteriaBuilder().createQuery(entityType);
             JpaRoot<T> root = query.from(entityType);
             query.select(root);
@@ -556,14 +599,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 hydrateGeoPoints(session, result, new IdentityHashMap<>());
             }
             return (List<Object>) (List<?>) results;
-        }
+        });
     }
 
     @Override
     public void deleteById(Class<?> entityType, UUID id) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
-            Transaction tx = session.beginTransaction();
+        inTransactionalSession(session -> {
             JavAIFlushVectorListener.begin();
             try {
                 Object entity = session.find(entityType, id);
@@ -583,41 +624,30 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     deleteVectors(session, deleted.ownerType(), deleted.id());
                     deleteGeoPoints(session, deleted.ownerType(), deleted.id());
                 }
-                tx.commit();
-            } catch (RuntimeException e) {
-                tx.rollback();
-                throw e;
+                return null;
             } finally {
                 JavAIFlushVectorListener.end();
             }
-        }
+        });
     }
 
     @Override
     public List<Object> findNearestByFieldVector(
             Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        SessionFactory factory = sessionFactory();
-        List<UUID> rankedIds;
-        try (Session session = factory.openSession()) {
-            rankedIds = session.doReturningWork(connection -> {
-                String table = ensureFieldVectorTable(connection, reference.modelId(), reference.dims());
-                return rankIds(connection, table, entityType, fieldName, reference, limit);
-            });
-        }
-        return hydrate(factory, entityType, rankedIds);
+        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
+            String table = ensureFieldVectorTable(connection, reference.modelId(), reference.dims());
+            return rankIds(connection, table, entityType, fieldName, reference, limit);
+        }));
+        return hydrate(entityType, rankedIds);
     }
 
     @Override
     public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        SessionFactory factory = sessionFactory();
-        List<UUID> rankedIds;
-        try (Session session = factory.openSession()) {
-            rankedIds = session.doReturningWork(connection -> {
-                String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
-                return rankIds(connection, table, entityType, null, reference, limit);
-            });
-        }
-        return hydrate(factory, entityType, rankedIds);
+        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
+            String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
+            return rankIds(connection, table, entityType, null, reference, limit);
+        }));
+        return hydrate(entityType, rankedIds);
     }
 
     // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
@@ -714,8 +744,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private <T> List<Object> findByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args,
             DerivedFinderQuery.Constraints constraints) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
             JpaCriteriaQuery<T> cq = cb.createQuery(entityType);
             JpaRoot<T> root = cq.from(entityType);
@@ -745,7 +774,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 out.add(entity);
             }
             return out;
-        }
+        });
     }
 
     @Override
@@ -754,8 +783,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     private <T> long countByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
             JpaCriteriaQuery<Long> cq = cb.createQuery(Long.class);
             JpaRoot<T> root = cq.from(entityType);
@@ -766,7 +794,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 cq.where(where);
             }
             return session.createQuery(cq).getSingleResult();
-        }
+        });
     }
 
     @Override
@@ -1657,8 +1685,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     /** Second half: a targeted load of exactly the ranked ids, one {@code find} per id (bounded by
      *  {@code limit}, typically small) -- simpler and just as correct as a batch multi-load API for this
      *  volume, and trivially preserves rank order without a separate re-sort step. */
-    private List<Object> hydrate(SessionFactory factory, Class<?> entityType, List<UUID> rankedIds) {
-        try (Session session = factory.openSession()) {
+    private List<Object> hydrate(Class<?> entityType, List<UUID> rankedIds) {
+        return inSession(session -> {
             List<Object> results = new ArrayList<>(rankedIds.size());
             for (UUID id : rankedIds) {
                 Object entity = session.find(entityType, id);
@@ -1669,7 +1697,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 }
             }
             return results;
-        }
+        });
     }
 
     /** pgvector's own text input format for a vector literal, e.g. {@code "[0.1,0.2,0.3]"} -- avoids
@@ -1740,7 +1768,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         synchronized (bootstrapLock) {
             if (sessionFactory == null) {
                 sessionFactory = config.externalSessionFactory() != null
-                        ? config.externalSessionFactory()
+                        ? nativeFactory(config.externalSessionFactory())
                         : buildSessionFactory();
                 registerFlushVectorListener(sessionFactory);
                 initializeSchema(sessionFactory);
@@ -1785,13 +1813,134 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
+    /**
+     * The session this call should run on when the caller already owns one, or {@code null} when this
+     * backend should open (and commit) its own -- the whole of OMI-146's "join an ambient transaction"
+     * behavior, in one place.
+     *
+     * <p>Two sources, checked in order, both scoped to <em>this</em> backend's own {@code SessionFactory} so
+     * a second, independently-configured backend on the same thread is never handed the wrong session:
+     * {@link JavAIPI#inTransaction} for callers who aren't running under Spring, then a Spring-managed
+     * transaction ({@link SpringManagedSessions}) for callers who are.
+     *
+     * <p>Returning {@code null} is the ordinary case and preserves the pre-0.1.5 behavior exactly: one
+     * session per repository call, committed on its own.
+     */
+    /**
+     * The real Hibernate {@code SessionFactory} behind whatever the caller supplied. Spring's
+     * {@code LocalContainerEntityManagerFactoryBean} hands out a <em>proxy</em> {@code EntityManagerFactory},
+     * and {@code unwrap(SessionFactory.class)} on it yields a proxy implementing {@code SessionFactory} --
+     * not the {@code SessionFactoryImplementor} this backend needs. Two things break on the proxy, both
+     * discovered by test rather than reasoned about: {@link #registerFlushVectorListener} casts to
+     * {@code SessionFactoryImplementor} and threw {@code ClassCastException}, and -- more subtly --
+     * {@code session.getSessionFactory()} on a Spring-managed session returns the <em>native</em> factory, so
+     * comparing it against the proxy never matched and no transaction was ever joined. Normalizing here, at
+     * the one place an external factory enters, fixes both at once and keeps every downstream comparison
+     * against a single identity.
+     */
+    private static SessionFactory nativeFactory(SessionFactory supplied) {
+        if (supplied instanceof SessionFactoryImplementor) {
+            return supplied;
+        }
+        return supplied.unwrap(SessionFactoryImplementor.class);
+    }
+
+    private Session ambientSession() {
+        SessionFactory factory = sessionFactory();
+        Session javAIScoped = JavAITransactionScope.current(factory);
+        if (javAIScoped != null) {
+            return javAIScoped;
+        }
+        return SpringManagedSessions.isAvailable() ? SpringManagedSessions.current(factory) : null;
+    }
+
+    /**
+     * Runs read-only work on the ambient session if there is one, otherwise on a short-lived session of this
+     * backend's own. Reads need no transaction of their own either way -- joining one matters because
+     * entities the caller has already written but not yet committed must be visible to a subsequent read in
+     * the same unit of work, which a separate session could not see.
+     */
+    private <T> T inSession(Function<Session, T> work) {
+        Session ambient = ambientSession();
+        if (ambient != null) {
+            return work.apply(ambient);
+        }
+        try (Session session = sessionFactory().openSession()) {
+            return work.apply(session);
+        }
+    }
+
+    /**
+     * Runs write work transactionally: joined to the caller's transaction when one exists -- committing and
+     * rolling back with it, never independently of it -- and otherwise in this backend's own
+     * open/begin/commit cycle, exactly as before OMI-146.
+     *
+     * <p>The joined branch deliberately neither commits nor closes: both belong to whoever opened the
+     * transaction. It also doesn't roll back on failure, only propagates -- Spring marks its own transaction
+     * rollback-only when the exception escapes the {@code @Transactional} boundary, and rolling back here
+     * would instead end the caller's unit of work early, out from under work it still intended to do.
+     */
+    private <T> T inTransactionalSession(Function<Session, T> work) {
+        Session ambient = ambientSession();
+        if (ambient != null) {
+            return work.apply(ambient);
+        }
+        try (Session session = sessionFactory().openSession()) {
+            Transaction tx = session.beginTransaction();
+            try {
+                T result = work.apply(session);
+                tx.commit();
+                return result;
+            } catch (RuntimeException e) {
+                if (tx.isActive()) {
+                    tx.rollback();
+                }
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Runs {@code body} as one unit of work on one session -- {@link JavAIPI#inTransaction}'s implementation.
+     * Every repository call the body makes against this backend resolves the same session via
+     * {@link #ambientSession()} and therefore commits, or rolls back, exactly once, together.
+     *
+     * <p>Joins rather than nests when the caller is already inside a Spring transaction: that transaction is
+     * the more meaningful boundary, and opening a second one underneath it would produce precisely the split
+     * unit of work this method exists to prevent.
+     */
+    @Override
+    public <T> T inTransaction(Supplier<T> body) {
+        if (ambientSession() != null) {
+            return body.get();
+        }
+        SessionFactory factory = sessionFactory();
+        try (Session session = factory.openSession()) {
+            Transaction tx = session.beginTransaction();
+            JavAITransactionScope.begin(factory, session);
+            try {
+                T result = body.get();
+                tx.commit();
+                return result;
+            } catch (RuntimeException e) {
+                if (tx.isActive()) {
+                    tx.rollback();
+                }
+                throw e;
+            } finally {
+                JavAITransactionScope.end();
+            }
+        }
+    }
+
     private SessionFactory buildSessionFactory() {
-        StandardServiceRegistry registry = new StandardServiceRegistryBuilder()
+        StandardServiceRegistryBuilder registryBuilder = new StandardServiceRegistryBuilder()
                 .applySetting("jakarta.persistence.jdbc.url", config.postgresUrl())
                 .applySetting("jakarta.persistence.jdbc.user", config.postgresUsername())
                 .applySetting("jakarta.persistence.jdbc.password", config.postgresPassword())
-                .applySetting("hibernate.hbm2ddl.auto", "update")
-                .build();
+                .applySetting("hibernate.hbm2ddl.auto", "update");
+        config.hibernateProperties().forEach(registryBuilder::applySetting);
+        StandardServiceRegistry registry = registryBuilder.build();
         MetadataSources sources = new MetadataSources(registry);
         for (Class<?> entityType : registeredEntityTypes) {
             sources.addAnnotatedClass(entityType);
@@ -1800,9 +1949,40 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         if (autoTransientOverrideXml != null) {
             sources.addInputStream(new ByteArrayInputStream(autoTransientOverrideXml.getBytes(StandardCharsets.UTF_8)));
         }
-        Metadata metadata = sources.buildMetadata();
+        MetadataBuilder metadataBuilder = sources.getMetadataBuilder();
+        PhysicalNamingStrategy namingStrategy = resolvePhysicalNamingStrategy();
+        if (namingStrategy != null) {
+            metadataBuilder.applyPhysicalNamingStrategy(namingStrategy);
+        }
+        Metadata metadata = metadataBuilder.build();
         attachJavAICollectionTypes(metadata);
         return metadata.buildSessionFactory();
+    }
+
+    /**
+     * The physical naming strategy to apply, or {@code null} to leave whatever the service registry already
+     * resolved from settings. Three-way precedence, most specific first:
+     *
+     * <ol>
+     *   <li>{@link JavAIPersistenceConfig.Builder#physicalNamingStrategy} -- an explicit, typed instance.</li>
+     *   <li>A {@code hibernate.physical_naming_strategy} key passed through
+     *       {@link JavAIPersistenceConfig.Builder#hibernateProperty} -- returns {@code null} here so
+     *       Hibernate resolves that setting itself, exactly as it would in any other application.</li>
+     *   <li>Neither: {@link CamelCaseToUnderscoresNamingStrategy}, so {@code emailVerified} maps to the
+     *       column {@code email_verified} rather than Hibernate's bare-default {@code emailverified}. This
+     *       matches Spring Boot's own default, which matters concretely: a JavAI repository pointed at a
+     *       table some other tool already created under that convention now sees the same columns instead of
+     *       silently adding a second, differently-cased set alongside them (OMI-145).</li>
+     * </ol>
+     */
+    private PhysicalNamingStrategy resolvePhysicalNamingStrategy() {
+        if (config.physicalNamingStrategy() != null) {
+            return config.physicalNamingStrategy();
+        }
+        if (config.hibernateProperties().containsKey(AvailableSettings.PHYSICAL_NAMING_STRATEGY)) {
+            return null;
+        }
+        return new CamelCaseToUnderscoresNamingStrategy();
     }
 
     /**

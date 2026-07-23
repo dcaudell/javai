@@ -6,7 +6,7 @@
 
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
   <packaging>pom</packaging>
 
   <name>JavAI Extensions</name>
@@ -140,6 +140,13 @@
          transitive it doesn't name. Must stay equal to whatever spring-data-mongodb.version above resolves
          to; bumping one without the other risks two spring-data-commons lines on one classpath. -->
     <spring-data-commons.version>4.1.0</spring-data-commons.version>
+    <!-- Spring Framework itself is otherwise never named here: spring-core/tx/context/beans arrive
+         transitively via spring-data-mongodb (7.0.8, confirmed via `mvn dependency:tree`). This property
+         exists only so javai-persistence can name spring-orm explicitly for OMI-146's Spring-transaction
+         bridge, and MUST stay equal to the Spring Framework version the two spring-data properties above
+         resolve to. A spring-orm on a different line than the spring-tx it collaborates with is exactly
+         the kind of split-version classpath the comments above are guarding against. -->
+    <spring-framework.version>7.0.8</spring-framework.version>
     <mongodb-driver.version>5.9.0</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
@@ -286,6 +293,20 @@
         <groupId>org.springframework.data</groupId>
         <artifactId>spring-data-commons</artifactId>
         <version>${spring-data-commons.version}</version>
+      </dependency>
+      <dependency>
+        <!-- javai-persistence only, and declared <optional> there: it is what lets a JavAIRepository call
+             join a Spring @Transactional unit of work instead of always opening its own session (OMI-146).
+             spring-tx/spring-core/spring-context are already on that module's compile classpath transitively
+             via spring-data-mongodb, but the JPA/Hibernate resource holders a Spring transaction actually
+             binds to the thread (EntityManagerHolder/SessionHolder) live in spring-orm, which nothing else
+             brings. Optional because it is only reachable when the consumer is a Spring application that
+             already has it: a non-Spring consumer never loads the bridge class and needs no such
+             dependency. Version tracks spring-framework.version, which must stay equal to whatever
+             spring-data-mongodb.version resolves to; see that property's own comment. -->
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-orm</artifactId>
+        <version>${spring-framework.version}</version>
       </dependency>
       <dependency>
         <groupId>org.mongodb</groupId>

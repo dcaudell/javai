@@ -23,9 +23,10 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
 /**
  * Client code exercising both containment shapes doc/spec/vector-core.md's {@code summaryVector()}
  * formula covers: a single {@code @Summary} reference ({@link #featuredComment}) and a
- * {@code @Summary} collection ({@link #comments}, initialized inline and never reassigned -- elements
- * are added through the collection itself, exercising {@code javai-substrate}'s constructor-exit wiring for
- * that case).
+ * {@code @Summary} collection ({@link #comments}, initialized inline and never reassigned by application
+ * code -- elements are added through the collection itself, exercising {@code javai-substrate}'s
+ * constructor-exit wiring for that case; Hibernate does substitute its own {@code PersistentJavAIList} into
+ * the field when loading a persisted instance, which is the point of the OMI-142 shape described below).
  *
  * <p>{@link #title}/{@link #body} also carry {@code @PromptContext} -- Completion Fabric's field-level
  * allowlist for {@code PromptContext.defaultMarshall(Object)} -- so an {@code Article} wrapped in
@@ -52,18 +53,22 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code draftComment}/
  * {@code attachment} are real {@code @OneToOne(cascade = CascadeType.ALL)} associations -- ordinary
  * Hibernate relational mapping, since a *singular* reference field never collides with Hibernate's own
- * collection-proxy substitution. {@code relatedComments} is the field that would: a
- * concrete JavAI collection class ({@code JavAIArrayList}/{@code JavAILinkedHashMap}) can never be a native
- * Hibernate-mapped collection field (confirmed empirically -- a {@code ClassCastException} the moment
- * Hibernate tries to substitute its own {@code PersistentBag}/{@code PersistentMap} into a field statically
- * typed as the concrete JavAI class). Note there's no {@code @Transient} here, though, and no manual
- * repository pre-registration for {@code Comment} either: {@code RepositoryBackendHibernatePostgres}
- * auto-detects both of these fields reflectively and excludes them from Hibernate's own mapping itself, and
- * auto-registers {@code Comment} as reachable through them -- see that class's javadoc ("No manual
- * {@code @Transient} required" / "Related entity types are auto-registered too"). Both fields instead
- * round-trip through {@code javai-persistence}'s own {@code javai_collection_members} side table, which,
- * being reflective rather than proxy-based, hydrates a real {@code JavAIArrayList}/{@code JavAILinkedHashMap}
- * back (full dirty-tracking intact) exactly like Neo4j's own reflective relationship mapping already does.
+ * collection-proxy substitution. The two collection fields deliberately carry <em>one shape each</em>, so
+ * this one class exercises both halves of OMI-142 side by side:
+ *
+ * <p>{@code comments} is declared by the JavAI <em>interface</em> ({@code JavAIList}) and non-final, with an
+ * ordinary {@code @OneToMany} -- a genuine, natively Hibernate-managed association (its own join table,
+ * cascade, lazy loading), with a {@code PersistentJavAIList} substituted into the field so vectors and
+ * dirty-tracking survive. {@code relatedComments} is declared by the <em>concrete</em> class
+ * ({@code JavAILinkedHashMap}) and unannotated, which can never be a natively mapped collection field
+ * (confirmed empirically -- a {@code ClassCastException} the moment Hibernate tries to substitute its own
+ * {@code PersistentMap} into a field statically typed as the concrete JavAI class), so it keeps JavAI's own
+ * {@code javai_collection_members} side-table storage, hydrated reflectively rather than by proxy, exactly
+ * like Neo4j's own relationship mapping already does. Note there's no {@code @Transient} on it, though, and
+ * no manual repository pre-registration for {@code Comment} either: {@code RepositoryBackendHibernatePostgres}
+ * auto-detects the side-table field reflectively and excludes it from Hibernate's own mapping itself, and
+ * auto-registers {@code Comment} as reachable through either field -- see that class's javadoc ("No manual
+ * {@code @Transient} required" / "Related entity types are auto-registered too").
  */
 @Entity
 @JavAIVectorizable

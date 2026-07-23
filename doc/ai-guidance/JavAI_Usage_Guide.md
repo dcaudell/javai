@@ -111,7 +111,9 @@ conventional `setXxx(...)` setter for a `@Vectorize`/`@Summary` field gets its *
 original assignment is untouched; dirty-marking and dependency-registration calls are added around it) —
 and if a `@Summary` field is initialized inline in a field initializer rather than via a setter (a
 `final JavAIArrayList<Comment> comments = new JavAIArrayList<>();`-style field, elements added to later
-through the collection itself), the weaver wires that dependency at **constructor exit** instead.
+through the collection itself), the weaver wires that dependency at **constructor exit** instead. That
+concrete-typed declaration is one of two supported shapes for a collection field on a *persisted* entity —
+see "Collection fields on a persisted `@Entity`" below before choosing one.
 
 ## Annotation reference
 
@@ -126,6 +128,48 @@ through the collection itself), the weaver wires that dependency at **constructo
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
+
+### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
+
+When a class is both `@JavAIVectorizable` and a JPA `@Entity` persisted through `JavAIRepository` on
+**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides how it is
+stored. Both shapes are fully supported, and one entity can carry both.
+
+**1. Interface-typed + an ordinary JPA association → a native Hibernate association.** The recommended shape:
+
+```java
+@OneToMany(cascade = CascadeType.ALL)
+@Summary
+private JavAIList<Comment> comments = new JavAIArrayList<>();   // interface-typed, and NOT final
+```
+
+This is a real JPA association in every respect — its own join table with foreign keys, `mappedBy`,
+cascade/`orphanRemoval`, lazy loading, `@ManyToMany` shared ownership. What Hibernate substitutes into the
+field is a `PersistentJavAIList`/`PersistentJavAISet`/`PersistentJavAIMap`, i.e. still a real JavAI
+collection, so vectors and dirty-tracking survive the load. You write **nothing** JavAI-specific to get
+this — no `@CollectionType`; the backend attaches it at mapping time. Two requirements, both mechanical:
+declare the field by the JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), and don't make it `final`,
+since Hibernate assigns the field its own instance.
+
+**2. Concrete-typed with no association annotation → JavAI's own side-table storage.**
+
+```java
+private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+```
+
+Stored in `javai_collection_members`, a shared side table the persistence backend owns, and hydrated
+reflectively back into the instance your own constructor created — so `final` is fine here. No join table and
+no FK integrity; `Map` keys must be `String` in this phase.
+
+**The one combination that fails fast:** a *concrete*-typed field carrying `@OneToMany`/`@ManyToMany` is
+rejected with an `IllegalArgumentException` at repository-registration time, naming the interface-typed fix.
+It can't be honored — you'd silently get JavAI's own "owner owns its members" cascade instead of the JPA
+semantics you asked for, which is actively unsafe for `@ManyToMany`.
+
+**Backend caveat:** native associations are **Postgres-only**. Neo4j and MongoDB classify collection fields by
+declared type and store both shapes their own way, so an interface-typed field buys you nothing there. Check
+[`persistence-support-matrix.md`](persistence-support-matrix.md) — it has the per-backend tables for JPA
+annotations, derived-finder capabilities, and collection types — before relying on any of this.
 
 ### Completion Fabric — grounding a completion in real data
 
@@ -360,7 +404,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.4` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.5` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -368,42 +412,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 ```
 
@@ -414,14 +458,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.4")
-    implementation("io.github.dcaudell:javai-model:0.1.4")
-    implementation("io.github.dcaudell:javai-substrate:0.1.4")
-    implementation("io.github.dcaudell:javai-supervision:0.1.4")
-    implementation("io.github.dcaudell:javai-collections:0.1.4")
-    implementation("io.github.dcaudell:javai-persistence:0.1.4")
-    implementation("io.github.dcaudell:javai-completion:0.1.4")
-    implementation("io.github.dcaudell:javai-tagging:0.1.4")
+    implementation("io.github.dcaudell:javai-vector:0.1.5")
+    implementation("io.github.dcaudell:javai-model:0.1.5")
+    implementation("io.github.dcaudell:javai-substrate:0.1.5")
+    implementation("io.github.dcaudell:javai-supervision:0.1.5")
+    implementation("io.github.dcaudell:javai-collections:0.1.5")
+    implementation("io.github.dcaudell:javai-persistence:0.1.5")
+    implementation("io.github.dcaudell:javai-completion:0.1.5")
+    implementation("io.github.dcaudell:javai-tagging:0.1.5")
 }
 ```
 
@@ -500,6 +544,7 @@ run in production — each backend is configured independently:
 |---|---|
 | Embedding provider | `javai-vector`'s `LocalEmbeddingDefaults` picks Ollama or Hugging Face TEI per host platform, or supply your own `JavAIEmbeddingProvider` |
 | Postgres/Neo4j | `javai-persistence/README.md`; connection settings default to `javai.persistence.*` system properties |
+| Postgres schema naming | snake_case by default (`emailVerified` → `email_verified`); override with `JavAIPersistenceConfig.Builder.physicalNamingStrategy(...)` or the general `.hibernateProperty(key, value)` passthrough — see below |
 | Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
 
 **Embedding provider, in detail** — registered once, globally, before anything calls `vector()`:
@@ -525,6 +570,48 @@ other four: Replicate has no vendor-wide embeddings contract, so it defaults to 
 field name that you should verify against whatever model you actually run — see `javai-vector/README.md`'s
 "Hosted-vendor providers" section for the full detail.
 
+**Transactions, in detail** — since **0.1.5** (Postgres), a `JavAIRepository` call joins a transaction that is
+already in progress instead of always opening its own:
+
+- **In a Spring application**, write ordinary `@Transactional` code and nothing else. Several repository
+  calls in one such method commit or roll back together, later calls see earlier ones' uncommitted writes,
+  and the annotation's attributes (`isolation`, `readOnly`, `rollbackFor`/`noRollbackFor`, `propagation`,
+  `timeout`) govern JavAI's writes because they run on the caller's own session and connection. **One wiring
+  requirement**: JavAI must share the application's factory, or it has nothing to join —
+  `.sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))` on the config builder.
+- **Outside Spring**, wrap the calls: `JavAIPI.inTransaction(config, () -> { repoA.save(a); repoB.save(b); })`.
+  One commit, or one rollback if the body throws. Nesting joins the outer body rather than starting a second
+  transaction, and the scope is thread-bound.
+- **With neither**, each call is its own transaction, exactly as before 0.1.5.
+
+Two edges worth knowing: a write inside `readOnly = true` fails loudly (Postgres rejects the INSERT), and
+`PROPAGATION_NESTED` is unavailable under `JpaTransactionManager` — Spring's Hibernate JPA dialect has no
+savepoint manager, so Spring refuses it before JavAI is reached. **Neo4j and MongoDB have no equivalent**:
+every call is its own unit of work there, and `JavAIPI.inTransaction` throws rather than pretending, so
+multi-call flows against those backends must be designed to be safely retryable.
+
+**Postgres schema naming, in detail** — since **0.1.5**, the `SessionFactory` JavAI builds applies
+`CamelCaseToUnderscoresNamingStrategy`, so `emailVerified` maps to the column `email_verified` and an entity
+`OrderLine` to the table `order_line`, exactly as Spring Boot would. Two things follow:
+
+- **If your schema was created by JavAI 0.1.4 or earlier** and has any multi-word field or class name, its
+  columns are the old all-lowercase form (`emailverified`). `hbm2ddl=update` never renames — it would *add*
+  the new columns beside the old ones — so either rename them yourself, or pin the previous behavior:
+  ```java
+  JavAIPersistenceConfig.builder()
+      .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+      .physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())   // pre-0.1.5 naming
+      .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+      .build();
+  ```
+- **Any other Hibernate setting** goes through `.hibernateProperty(key, value)` (or `.hibernateProperties(map)`),
+  applied after JavAI's own settings, so it wins on a key collision. This is the supported way to influence
+  the factory JavAI builds without supplying your own `SessionFactory` — which you generally shouldn't, since
+  a factory JavAI didn't build skips the mapping-time hooks that JavAI collection fields depend on.
+
+Neo4j and MongoDB are unaffected either way: they classify fields by declared type and have no JPA column
+naming to configure.
+
 **Completion provider, in detail** — no global registration; construct whichever `Cortex` you want, wherever
 you use it:
 
@@ -546,9 +633,17 @@ from):
 import dev.xtrafe.javai.annotations.*;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAILinkedHashMap;
+import jakarta.persistence.*;
+import java.util.UUID;
 
+@Entity
 @JavAIVectorizable
 public class Article implements JavAIGraphNode {   // implements is required -- @JavAIGraphNode alone is not
+
+    @Id
+    private UUID id;
 
     @Vectorize
     @PromptContext
@@ -558,14 +653,26 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
     @PromptContext
     private String body;
 
+    // Shape 1: interface-typed + @OneToMany -> a native Hibernate association (Postgres).
+    // Non-final, because Hibernate substitutes its own PersistentJavAIList into the field.
+    @OneToMany(cascade = CascadeType.ALL)
     @Summary
-    private final JavAIArrayList<Comment> comments = new JavAIArrayList<>();
+    private JavAIList<Comment> comments = new JavAIArrayList<>();
+
+    // Shape 2: concrete-typed, unannotated -> JavAI's own javai_collection_members side table.
+    // final is fine here: this instance is hydrated into, never replaced.
+    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     public void setTitle(String title) { this.title = title; }   // re-vectorizes lazily on next vector() read
     public void setBody(String body) { this.body = body; }
-    public JavAIArrayList<Comment> getComments() { return comments; }
+    public JavAIList<Comment> getComments() { return comments; }
 }
 ```
+
+Both collection shapes appear here deliberately — see "Collection fields on a persisted `@Entity`" above.
+Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments` can just as well be a plain
+`final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()` don't depend on persistence
+at all.
 
 Using it — every call below is a woven method, not something declared in `Article.java`
 (imports for `EmbeddingVector`/`JavAIList`/`Cortex`/`CompletionRequest`/`CompletionResult`/`PromptContext`/
