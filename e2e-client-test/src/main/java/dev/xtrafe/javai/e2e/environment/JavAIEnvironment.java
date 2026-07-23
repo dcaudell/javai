@@ -7,6 +7,12 @@ import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
 import dev.xtrafe.javai.e2e.domain.PlaceRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocHubRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocLeafRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocSelfNodeRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.PlainLeafRepository;
 import dev.xtrafe.javai.e2e.fixtures.SampleDataSeeder;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.persistence.JavAIPI;
@@ -69,6 +75,15 @@ public final class JavAIEnvironment {
     private static final TagSetRepository NEO4J_TAG_SET_REPOSITORY;
     private static final TagSetRepository MONGO_TAG_SET_REPOSITORY;
 
+    // OMI-161: the association-shape regression matrix (see AssocHub). Postgres only -- the bug was in
+    // the Hibernate backend's proxy handling, and Hibernate proxies exist on no other backend.
+    private static final AssocHubRepository POSTGRES_ASSOC_HUB_REPOSITORY;
+    private static final AssocLeafRepository POSTGRES_ASSOC_LEAF_REPOSITORY;
+    private static final PlainLeafRepository POSTGRES_PLAIN_LEAF_REPOSITORY;
+    private static final AssocChainTopRepository POSTGRES_ASSOC_CHAIN_TOP_REPOSITORY;
+    private static final AssocSelfNodeRepository POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
+    private static final AssocBiParentRepository POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
+
     private static final Cortex CORTEX;
 
     private static final JavAITagRepository POSTGRES_TAGGING;
@@ -95,6 +110,14 @@ public final class JavAIEnvironment {
         POSTGRES_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, postgresConfig);
         POSTGRES_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, postgresConfig);
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
+        // AssocLeaf/AssocChainMiddle/AssocBiChild are auto-registered as related types, but each root that
+        // tests query independently still needs its own proxy.
+        POSTGRES_ASSOC_HUB_REPOSITORY = JavAIPI.repository(AssocHubRepository.class, postgresConfig);
+        POSTGRES_ASSOC_LEAF_REPOSITORY = JavAIPI.repository(AssocLeafRepository.class, postgresConfig);
+        POSTGRES_PLAIN_LEAF_REPOSITORY = JavAIPI.repository(PlainLeafRepository.class, postgresConfig);
+        POSTGRES_ASSOC_CHAIN_TOP_REPOSITORY = JavAIPI.repository(AssocChainTopRepository.class, postgresConfig);
+        POSTGRES_ASSOC_SELF_NODE_REPOSITORY = JavAIPI.repository(AssocSelfNodeRepository.class, postgresConfig);
+        POSTGRES_ASSOC_BI_PARENT_REPOSITORY = JavAIPI.repository(AssocBiParentRepository.class, postgresConfig);
 
         // Neo4j still needs explicit registration for every independently-queried type -- only the Postgres
         // backend's related-type auto-registration has been automated so far.
@@ -210,6 +233,30 @@ public final class JavAIEnvironment {
 
     public static TagSetRepository mongoTagSetRepository() {
         return MONGO_TAG_SET_REPOSITORY;
+    }
+
+    public static AssocHubRepository postgresAssocHubRepository() {
+        return POSTGRES_ASSOC_HUB_REPOSITORY;
+    }
+
+    public static AssocLeafRepository postgresAssocLeafRepository() {
+        return POSTGRES_ASSOC_LEAF_REPOSITORY;
+    }
+
+    public static PlainLeafRepository postgresPlainLeafRepository() {
+        return POSTGRES_PLAIN_LEAF_REPOSITORY;
+    }
+
+    public static AssocChainTopRepository postgresAssocChainTopRepository() {
+        return POSTGRES_ASSOC_CHAIN_TOP_REPOSITORY;
+    }
+
+    public static AssocSelfNodeRepository postgresAssocSelfNodeRepository() {
+        return POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
+    }
+
+    public static AssocBiParentRepository postgresAssocBiParentRepository() {
+        return POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
     }
 
     public static Cortex cortex() {
