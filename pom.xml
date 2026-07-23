@@ -181,7 +181,7 @@
          JsonSerializeAs (removed from jackson-annotations well before 2.10, present in whatever
          jackson-databind:2.21.4 itself expects). Pinned here in dependencyManagement, which overrides
          transitive resolution for every reactor module regardless of declaration depth. -->
-    <jackson-annotations.version>2.21</jackson-annotations.version>
+    <jackson-annotations.version>2.22</jackson-annotations.version>
   </properties>
 
   <!--
