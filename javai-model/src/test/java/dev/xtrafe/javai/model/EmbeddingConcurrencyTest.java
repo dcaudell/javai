@@ -375,12 +375,25 @@ class EmbeddingConcurrencyTest {
         TestNode node = new TestNode("seed");
         node.fieldVector("text"); // land the first-ever computation
 
-        provider.failNextCalls(1);
-        node.setText("second"); // the one real dispatch for this generation is doomed to fail
+        int readerCount = 3;
+        // Arms the failure for the owning dispatch AND for every reader, rather than just the one dispatch
+        // (OMI-148). A reader only *joins* the eager dispatch while that computation is still outstanding:
+        // dispatchBackground clears the pending claim in its finally block, so a reader arriving after the
+        // doomed computation has already resolved legitimately becomes the owner of a fresh one -- correct
+        // product behavior, since a transient provider failure must not poison the slot permanently. Arming
+        // exactly one failure therefore made this test depend on all three readers winning a race against
+        // the provider's 150ms delay: on a loaded CI runner a reader could be scheduled late, recompute
+        // successfully, and fail the assertion with no product defect involved (observed intermittently,
+        // passing on re-run). The delay still makes joining the overwhelmingly likely path -- what this test
+        // is named for -- but the outcome no longer depends on it, since a late arrival now observes the
+        // same failure. That one reader shares one embed() call rather than firing its own is separately and
+        // deterministically proven by coalescedConsistencyManyConcurrentReadersShareOneComputation.
+        provider.failNextCalls(1 + readerCount);
+        node.setText("second"); // the eager dispatch for this generation is doomed to fail
 
-        ExecutorService executor = Executors.newFixedThreadPool(3);
+        ExecutorService executor = Executors.newFixedThreadPool(readerCount);
         List<Future<EmbeddingVector>> results = new ArrayList<>();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < readerCount; i++) {
             results.add(executor.submit(() -> node.fieldVector("text")));
         }
         for (Future<EmbeddingVector> result : results) {
@@ -404,12 +417,14 @@ class EmbeddingConcurrencyTest {
         TestNode node = new TestNode("seed");
         node.fieldVector("text");
 
-        provider.failNextCalls(1);
+        int readerCount = 3;
+        // Same late-arrival race, same reasoning as the THROW-mode test above (OMI-148).
+        provider.failNextCalls(1 + readerCount);
         node.setText("second");
 
-        ExecutorService executor = Executors.newFixedThreadPool(3);
+        ExecutorService executor = Executors.newFixedThreadPool(readerCount);
         List<Future<EmbeddingVector>> results = new ArrayList<>();
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < readerCount; i++) {
             results.add(executor.submit(() -> node.fieldVector("text")));
         }
         for (Future<EmbeddingVector> result : results) {

@@ -10,6 +10,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
@@ -25,7 +26,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Real container -- see {@link JavAITaggingPostgresE2ETest}'s own javadoc for why, and
  *  {@code RepositoryBackendSpringDataMongoTest} (javai-persistence) for why {@code mongodb-atlas-local}
- *  specifically and {@code directConnection=true}. */
+ *  specifically, why {@code directConnection=true}, and why {@code Wait.forHealthcheck()} is required
+ *  rather than the default port-listening strategy (OMI-148: this image restarts {@code mongod} twice
+ *  while starting, and a Search-Index-Management command in flight across a restart fails with
+ *  {@code error 90 CallbackCanceled}). */
 @Testcontainers
 class JavAITaggingMongoE2ETest {
 
@@ -35,6 +39,7 @@ class JavAITaggingMongoE2ETest {
     static final GenericContainer<?> mongo =
             new GenericContainer<>(DockerImageName.parse("mongodb/mongodb-atlas-local:8.2"))
                     .withExposedPorts(27017)
+                    .waitingFor(Wait.forHealthcheck())
                     .withStartupTimeout(Duration.ofMinutes(3));
 
     private static TagRepository tagRepository;

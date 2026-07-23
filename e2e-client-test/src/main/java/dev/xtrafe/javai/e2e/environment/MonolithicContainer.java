@@ -150,6 +150,37 @@ public final class MonolithicContainer {
             }
         }
         waitForPort(HOST_MONGO_PORT);
+        waitForHealthy(MONGO_CONTAINER_NAME);
+    }
+
+    /**
+     * Waits for Docker to report {@code container}'s own {@code HEALTHCHECK} as healthy. Required for the
+     * MongoDB companion specifically, on top of {@link #waitForPort} (OMI-148): {@code mongodb-atlas-local}
+     * restarts {@code mongod} <em>twice</em> while coming up -- once to initialize the replica set, then
+     * again with the {@code mongotHost}/{@code searchIndexManagementHostAndPort} parameters set -- and the
+     * mapped port already accepts connections during the first of those. A client that starts work at
+     * port-open is therefore talking to a deployment about to be torn down under it, and any
+     * Search-Index-Management command in flight across a restart comes back as
+     * {@code error 90 (CallbackCanceled)}, because {@code mongod}'s shutdown cancels pending search-executor
+     * callbacks. The image's own healthcheck only passes after the final restart, which is what makes it the
+     * correct readiness signal here -- the same reason {@code RepositoryBackendSpringDataMongoTest} and
+     * {@code JavAITaggingMongoE2ETest} use Testcontainers' {@code Wait.forHealthcheck()} rather than its
+     * default port-listening strategy. Neither the monolith's own three services nor any other container
+     * here declares a {@code HEALTHCHECK}, so this is deliberately called only for the Mongo companion.
+     */
+    private static void waitForHealthy(String container) {
+        Instant deadline = Instant.now().plus(HEALTH_CHECK_TIMEOUT);
+        String lastStatus = "unknown";
+        while (Instant.now().isBefore(deadline)) {
+            lastStatus = runCapturingOutput(RUN_TIMEOUT, "docker", "inspect",
+                    "--format", "{{.State.Health.Status}}", container).trim();
+            if ("healthy".equals(lastStatus)) {
+                return;
+            }
+            sleep(Duration.ofMillis(500));
+        }
+        throw new IllegalStateException("Timed out after " + HEALTH_CHECK_TIMEOUT + " waiting for container '"
+                + container + "' to report healthy (last status: " + lastStatus + ")");
     }
 
     public static URI embeddingEndpoint() {
