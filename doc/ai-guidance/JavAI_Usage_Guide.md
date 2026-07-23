@@ -404,7 +404,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.4` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.5` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -412,42 +412,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.4</version>
+  <version>0.1.5</version>
 </dependency>
 ```
 
@@ -458,14 +458,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.4")
-    implementation("io.github.dcaudell:javai-model:0.1.4")
-    implementation("io.github.dcaudell:javai-substrate:0.1.4")
-    implementation("io.github.dcaudell:javai-supervision:0.1.4")
-    implementation("io.github.dcaudell:javai-collections:0.1.4")
-    implementation("io.github.dcaudell:javai-persistence:0.1.4")
-    implementation("io.github.dcaudell:javai-completion:0.1.4")
-    implementation("io.github.dcaudell:javai-tagging:0.1.4")
+    implementation("io.github.dcaudell:javai-vector:0.1.5")
+    implementation("io.github.dcaudell:javai-model:0.1.5")
+    implementation("io.github.dcaudell:javai-substrate:0.1.5")
+    implementation("io.github.dcaudell:javai-supervision:0.1.5")
+    implementation("io.github.dcaudell:javai-collections:0.1.5")
+    implementation("io.github.dcaudell:javai-persistence:0.1.5")
+    implementation("io.github.dcaudell:javai-completion:0.1.5")
+    implementation("io.github.dcaudell:javai-tagging:0.1.5")
 }
 ```
 

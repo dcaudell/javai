@@ -12,6 +12,10 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.1.5] - 2026-07-23
+
 ### Changed -- BREAKING
 
 - **`javai-persistence` (Postgres only): the default physical naming strategy is now
@@ -91,4 +95,5 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/dcaudell/javai/compare/v0.1.4...v0.1.5
