@@ -105,6 +105,10 @@ import java.util.regex.Pattern;
  */
 final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
+    /** MongoDB's {@code CallbackCanceled} -- see {@link #isTransientSearchServiceError} for why a
+     *  Search-Index-Management command comes back with this while the deployment is still starting. */
+    private static final int CALLBACK_CANCELED_ERROR_CODE = 90;
+
     private final JavAIPersistenceConfig config;
     private final Set<Class<?>> registeredEntityTypes = ConcurrentHashMap.newKeySet();
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
@@ -325,7 +329,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 if (isDuplicateIndexError(e)) {
                     return;
                 }
-                if (!isSearchServiceNotYetReadyError(e) || Instant.now().isAfter(deadline)) {
+                if (!isTransientSearchServiceError(e) || Instant.now().isAfter(deadline)) {
                     throw e;
                 }
                 try {
@@ -343,7 +347,35 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         return message != null && message.toLowerCase(Locale.ROOT).contains("already exist");
     }
 
-    private static boolean isSearchServiceNotYetReadyError(MongoCommandException e) {
+    /**
+     * Whether {@code e} means "the Search Index Management service isn't usable <em>right now</em>, but
+     * should be shortly" -- as opposed to a real, terminal error worth surfacing. Two distinct causes, both
+     * confirmed empirically against a real {@code mongodb/mongodb-atlas-local} container rather than assumed:
+     *
+     * <ul>
+     *   <li><b>Not reachable yet.</b> {@code mongot} isn't listening the instant {@code mongod} starts
+     *       accepting connections, and says so in the message ("Error connecting to Search Index Management
+     *       service.").</li>
+     *   <li><b>Went away mid-command</b> ({@code CallbackCanceled}, OMI-148). {@code mongodb-atlas-local}
+     *       restarts {@code mongod} twice while coming up -- once to initialize the replica set, then again
+     *       with the {@code mongotHost}/{@code searchIndexManagementHostAndPort} parameters set. A command
+     *       already in flight when one of those restarts lands fails with error 90, because
+     *       {@code mongod}'s shutdown cancels pending search-executor callbacks
+     *       ({@code shutDownSearchTaskExecutors}). The message is
+     *       "onInvoke :: caused by :: Callback was canceled" -- it names neither the service nor the cause,
+     *       so it has to be matched on the code.</li>
+     * </ul>
+     *
+     * <p>Both are transient startup conditions every fresh deployment passes through once, so both are
+     * retried by the callers below rather than surfaced. A consumer that starts its own MongoDB container
+     * and immediately uses this backend hits exactly this window; the alternative is spurious failures on
+     * the very first vector search. Retrying stays bounded by each caller's own deadline, so a genuinely
+     * dead {@code mongot} still fails, just after the wait rather than instantly.
+     */
+    private static boolean isTransientSearchServiceError(MongoCommandException e) {
+        if (e.getErrorCode() == CALLBACK_CANCELED_ERROR_CODE) {
+            return true;
+        }
         String message = e.getErrorMessage();
         return message != null && message.toLowerCase(Locale.ROOT).contains("search index management service");
     }
@@ -366,7 +398,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                     }
                 }
             } catch (MongoCommandException e) {
-                if (!isSearchServiceNotYetReadyError(e)) {
+                if (!isTransientSearchServiceError(e)) {
                     throw e;
                 }
             }
