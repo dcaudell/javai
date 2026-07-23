@@ -1,5 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
+import org.hibernate.SessionFactory;
+
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
@@ -159,6 +161,62 @@ public final class JavAIPI {
             body.run();
             return null;
         });
+    }
+
+    /**
+     * The Hibernate {@link SessionFactory} this module built for {@code config} -- the same instance every
+     * repository sharing that config runs on. <b>Postgres only</b>; the other two backends have no such
+     * thing and throw rather than return null.
+     *
+     * <p><b>What this is for (OMI-160).</b> A {@code JavAIRepository} call joins a Spring
+     * {@code @Transactional} unit of work only when Spring's transaction manager and JavAI hold the
+     * <em>same</em> {@code SessionFactory} instance -- the lookup is an identity comparison. There are two
+     * ways to arrange that, and only one of them was previously reachable:
+     *
+     * <ul>
+     *   <li><b>Spring owns the factory.</b> Hand it to JavAI with
+     *       {@link JavAIPersistenceConfig.Builder#sessionFactory}. Already supported -- but it skips the two
+     *       mapping-time hooks JavAI can only apply to a factory it builds itself, so an interface-typed
+     *       {@code @OneToMany JavAIList<T>} maps as a plain Hibernate bag instead of a real JavAI
+     *       collection. You trade working JavAI collections for working transactions.</li>
+     *   <li><b>JavAI owns the factory</b> -- this method. Keeps the JavAI collection mapping intact and
+     *       still lets an application wire a transaction manager onto the very same factory.</li>
+     * </ul>
+     *
+     * <p><b>Use {@code JpaTransactionManager}, not {@code HibernateTransactionManager}.</b> A
+     * {@code SessionFactory} is a {@code jakarta.persistence.EntityManagerFactory}, so the JPA manager takes
+     * it directly. {@code HibernateTransactionManager}'s {@code (SessionFactory)} constructor eagerly
+     * unwraps a {@code javax.sql.DataSource} to share connections with plain JDBC, and a JavAI-built factory
+     * configures Hibernate's own connection provider from raw {@code jakarta.persistence.jdbc.*} settings --
+     * so it throws {@code UnknownUnwrapTypeException}. Confirmed empirically, not inferred.
+     *
+     * <pre>{@code
+     * @Bean SessionFactory javAiSessionFactory(JavAIPersistenceConfig config) {
+     *     return JavAIPI.sessionFactory(config);
+     * }
+     * @Bean PlatformTransactionManager transactionManager(SessionFactory factory) {
+     *     return new JpaTransactionManager(factory);   // NOT HibernateTransactionManager
+     * }
+     * }</pre>
+     *
+     * <p><b>This call builds the factory, so it also freezes the entity set.</b> It is subject to the same
+     * registration-before-use rule as invoking a repository method (see this class's own javadoc): call
+     * {@link #repository(Class, JavAIPersistenceConfig)} for every repository interface the application
+     * needs <em>before</em> calling this, or the types registered afterwards will be rejected with an
+     * {@code IllegalStateException} explaining exactly that. In a Spring application that means the
+     * {@code @Bean} method above should depend on whatever bean creates the repositories, not race it.
+     *
+     * @throws IllegalArgumentException if {@code config} names a backend other than
+     *         {@link JavAIPersistenceConfig.Backend#POSTGRES}
+     */
+    public static SessionFactory sessionFactory(JavAIPersistenceConfig config) {
+        RepositoryBackend backend = backendFor(config);
+        if (!(backend instanceof RepositoryBackendHibernatePostgres postgres)) {
+            throw new IllegalArgumentException("JavAIPI.sessionFactory(...) is Postgres-only -- a "
+                    + config.backend() + " backend has no Hibernate SessionFactory. Spring @Transactional "
+                    + "integration is likewise Postgres-only in this phase; see JavAIPI.inTransaction's javadoc.");
+        }
+        return postgres.sessionFactory();
     }
 
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {
