@@ -99,7 +99,7 @@
          reason 1.15.10 was rejected above; untested whether 1.17.5's own bundled core would hit the same
          wall running under this repo's JDK 26 dev/CI toolchain, but there's no reason to risk finding out
          empirically when overriding to the already-proven-working version costs nothing. -->
-    <byte-buddy-maven-plugin.version>1.17.5</byte-buddy-maven-plugin.version>
+    <byte-buddy-maven-plugin.version>1.18.11</byte-buddy-maven-plugin.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
     <neo4j-driver.version>6.2.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
