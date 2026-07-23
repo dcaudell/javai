@@ -62,6 +62,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -147,6 +149,16 @@ import java.util.concurrent.ConcurrentHashMap;
  * fields at all; detection is 100%-confidence from the field's declared type alone, since a
  * {@code JavAIDirtyTracking}-implementing collection can never be validly Hibernate-mapped natively
  * regardless of context.
+ *
+ * <p><b>Transactions: joins the caller's, or opens its own (OMI-146).</b> Every operation resolves its
+ * session through {@link #ambientSession()} rather than calling {@code openSession()} directly. When the
+ * caller already owns a unit of work -- a Spring {@code @Transactional} method (shared-{@code SessionFactory}
+ * mode; see {@link SpringManagedSessions}) or a {@link JavAIPI#inTransaction} body (see
+ * {@link JavAITransactionScope}) -- the call runs on that session and neither commits nor closes it, so
+ * several repository calls compose into one atomic unit and this backend's vector/collection/geo writes land
+ * or roll back with everything else the caller did. With no ambient transaction the behavior is exactly what
+ * it was before: open a session, commit, close. The distinction matters most for the write path, where
+ * vectors used to be committed by a transaction of this backend's own that the caller could not roll back.
  *
  * <p><b>Physical naming: snake_case by default, and configurable (OMI-145).</b> The {@code SessionFactory}
  * this class builds applies {@link CamelCaseToUnderscoresNamingStrategy}, so {@code emailVerified} maps to
@@ -444,47 +456,42 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // below can never persist a vector that's stale relative to the field value committed in this same
         // transaction, regardless of the ambient EmbeddingConsistencyMode.
         Object[] result = new Object[1];
-        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> {
-            SessionFactory factory = sessionFactory();
-            try (Session session = factory.openSession()) {
-                Transaction tx = session.beginTransaction();
-                JavAIFlushVectorListener.begin();
-                try {
-                    // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
-                    // element this backend persists itself) needs its own id set before Hibernate/this backend
-                    // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
-                    ensureIdsAssigned(entity, new IdentityHashMap<>());
-                    Object managed = session.merge(entity);
-                    session.flush();
-                    writeVectors(session, entityType, managed);
-                    writeVectorsForRelatedEntities(session, managed);
-                    // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
-                    // merge() never copies its contents onto the managed instance (transient state isn't part
-                    // of what merge() reconciles) -- managed.comments would still be the empty list its own
-                    // no-arg constructor produced. entity's id was already assigned above, so it matches.
-                    syncCollectionMembers(session, entityType, entity);
-                    // Same reason as syncCollectionMembers: a Point field is @Transient (mapped by this
-                    // backend, not Hibernate), so its value lives only on the original `entity`, not `managed`.
-                    syncGeoPoints(session, entity, new IdentityHashMap<>());
-                    // Last, after every write above has been flushed: covers anything Hibernate persisted by
-                    // cascading that the explicit walks never reach (a related entity two or more hops away).
-                    session.flush();
-                    writeVectorsForFlushedEntities(session);
-                    tx.commit();
-                    // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
-                    // @Transient collection fields are left empty by merge(), so returning it would hand the
-                    // caller back an Article whose in-memory `comments` looks wrong immediately after save().
-                    // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
-                    // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
-                    result[0] = entity;
-                } catch (RuntimeException e) {
-                    tx.rollback();
-                    throw e;
-                } finally {
-                    JavAIFlushVectorListener.end();
-                }
+        JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> result[0] = inTransactionalSession(session -> {
+            JavAIFlushVectorListener.begin();
+            try {
+                // Assigned before merge(), recursively: a cascaded @OneToOne (or a @Transient collection
+                // element this backend persists itself) needs its own id set before Hibernate/this backend
+                // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
+                ensureIdsAssigned(entity, new IdentityHashMap<>());
+                Object managed = session.merge(entity);
+                session.flush();
+                writeVectors(session, entityType, managed);
+                writeVectorsForRelatedEntities(session, managed);
+                // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
+                // merge() never copies its contents onto the managed instance (transient state isn't part
+                // of what merge() reconciles) -- managed.comments would still be the empty list its own
+                // no-arg constructor produced. entity's id was already assigned above, so it matches.
+                syncCollectionMembers(session, entityType, entity);
+                // Same reason as syncCollectionMembers: a Point field is @Transient (mapped by this
+                // backend, not Hibernate), so its value lives only on the original `entity`, not `managed`.
+                syncGeoPoints(session, entity, new IdentityHashMap<>());
+                // Last, after every write above has been flushed: covers anything Hibernate persisted by
+                // cascading that the explicit walks never reach (a related entity two or more hops away).
+                // Flushed, not committed: when this call joined a caller's transaction (OMI-146) the commit
+                // is theirs to make, and these vector rows must land or roll back with everything else they
+                // did -- which they do, since this is the caller's own session and connection.
+                session.flush();
+                writeVectorsForFlushedEntities(session);
+                // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
+                // @Transient collection fields are left empty by merge(), so returning it would hand the
+                // caller back an Article whose in-memory `comments` looks wrong immediately after save().
+                // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
+                // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
+                return entity;
+            } finally {
+                JavAIFlushVectorListener.end();
             }
-        });
+        }));
         return result[0];
     }
 
@@ -502,14 +509,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      */
     @Override
     public void reindexAll() {
-        SessionFactory factory = sessionFactory();
-        Set<String> manifest;
-        try (Session session = factory.openSession()) {
-            manifest = session.doReturningWork(connection -> {
-                String newest = newestVectorTable(connection);
-                return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
-            });
-        }
+        Set<String> manifest = inSession(session -> session.doReturningWork(connection -> {
+            String newest = newestVectorTable(connection);
+            return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+        }));
 
         for (Class<?> registered : registeredEntityTypes) {
             for (Object entity : findAll(registered)) {
@@ -517,19 +520,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
         }
 
-        try (Session session = factory.openSession()) {
-            List<String> missing = session.doReturningWork(connection -> {
-                String newest = newestVectorTable(connection);
-                Set<String> reindexed = newest == null ? Set.<String>of() : ownerKeys(connection, newest);
-                return manifest.stream().filter(key -> !reindexed.contains(key)).limit(10).toList();
-            });
-            if (!missing.isEmpty()) {
-                throw new IllegalStateException("reindexAll() left " + missing.size() + " or more entities "
-                        + "un-reindexed under the newly configured model -- the store is now split across two "
-                        + "models. Unreindexed (up to 10, as owner_type/owner_id): " + missing
-                        + ". This usually means an entity type holding vectors was never registered via "
-                        + "JavAIPI.repository(...) in this process.");
-            }
+        List<String> missing = inSession(session -> session.doReturningWork(connection -> {
+            String newest = newestVectorTable(connection);
+            Set<String> reindexed = newest == null ? Set.<String>of() : ownerKeys(connection, newest);
+            return manifest.stream().filter(key -> !reindexed.contains(key)).limit(10).toList();
+        }));
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException("reindexAll() left " + missing.size() + " or more entities "
+                    + "un-reindexed under the newly configured model -- the store is now split across two "
+                    + "models. Unreindexed (up to 10, as owner_type/owner_id): " + missing
+                    + ". This usually means an entity type holding vectors was never registered via "
+                    + "JavAIPI.repository(...) in this process.");
         }
     }
 
@@ -571,15 +572,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public Optional<Object> findById(Class<?> entityType, UUID id) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             Object entity = session.find(entityType, id);
             if (entity != null) {
                 hydrateCollectionMembers(session, entity);
                 hydrateGeoPoints(session, entity, new IdentityHashMap<>());
             }
             return Optional.ofNullable(entity);
-        }
+        });
     }
 
     @Override
@@ -589,8 +589,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @SuppressWarnings("unchecked")
     private <T> List<Object> findAllTyped(Class<T> entityType) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             JpaCriteriaQuery<T> query = session.getCriteriaBuilder().createQuery(entityType);
             JpaRoot<T> root = query.from(entityType);
             query.select(root);
@@ -600,14 +599,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 hydrateGeoPoints(session, result, new IdentityHashMap<>());
             }
             return (List<Object>) (List<?>) results;
-        }
+        });
     }
 
     @Override
     public void deleteById(Class<?> entityType, UUID id) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
-            Transaction tx = session.beginTransaction();
+        inTransactionalSession(session -> {
             JavAIFlushVectorListener.begin();
             try {
                 Object entity = session.find(entityType, id);
@@ -627,41 +624,30 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     deleteVectors(session, deleted.ownerType(), deleted.id());
                     deleteGeoPoints(session, deleted.ownerType(), deleted.id());
                 }
-                tx.commit();
-            } catch (RuntimeException e) {
-                tx.rollback();
-                throw e;
+                return null;
             } finally {
                 JavAIFlushVectorListener.end();
             }
-        }
+        });
     }
 
     @Override
     public List<Object> findNearestByFieldVector(
             Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        SessionFactory factory = sessionFactory();
-        List<UUID> rankedIds;
-        try (Session session = factory.openSession()) {
-            rankedIds = session.doReturningWork(connection -> {
-                String table = ensureFieldVectorTable(connection, reference.modelId(), reference.dims());
-                return rankIds(connection, table, entityType, fieldName, reference, limit);
-            });
-        }
-        return hydrate(factory, entityType, rankedIds);
+        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
+            String table = ensureFieldVectorTable(connection, reference.modelId(), reference.dims());
+            return rankIds(connection, table, entityType, fieldName, reference, limit);
+        }));
+        return hydrate(entityType, rankedIds);
     }
 
     @Override
     public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        SessionFactory factory = sessionFactory();
-        List<UUID> rankedIds;
-        try (Session session = factory.openSession()) {
-            rankedIds = session.doReturningWork(connection -> {
-                String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
-                return rankIds(connection, table, entityType, null, reference, limit);
-            });
-        }
-        return hydrate(factory, entityType, rankedIds);
+        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
+            String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
+            return rankIds(connection, table, entityType, null, reference, limit);
+        }));
+        return hydrate(entityType, rankedIds);
     }
 
     // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
@@ -758,8 +744,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private <T> List<Object> findByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args,
             DerivedFinderQuery.Constraints constraints) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
             JpaCriteriaQuery<T> cq = cb.createQuery(entityType);
             JpaRoot<T> root = cq.from(entityType);
@@ -789,7 +774,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 out.add(entity);
             }
             return out;
-        }
+        });
     }
 
     @Override
@@ -798,8 +783,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     private <T> long countByDerivedTyped(Class<T> entityType, DerivedFinderQuery query, Object[] args) {
-        SessionFactory factory = sessionFactory();
-        try (Session session = factory.openSession()) {
+        return inSession(session -> {
             HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
             JpaCriteriaQuery<Long> cq = cb.createQuery(Long.class);
             JpaRoot<T> root = cq.from(entityType);
@@ -810,7 +794,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 cq.where(where);
             }
             return session.createQuery(cq).getSingleResult();
-        }
+        });
     }
 
     @Override
@@ -1701,8 +1685,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     /** Second half: a targeted load of exactly the ranked ids, one {@code find} per id (bounded by
      *  {@code limit}, typically small) -- simpler and just as correct as a batch multi-load API for this
      *  volume, and trivially preserves rank order without a separate re-sort step. */
-    private List<Object> hydrate(SessionFactory factory, Class<?> entityType, List<UUID> rankedIds) {
-        try (Session session = factory.openSession()) {
+    private List<Object> hydrate(Class<?> entityType, List<UUID> rankedIds) {
+        return inSession(session -> {
             List<Object> results = new ArrayList<>(rankedIds.size());
             for (UUID id : rankedIds) {
                 Object entity = session.find(entityType, id);
@@ -1713,7 +1697,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 }
             }
             return results;
-        }
+        });
     }
 
     /** pgvector's own text input format for a vector literal, e.g. {@code "[0.1,0.2,0.3]"} -- avoids
@@ -1784,7 +1768,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         synchronized (bootstrapLock) {
             if (sessionFactory == null) {
                 sessionFactory = config.externalSessionFactory() != null
-                        ? config.externalSessionFactory()
+                        ? nativeFactory(config.externalSessionFactory())
                         : buildSessionFactory();
                 registerFlushVectorListener(sessionFactory);
                 initializeSchema(sessionFactory);
@@ -1825,6 +1809,126 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             if (entity instanceof JavAIVectorizable vectorizable
                     && entity.getClass().isAnnotationPresent(Entity.class)) {
                 writeVectors(session, entity.getClass(), vectorizable);
+            }
+        }
+    }
+
+    /**
+     * The session this call should run on when the caller already owns one, or {@code null} when this
+     * backend should open (and commit) its own -- the whole of OMI-146's "join an ambient transaction"
+     * behavior, in one place.
+     *
+     * <p>Two sources, checked in order, both scoped to <em>this</em> backend's own {@code SessionFactory} so
+     * a second, independently-configured backend on the same thread is never handed the wrong session:
+     * {@link JavAIPI#inTransaction} for callers who aren't running under Spring, then a Spring-managed
+     * transaction ({@link SpringManagedSessions}) for callers who are.
+     *
+     * <p>Returning {@code null} is the ordinary case and preserves the pre-0.1.5 behavior exactly: one
+     * session per repository call, committed on its own.
+     */
+    /**
+     * The real Hibernate {@code SessionFactory} behind whatever the caller supplied. Spring's
+     * {@code LocalContainerEntityManagerFactoryBean} hands out a <em>proxy</em> {@code EntityManagerFactory},
+     * and {@code unwrap(SessionFactory.class)} on it yields a proxy implementing {@code SessionFactory} --
+     * not the {@code SessionFactoryImplementor} this backend needs. Two things break on the proxy, both
+     * discovered by test rather than reasoned about: {@link #registerFlushVectorListener} casts to
+     * {@code SessionFactoryImplementor} and threw {@code ClassCastException}, and -- more subtly --
+     * {@code session.getSessionFactory()} on a Spring-managed session returns the <em>native</em> factory, so
+     * comparing it against the proxy never matched and no transaction was ever joined. Normalizing here, at
+     * the one place an external factory enters, fixes both at once and keeps every downstream comparison
+     * against a single identity.
+     */
+    private static SessionFactory nativeFactory(SessionFactory supplied) {
+        if (supplied instanceof SessionFactoryImplementor) {
+            return supplied;
+        }
+        return supplied.unwrap(SessionFactoryImplementor.class);
+    }
+
+    private Session ambientSession() {
+        SessionFactory factory = sessionFactory();
+        Session javAIScoped = JavAITransactionScope.current(factory);
+        if (javAIScoped != null) {
+            return javAIScoped;
+        }
+        return SpringManagedSessions.isAvailable() ? SpringManagedSessions.current(factory) : null;
+    }
+
+    /**
+     * Runs read-only work on the ambient session if there is one, otherwise on a short-lived session of this
+     * backend's own. Reads need no transaction of their own either way -- joining one matters because
+     * entities the caller has already written but not yet committed must be visible to a subsequent read in
+     * the same unit of work, which a separate session could not see.
+     */
+    private <T> T inSession(Function<Session, T> work) {
+        Session ambient = ambientSession();
+        if (ambient != null) {
+            return work.apply(ambient);
+        }
+        try (Session session = sessionFactory().openSession()) {
+            return work.apply(session);
+        }
+    }
+
+    /**
+     * Runs write work transactionally: joined to the caller's transaction when one exists -- committing and
+     * rolling back with it, never independently of it -- and otherwise in this backend's own
+     * open/begin/commit cycle, exactly as before OMI-146.
+     *
+     * <p>The joined branch deliberately neither commits nor closes: both belong to whoever opened the
+     * transaction. It also doesn't roll back on failure, only propagates -- Spring marks its own transaction
+     * rollback-only when the exception escapes the {@code @Transactional} boundary, and rolling back here
+     * would instead end the caller's unit of work early, out from under work it still intended to do.
+     */
+    private <T> T inTransactionalSession(Function<Session, T> work) {
+        Session ambient = ambientSession();
+        if (ambient != null) {
+            return work.apply(ambient);
+        }
+        try (Session session = sessionFactory().openSession()) {
+            Transaction tx = session.beginTransaction();
+            try {
+                T result = work.apply(session);
+                tx.commit();
+                return result;
+            } catch (RuntimeException e) {
+                if (tx.isActive()) {
+                    tx.rollback();
+                }
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Runs {@code body} as one unit of work on one session -- {@link JavAIPI#inTransaction}'s implementation.
+     * Every repository call the body makes against this backend resolves the same session via
+     * {@link #ambientSession()} and therefore commits, or rolls back, exactly once, together.
+     *
+     * <p>Joins rather than nests when the caller is already inside a Spring transaction: that transaction is
+     * the more meaningful boundary, and opening a second one underneath it would produce precisely the split
+     * unit of work this method exists to prevent.
+     */
+    @Override
+    public <T> T inTransaction(Supplier<T> body) {
+        if (ambientSession() != null) {
+            return body.get();
+        }
+        SessionFactory factory = sessionFactory();
+        try (Session session = factory.openSession()) {
+            Transaction tx = session.beginTransaction();
+            JavAITransactionScope.begin(factory, session);
+            try {
+                T result = body.get();
+                tx.commit();
+                return result;
+            } catch (RuntimeException e) {
+                if (tx.isActive()) {
+                    tx.rollback();
+                }
+                throw e;
+            } finally {
+                JavAITransactionScope.end();
             }
         }
     }

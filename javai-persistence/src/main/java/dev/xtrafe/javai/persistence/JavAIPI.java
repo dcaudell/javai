@@ -7,6 +7,7 @@ import java.lang.reflect.Proxy;
 import java.lang.reflect.Type;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /**
  * JavAI Persistence Interface -- the save/query/re-index contract JavAI objects speak internally, per
@@ -114,6 +115,50 @@ public final class JavAIPI {
         }
         throw new IllegalArgumentException(repositoryInterface
                 + " must directly extend JavAIRepository<SomeEntity> with a concrete type argument");
+    }
+
+    /**
+     * Runs {@code body} as <b>one unit of work</b>: every repository call it makes against {@code config}'s
+     * backend shares a single session and transaction, committing together at the end or rolling back
+     * together if the body throws (OMI-146).
+     *
+     * <pre>{@code
+     * JavAIPI.inTransaction(config, () -> {
+     *     Channel channel = channels.save(findOrCreateChannel(platform));
+     *     Participant participant = participants.save(findOrCreateParticipant(sender));
+     *     entries.save(new ConversationEntry(channel, participant, text));
+     * });
+     * }</pre>
+     *
+     * <p>Without this, each of those three calls opens its own session and commits on its own, so a failure
+     * on the third leaves the first two permanently committed. This is the API for callers who are not
+     * running under Spring; <b>a Spring application needs nothing here</b> -- an ordinary
+     * {@code @Transactional} method already establishes the unit of work, and repository calls made inside it
+     * join it automatically, provided JavAI was configured with that application's own
+     * {@code SessionFactory} via {@link JavAIPersistenceConfig.Builder#sessionFactory}.
+     *
+     * <p>Bound to the calling thread: work handed to another thread inside {@code body} is <em>not</em> part
+     * of the transaction, the same restriction Spring's own transaction management carries.
+     *
+     * <p><b>Nesting joins, it does not nest.</b> Calling this inside another {@code inTransaction} body -- or
+     * inside a Spring {@code @Transactional} method -- runs the inner body on the transaction already in
+     * progress, so it commits or rolls back with the outer one and never independently. That is Spring's own
+     * {@code PROPAGATION_REQUIRED} behavior, and it is what keeps two methods that each wrap their work this
+     * way composable; there is no {@code REQUIRES_NEW} equivalent here in this phase.
+     *
+     * <p>Postgres only in this phase; the other two backends throw a message saying so rather than pretending
+     * to be atomic.
+     */
+    public static <T> T inTransaction(JavAIPersistenceConfig config, Supplier<T> body) {
+        return backendFor(config).inTransaction(body);
+    }
+
+    /** Void form of {@link #inTransaction(JavAIPersistenceConfig, Supplier)}, for a body that returns nothing. */
+    public static void inTransaction(JavAIPersistenceConfig config, Runnable body) {
+        backendFor(config).inTransaction(() -> {
+            body.run();
+            return null;
+        });
     }
 
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {

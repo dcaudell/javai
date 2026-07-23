@@ -48,6 +48,35 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **`javai-persistence` (Postgres): repository calls now join a caller's transaction (OMI-146).** Previously
+  every call opened its own Hibernate `Session` and committed independently, so several calls could never
+  form one atomic unit of work — a Spring `@Transactional` service method composing four repositories got
+  four transactions, and a failure on the last left the first three permanently committed.
+
+  A call now runs on the caller's session when one is active, and opens its own only when there isn't:
+  - **Spring `@Transactional`**, with no JavAI-specific API at the call site. Requires that JavAI share the
+    application's own factory (`Builder.sessionFactory(emf.unwrap(SessionFactory.class))`), since that is
+    what there is to join. Works under `JpaTransactionManager` and `HibernateTransactionManager`, at class
+    and method level, and honors the annotation's attributes — `isolation`, `readOnly`,
+    `rollbackFor`/`noRollbackFor`, and the propagation modes, including correctly *not* joining under
+    `REQUIRES_NEW`/`NOT_SUPPORTED`, where the caller has deliberately stepped outside the transaction.
+  - **`JavAIPI.inTransaction(config, body)`** (new), for callers not running under Spring: every repository
+    call in the body shares one session and commits, or rolls back, once. Nesting joins the outer body
+    (`PROPAGATION_REQUIRED` semantics) rather than opening a second transaction. Thread-bound.
+
+  Vector rows are written on the caller's own connection before their commit, so they now roll back with the
+  caller's transaction rather than being committed separately.
+
+  Behavior is unchanged when there is no ambient transaction, which is every pre-0.1.5 usage. Neo4j and
+  MongoDB are unaffected: each call remains its own unit of work, and `inTransaction` throws there rather
+  than implying an atomicity it doesn't provide. Two documented edges: a write inside `readOnly = true` fails
+  loudly (Postgres rejects the INSERT), and `PROPAGATION_NESTED` is unsupported under `JpaTransactionManager`
+  because Spring's Hibernate JPA dialect exposes no savepoint manager — Spring refuses it before JavAI is
+  involved.
+
+  Adds `org.springframework:spring-orm` as an **optional** dependency: it is what holds the resource holders
+  a Spring transaction binds. Optional dependencies are not transitive, and the bridge class is only loaded
+  after a runtime presence check, so a non-Spring consumer's classpath is unaffected.
 - **`javai-persistence`: `JavAIPersistenceConfig.Builder.physicalNamingStrategy(PhysicalNamingStrategy)`** —
   overrides the naming strategy applied to the `SessionFactory` this module builds, including pinning the
   pre-0.1.5 behavior above.

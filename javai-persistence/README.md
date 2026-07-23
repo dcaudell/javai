@@ -125,6 +125,63 @@ an already-registered type's own fields are discovered and registered automatica
 need to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and
 independently* (Neo4j is the exception here -- see below).
 
+## Transactions: joining a caller's unit of work (Postgres)
+
+Up to 0.1.4 every repository call opened its own session and committed on its own, so several calls could
+never be one atomic unit -- a `@Transactional` service method composing four repositories got four
+transactions, and a failure on the last left the first three permanently committed. Since 0.1.5 (OMI-146) a
+call **joins a transaction that already exists** and only opens its own when there is none:
+
+| Situation | What a repository call does |
+|---|---|
+| Inside a Spring `@Transactional` method, JavAI configured with that application's own `SessionFactory` | Joins it. Commits/rolls back with the caller, never separately. |
+| Inside `JavAIPI.inTransaction(config, ...)` | Joins that body's session; the whole body commits once. |
+| Anywhere else | Opens a session, commits, closes -- exactly the pre-0.1.5 behavior. |
+
+**Spring consumers need no JavAI-specific API at all**, provided JavAI shares the application's factory:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+        .sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))   // the app's own factory
+        .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+        .build();
+
+@Transactional                       // ordinary Spring; nothing below knows about JavAI
+public void recordEntry(...) {
+    channels.save(channel);          // all three
+    participants.save(participant);  //   share one
+    entries.save(entry);             //     transaction
+}
+```
+
+This works for `JpaTransactionManager` and `HibernateTransactionManager` alike, for class-level and
+method-level `@Transactional`, and it honors the annotation's attributes because JavAI is writing through the
+caller's own session and connection -- `isolation` reaches JavAI's writes, `readOnly` makes them fail loudly
+(Postgres rejects the INSERT), `rollbackFor`/`noRollbackFor` decide JavAI's rows along with everything else,
+and `REQUIRES_NEW`/`NOT_SUPPORTED` correctly *don't* get joined, since the caller has stepped outside the
+transaction. `SpringTransactionalIntegrationTest` asserts each of these against a real Postgres.
+
+Two things this does **not** do. Vector rows are written before the caller's commit, on the caller's own
+connection, so they roll back with it -- but a *read-only* transaction therefore can't write them either.
+And `PROPAGATION_NESTED` is unavailable under `JpaTransactionManager`: Spring's Hibernate JPA dialect exposes
+no savepoint manager, so Spring refuses the call before JavAI is involved (it works under
+`HibernateTransactionManager`, and both cases are pinned by tests).
+
+**Non-Spring callers** get the same atomicity explicitly:
+
+```java
+JavAIPI.inTransaction(config, () -> {
+    Channel channel = channels.save(findOrCreateChannel(platform));
+    entries.save(new ConversationEntry(channel, text));
+});   // one commit; any exception rolls back both
+```
+
+Nesting joins rather than nests (Spring's `PROPAGATION_REQUIRED` semantics), so two methods that each wrap
+their own work this way stay composable. It is thread-bound, like Spring's own transaction management: work
+handed to another thread inside the body is not part of the transaction. Postgres only -- Neo4j and MongoDB
+throw a message saying so rather than pretending to be atomic.
+
 ## Physical naming, and configuring the `SessionFactory` JavAI builds (Postgres)
 
 **Columns and tables are snake_cased by default** (OMI-145, 0.1.5): a field `emailVerified` maps to
@@ -336,6 +393,11 @@ backends' save/findById/findAll/deleteById/reindexAll plus the three `findNeares
 above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
 `RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
 methods.
+
+**Transaction participation (OMI-146), Postgres.** A repository call joins a Spring `@Transactional` unit of
+work or a `JavAIPI.inTransaction(...)` body when one is active, and opens its own session only when there
+isn't -- see "Transactions" above. `SpringTransactionalIntegrationTest` (19 tests, real Spring contexts over a
+real Postgres) and `JavAIProgrammaticTransactionTest` (5) cover both paths.
 
 **Configurable physical naming (OMI-145), Postgres.** snake_case by default, overridable via
 `Builder.physicalNamingStrategy(...)`, plus a general `Builder.hibernateProperty(...)`/`.hibernateProperties(...)`
