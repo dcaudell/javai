@@ -404,7 +404,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.5` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.6` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -412,42 +412,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.5</version>
+  <version>0.1.6</version>
 </dependency>
 ```
 
@@ -458,14 +458,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.5")
-    implementation("io.github.dcaudell:javai-model:0.1.5")
-    implementation("io.github.dcaudell:javai-substrate:0.1.5")
-    implementation("io.github.dcaudell:javai-supervision:0.1.5")
-    implementation("io.github.dcaudell:javai-collections:0.1.5")
-    implementation("io.github.dcaudell:javai-persistence:0.1.5")
-    implementation("io.github.dcaudell:javai-completion:0.1.5")
-    implementation("io.github.dcaudell:javai-tagging:0.1.5")
+    implementation("io.github.dcaudell:javai-vector:0.1.6")
+    implementation("io.github.dcaudell:javai-model:0.1.6")
+    implementation("io.github.dcaudell:javai-substrate:0.1.6")
+    implementation("io.github.dcaudell:javai-supervision:0.1.6")
+    implementation("io.github.dcaudell:javai-collections:0.1.6")
+    implementation("io.github.dcaudell:javai-persistence:0.1.6")
+    implementation("io.github.dcaudell:javai-completion:0.1.6")
+    implementation("io.github.dcaudell:javai-tagging:0.1.6")
 }
 ```
 
@@ -577,8 +577,35 @@ already in progress instead of always opening its own:
   calls in one such method commit or roll back together, later calls see earlier ones' uncommitted writes,
   and the annotation's attributes (`isolation`, `readOnly`, `rollbackFor`/`noRollbackFor`, `propagation`,
   `timeout`) govern JavAI's writes because they run on the caller's own session and connection. **One wiring
-  requirement**: JavAI must share the application's factory, or it has nothing to join —
-  `.sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))` on the config builder.
+  requirement**: Spring's transaction manager and JavAI must hold the *same* `SessionFactory` instance — the
+  match is by identity. There are two ways to arrange that, and which one you want depends on who owns the
+  factory; see the next bullet.
+- **Choose who owns the `SessionFactory`.** Both directions work, and the choice has a real consequence:
+  - **JavAI owns it** (no `.sessionFactory(...)` call) — ask for it with
+    `JavAIPI.sessionFactory(config)` (**since 0.1.6**, Postgres only) and wire your transaction manager onto
+    that instance. **Prefer this.** It keeps the mapping-time hooks JavAI can only apply to a factory it
+    builds itself, which is what makes an interface-typed `@OneToMany JavAIList<T>` a real JavAI collection
+    rather than a plain Hibernate bag.
+    ```java
+    @Bean SessionFactory javAiSessionFactory(JavAIPersistenceConfig config) {
+        return JavAIPI.sessionFactory(config);
+    }
+    @Bean PlatformTransactionManager transactionManager(SessionFactory factory) {
+        return new JpaTransactionManager(factory);        // see the note below
+    }
+    ```
+    ⚠️ Use **`JpaTransactionManager`**, not `HibernateTransactionManager`. A `SessionFactory` *is* a
+    `jakarta.persistence.EntityManagerFactory`, so the JPA manager takes it directly.
+    `HibernateTransactionManager`'s `(SessionFactory)` constructor eagerly unwraps a `javax.sql.DataSource`
+    to share connections with plain JDBC, and a JavAI-built factory configures Hibernate's own connection
+    provider from raw `jakarta.persistence.jdbc.*` settings — so it throws `UnknownUnwrapTypeException`.
+    ⚠️ Asking for the factory **builds** it, which **freezes the entity set**. Call
+    `JavAIPI.repository(...)` for every repository your application needs *before* this bean is created, or
+    the later ones are rejected (registration-before-use, same rule as calling a repository method).
+  - **Spring owns it** — build it yourself and hand it over with
+    `.sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))`. Works, but a factory JavAI didn't
+    build skips those mapping hooks, so you trade working JavAI collections for working transactions. Only
+    pick this if the application genuinely must own the factory for other reasons.
 - **Outside Spring**, wrap the calls: `JavAIPI.inTransaction(config, () -> { repoA.save(a); repoB.save(b); })`.
   One commit, or one rollback if the body throws. Nesting joins the outer body rather than starting a second
   transaction, and the scope is thread-bound.

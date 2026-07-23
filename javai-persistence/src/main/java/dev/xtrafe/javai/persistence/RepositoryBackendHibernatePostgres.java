@@ -1798,7 +1798,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
-    private SessionFactory sessionFactory() {
+    /** Package-private rather than private so {@link JavAIPI#sessionFactory(JavAIPersistenceConfig)} can
+     *  hand this exact instance to a caller wiring their own Spring transaction manager (OMI-160). */
+    SessionFactory sessionFactory() {
         SessionFactory factory = sessionFactory;
         if (factory != null) {
             return factory;
