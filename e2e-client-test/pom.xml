@@ -75,6 +75,16 @@
       <artifactId>javai-vector</artifactId>
       <version>${javai.version}</version>
     </dependency>
+    <!-- OMI-187's instrumented provider (RecordingEmbeddingProvider/EmbeddingLedger) and the shared
+         FakeEmbeddingProvider, published as javai-vector's test-jar. Resolved from the local repository
+         like every other javai artifact here, so `mvn install` at the reactor root is enough. -->
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+      <version>${javai.version}</version>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-model</artifactId>

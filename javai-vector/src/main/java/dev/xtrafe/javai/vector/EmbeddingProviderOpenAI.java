@@ -137,4 +137,9 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
             super(message, cause);
         }
     }
+
+    @Override
+    public String modelId() {
+        return model;
+    }
 }

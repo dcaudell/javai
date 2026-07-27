@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * An alternate real {@link JavAIEmbeddingProvider}: a thin HTTP client against
@@ -99,10 +101,66 @@ public final class EmbeddingProviderOllama implements JavAIEmbeddingProvider {
     }
 
     /**
+     * One request for every text, rather than one request per text. Ollama's {@code /api/embed} already
+     * accepts {@code "input"} as an array and answers with one row per input, in order -- so the only thing
+     * standing between a seeding loop and a single round trip was this provider always sending a scalar.
+     *
+     * <p>See {@link JavAIEmbeddingProvider#embedAll} for why this matters more than the call count: at the
+     * ~10ms per embed measured in OMI-187, a 1,400-tag catalog is ~14s of sequential HTTP versus well under
+     * a second batched.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        StringBuilder inputs = new StringBuilder();
+        for (String text : texts) {
+            if (!inputs.isEmpty()) {
+                inputs.append(',');
+            }
+            // Same empty-input substitution as embed() -- see its comment for why Ollama needs it.
+            inputs.append('"').append(JsonStrings.escape(text.isEmpty() ? " " : text)).append('"');
+        }
+        String requestBody = "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":[" + inputs + "]}";
+        HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(30))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = parseAllEmbeddingRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("Ollama returned " + rows.size() + " embeddings for "
+                    + texts.size() + " inputs; the batch response must line up with the request: " + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, model, values.length, computedAt));
+        }
+        return vectors;
+    }
+
+    /**
      * Extracts the first row of {@code "embeddings": [[float, ...]]} out of Ollama's response object,
      * ignoring every other field in the JSON body.
      */
     static float[] parseEmbeddingsField(String responseBody) {
+        List<float[]> rows = parseAllEmbeddingRows(responseBody);
+        return rows.isEmpty() ? new float[0] : rows.get(0);
+    }
+
+    /** Every row of {@code "embeddings": [[...], [...]]}, in response order -- one per batched input. */
+    static List<float[]> parseAllEmbeddingRows(String responseBody) {
         String key = "\"embeddings\"";
         int keyIndex = responseBody.indexOf(key);
         if (keyIndex < 0) {
@@ -110,16 +168,39 @@ public final class EmbeddingProviderOllama implements JavAIEmbeddingProvider {
         }
         int colonIndex = responseBody.indexOf(':', keyIndex + key.length());
         int outerStart = responseBody.indexOf('[', colonIndex);
-        int rowStart = responseBody.indexOf('[', outerStart + 1);
-        int rowEnd = responseBody.indexOf(']', rowStart);
-        if (colonIndex < 0 || outerStart < 0 || rowStart < 0 || rowEnd < 0) {
+        if (colonIndex < 0 || outerStart < 0) {
             throw new EmbeddingProviderException("Unexpected Ollama response shape: " + responseBody);
         }
-        String row = responseBody.substring(rowStart + 1, rowEnd).strip();
-        if (row.isBlank()) {
+        int outerEnd = responseBody.indexOf(']', outerStart);
+        List<float[]> rows = new ArrayList<>();
+        int cursor = outerStart + 1;
+        while (true) {
+            int rowStart = responseBody.indexOf('[', cursor);
+            // Past the closing bracket of the outer array means there are no further rows to read. Recomputed
+            // rather than cached, since each row's ']' shifts where the outer one is found.
+            int outerClose = responseBody.indexOf(']', cursor);
+            if (rowStart < 0 || (outerClose >= 0 && outerClose < rowStart)) {
+                break;
+            }
+            int rowEnd = responseBody.indexOf(']', rowStart);
+            if (rowEnd < 0) {
+                throw new EmbeddingProviderException("Unexpected Ollama response shape: " + responseBody);
+            }
+            rows.add(parseRow(responseBody.substring(rowStart + 1, rowEnd)));
+            cursor = rowEnd + 1;
+        }
+        if (rows.isEmpty() && outerEnd < 0) {
+            throw new EmbeddingProviderException("Unexpected Ollama response shape: " + responseBody);
+        }
+        return rows;
+    }
+
+    private static float[] parseRow(String row) {
+        String trimmed = row.strip();
+        if (trimmed.isBlank()) {
             return new float[0];
         }
-        String[] parts = row.split(",");
+        String[] parts = trimmed.split(",");
         float[] values = new float[parts.length];
         for (int i = 0; i < parts.length; i++) {
             values[i] = Float.parseFloat(parts[i].strip());
@@ -135,5 +216,10 @@ public final class EmbeddingProviderOllama implements JavAIEmbeddingProvider {
         EmbeddingProviderException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    @Override
+    public String modelId() {
+        return model;
     }
 }

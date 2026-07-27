@@ -59,6 +59,7 @@ import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -465,9 +466,18 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // tries to INSERT it -- there's no @GeneratedValue, identity is always application-assigned.
                 ensureIdsAssigned(entity, new IdentityHashMap<>());
                 Object managed = session.merge(entity);
+                // merge() copies mapped field values onto its managed copy but not the woven $javai$state
+                // holding this project's vector caches -- the same "transient state stays on the original"
+                // property syncCollectionMembers and syncGeoPoints below already rely on. Without this, the
+                // managed copy looks brand new and re-embeds vectors the caller already had, which is the
+                // bulk of what OMI-187 measured. Only clean, already-computed slots move across, so a field
+                // the caller actually changed is still embedded fresh.
+                Map<UUID, Object> originalsById = vectorizablesById(entity);
+                transferVectorState(entity, managed, originalsById);
+                transferToSummaryChildren(managed, originalsById);
                 session.flush();
                 writeVectors(session, entityType, managed);
-                writeVectorsForRelatedEntities(session, managed);
+                writeVectorsForRelatedEntities(session, managed, originalsById);
                 // Reads from the original `entity`, not `managed`: the collection field is @Transient, so
                 // merge() never copies its contents onto the managed instance (transient state isn't part
                 // of what merge() reconciles) -- managed.comments would still be the empty list its own
@@ -482,7 +492,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // is theirs to make, and these vector rows must land or roll back with everything else they
                 // did -- which they do, since this is the caller's own session and connection.
                 session.flush();
-                writeVectorsForFlushedEntities(session);
+                writeVectorsForFlushedEntities(session, originalsById);
+                // And back the other way, now that everything above has computed real vectors on the
+                // managed copies. This half is what actually pays off across repeated saves: writeVectors
+                // computes on `managed`, but save() hands the caller `entity` back, so without this the
+                // caller's own instance stays cold forever and every subsequent save re-embeds it from
+                // scratch. That is exactly the shape of a seeding loop -- save a TagSet, then save N tags
+                // that each reference the caller's TagSet -- and it was the last of OMI-187's waste.
+                transferVectorState(managed, entity, vectorizablesById(managed));
                 // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
                 // @Transient collection fields are left empty by merge(), so returning it would hand the
                 // caller back an Article whose in-memory `comments` looks wrong immediately after save().
@@ -578,6 +595,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             if (entity != null) {
                 hydrateCollectionMembers(session, entity);
                 hydrateGeoPoints(session, entity, new IdentityHashMap<>());
+                hydrateVectors(session, entity);
             }
             return Optional.ofNullable(entity);
         });
@@ -598,6 +616,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             for (T result : results) {
                 hydrateCollectionMembers(session, result);
                 hydrateGeoPoints(session, result, new IdentityHashMap<>());
+                hydrateVectors(session, result);
             }
             return (List<Object>) (List<?>) results;
         });
@@ -772,6 +791,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             for (T entity : results) {
                 hydrateCollectionMembers(session, entity);
                 hydrateGeoPoints(session, entity, new IdentityHashMap<>());
+                hydrateVectors(session, entity);
                 out.add(entity);
             }
             return out;
@@ -1278,19 +1298,41 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         UUID id = EntityReflection.readId(entity);
         String ownerType = entityType.getName();
 
+        // NOT hydrated here, deliberately -- see hydrateVectors' javadoc. Hydrating on the write path
+        // persisted a stale vector, caught by savedVectorIsAlwaysAccurateUnderImmediateConsistency.
+        //
+        // An absent vector (EmbeddingVector.absent(), OMI-187) means "no embeddable content". It is not
+        // written -- zero dimensions would try to provision a vector(0) column under the synthetic
+        // "<absent>" model id -- and, just as importantly, any row a previous save left for that field is
+        // deleted. Skipping the write alone would leave a stale vector behind, and a stale row in an ANN
+        // index is worse than a wasted embedding: the entity keeps matching searches for content it no
+        // longer has. Reaching it needs a @Vectorize field to go from populated to null between saves.
         session.doWork(connection -> {
+            String currentModelId = JavAIRuntime.currentModelId();
             for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
                 EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                if (vector.isAbsent()) {
+                    deleteFieldVectorRow(connection, currentModelId, ownerType, id, fieldName);
+                    continue;
+                }
                 String table = ensureFieldVectorTable(connection, vector.modelId(), vector.dims());
                 upsertVector(connection, table, ownerType, id, fieldName, vector);
             }
             EmbeddingVector combined = vectorizable.vector();
-            String combinedTable = ensureFieldVectorTable(connection, combined.modelId(), combined.dims());
-            upsertVector(connection, combinedTable, ownerType, id, COMBINED_VECTOR_FIELD, combined);
+            if (combined.isAbsent()) {
+                deleteFieldVectorRow(connection, currentModelId, ownerType, id, COMBINED_VECTOR_FIELD);
+            } else {
+                String combinedTable = ensureFieldVectorTable(connection, combined.modelId(), combined.dims());
+                upsertVector(connection, combinedTable, ownerType, id, COMBINED_VECTOR_FIELD, combined);
+            }
 
             EmbeddingVector summary = vectorizable.summaryVector();
-            String summaryTable = ensureSummaryVectorTable(connection, summary.modelId(), summary.dims());
-            upsertSummaryVector(connection, summaryTable, ownerType, id, summary);
+            if (summary.isAbsent()) {
+                deleteSummaryVectorRow(connection, currentModelId, ownerType, id);
+            } else {
+                String summaryTable = ensureSummaryVectorTable(connection, summary.modelId(), summary.dims());
+                upsertSummaryVector(connection, summaryTable, ownerType, id, summary);
+            }
         });
     }
 
@@ -1339,7 +1381,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  {@code JavAIVectorizable} (that's what makes their own {@code centroid()}/{@code vector()} work), so
      *  without this exclusion the collection/map field itself would be mistaken for a related entity and
      *  fail {@code EntityReflection.readId} since it has no {@code @Id}. */
-    private void writeVectorsForRelatedEntities(Session session, Object entity) {
+    private void writeVectorsForRelatedEntities(Session session, Object entity, Map<UUID, Object> originalsById) {
         for (Field field : EntityReflection.allFields(entity.getClass())) {
             field.setAccessible(true);
             Object value;
@@ -1352,11 +1394,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 continue; // syncCollectionMembers writes these members' vectors as it persists them
             }
             if (value instanceof Map<?, ?> map) {
-                writeVectorsForCollectionMembers(session, map.values());
+                writeVectorsForCollectionMembers(session, map.values(), originalsById);
             } else if (value instanceof Collection<?> collection) {
-                writeVectorsForCollectionMembers(session, collection);
+                writeVectorsForCollectionMembers(session, collection, originalsById);
             } else {
-                writeVectorsForRelatedEntity(session, value);
+                writeVectorsForRelatedEntity(session, value, originalsById);
             }
         }
     }
@@ -1386,13 +1428,148 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * indiscriminately would have traded this bug for a quieter one: a modified related entity whose vector
      * silently went stale.
      */
-    private void writeVectorsForRelatedEntity(Session session, Object value) {
+    /**
+     * Hands the caller's already-computed vectors to Hibernate's managed copies, across the whole reachable
+     * graph rather than just the saved root (OMI-187).
+     *
+     * <p>The root alone is not enough, and the owner-re-embedding this ticket started from is exactly why:
+     * saving a {@code Tag} re-embeds its {@code TagSet}'s unchanged slug, and that {@code TagSet} is reached
+     * through the <em>managed</em> tag, so it is Hibernate's instance, not the caller's. Matching the two
+     * graphs by entity id is what lets the caller's computed vector reach it.
+     *
+     * <p>Identity is matched on {@code @Id}, not object identity -- the whole point is that these are two
+     * different objects standing for the same row. Anything without an id (a JavAI collection, an entity
+     * whose id has not been assigned) simply has no counterpart to match and is skipped.
+     */
+    private void transferVectorState(Object original, Object managed, Map<UUID, Object> byId) {
+        if (original == managed || byId.isEmpty()) {
+            return;
+        }
+        for (Object candidate : JavAIRuntime.reachableVectorizables(managed)) {
+            Object target = resolve(candidate);
+            UUID id = target == null ? null : idOrNull(target);
+            if (id == null) {
+                continue;
+            }
+            Object source = byId.get(id);
+            if (source != null) {
+                JavAIRuntime.transferComputedVectors(source, target);
+            }
+        }
+    }
+
+    /**
+     * Hands the caller's already-computed vectors to the managed entity's {@code @Summary} children before
+     * anything reads its {@code summaryVector()}.
+     *
+     * <p>These children are the one case the ordinary transfer cannot reach. A lazy {@code @Summary}
+     * association is still an uninitialized proxy when {@code save()} runs its up-front transfer, so it is
+     * skipped there; it then materializes <em>inside</em> {@code JavAIRuntime.summaryVector}'s own recursion,
+     * cold, and re-embeds a value the caller already had. That recursion is not a place persistence can hook.
+     *
+     * <p>Initializing the proxy here is not the "forced load" that
+     * {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} forbids: that guards <em>non-summary</em>
+     * associations, which the vector walk genuinely never needs. A {@code @Summary} child is loaded moments
+     * later regardless, because summarizing is defined in terms of it -- so this changes when it loads, not
+     * whether.
+     */
+    private static void transferToSummaryChildren(Object managed, Map<UUID, Object> originalsById) {
+        if (originalsById.isEmpty()) {
+            return;
+        }
+        for (Field field : EntityReflection.allFields(managed.getClass())) {
+            if (!field.isAnnotationPresent(dev.xtrafe.javai.annotations.Summary.class)) {
+                continue;
+            }
+            field.setAccessible(true);
+            Object value;
+            try {
+                value = field.get(managed);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read field " + field + " on " + managed.getClass(), e);
+            }
+            for (Object child : summaryChildren(value)) {
+                Object related = Hibernate.unproxy(child);
+                UUID id = idOrNull(related);
+                if (id != null) {
+                    JavAIRuntime.transferComputedVectors(originalsById.get(id), related);
+                }
+            }
+        }
+    }
+
+    /** A {@code @Summary} field's vectorizable children, whether it holds one directly or a collection/map. */
+    private static Collection<?> summaryChildren(Object value) {
+        if (value == null) {
+            return List.of();
+        }
+        if (value instanceof Map<?, ?> map) {
+            return map.values();
+        }
+        if (value instanceof Collection<?> collection) {
+            return collection;
+        }
+        return List.of(value);
+    }
+
+    /** Every initialized, id-bearing vectorizable reachable from {@code root}, keyed by entity id. */
+    private static Map<UUID, Object> vectorizablesById(Object root) {
+        Map<UUID, Object> byId = new HashMap<>();
+        for (Object candidate : JavAIRuntime.reachableVectorizables(root)) {
+            Object resolved = resolve(candidate);
+            UUID id = resolved == null ? null : idOrNull(resolved);
+            if (id != null) {
+                byId.put(id, resolved);
+            }
+        }
+        return byId;
+    }
+
+    /**
+     * The real instance behind a possible Hibernate proxy, or null if the proxy has never been initialized.
+     *
+     * <p>Unavoidable here, and for the reason OMI-161 already established: a proxy is a generated subclass,
+     * so it satisfies {@code instanceof JavAIVectorizable} while holding none of the entity's field state --
+     * including the woven {@code $javai$state} the vector caches live in. Reading through the proxy would
+     * transfer onto the wrong object and silently do nothing. An uninitialized proxy is skipped rather than
+     * resolved: forcing a load purely to move a cache entry would trade the embedding call we are trying to
+     * avoid for a database round trip nobody asked for.
+     */
+    private static Object resolve(Object candidate) {
+        if (!Hibernate.isInitialized(candidate)) {
+            return null;
+        }
+        return Hibernate.unproxy(candidate);
+    }
+
+    /** {@code @Id} if this object has a readable one, else null -- JavAI collections and un-assigned
+     *  entities both legitimately have none, and neither is an error worth propagating. */
+    private static UUID idOrNull(Object candidate) {
+        if (!candidate.getClass().isAnnotationPresent(Entity.class)) {
+            return null;
+        }
+        try {
+            return EntityReflection.readId(candidate);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    private void writeVectorsForRelatedEntity(Session session, Object value, Map<UUID, Object> originalsById) {
         if (value == null || !Hibernate.isInitialized(value)) {
             return;
         }
         Object related = Hibernate.unproxy(value);
         if (related instanceof JavAIVectorizable vectorizable
                 && related.getClass().isAnnotationPresent(Entity.class)) {
+            // Last chance to hand this instance the caller's already-computed vector. A lazy @Summary child
+            // is still an uninitialized proxy when save() does its up-front transfer, so it is skipped there
+            // (resolving it then would force a load nobody asked for); it only materializes here, when the
+            // summary walk reads it -- cold, and about to re-embed a value the caller already has. OMI-187.
+            UUID id = idOrNull(related);
+            if (id != null) {
+                JavAIRuntime.transferComputedVectors(originalsById.get(id), vectorizable);
+            }
             writeVectors(session, related.getClass(), vectorizable);
         }
     }
@@ -1403,13 +1580,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  yet never get a vector row -- silently breaking the "every {@code @JavAIVectorizable} written through a
      *  repository has an up-to-date, persisted vector" guarantee. JavAI collection fields are excluded by the
      *  caller because {@link #syncCollectionMembers} already does this for them. */
-    private void writeVectorsForCollectionMembers(Session session, Collection<?> members) {
+    private void writeVectorsForCollectionMembers(Session session, Collection<?> members,
+            Map<UUID, Object> originalsById) {
         for (Object member : members) {
             // Same proxy resolution as a singular association -- a lazily-mapped element can be a proxy
             // here just as readily (OMI-161). This used to rely on `@Entity` not being inherited by the
             // generated proxy subclass to skip them, which happened to avoid the crash but also silently
             // dropped *initialized* proxies whose entity the caller had genuinely modified.
-            writeVectorsForRelatedEntity(session, member);
+            writeVectorsForRelatedEntity(session, member, originalsById);
         }
     }
 
@@ -1441,6 +1619,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             String fieldName = field.getName();
             List<MemberWrite> persistedMembers;
+            // Kept alongside the merged copies so vectors can be carried in both directions, exactly as
+            // save() does for the root (OMI-187): the caller's element into the managed copy so it isn't
+            // re-embedded, and back afterwards so the caller's own instance stays warm for its next save.
+            List<Object> originalMembers = new ArrayList<>();
             if (value instanceof Map<?, ?> map) {
                 persistedMembers = new ArrayList<>();
                 for (Map.Entry<?, ?> mapEntry : map.entrySet()) {
@@ -1448,7 +1630,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     if (element == null || !element.getClass().isAnnotationPresent(Entity.class)) {
                         continue;
                     }
-                    persistedMembers.add(new MemberWrite(String.valueOf(mapEntry.getKey()), session.merge(element)));
+                    Object merged = session.merge(element);
+                    JavAIRuntime.transferComputedVectors(element, merged);
+                    originalMembers.add(element);
+                    persistedMembers.add(new MemberWrite(String.valueOf(mapEntry.getKey()), merged));
                 }
             } else if (value instanceof Collection<?> collection) {
                 persistedMembers = new ArrayList<>();
@@ -1456,16 +1641,21 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     if (!element.getClass().isAnnotationPresent(Entity.class)) {
                         continue;
                     }
-                    persistedMembers.add(new MemberWrite(null, session.merge(element)));
+                    Object merged = session.merge(element);
+                    JavAIRuntime.transferComputedVectors(element, merged);
+                    originalMembers.add(element);
+                    persistedMembers.add(new MemberWrite(null, merged));
                 }
             } else {
                 continue;
             }
             session.flush();
             replaceCollectionMembership(session, ownerType, ownerId, fieldName, persistedMembers);
-            for (MemberWrite member : persistedMembers) {
+            for (int i = 0; i < persistedMembers.size(); i++) {
+                MemberWrite member = persistedMembers.get(i);
                 if (member.entity() instanceof JavAIVectorizable vectorizable) {
                     writeVectors(session, member.entity().getClass(), vectorizable);
+                    JavAIRuntime.transferComputedVectors(member.entity(), originalMembers.get(i));
                 }
             }
         }
@@ -1624,6 +1814,146 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         });
     }
 
+    /**
+     * Serves every {@code @Vectorize} field's already-stored vector back into the loaded instance's cache
+     * slots, so reading it costs nothing rather than a fresh round trip to the embedding model (OMI-187).
+     *
+     * <p>Why this is needed at all: JavAI's vector caches live on a woven <em>instance</em> field, so they
+     * are keyed to object identity and cannot survive a load -- Hibernate hands back a different object for
+     * the same logical entity every time. Without this, an entity loaded from a row that already contains
+     * its vectors re-embeds every one of them. That was two thirds of OMI-187's measured waste, and unlike
+     * the empty-collection half it is not avoidable by computing less: the value is genuinely needed, we
+     * simply already had it.
+     *
+     * <p>Validity is decided by model identity, which is also why {@code JavAIEmbeddingProvider.modelId()}
+     * exists: vectors are stored per model, so a row is reusable exactly when its table is the one the
+     * currently-configured provider would write to. A provider that cannot name its model (the SPI default)
+     * makes this a no-op and everything recomputes exactly as it did before -- correct, just not free.
+     *
+     * <p><b>Load paths only. Deliberately not called from {@code writeVectors}</b>, even though that is
+     * where the remaining OMI-187 waste lives (a child save re-embedding its owner's unchanged field).
+     * {@code JavAIRuntime.hydrateFieldVector} refuses any slot whose generation a setter has bumped, and
+     * that guard cannot see through {@code merge()}: the caller mutates their own detached instance, so
+     * the bump lands there, while Hibernate's merged copy carries the <em>new</em> field value on a
+     * <em>pristine</em> slot. Hydrating that copy served the old vector and persisted it, which
+     * {@code savedVectorIsAlwaysAccurateUnderImmediateConsistency} catches.
+     *
+     * <p>This is not the "someone mutated a field behind JavAI's back" case, which JavAI legitimately
+     * declines to defend against -- it is an ordinary, correctly-reported mutation that merge launders into
+     * an instance with no record of it. Closing it safely needs the stored vector to carry a hash of the
+     * text it was computed from, so reuse becomes a check ("does this vector match the current value?")
+     * rather than an inference from cache state.
+     */
+    private void hydrateVectors(Session session, Object entity) {
+        if (!(entity instanceof JavAIVectorizable)) {
+            return;
+        }
+        String modelId = JavAIRuntime.currentModelId();
+        if (modelId == null) {
+            return;
+        }
+        Class<?> entityType = entity.getClass();
+        Set<String> fieldNames = EntityReflection.vectorizeFieldNames(entityType);
+        if (fieldNames.isEmpty()) {
+            return;
+        }
+        UUID ownerId = EntityReflection.readId(entity);
+        if (ownerId == null) {
+            return;
+        }
+        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        String ownerType = entityType.getName();
+        session.doWork(connection -> {
+            if (!tableExists(connection, table)) {
+                // Nothing has been written for this model yet -- a first run, or a model switch. Recompute.
+                return;
+            }
+            String sql = "SELECT field_name, model_id, dims, computed_at, vector::text FROM " + table
+                    + " WHERE owner_type = ? AND owner_id = ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ownerType);
+                statement.setObject(2, ownerId);
+                try (ResultSet rows = statement.executeQuery()) {
+                    while (rows.next()) {
+                        String fieldName = rows.getString("field_name");
+                        if (!fieldNames.contains(fieldName)) {
+                            // COMBINED_VECTOR_FIELD and any field no longer annotated: stored, but not a
+                            // slot anything reads. vector()/summaryVector() recombine from field slots.
+                            continue;
+                        }
+                        float[] values = parseVectorLiteral(rows.getString(5));
+                        JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
+                                values, rows.getString("model_id"), rows.getInt("dims"),
+                                rows.getTimestamp("computed_at").toInstant()));
+                    }
+                }
+            }
+        });
+    }
+
+    private static boolean tableExists(Connection connection, String table) throws SQLException {
+        try (ResultSet tables = connection.getMetaData().getTables(null, null, table, null)) {
+            return tables.next();
+        }
+    }
+
+    /** Inverse of {@link #toVectorLiteral} -- pgvector renders as {@code [1.0,2.0,3.0]}. */
+    private static float[] parseVectorLiteral(String literal) {
+        String body = literal.substring(1, literal.length() - 1);
+        if (body.isEmpty()) {
+            return new float[0];
+        }
+        String[] parts = body.split(",");
+        float[] values = new float[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            values[i] = Float.parseFloat(parts[i].trim());
+        }
+        return values;
+    }
+
+    /**
+     * Removes whatever vector a previous save stored for {@code fieldName}, because this save has none.
+     *
+     * <p>Targets only the currently-configured model's table: vectors are stored per model precisely so
+     * several models can coexist, and a field losing its content under today's model says nothing about
+     * a vector another model wrote. No table means nothing was ever written, which is not an error.
+     */
+    private static void deleteFieldVectorRow(Connection connection, String modelId, String ownerType,
+            UUID ownerId, String fieldName) throws SQLException {
+        if (modelId == null) {
+            return; // provider can't name its model, so there is no table to target -- see modelId()'s javadoc
+        }
+        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        if (!tableExists(connection, table)) {
+            return;
+        }
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM " + table + " WHERE owner_type = ? AND owner_id = ? AND field_name = ?")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, ownerId);
+            statement.setString(3, fieldName);
+            statement.executeUpdate();
+        }
+    }
+
+    /** {@link #deleteFieldVectorRow}'s counterpart for the summary table, which is keyed by owner alone. */
+    private static void deleteSummaryVectorRow(Connection connection, String modelId, String ownerType,
+            UUID ownerId) throws SQLException {
+        if (modelId == null) {
+            return;
+        }
+        String table = SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        if (!tableExists(connection, table)) {
+            return;
+        }
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM " + table + " WHERE owner_type = ? AND owner_id = ?")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, ownerId);
+            statement.executeUpdate();
+        }
+    }
+
     private static void upsertVector(Connection connection, String table, String ownerType, UUID ownerId,
             String fieldName, EmbeddingVector vector) throws SQLException {
         String sql = "INSERT INTO " + table + " (owner_type, owner_id, field_name, model_id, dims, vector, computed_at) "
@@ -1731,6 +2061,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 if (entity != null) {
                     hydrateCollectionMembers(session, entity);
                     hydrateGeoPoints(session, entity, new IdentityHashMap<>());
+                    hydrateVectors(session, entity);
                     results.add(entity);
                 }
             }
@@ -1844,10 +2175,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     /** Writes vectors for every {@code @JavAIVectorizable} Hibernate reported persisting in this flush.
      *  Complements -- never replaces -- the explicit walk above: an entity whose mapped columns didn't change
      *  produces no Hibernate event at all, which is exactly the case {@code reindexAll()} relies on. */
-    private void writeVectorsForFlushedEntities(Session session) {
+    private void writeVectorsForFlushedEntities(Session session, Map<UUID, Object> originalsById) {
         for (Object entity : JavAIFlushVectorListener.current().persisted()) {
             // Proxy-resolving, for consistency with the two explicit walks above (OMI-161).
-            writeVectorsForRelatedEntity(session, entity);
+            writeVectorsForRelatedEntity(session, entity, originalsById);
         }
     }
 

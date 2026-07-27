@@ -30,12 +30,18 @@ public final class CollectionVectorSupport {
 
     public static EmbeddingVector vector(DirtyTrackingSupport state, Collection<?> elements) {
         // Unlike a plain object, a collection's "own vector" (its centroid) has no @Vectorize fields of
-        // its own -- it's entirely derived from elements' own vectors. So it must also recompute when
-        // SummaryDirty (an element changed), not just when this collection's own membership changed
-        // (FieldDirty), or the centroid would go stale the moment an element mutates without itself
-        // being added/removed.
-        if (state.cachedVector() == null || state.isFieldDirty() || state.isSummaryDirty()) {
+        // its own -- it's entirely derived from elements' own vectors. So it must recompute both when this
+        // collection's membership changed and when an element mutated; CentroidDirty is set by each of
+        // those events (see DirtyTrackingSupport.centroidDirty) and cleared here, by its only reader.
+        //
+        // This gate used to read `isFieldDirty() || isSummaryDirty()` directly. Both clauses were
+        // necessary -- an element mutation reaches this collection only as SummaryDirty -- but SummaryDirty
+        // is simultaneously summaryVector()'s own staleness signal, and only summaryVector() cleared it. A
+        // collection read through vector() alone therefore recomputed its centroid on every read forever
+        // (OMI-187). Two flags set by the same events, each cleared by the reader that consumes it.
+        if (state.cachedVector() == null || state.isCentroidDirty()) {
             state.cacheVector(computeCentroid(elements));
+            state.clearCentroidDirty();
             state.clearFieldDirty();
         }
         return state.cachedVector();
@@ -51,17 +57,25 @@ public final class CollectionVectorSupport {
             }
             try {
                 EmbeddingVector own = vector(state, elements);
-                float[] sum = own.values().clone();
-                for (Object element : elements) {
-                    if (element instanceof JavAIVectorizable child) {
-                        EmbeddingVector childSummary = child.summaryVector();
-                        if (childSummary.dims() == sum.length) {
-                            VectorMath.addWeighted(sum, childSummary.values(), JavAIRuntime.DEFAULT_SUMMARY_DECAY);
+                // A collection holding nothing vectorizable has no content of its own and no children to
+                // sum, so its summary is absent -- it contributes nothing to whatever contains it, rather
+                // than contributing the embedding of a space (OMI-187; see EmbeddingVector.absent()).
+                EmbeddingVector recomputed;
+                if (own.isAbsent()) {
+                    recomputed = EmbeddingVector.absent();
+                } else {
+                    float[] sum = own.values().clone();
+                    for (Object element : elements) {
+                        if (element instanceof JavAIVectorizable child) {
+                            EmbeddingVector childSummary = child.summaryVector();
+                            if (!childSummary.isAbsent() && childSummary.dims() == sum.length) {
+                                VectorMath.addWeighted(sum, childSummary.values(), JavAIRuntime.DEFAULT_SUMMARY_DECAY);
+                            }
                         }
                     }
+                    recomputed = new EmbeddingVector(
+                            VectorMath.normalize(sum), own.modelId(), sum.length, Instant.now());
                 }
-                EmbeddingVector recomputed =
-                        new EmbeddingVector(VectorMath.normalize(sum), own.modelId(), sum.length, Instant.now());
                 state.cacheSummaryVector(recomputed);
                 state.clearSummaryDirty();
             } finally {
@@ -113,12 +127,15 @@ public final class CollectionVectorSupport {
                 vectors.add(vectorizable.vector());
             }
         }
-        if (vectors.isEmpty()) {
-            // No vectorizable elements (including the empty-collection case) -- still return a real,
-            // correctly-dimensioned vector from the current model rather than a fabricated zero vector,
-            // so combining it arithmetically with a parent's summaryVector() never hits a dims mismatch.
-            return JavAIRuntime.embeddingProvider().embed("");
-        }
+        // No vectorizable elements (including the empty-collection case) yields an absent vector, which
+        // every arithmetic site skips -- so there is no dims mismatch to pre-empt and nothing to fabricate.
+        //
+        // This used to call embeddingProvider().embed(""), to guarantee a real, correctly-dimensioned
+        // vector. It was the single largest source of wasted embedding calls in the codebase (OMI-187:
+        // one live round trip per empty collection, per read, across every graph shape measured), and
+        // because real providers substitute a space for an empty input it also injected the embedding of
+        // a space into every ancestor's summaryVector(). VectorMath.centroid now returns absent for an
+        // empty input directly, so this method has no special case left to write.
         return VectorMath.centroid(vectors);
     }
 }

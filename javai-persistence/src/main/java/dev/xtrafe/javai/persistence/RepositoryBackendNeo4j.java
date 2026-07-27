@@ -665,21 +665,39 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets a real node
         // with its plain properties above, it just has no vector properties to add here.
         if (entity instanceof JavAIVectorizable vectorizable) {
+            // An absent vector (EmbeddingVector.absent(), OMI-187) carries no content and no dimensions, so
+            // it gets no property rather than an empty array under a synthetic "<absent>" model id -- and
+            // any property a previous save wrote is removed, so a field that loses its content cannot keep
+            // matching vector searches for content it no longer has. A null in a `SET n += $props` map is
+            // Cypher's property removal, so this needs no separate REMOVE clause.
+            String currentModelId = JavAIRuntime.currentModelId();
             for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
                 EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                if (vector.isAbsent()) {
+                    clearVectorProperty(properties, fieldName + "Vector", currentModelId);
+                    continue;
+                }
                 String qualified = qualify(fieldName + "Vector", vector.modelId());
                 properties.put(qualified, vector.values());
                 properties.put(qualified + "ComputedAt", vector.computedAt().toString());
             }
             EmbeddingVector combined = vectorizable.vector();
-            String qualifiedCombined = qualify("vector", combined.modelId());
-            properties.put(qualifiedCombined, combined.values());
-            properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            if (combined.isAbsent()) {
+                clearVectorProperty(properties, "vector", currentModelId);
+            } else {
+                String qualifiedCombined = qualify("vector", combined.modelId());
+                properties.put(qualifiedCombined, combined.values());
+                properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            }
 
             EmbeddingVector summary = vectorizable.summaryVector();
-            String qualifiedSummary = qualify("summaryVector", summary.modelId());
-            properties.put(qualifiedSummary, summary.values());
-            properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            if (summary.isAbsent()) {
+                clearVectorProperty(properties, "summaryVector", currentModelId);
+            } else {
+                String qualifiedSummary = qualify("summaryVector", summary.modelId());
+                properties.put(qualifiedSummary, summary.values());
+                properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            }
         }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
@@ -848,7 +866,58 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 hydrateRelationshipField(session, entity, field.getName(), hydrated);
             }
         }
+        hydrateVectors(entityType, entity, node);
         return entity;
+    }
+
+    /**
+     * Serves each {@code @Vectorize} field's already-stored vector straight into the materialized
+     * instance's cache slots, so reading it costs nothing instead of a fresh model call (OMI-187).
+     *
+     * <p>Cheaper here than on any other backend: JavAI's vectors are ordinary node properties, so they
+     * arrived with the node this method is already reading. There is no extra query -- an entity loaded
+     * from Neo4j has literally always been carrying its vectors, and until now threw them away and
+     * re-embedded.
+     *
+     * <p>Only the currently-configured model's properties are read (they are qualified per model, exactly
+     * so that vectors from different models can coexist), and {@code JavAIRuntime.hydrateFieldVector}
+     * declines any slot a setter has already touched, so a genuine mutation still wins.
+     */
+    /** Marks a vector property (and its timestamp) for removal under the current model -- {@code null} in a
+     *  {@code SET n += $props} map deletes the property rather than storing a null. */
+    private static void clearVectorProperty(Map<String, Object> properties, String baseName, String modelId) {
+        if (modelId == null) {
+            return; // no model named, so no property name to target -- see JavAIEmbeddingProvider.modelId()
+        }
+        String qualified = qualify(baseName, modelId);
+        properties.put(qualified, null);
+        properties.put(qualified + "ComputedAt", null);
+    }
+
+    private void hydrateVectors(Class<?> entityType, Object entity, Node node) {
+        if (!(entity instanceof JavAIVectorizable)) {
+            return;
+        }
+        String modelId = JavAIRuntime.currentModelId();
+        if (modelId == null) {
+            return;
+        }
+        for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+            String qualified = qualify(fieldName + "Vector", modelId);
+            if (!node.containsKey(qualified)) {
+                continue;
+            }
+            List<Object> raw = node.get(qualified).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualified + "ComputedAt")
+                    ? Instant.parse(node.get(qualified + "ComputedAt").asString())
+                    : Instant.now();
+            JavAIRuntime.hydrateFieldVector(entity, fieldName,
+                    new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
     }
 
     /** One related node reached via a relationship, plus that relationship's {@code mapKey} property

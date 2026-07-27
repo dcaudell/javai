@@ -41,7 +41,16 @@ public final class VectorMath {
         }
     }
 
+    /**
+     * Cosine similarity, or {@link Double#NEGATIVE_INFINITY} when either side {@link EmbeddingVector#isAbsent()
+     * is absent} -- content-free by definition, so it has no direction to compare and must never rank as
+     * anyone's nearest neighbour. Matches how {@code CollectionVectorSupport.similarityOf} already treats a
+     * non-vectorizable element, so ranking code needs no special case of its own.
+     */
     public static double cosineSimilarity(EmbeddingVector a, EmbeddingVector b) {
+        if (a.isAbsent() || b.isAbsent()) {
+            return Double.NEGATIVE_INFINITY;
+        }
         if (a.dims() != b.dims()) {
             throw new IllegalArgumentException(
                     "Cannot compare vectors of different dimensionality: " + a.dims() + " vs " + b.dims());
@@ -60,15 +69,24 @@ public final class VectorMath {
         return dot / (Math.sqrt(normA) * Math.sqrt(normB));
     }
 
-    /** Mean vector of {@code vectors}, treating the whole collection as one point. */
+    /**
+     * Mean vector of {@code vectors}, treating the whole collection as one point.
+     *
+     * <p>{@link EmbeddingVector#isAbsent() Absent} inputs are skipped rather than averaged in -- a member
+     * with no content must not drag the mean toward an arbitrary direction. A collection of nothing but
+     * absent vectors (or of none at all) is itself absent, which is why this no longer throws on empty
+     * input: "nothing to average" is now a representable answer instead of an error the caller had to
+     * pre-empt by fabricating a vector (OMI-187).
+     */
     public static EmbeddingVector centroid(List<EmbeddingVector> vectors) {
-        if (vectors.isEmpty()) {
-            throw new IllegalStateException("Cannot compute a centroid of zero vectors");
+        List<EmbeddingVector> present = vectors.stream().filter(vector -> !vector.isAbsent()).toList();
+        if (present.isEmpty()) {
+            return EmbeddingVector.absent();
         }
-        String modelId = vectors.get(0).modelId();
-        int dims = vectors.get(0).dims();
+        String modelId = present.get(0).modelId();
+        int dims = present.get(0).dims();
         float[] sum = new float[dims];
-        for (EmbeddingVector vector : vectors) {
+        for (EmbeddingVector vector : present) {
             if (!vector.modelId().equals(modelId)) {
                 throw new IllegalArgumentException(
                         "Cannot average vectors from different models: " + modelId + " vs " + vector.modelId());
@@ -76,7 +94,7 @@ public final class VectorMath {
             addWeighted(sum, vector.values(), 1f);
         }
         for (int i = 0; i < sum.length; i++) {
-            sum[i] /= vectors.size();
+            sum[i] /= present.size();
         }
         return new EmbeddingVector(sum, modelId, dims, Instant.now());
     }

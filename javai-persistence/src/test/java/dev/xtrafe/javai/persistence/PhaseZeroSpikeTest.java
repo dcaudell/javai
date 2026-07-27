@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.boot.MetadataSources;

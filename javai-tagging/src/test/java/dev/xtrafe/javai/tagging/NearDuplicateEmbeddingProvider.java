@@ -2,6 +2,7 @@ package dev.xtrafe.javai.tagging;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 
 import java.time.Instant;
 import java.util.Locale;

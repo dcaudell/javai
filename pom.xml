@@ -224,6 +224,17 @@
         <artifactId>javai-vector</artifactId>
         <version>${project.version}</version>
       </dependency>
+      <!-- javai-vector's test tree, published as a `tests`-classified jar: the shared test fixtures in
+           dev.xtrafe.javai.vector.testsupport (FakeEmbeddingProvider, and OMI-187's instrumented
+           RecordingEmbeddingProvider/EmbeddingLedger). Test-scoped here so declaring modules need only
+           groupId/artifactId/classifier. See javai-vector/pom.xml for why this exists. -->
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-vector</artifactId>
+        <version>${project.version}</version>
+        <classifier>tests</classifier>
+        <scope>test</scope>
+      </dependency>
       <dependency>
         <groupId>io.github.dcaudell</groupId>
         <artifactId>javai-model</artifactId>
@@ -349,6 +360,13 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>3.15.0</version>
+        </plugin>
+        <!-- Only version-pinned here; the test-jar execution that actually needs it is bound in
+             javai-vector/pom.xml, which explains why that module publishes its test tree. -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.4.2</version>
         </plugin>
         <!-- Build-time self-weaving, currently only bound in javai-tagging/pom.xml (the first module
              shipping its own pre-built @JavAIVectorizable classes); see JavAIBuildTimeWeaverPlugin's own

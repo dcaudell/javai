@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.hibernate.SessionFactory;
 import org.hibernate.service.UnknownUnwrapTypeException;
 import org.junit.jupiter.api.BeforeAll;
