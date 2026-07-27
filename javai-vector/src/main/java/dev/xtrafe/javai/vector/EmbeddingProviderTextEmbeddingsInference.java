@@ -112,4 +112,9 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
             super(message, cause);
         }
     }
+
+    @Override
+    public String modelId() {
+        return modelId;
+    }
 }

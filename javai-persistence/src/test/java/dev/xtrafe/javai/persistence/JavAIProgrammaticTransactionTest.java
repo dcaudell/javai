@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

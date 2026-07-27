@@ -7,6 +7,7 @@ import com.mongodb.client.model.Filters;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;

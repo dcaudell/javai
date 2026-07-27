@@ -12,9 +12,13 @@ import dev.xtrafe.javai.vector.JavAIDirtyTracking;
  * self-contained within this benchmark package rather than reusing {@code dev.xtrafe.javai.model}'s own
  * correctness-test fixtures (e.g. {@code TestNode}): those are package-private, and Java grants a
  * subpackage no special access to a parent package's package-private members. Duplicating a fixture this
- * small keeps every benchmark suite decoupled from whatever the correctness tests happen to use -- the
- * same reasoning this project already applies to duplicating {@code FakeEmbeddingProvider} per module
- * rather than sharing test code across module boundaries via a test-jar dependency.
+ * small keeps every benchmark suite decoupled from whatever the correctness tests happen to use.
+ *
+ * <p>This used to cite {@code FakeEmbeddingProvider}'s per-module duplication as the same reasoning. That
+ * precedent is gone: OMI-187 consolidated all six copies into {@code javai-vector}'s test-jar
+ * ({@code dev.xtrafe.javai.vector.testsupport}), because a fixture shared by tests that must agree with
+ * each other is the opposite case from a fixture deliberately isolated from them. The argument for
+ * duplicating <em>this</em> class stands on its own -- decoupling, not a house style.
  *
  * <p>The {@code $javai$state} field name must match {@link JavAIRuntime#STATE_FIELD} exactly, same
  * requirement as every other hand-written stand-in for woven bytecode in this project.

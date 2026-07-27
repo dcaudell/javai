@@ -12,7 +12,119 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`javai-model`, `javai-vector`, `javai-persistence`: JavAI made roughly three embedding calls where one
+  was correct (OMI-187).** Reported as untenably slow seeding of a large `TagSet` (~1,400 tags could not be
+  seeded in ten minutes). Instrumenting the embedding provider showed 36 calls to seed 12 tags -- 12 correct,
+  24 wasted -- in the repeating sequence `[tag.slug, tagSet.slug, ""]`. Two independent defects:
+
+  **1. An empty JavAI collection embedded the empty string, on every read.** `CollectionVectorSupport`
+  computed a centroid by calling `embed("")` whenever a collection held nothing vectorizable, to obtain a
+  correctly-dimensioned vector. Because real providers reject a genuinely empty input,
+  `EmbeddingProviderOllama`/`EmbeddingProviderOpenAI` substitute a single space -- so each empty collection
+  cost a live model round trip to embed *a space*, and then contributed that arbitrary, content-free
+  direction to every ancestor's `summaryVector()` at the usual decay weight. Both the cost and the
+  distortion were invisible to the test suite, whose fake provider happens to hash `""` to the zero vector.
+
+  Measured across 12 in-memory graph shapes (deep chains, wide fan-out, diamonds, cycles, self-reference,
+  nested collections, every collection type): **696 wasted calls, every one of them the empty string**, at
+  exactly one per empty collection reachable from the read. Now zero -- see `EmbeddingVector.absent()` below.
+
+  **2. A loaded or merged entity re-embedded vectors it already had.** Vector caches live in the woven
+  `$javai$state` *instance* field, so they are keyed to object identity and do not survive a persistence
+  round trip. Hibernate's `merge()` copies mapped field values onto a managed copy and leaves the tracking
+  state behind, so the copy looked brand new and recomputed. Confirmed by measurement rather than inference:
+  identical waste under all three `EmbeddingConsistencyMode`s, which rules out a dirty-flag cause, since
+  `mustBlockUnderObjectLock` short-circuits on `!slot.everComputed()` regardless of mode.
+
+  Fixed by carrying the vectors across instead of recomputing them -- `JavAIRuntime.transferComputedVectors`
+  on both sides of `merge()`, plus reading stored vectors back into a loaded entity's slots on all three
+  backends. Only clean, already-computed slots move, so a field the caller actually changed is still
+  embedded fresh (pinned by `savedVectorIsAlwaysAccurateUnderImmediateConsistency`).
+
+  Neo4j and MongoDB were never affected -- neither backend merges -- which is now measured rather than
+  assumed (`TagSetSeedEmbeddingCostAllBackendsTest`).
+
+  **Net: seeding 12 tags went from 36 embedding calls to 12.**
+
+  Deliberately *not* fixed by caching. The empty-string case is not computed at all rather than memoized,
+  which also removes the summary-vector distortion that memoizing would have preserved permanently; and
+  reuse across instances is decided from cache state already being maintained, never by hashing field
+  content, which would not survive JavAI eventually vectorizing something larger than a slug.
+
+- **`javai-persistence` (all three backends): a `@Vectorize` field that loses its content no longer leaves a
+  stale vector behind.** Vectors are stored per field and written by upsert; nothing ever deleted one except
+  deleting the whole entity. That was unreachable while every field always produced *some* vector, and became
+  reachable the moment `EmbeddingVector.absent()` existed -- skipping the write left the previous save's row
+  in place, so an ANN search kept returning the entity as a similarity match for content it no longer had.
+  A wrong answer rather than a slow one, and invisible from the in-memory object, which stayed correct
+  throughout. Postgres deletes the row, Neo4j removes the property, MongoDB `$unset`s the field -- each
+  scoped to the current model, so another model's vectors are untouched.
+
+  Reaching it also required the last of the `embed("")` sources: a null or blank `@Vectorize` field rendered
+  as `""` and was embedded (as a space, after the providers' substitution) rather than being absent. It is
+  now absent, which both removes the call and makes "this field has no content" representable at rest.
+
+### Added
+
+- **`javai-vector`: `EmbeddingVector.absent()`** -- the vector of *nothing*, for an object or collection with
+  no embeddable content. Zero dimensions ("all dimensions and none"), so arithmetic skips it, similarity
+  ranks it last, and persistence writes no row for it. A value rather than a null, so nothing has to
+  null-check a return.
+- **`javai-vector`: `JavAIEmbeddingProvider.modelId()`** -- which model a provider embeds with, without
+  performing an embedding to find out. Needed to decide whether an already-stored vector is still valid.
+  A `default` returning `null`, deliberately: adding an abstract method to a published SPI would break every
+  third-party implementation, and a provider that does not override it simply recomputes as before. All five
+  bundled providers override it.
+- **`javai-model`: `JavAIRuntime.hydrateFieldVector` / `transferComputedVectors` / `currentModelId`** -- the
+  entry points `javai-persistence` uses to serve stored or already-computed vectors instead of recomputing.
+- **`javai-vector`: `JavAIEmbeddingProvider.embedAll(List<String>)`**, and **`javai-model`:
+  `JavAIRuntime.precomputeVectors(Collection<?>)`** -- OMI-187's bulk-seed path.
+
+  This addresses a different problem from the waste above, and a larger one. Eliminating redundant calls
+  cannot fix latency that is inherent to *how* the necessary calls are issued: lazy computation discovers one
+  text at a time, deep inside a read, so seeding 1,400 tags is 1,400 sequential HTTP round trips even when
+  every single one is warranted -- roughly 14s at the ~10ms per embed this ticket measured. Every real
+  embedding API accepts an array; nothing could use that, because nothing gathered the texts first.
+
+  `precomputeVectors` gathers across a collection of objects, de-duplicates (a value shared by several
+  objects is embedded once and seeded into every slot holding it), skips fields whose slot is already clean
+  (so it is safely re-runnable), and issues chunked `embedAll` calls. Recommended seeding shape:
+
+  ```java
+  JavAIRuntime.precomputeVectors(allTags);           // a few batched round trips
+  for (Tag tag : allTags) tagRepository.save(tag);   // finds every vector already on file
+  ```
+
+  `embedAll`'s `default` loops over `embed`, so an existing provider stays correct and simply gains nothing;
+  overriding it is a pure latency optimization with no semantic difference, which is why callers can use it
+  unconditionally. `EmbeddingProviderOllama` now issues a genuine batched request (its `/api/embed` already
+  accepted an array -- only this client was sending scalars); the other bundled providers still use the
+  looping default.
+- **`javai-vector` test-jar (`dev.xtrafe.javai.vector.testsupport`)** -- one shared `FakeEmbeddingProvider`
+  replacing six byte-identical per-module copies, plus `RecordingEmbeddingProvider`/`EmbeddingLedger`, the
+  instrument OMI-187 was diagnosed with. The ledger asserts a three-part invariant (REDUNDANT / PHANTOM /
+  OMITTED) rather than a bare call count; the OMITTED class exists so a "fix" cannot pass by embedding less
+  than correctness requires. Consumable from every module and from `e2e-client-test`.
+
+### Changed
+
+- **`javai-vector`: `VectorMath.centroid(List.of())` returns `EmbeddingVector.absent()` instead of throwing
+  `IllegalStateException`.** That throw was the reason callers fabricated a vector for the empty case in the
+  first place. Absent members are skipped rather than averaged in.
+- **`javai-vector`: `VectorMath.cosineSimilarity` returns `Double.NEGATIVE_INFINITY`** when either side is
+  absent, rather than throwing on the dimension mismatch. Matches how `CollectionVectorSupport.similarityOf`
+  already treats a non-vectorizable element, so ranking code needs no special case.
+- **`javai-vector`: a JavAI collection's centroid tracks its own staleness** (`DirtyTrackingSupport`'s new
+  `centroidDirty`). It previously shared `SummaryDirty` with the collection's summary vector, and only
+  `summaryVector()` cleared it -- so a collection read through `vector()` alone recomputed its centroid on
+  every read, forever. One flag cannot serve two readers; whichever clears it starves the other.
+- **`SPEC.md`: the mutation rule is now stated explicitly** ("only JavAI may change a `@Vectorize` field"),
+  including why it is deliberate and how persistence makes breaking it durable rather than process-local.
+- **A null or blank `@Vectorize` field now yields no vector rather than the embedding of a space.** Its
+  `fieldVector()` is `EmbeddingVector.absent()`, it costs no provider call, and it contributes nothing to any
+  `summaryVector()`. Previously such a field produced a real vector of meaningless content.
 
 ## [0.1.6] - 2026-07-23
 

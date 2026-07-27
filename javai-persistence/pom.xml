@@ -21,6 +21,15 @@
   -->
 
   <dependencies>
+    <!-- Shared test fixtures: dev.xtrafe.javai.vector.testsupport's FakeEmbeddingProvider (one copy,
+         replacing this module's own former private duplicate) and OMI-187's instrumented
+         RecordingEmbeddingProvider/EmbeddingLedger. -->
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-collections</artifactId>

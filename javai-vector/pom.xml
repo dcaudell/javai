@@ -31,4 +31,36 @@
       <artifactId>javai-annotations</artifactId>
     </dependency>
   </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <!--
+          Publishes this module's test tree as a `tests`-classified jar, so dev.xtrafe.javai.vector.testsupport
+          is usable from every downstream module's tests and from the standalone e2e-client-test project
+          (which resolves JavAI from the local repository, so `mvn install` is enough — see its README).
+
+          Added for OMI-187. Before it, FakeEmbeddingProvider existed as six byte-identical private copies,
+          each documenting the decision not to share test code across module boundaries. That was a
+          reasonable call for an inert 20-line fake and a bad one for a *measuring instrument*: OMI-187
+          needs one instrumented provider (RecordingEmbeddingProvider) whose counts mean the same thing in
+          javai-model, javai-tagging, javai-persistence and e2e alike. Six copies of a ruler is six rulers.
+
+          This module is the right home because it owns the JavAIEmbeddingProvider SPI and every other
+          module depends on it, directly or transitively — so the test-jar reaches all of them without
+          inventing a new reactor module or perturbing the nine-module published set.
+        -->
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <executions>
+          <execution>
+            <id>attach-test-jar</id>
+            <goals>
+              <goal>test-jar</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
 </project>

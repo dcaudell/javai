@@ -294,4 +294,9 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
             super(message, cause);
         }
     }
+
+    @Override
+    public String modelId() {
+        return model;
+    }
 }

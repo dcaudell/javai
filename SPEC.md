@@ -149,6 +149,35 @@ Every vectorizable instance carries two independent staleness flags, not one:
 An object can be both at once; each clears independently. There is no global generation counter — each
 object's pair of flags is the entire durable state. Full diagram: `doc/spec/vector-core.md`.
 
+## The mutation rule: only JavAI may change a `@Vectorize` field
+
+Everything above depends on one assumption, stated here because it is load-bearing and easy to violate by
+accident: **a `@Vectorize` field is mutated only through the accessor JavAI wove for it.** That is what fires
+`vectorizeFieldMutated`, which is what marks the field's cache slot stale, which is what causes the next read
+to re-embed. Write the field some other way — reflection, `Unsafe`, a framework that populates fields
+directly, a hand-written setter the weaver never saw — and JavAI is never told. It will go on serving the
+vector it computed for the *old* value, indefinitely and without complaint.
+
+This is deliberate, not a gap waiting to be closed. Detecting arbitrary field writes would mean either
+re-reading and re-hashing every field on every access (unaffordable the moment field content is large — a
+vectorized blob, say) or intercepting all field access at the JVM level, which is exactly the kind of
+"correctness depends on a custom runtime" dependency the hard interop rule forbids. Consistency is bought
+with the mutation accessor; code that bypasses it has opted out.
+
+**Persistence widens the consequence, and this is the part worth internalizing.** Vectors are written to the
+database and, since OMI-187, read straight back into a loaded object's cache slots rather than recomputed
+(see `JavAIRuntime.hydrateFieldVector`). So a vector that went stale because someone bypassed the accessor is
+no longer stale merely for that object's lifetime — it is stored, served on every subsequent load, and
+outlives the process that produced it. The rule is the same rule; persistence just makes breaking it durable.
+
+Two things that are explicitly *not* violations, because JavAI handles them itself:
+- **`merge()` handing back a different instance.** Hibernate copies mapped field values onto a managed copy
+  but not the woven `$javai$state` the caches live in. `javai-persistence` carries the vectors across
+  explicitly (`JavAIRuntime.transferComputedVectors`), in both directions, and only ever moves slots that are
+  clean — so a field the caller genuinely changed is still re-embedded.
+- **An object loaded fresh from the database.** Its fields match the stored row by construction, so its
+  stored vectors are served straight into its slots.
+
 ## Summary-vector formula (cross-cutting)
 
 ```

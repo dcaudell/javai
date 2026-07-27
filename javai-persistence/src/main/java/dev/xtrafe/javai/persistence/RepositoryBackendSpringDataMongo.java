@@ -765,6 +765,8 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         Class<?> entityType = entity.getClass();
 
         Map<String, Object> updates = new HashMap<>();
+
+        Set<String> removals = new LinkedHashSet<>();
         for (Field field : EntityReflection.allFields(entityType)) {
             String fieldName = field.getName();
             if (isIdField(field)) {
@@ -789,28 +791,50 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets its plain
         // fields written above, it just has no vector fields to add here.
         if (entity instanceof JavAIVectorizable vectorizable) {
+            // An absent vector (EmbeddingVector.absent(), OMI-187) carries no content and no dimensions, so
+            // it gets no field rather than an empty array under a synthetic "<absent>" model id -- and any
+            // field a previous save wrote is $unset, so a field that loses its content cannot keep matching
+            // vector searches for content it no longer has.
+            String currentModelId = JavAIRuntime.currentModelId();
             for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
                 EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                if (vector.isAbsent()) {
+                    clearVectorField(removals, fieldName + "Vector", currentModelId);
+                    continue;
+                }
                 String qualified = qualify(fieldName + "Vector", vector.modelId());
                 updates.put(qualified, toDoubleList(vector.values()));
                 updates.put(qualified + "ComputedAt", vector.computedAt().toString());
             }
             EmbeddingVector combined = vectorizable.vector();
-            String qualifiedCombined = qualify("vector", combined.modelId());
-            updates.put(qualifiedCombined, toDoubleList(combined.values()));
-            updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            if (combined.isAbsent()) {
+                clearVectorField(removals, "vector", currentModelId);
+            } else {
+                String qualifiedCombined = qualify("vector", combined.modelId());
+                updates.put(qualifiedCombined, toDoubleList(combined.values()));
+                updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            }
 
             EmbeddingVector summary = vectorizable.summaryVector();
-            String qualifiedSummary = qualify("summaryVector", summary.modelId());
-            updates.put(qualifiedSummary, toDoubleList(summary.values()));
-            updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            if (summary.isAbsent()) {
+                clearVectorField(removals, "summaryVector", currentModelId);
+            } else {
+                String qualifiedSummary = qualify("summaryVector", summary.modelId());
+                updates.put(qualifiedSummary, toDoubleList(summary.values()));
+                updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            }
         }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
         // ("Writes are additive") for why a replace would destroy older models' already-written vectors.
-        List<Bson> setOps = new ArrayList<>(updates.size());
+        List<Bson> setOps = new ArrayList<>(updates.size() + removals.size());
         for (Map.Entry<String, Object> entry : updates.entrySet()) {
             setOps.add(Updates.set(entry.getKey(), entry.getValue()));
+        }
+        // $unset for vectors that no longer exist. Paired with the additive $set above rather than replacing
+        // it: only the named fields go, so another model's vectors are untouched.
+        for (String field : removals) {
+            setOps.add(Updates.unset(field));
         }
         collectionFor(entityType).updateOne(
                 Filters.eq("_id", id.toString()), Updates.combine(setOps), new UpdateOptions().upsert(true));
@@ -886,7 +910,54 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 hydrateReferenceField(entity, field, doc.get(field.getName()), hydrated);
             }
         }
+        hydrateVectors(entityType, entity, doc);
         return entity;
+    }
+
+    /**
+     * Serves each {@code @Vectorize} field's already-stored vector straight into the materialized
+     * instance's cache slots, so reading it costs nothing instead of a fresh model call (OMI-187).
+     *
+     * <p>Free here, as on Neo4j: JavAI's vectors are ordinary document fields, so they came back with the
+     * document this method is already reading -- no extra query. Only the currently-configured model's
+     * fields are read (they are qualified per model so several models' vectors can coexist), and
+     * {@code JavAIRuntime.hydrateFieldVector} declines any slot a setter has touched, so a real mutation
+     * still wins over the stored value.
+     */
+    /** Marks a vector field (and its timestamp) for {@code $unset} under the current model. */
+    private static void clearVectorField(Set<String> removals, String baseName, String modelId) {
+        if (modelId == null) {
+            return; // no model named, so no field name to target -- see JavAIEmbeddingProvider.modelId()
+        }
+        String qualified = qualify(baseName, modelId);
+        removals.add(qualified);
+        removals.add(qualified + "ComputedAt");
+    }
+
+    @SuppressWarnings("unchecked")
+    private void hydrateVectors(Class<?> entityType, Object entity, Document doc) {
+        if (!(entity instanceof JavAIVectorizable)) {
+            return;
+        }
+        String modelId = JavAIRuntime.currentModelId();
+        if (modelId == null) {
+            return;
+        }
+        for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+            String qualified = qualify(fieldName + "Vector", modelId);
+            Object raw = doc.get(qualified);
+            if (!(raw instanceof List<?> stored)) {
+                continue;
+            }
+            float[] values = new float[stored.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) stored.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualified + "ComputedAt");
+            JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
+                    values, modelId, values.length,
+                    computedAt == null ? Instant.now() : Instant.parse(computedAt)));
+        }
     }
 
     @SuppressWarnings("unchecked")

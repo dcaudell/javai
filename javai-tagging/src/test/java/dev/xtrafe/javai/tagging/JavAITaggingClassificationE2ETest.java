@@ -4,6 +4,7 @@ import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

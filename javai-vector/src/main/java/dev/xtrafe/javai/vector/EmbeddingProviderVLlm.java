@@ -104,4 +104,9 @@ public final class EmbeddingProviderVLlm implements JavAIEmbeddingProvider {
             super(message, cause);
         }
     }
+
+    @Override
+    public String modelId() {
+        return model;
+    }
 }

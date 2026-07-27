@@ -7,6 +7,7 @@ import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.testcontainers.containers.PostgreSQLContainer;
