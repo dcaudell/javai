@@ -1,11 +1,15 @@
 package dev.xtrafe.javai.e2e;
 
+import dev.xtrafe.javai.e2e.domain.assoc.AssocAnyPlain;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocAnyTarget;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocAnyVectorizable;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiChild;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParent;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainMiddle;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTop;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocHub;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocLeaf;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocNestedAny;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocSelfNode;
 import dev.xtrafe.javai.e2e.domain.assoc.PlainLeaf;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
@@ -27,6 +31,8 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -65,6 +71,9 @@ class AssociationGraphE2ETest {
     private static AssocLeaf lazyManyToOneLeaf;
     private static AssocLeaf summaryLeaf;
     private static PlainLeaf plainLeaf;
+    private static AssocAnyVectorizable anyVectorizableTarget;
+    private static AssocAnyPlain anyPlainTarget;
+    private static AssocNestedAny nestedAnyTarget;
 
     @BeforeAll
     static void saveTheWholeMatrix() {
@@ -72,7 +81,12 @@ class AssociationGraphE2ETest {
 
         mandatoryLeaf = JavAIEnvironment.postgresAssocLeafRepository().save(new AssocLeaf("mandatory target"));
         lazyManyToOneLeaf = JavAIEnvironment.postgresAssocLeafRepository().save(new AssocLeaf("lazy many-to-one target"));
-        summaryLeaf = JavAIEnvironment.postgresAssocLeafRepository().save(new AssocLeaf("summary target"));
+        // Built with its own nested @Any before being saved, so the nested target is two hops from any
+        // repository anyone asks for: hub -> summaryLeaf -> discriminator (OMI-212).
+        summaryLeaf = new AssocLeaf("summary target");
+        nestedAnyTarget = new AssocNestedAny("nested any target");
+        summaryLeaf.setNestedAny(nestedAnyTarget);
+        summaryLeaf = JavAIEnvironment.postgresAssocLeafRepository().save(summaryLeaf);
         AssocLeaf eagerManyToOneLeaf =
                 JavAIEnvironment.postgresAssocLeafRepository().save(new AssocLeaf("eager many-to-one target"));
         plainLeaf = JavAIEnvironment.postgresPlainLeafRepository().save(new PlainLeaf("plain target"));
@@ -87,6 +101,18 @@ class AssociationGraphE2ETest {
         hub.getLazyOneToMany().add(new AssocLeaf("lazy one-to-many member"));
         hub.getLazyManyToMany().add(new AssocLeaf("lazy many-to-many member"));
         hub.getSummaryJavAICollection().add(new AssocLeaf("javai collection member"));
+
+        // @Any (OMI-212). Deliberately mixed: the eager reference resolves to a vectorizable target and the
+        // lazy one to a plain target, so a single save exercises both sides of the polymorphism at once and
+        // neither is only ever seen in isolation.
+        anyVectorizableTarget = new AssocAnyVectorizable("eager any vectorizable target");
+        anyPlainTarget = new AssocAnyPlain("lazy any plain target");
+        hub.setEagerAny(anyVectorizableTarget);
+        hub.setEagerAnyPlain(anyPlainTarget);
+        hub.setLazyAny(new AssocAnyVectorizable("lazy any target"));
+        hub.setSummaryLazyAny(new AssocAnyVectorizable("summary any target"));
+        hub.getManyToAny().add(new AssocAnyVectorizable("many-to-any vectorizable member"));
+        hub.getManyToAny().add(new AssocAnyPlain("many-to-any plain member"));
 
         savedHub = JavAIEnvironment.postgresAssocHubRepository().save(hub);
     }
@@ -589,4 +615,163 @@ class AssociationGraphE2ETest {
         }
         return found;
     }
+
+    // ---- 4. @Any: polymorphic associations (OMI-212) ----------------------------------------------
+
+    /**
+     * The headline OMI-212 failure. Every {@code @Any} target above is named <em>only</em> by a
+     * discriminator, and no repository is ever requested for one -- so before the fix this whole class
+     * failed at {@code SessionFactory} boot with {@code UnknownEntityTypeException}, taking every unrelated
+     * test in it down as well. That the fixture saved at all is the assertion.
+     */
+    @Test
+    void theMatrixBootsAndSavesWithTargetsReachableOnlyByDiscriminator() {
+        assertNotNull(savedHub.getId());
+        assertNotNull(anyVectorizableTarget.getId(), "a cascaded @Any target must have been persisted");
+        assertNotNull(anyPlainTarget.getId());
+    }
+
+    /** Eager polymorphic to-one, resolving to a <em>vectorizable</em> concrete type. */
+    @Test
+    void eagerAnyResolvesToItsConcreteVectorizableType() {
+        AssocHub reloaded = JavAIEnvironment.postgresAssocHubRepository().findById(savedHub.getId()).orElseThrow();
+
+        AssocAnyTarget target = reloaded.getEagerAny();
+        assertInstanceOf(AssocAnyVectorizable.class, target,
+                "the discriminator must resolve to the concrete type that was stored");
+        assertEquals("eager any vectorizable target", target.label());
+    }
+
+    /**
+     * The other axis: an eager polymorphic to-one resolving to a <em>non</em>-vectorizable concrete type.
+     * Paired with {@link #eagerAnyResolvesToItsConcreteVectorizableType} so neither "eager" nor "target
+     * happens to be vectorizable" can be the reason resolution works.
+     */
+    @Test
+    void eagerAnyResolvesToItsConcreteNonVectorizableType() {
+        AssocHub reloaded = JavAIEnvironment.postgresAssocHubRepository().findById(savedHub.getId()).orElseThrow();
+
+        AssocAnyTarget target = reloaded.getEagerAnyPlain();
+        assertInstanceOf(AssocAnyPlain.class, target);
+        assertEquals("lazy any plain target", target.label());
+    }
+
+    /**
+     * A <em>lazy</em> {@code @Any} behaves like any other lazy association on a detached entity: touching it
+     * outside a session throws. Asserted rather than worked around, for the same reason
+     * {@link #touchingAnUninitializedLazyAssociationOutsideASessionThrows} asserts it for the fixed-type
+     * case -- being polymorphic changes what the proxy resolves to, not when it may be resolved.
+     *
+     * <p>The registration this ticket is about happens at boot and is already proven by every other test
+     * here; that a lazy target cannot be dereferenced off a detached instance is orthogonal, and quietly
+     * making these fields eager to dodge it would have removed real coverage of the lazy-@Any save path.
+     */
+    @Test
+    void aLazyAnyOnADetachedEntityThrowsLikeAnyOtherLazyAssociation() {
+        AssocHub detached = JavAIEnvironment.postgresAssocHubRepository().findById(savedHub.getId()).orElseThrow();
+
+        assertThrows(LazyInitializationException.class, () -> detached.getLazyAny().label(),
+                "a lazy polymorphic target is still a lazy target");
+    }
+
+    /**
+     * A vectorizable {@code @Any} target gets its vectors written, exactly like a fixed-type association --
+     * and a non-vectorizable one gets none. The vector-write walk cannot know which it is holding until it
+     * has resolved the discriminator, which is what makes this worth asserting rather than assuming.
+     */
+    @Test
+    void vectorsAreWrittenForVectorizableAnyTargetsAndOnlyThose() throws Exception {
+        assertEquals(1, vectorRowCount(anyVectorizableTarget.getId(), AssocAnyVectorizable.class, "label"),
+                "a polymorphic reference to a vectorizable target must still persist its vector");
+        assertEquals(0, vectorRowCountForOwnerType(AssocAnyPlain.class),
+                "and a non-vectorizable target must never acquire one, however it was reached");
+    }
+
+    /** {@code @Summary} through a polymorphic reference: the summary walk resolves the discriminator too. */
+    @Test
+    void summaryVectorIncludesAPolymorphicSummaryChild() {
+        EmbeddingVector summary = ((JavAIVectorizable) savedHub).summaryVector();
+
+        assertNotNull(summary);
+        assertTrue(summary.dims() > 0,
+                "a @Summary @Any child must contribute to its owner's summary, not break it");
+    }
+
+    /**
+     * The to-many polymorphic form, holding both concrete kinds at once. Its declared type is a
+     * {@code Collection} whose element type is the same non-entity interface, so neither the field type nor
+     * the generic argument names anything registrable -- only the discriminator does.
+     */
+    @Test
+    void manyToAnyRoundTripsAMixOfConcreteTypes() {
+        AssocHub reloaded = JavAIEnvironment.postgresAssocHubRepository().findById(savedHub.getId()).orElseThrow();
+
+        List<AssocAnyTarget> members = reloaded.getManyToAny();
+        assertEquals(2, members.size(), "both members must come back: " + members);
+        assertTrue(members.stream().anyMatch(AssocAnyVectorizable.class::isInstance),
+                "one vectorizable member expected in: " + members);
+        assertTrue(members.stream().anyMatch(AssocAnyPlain.class::isInstance),
+                "one plain member expected in: " + members);
+    }
+
+    /**
+     * Position, not configuration: this target is reachable only as {@code hub -> summaryLeaf ->
+     * discriminator}. A fix that registered discriminator targets on the root entity without recursing
+     * would pass every other test here and fail this one.
+     */
+    @Test
+    void anAnyTargetTwoHopsFromTheRepositoryIsRegisteredAndRoundTrips() {
+        AssocLeaf reloaded = JavAIEnvironment.postgresAssocLeafRepository()
+                .findById(summaryLeaf.getId()).orElseThrow();
+
+        AssocAnyTarget nested = reloaded.getNestedAny();
+        assertInstanceOf(AssocNestedAny.class, nested,
+                "a discriminator target on a nested entity must be registered by the recursive walk");
+        assertEquals("nested any target", nested.label());
+    }
+
+    /** An unset polymorphic reference is ordinary, not an error -- and must not fabricate a target. */
+    @Test
+    void anUnsetAnyReferenceRoundTripsAsNull() {
+        AssocHub bare = JavAIEnvironment.postgresAssocHubRepository()
+                .save(new AssocHub("hub with no polymorphic references", mandatoryLeaf));
+
+        AssocHub reloaded = JavAIEnvironment.postgresAssocHubRepository().findById(bare.getId()).orElseThrow();
+        assertNull(reloaded.getEagerAny());
+        assertNull(reloaded.getLazyAny());
+        assertTrue(reloaded.getManyToAny().isEmpty());
+    }
+
+    /** The discriminator and FK columns each polymorphic field is supposed to generate actually exist. */
+    @Test
+    void anyAssociationsGenerateDiscriminatorAndKeyColumns() throws Exception {
+        Set<String> columns = columns("assoc_hub");
+        assertTrue(columns.containsAll(Set.of(
+                        "eager_any_type", "eager_any_id",
+                        "lazy_any_type", "lazy_any_id",
+                        "summary_any_type", "summary_any_id")),
+                "each @Any needs a discriminator column and a key column; found: " + columns);
+        assertTrue(columns.containsAll(Set.of("eager_any_plain_type", "eager_any_plain_id")),
+                "including the non-vectorizable-target pair; found: " + columns);
+
+        Set<String> joinTable = columns("assoc_hub_many_to_any");
+        assertTrue(joinTable.containsAll(Set.of("hub_id", "member_id", "member_type")),
+                "@ManyToAny needs its own join table carrying the discriminator; found: " + joinTable);
+    }
+
+    /**
+     * The trade {@code @Any} makes, asserted so nobody discovers it by surprise: the key column points into
+     * several tables, so it <b>cannot</b> carry a foreign key. Referential integrity is given up in exchange
+     * for the polymorphism -- documented in persistence-support-matrix.md, and pinned here because it is a
+     * property of the schema JavAI produces, not merely of the annotation.
+     */
+    @Test
+    void anAnyKeyColumnCarriesNoForeignKey() throws Exception {
+        Set<String> keys = foreignKeys("assoc_hub");
+
+        assertFalse(keys.contains("eager_any_id"),
+                "@Any cannot be FK-constrained -- its key may point into any target table: " + keys);
+        assertFalse(keys.contains("lazy_any_id"), "same for the lazy form: " + keys);
+    }
+
 }

@@ -117,6 +117,11 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     RepositoryBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
+        // Types the caller named explicitly, registered up front so they are known before any discovery
+        // runs -- see JavAIPersistenceConfig.Builder.entityType (OMI-212).
+        for (Class<?> additional : config.additionalEntityTypes()) {
+            registerEntityType(additional);
+        }
     }
 
     @Override
@@ -134,6 +139,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
         if (registeredEntityTypes.add(entityType)) {
             validateMapKeyTypesAreSupported(entityType);
+        validateNoAnyFields(entityType);
             validateNoKnowledgeGraphFields(entityType);
         }
         for (Field field : EntityReflection.allFields(entityType)) {
@@ -165,6 +171,34 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     /** Fails fast, at registration time, for a {@code Map} reference field keyed by anything other than
      *  {@code String} -- mirrors both other backends' identical limitation/validation for the same
      *  round-trip reason. */
+    /**
+     * Rejects {@code @Any} fields at registration, rather than silently dropping them at save time.
+     *
+     * <p>{@code @Any} is a Hibernate mapping: a to-one association whose target may be any of several
+     * unrelated entities, resolved through a discriminator column. This backend's mapping is hand-rolled and
+     * has no discriminator concept, and its reference detection keys off the declared field type -- which for
+     * {@code @Any} is deliberately a plain interface. So such a field matched neither the reference path nor
+     * the simple-value path and fell into the documented "anything else is silently skipped" boundary:
+     * measured empirically, the save succeeded and the association came back {@code null}. Silent data loss
+     * is a considerably worse outcome than an unsupported-feature error, and it is invisible until someone
+     * notices the field is empty.
+     *
+     * <p>Mirrors {@code validateNoKnowledgeGraphFields}, which is this codebase's established treatment of a
+     * feature one backend supports and another does not: fail loudly, at registration, naming the backend
+     * that does support it. {@code @Any} is Postgres-only for the same kind of reason
+     * {@code KnowledgeGraph} is Neo4j-only -- see doc/ai-guidance/persistence-support-matrix.md (OMI-212).
+     */
+    private static void validateNoAnyFields(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (field.isAnnotationPresent(org.hibernate.annotations.Any.class)) {
+                throw new IllegalArgumentException("MongoDB persistence does not support @Any fields -- "
+                        + entityType.getName() + "." + field.getName() + " is annotated @Any. Polymorphic "
+                        + "discriminator associations are Postgres-only in this phase; use "
+                        + "JavAIPersistenceConfig.Backend.POSTGRES for any entity type that declares one.");
+            }
+        }
+    }
+
     private static void validateMapKeyTypesAreSupported(Class<?> entityType) {
         for (Field field : EntityReflection.allFields(entityType)) {
             if (!Map.class.isAssignableFrom(field.getType())) {

@@ -19,6 +19,7 @@ import jakarta.persistence.criteria.Order;
 import jakarta.persistence.criteria.Path;
 import jakarta.persistence.criteria.Predicate;
 import org.hibernate.Hibernate;
+import org.hibernate.annotations.AnyDiscriminatorValue;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.Transaction;
@@ -219,6 +220,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     RepositoryBackendHibernatePostgres(JavAIPersistenceConfig config) {
         this.config = config;
+        // Types the caller named explicitly, registered up front so they are known before any discovery
+        // runs -- see JavAIPersistenceConfig.Builder.entityType (OMI-212).
+        for (Class<?> additional : config.additionalEntityTypes()) {
+            registerEntityType(additional);
+        }
     }
 
     @Override
@@ -247,30 +253,57 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         validateCollectionFieldMapping(entityType);
         registeredEntityTypes.add(entityType);
         for (Field field : EntityReflection.allFields(entityType)) {
-            Class<?> relatedType = relatedEntityType(field);
-            if (relatedType != null) {
+            for (Class<?> relatedType : relatedEntityTypes(field)) {
                 registerEntityTypeRecursively(relatedType, visited);
             }
         }
     }
 
-    /** The {@code @Entity}-annotated type reachable through {@code field}, if any: the field's own type for
-     *  a singular reference, or its generic element type (collection) / value type (map) otherwise. Returns
-     *  {@code null} for anything else (scalar fields, non-entity related types, unresolvable generics). */
-    private static Class<?> relatedEntityType(Field field) {
+    /**
+     * Every {@code @Entity}-annotated type reachable through {@code field}: its own type for a singular
+     * reference, its generic element type (collection) or value type (map), and -- for an {@code @Any}
+     * association -- each concrete target named by {@code @AnyDiscriminatorValue}. Empty for anything else
+     * (scalar fields, non-entity related types, unresolvable generics).
+     *
+     * <p>Returns a collection rather than a single type because of {@code @Any} (OMI-212): one field can
+     * name several unrelated targets, and they are reachable <em>only</em> through the discriminator. An
+     * {@code @Any} field's declared type is deliberately a plain interface with no shared table -- that is
+     * the whole point of the mapping -- so walking the declared type learns nothing, the targets went
+     * unregistered, and the {@code SessionFactory} failed to boot with {@code UnknownEntityTypeException}.
+     * That failure is at boot, so it took out every repository call in the configuration, not merely ones
+     * touching the association.
+     *
+     * <p>Nothing about the mapping itself was ever missing: JavAI registers entities through ordinary
+     * Hibernate annotation scanning, so once the targets are known, {@code @Any} works. The gap was purely
+     * discovery.
+     */
+    private static List<Class<?>> relatedEntityTypes(Field field) {
+        List<Class<?>> related = new ArrayList<>(2);
+
         Class<?> fieldType = field.getType();
         if (fieldType.isAnnotationPresent(Entity.class)) {
-            return fieldType;
-        }
-        if (Map.class.isAssignableFrom(fieldType)) {
+            related.add(fieldType);
+        } else if (Map.class.isAssignableFrom(fieldType)) {
             Class<?> valueType = genericTypeArgument(field, 1);
-            return valueType != null && valueType.isAnnotationPresent(Entity.class) ? valueType : null;
-        }
-        if (Collection.class.isAssignableFrom(fieldType)) {
+            if (valueType != null && valueType.isAnnotationPresent(Entity.class)) {
+                related.add(valueType);
+            }
+        } else if (Collection.class.isAssignableFrom(fieldType)) {
             Class<?> elementType = genericTypeArgument(field, 0);
-            return elementType != null && elementType.isAnnotationPresent(Entity.class) ? elementType : null;
+            if (elementType != null && elementType.isAnnotationPresent(Entity.class)) {
+                related.add(elementType);
+            }
         }
-        return null;
+
+        // getAnnotationsByType unwraps the repeatable container (@AnyDiscriminatorValues) as well as the
+        // single form, so both spellings are covered without handling the container explicitly.
+        for (AnyDiscriminatorValue discriminatorValue : field.getAnnotationsByType(AnyDiscriminatorValue.class)) {
+            Class<?> target = discriminatorValue.entity();
+            if (target.isAnnotationPresent(Entity.class) && !related.contains(target)) {
+                related.add(target);
+            }
+        }
+        return related;
     }
 
     /** {@code field}'s {@code index}-th generic type argument as a raw {@code Class}, or {@code null} if
@@ -324,8 +357,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             if (!collectionShaped || KnowledgeGraph.class.isAssignableFrom(type)) {
                 continue;
             }
+            // @ManyToAny is the polymorphic to-many, and is every bit as much a mapping annotation as
+            // @OneToMany/@ManyToMany -- it just carries its target types on a discriminator rather than in
+            // the field's generic argument. Omitting it here rejected a correctly-mapped field with advice
+            // to add an annotation the user had effectively already added (OMI-212).
             boolean association = field.isAnnotationPresent(OneToMany.class)
-                    || field.isAnnotationPresent(ManyToMany.class);
+                    || field.isAnnotationPresent(ManyToMany.class)
+                    || field.isAnnotationPresent(org.hibernate.annotations.ManyToAny.class);
             if (isJavAICollectionField(field)) {
                 if (association) {
                     throw new IllegalArgumentException("Cannot honor @OneToMany/@ManyToMany on "
@@ -343,7 +381,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     && !field.isAnnotationPresent(Transient.class)) {
                 throw new IllegalArgumentException("Postgres persistence cannot map the collection field "
                         + entityType.getName() + "." + field.getName() + " -- a plain JDK collection needs a JPA "
-                        + "mapping annotation (@OneToMany/@ManyToMany for entities, @ElementCollection for "
+                        + "mapping annotation (@OneToMany/@ManyToMany for entities, @ManyToAny for a polymorphic "
+                        + "collection, @ElementCollection for "
                         + "basic/embeddable values), or @Transient to exclude it. Use a JavAI collection type "
                         + "(JavAIArrayList/JavAILinkedHashSet/JavAILinkedHashMap) if you want JavAI's own "
                         + "vector-aware collection storage instead.");
