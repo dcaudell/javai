@@ -12,7 +12,53 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Changed
+
+- **`javai-vector`: `VectorMath`'s public surface is now `EmbeddingVector`-only (OMI-218).** It exposed
+  `normalize(float[])` and `addWeighted(float[], float[], float)` alongside its vector-level methods, and
+  every caller of those two was doing the same thing by hand — accumulate a weighted sum into a bare array,
+  then wrap it back up. Three sites, three copies of the model check, the dimension check and the
+  absent-input handling, and **they did not agree with each other**. Both array methods are now private,
+  replaced by `weightedSum(List<WeightedVector>)` and `normalize(EmbeddingVector)`.
+
+  That is the actual argument for the narrower surface rather than tidiness: `EmbeddingVector` carries the
+  model, the dimensionality and the absence that make those checks possible, and a `float[]` carries none of
+  them. Callers migrated: `JavAIRuntime.summaryVector`, `CollectionVectorSupport.summaryVector`,
+  `JavAITagRepository.recomputeTagSummaryVector`.
+
+  Every method now accepts absent **and null** inputs without throwing, treating both as "no vector here":
+  skipped from an aggregate rather than summed in, `NEGATIVE_INFINITY` from `cosineSimilarity` so a
+  content-free vector never ranks as anyone's nearest neighbour, and an absent result when nothing was
+  present. Dimension and model compatibility are checked wherever the operation requires it.
+
+  **Two behaviour changes in `CollectionVectorSupport.summaryVector`**, both to stop it disagreeing with the
+  object path over the same question. An absent centroid no longer short-circuits the whole summary to
+  absent — a member whose own `vector()` is absent can still have a non-absent `summaryVector()`, and
+  `JavAIRuntime.summaryVector` never made the equivalent assumption. And a member of a different
+  dimensionality now throws instead of being silently skipped, which is the shape of wrong answer that
+  cannot be noticed from outside: the summary comes back well-formed, just computed over fewer members than
+  the collection holds.
+
+  One diagnostic regression, accepted: `summaryVector()`'s dimension-mismatch message no longer singles out
+  the offending `@Summary` field, only the class and its field list. That is the cost of having one
+  implementation of the compatibility rule instead of three.
+
 ### Fixed
+
+- **`javai-tagging`: recomputing a tag-summary vector crashed, or stored a content-free vector, when a tag
+  had no embeddable content (OMI-218).** `Tag`'s only `@Vectorize` field is its slug, and a display name
+  with no alphanumerics slugifies to the empty string — so a tag with an absent `summaryVector()` is
+  reachable through the ordinary public constructor (now pinned by a test). Accumulating into a bare
+  `float[]` could not express that: such a tag arriving first sized the accumulator to zero dimensions and
+  stored the result as a real tag-summary vector, and arriving after a present tag threw
+  `ArrayIndexOutOfBoundsException` from inside the add loop. Absent tags are now skipped, and a ref whose
+  tags are *all* absent has its index entry deleted rather than being given a content-free vector that would
+  match arbitrary queries — the same rule the zero-associations case already followed.
+
+- **`javai-vector`: `VectorMath.centroid` never checked dimensionality.** It validated the model id and
+  assumed dimensions followed. Same model, different dimensions either threw
+  `ArrayIndexOutOfBoundsException` from inside the loop or silently truncated the longer vector, averaging a
+  value nobody asked for, depending on which way the mismatch fell.
 
 - **`javai-model`: dirty propagation stopped early and could leave an ancestor holding stale state
   (OMI-191).** `propagateDirty` pruned its walk at the first already-`SummaryDirty` node, on the reasoning

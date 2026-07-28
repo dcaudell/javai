@@ -56,26 +56,31 @@ public final class CollectionVectorSupport {
                 return vector(state, elements);
             }
             try {
-                EmbeddingVector own = vector(state, elements);
-                // A collection holding nothing vectorizable has no content of its own and no children to
-                // sum, so its summary is absent -- it contributes nothing to whatever contains it, rather
-                // than contributing the embedding of a space (OMI-187; see EmbeddingVector.absent()).
-                EmbeddingVector recomputed;
-                if (own.isAbsent()) {
-                    recomputed = EmbeddingVector.absent();
-                } else {
-                    float[] sum = own.values().clone();
-                    for (Object element : elements) {
-                        if (element instanceof JavAIVectorizable child) {
-                            EmbeddingVector childSummary = child.summaryVector();
-                            if (!childSummary.isAbsent() && childSummary.dims() == sum.length) {
-                                VectorMath.addWeighted(sum, childSummary.values(), JavAIRuntime.DEFAULT_SUMMARY_DECAY);
-                            }
-                        }
+                // The collection's own centroid at full weight, plus each member's summary at the decay
+                // factor -- the same formula, and now literally the same code, as an object's own
+                // summaryVector(). A collection with nothing to contribute is absent rather than a
+                // fabricated vector (OMI-187; see EmbeddingVector.absent()).
+                //
+                // Two behaviours changed here with OMI-218, both to stop this path disagreeing with the
+                // object path over the same question:
+                //
+                //  - An absent centroid no longer short-circuits the whole summary to absent. It did, on the
+                //    reasoning that a collection with no vectorizable content has "no children to sum" --
+                //    but a member whose own vector() is absent can still have a non-absent summaryVector()
+                //    (its own fields empty, its children not). JavAIRuntime.summaryVector never made that
+                //    assumption about an object's own vector; this no longer makes it about a collection's.
+                //  - A member whose dimensionality disagrees was silently skipped. It now throws, via
+                //    VectorMath. Silently dropping a member from an aggregate is exactly the kind of quietly
+                //    wrong answer that is impossible to notice from the outside.
+                List<VectorMath.WeightedVector> terms = new ArrayList<>();
+                terms.add(new VectorMath.WeightedVector(vector(state, elements), 1.0));
+                for (Object element : elements) {
+                    if (element instanceof JavAIVectorizable child) {
+                        terms.add(new VectorMath.WeightedVector(
+                                child.summaryVector(), JavAIRuntime.DEFAULT_SUMMARY_DECAY));
                     }
-                    recomputed = new EmbeddingVector(
-                            VectorMath.normalize(sum), own.modelId(), sum.length, Instant.now());
                 }
+                EmbeddingVector recomputed = VectorMath.normalize(VectorMath.weightedSum(terms));
                 state.cacheSummaryVector(recomputed);
                 state.clearSummaryDirty();
             } finally {
