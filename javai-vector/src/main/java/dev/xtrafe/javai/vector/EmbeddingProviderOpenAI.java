@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A real {@link JavAIEmbeddingProvider} backed by OpenAI's hosted {@code /v1/embeddings} endpoint -- a
@@ -30,21 +32,61 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
     private final URI embedEndpoint;
     private final String apiKey;
     private final String model;
+    private final Integer maxInputTokensOverride;
 
     public EmbeddingProviderOpenAI(String apiKey, String model) {
         this(DEFAULT_BASE_URL, apiKey, model);
     }
 
+    /**
+     * Pins the model's maximum input size against OpenAI's own endpoint.
+     *
+     * <p>Exists so pinning the limit doesn't force a caller to also spell out a base URL they don't want to
+     * change -- and, more importantly, so that writing it out doesn't quietly bind the API key to
+     * {@code baseUrl} via the three-argument {@code (baseUrl, apiKey, model)} overload, which is what the
+     * obvious shorthand would otherwise resolve to.
+     */
+    public EmbeddingProviderOpenAI(String apiKey, String model, int maxInputTokens) {
+        this(DEFAULT_BASE_URL, apiKey, model, maxInputTokens);
+    }
+
     /** Override only for testing against a fake server, or to point at an OpenAI-compatible proxy. */
     public EmbeddingProviderOpenAI(String baseUrl, String apiKey, String model) {
-        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model);
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model,
+                null);
+    }
+
+    /**
+     * Pins the model's maximum input size, overriding {@link EmbeddingModelLimits}'s best-effort table.
+     *
+     * <p>Matters more here than on the self-hosted providers: OpenAI exposes no API reporting a model's
+     * embedding input limit, so the table is the only other source. Reach for this whenever correctness
+     * matters more than the table's convenience -- the same escape hatch
+     * {@code Cortex.Builder.contextWindowTokens(int)} offers on the completion side.
+     */
+    public EmbeddingProviderOpenAI(String baseUrl, String apiKey, String model, int maxInputTokens) {
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model,
+                maxInputTokens);
     }
 
     EmbeddingProviderOpenAI(HttpClient httpClient, String baseUrl, String apiKey, String model) {
+        this(httpClient, baseUrl, apiKey, model, null);
+    }
+
+    EmbeddingProviderOpenAI(HttpClient httpClient, String baseUrl, String apiKey, String model,
+            Integer maxInputTokensOverride) {
         this.httpClient = httpClient;
         this.embedEndpoint = URI.create(baseUrl).resolve("/v1/embeddings");
         this.apiKey = apiKey;
         this.model = model;
+        this.maxInputTokensOverride = maxInputTokensOverride;
+    }
+
+    /** The override when given, else {@link EmbeddingModelLimits}'s table -- OpenAI publishes no endpoint
+     *  reporting an embedding model's input limit, so there is nothing to discover. */
+    @Override
+    public int maxInputTokens() {
+        return maxInputTokensOverride != null ? maxInputTokensOverride : EmbeddingModelLimits.lookup(model);
     }
 
     @Override
@@ -52,7 +94,15 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
         // Same defensive substitution as EmbeddingProviderOllama -- see its javadoc for why
         // CollectionVectorSupport.computeCentroid() needs embed("") to still yield a real, dimensioned
         // vector rather than relying on OpenAI's own (unconfirmed) handling of an empty input string.
-        String effectiveText = text.isEmpty() ? " " : text;
+        // Truncated client-side on every provider, not only the ones that would otherwise fail (OMI-216).
+        // TEI and Ollama already truncate server-side -- and do it exactly, having real tokenizers -- so
+        // deferring to them would preserve more text. Uniformity wins anyway: the whole complaint this fixes
+        // is that identical text yields a correct vector, a quietly partial one, or an exception depending
+        // only on which provider is configured. Cutting at the same estimated boundary everywhere makes the
+        // outcome reproducible across providers, which matters more than the last few tokens. TEI keeps its
+        // own "truncate": true as a server-side backstop regardless.
+        String effectiveText =
+                EmbeddingInputLimits.truncateToBudget(text.isEmpty() ? " " : text, maxInputTokens());
         String requestBody = "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":\""
                 + JsonStrings.escape(effectiveText) + "\"}";
         HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
@@ -72,6 +122,59 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
 
         float[] values = parseEmbeddingField(responseBody);
         return new EmbeddingVector(values, model, values.length, Instant.now());
+    }
+
+    /**
+     * One request for every text, rather than one request per text (OMI-213). {@code /v1/embeddings} already
+     * accepts {@code "input"} as an array and answers with one {@code data} entry per input.
+     *
+     * <p><b>Rows are placed by their {@code index} field, not by array position.</b> OpenAI documents that
+     * {@code data} entries carry their input index and are not guaranteed to arrive in request order, and
+     * trusting position would pair every text with the wrong vector without anything failing -- see
+     * {@link OpenAiCompatibleEmbeddings} for why that is the one failure this implementation is built around.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        // Resolved once for the batch, then applied per member: one over-long text must not shorten its
+        // neighbours. Same empty-input substitution as embed().
+        int budget = maxInputTokens();
+        List<String> substituted = new ArrayList<>(texts.size());
+        for (String text : texts) {
+            substituted.add(text.isEmpty() ? " " : text);
+        }
+        String inputs = JsonStrings.stringArray(EmbeddingInputLimits.truncateEach(substituted, budget));
+        String requestBody =
+                "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":" + inputs + "}";
+        HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + (apiKey == null ? "" : apiKey))
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = OpenAiCompatibleEmbeddings.parseIndexedRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("Embedding endpoint " + embedEndpoint + " returned "
+                    + rows.size() + " embeddings for " + texts.size()
+                    + " inputs; the batch response must line up with the request: " + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, model, values.length, computedAt));
+        }
+        return vectors;
     }
 
     private String send(HttpRequest request) {
@@ -99,33 +202,15 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
     }
 
     /**
-     * Extracts the first {@code "embedding":[...]} array nested inside {@code "data":[{...}]} -- OpenAI's
-     * response shape (and, sharing the identical wire contract, {@link EmbeddingProviderVLlm}'s own
-     * OpenAI-compatible response too). Ignores every other field ({@code object}, {@code index},
-     * {@code model}, {@code usage}).
+     * The first {@code "embedding":[...]} array nested inside {@code "data":[{...}]} -- OpenAI's response
+     * shape (and, sharing the identical wire contract, {@link EmbeddingProviderVLlm}'s own OpenAI-compatible
+     * response too). Ignores every other field ({@code object}, {@code index}, {@code model}, {@code usage}).
+     *
+     * <p>Delegates to {@link OpenAiCompatibleEmbeddings}, which both providers now share for the batched path
+     * as well -- the single-row case is just the batched parse with one row (OMI-213).
      */
     static float[] parseEmbeddingField(String responseBody) {
-        String key = "\"embedding\"";
-        int keyIndex = responseBody.indexOf(key);
-        if (keyIndex < 0) {
-            throw new EmbeddingProviderException("Response missing \"embedding\" field: " + responseBody);
-        }
-        int colonIndex = responseBody.indexOf(':', keyIndex + key.length());
-        int arrayStart = responseBody.indexOf('[', colonIndex);
-        int arrayEnd = responseBody.indexOf(']', arrayStart);
-        if (colonIndex < 0 || arrayStart < 0 || arrayEnd < 0) {
-            throw new EmbeddingProviderException("Unexpected response shape: " + responseBody);
-        }
-        String row = responseBody.substring(arrayStart + 1, arrayEnd).strip();
-        if (row.isBlank()) {
-            return new float[0];
-        }
-        String[] parts = row.split(",");
-        float[] values = new float[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            values[i] = Float.parseFloat(parts[i].strip());
-        }
-        return values;
+        return OpenAiCompatibleEmbeddings.parseFirstRow(responseBody);
     }
 
     public static final class EmbeddingProviderException extends RuntimeException {
@@ -136,5 +221,10 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
         EmbeddingProviderException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    @Override
+    public String modelId() {
+        return model;
     }
 }

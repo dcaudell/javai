@@ -6,7 +6,7 @@
 
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
   <packaging>pom</packaging>
 
   <name>JavAI Extensions</name>
@@ -224,6 +224,17 @@
         <artifactId>javai-vector</artifactId>
         <version>${project.version}</version>
       </dependency>
+      <!-- javai-vector's test tree, published as a `tests`-classified jar: the shared test fixtures in
+           dev.xtrafe.javai.vector.testsupport (FakeEmbeddingProvider, and OMI-187's instrumented
+           RecordingEmbeddingProvider/EmbeddingLedger). Test-scoped here so declaring modules need only
+           groupId/artifactId/classifier. See javai-vector/pom.xml for why this exists. -->
+      <dependency>
+        <groupId>io.github.dcaudell</groupId>
+        <artifactId>javai-vector</artifactId>
+        <version>${project.version}</version>
+        <classifier>tests</classifier>
+        <scope>test</scope>
+      </dependency>
       <dependency>
         <groupId>io.github.dcaudell</groupId>
         <artifactId>javai-model</artifactId>
@@ -295,6 +306,16 @@
         <version>${spring-data-commons.version}</version>
       </dependency>
       <dependency>
+        <!-- javai-persistence only: ClassPathScanningCandidateComponentProvider backs
+             JavAIPersistenceConfig.Builder.entityPackages(...) (OMI-214). Already on that module's compile
+             classpath transitively via spring-data-mongodb, but named because the module's own code now
+             uses it directly, the same reason spring-data-commons is named above. Version tracks
+             spring-framework.version, as spring-orm's own comment below explains. -->
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-context</artifactId>
+        <version>${spring-framework.version}</version>
+      </dependency>
+      <dependency>
         <!-- javai-persistence only, and declared <optional> there: it is what lets a JavAIRepository call
              join a Spring @Transactional unit of work instead of always opening its own session (OMI-146).
              spring-tx/spring-core/spring-context are already on that module's compile classpath transitively
@@ -349,6 +370,13 @@
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
           <version>3.15.0</version>
+        </plugin>
+        <!-- Only version-pinned here; the test-jar execution that actually needs it is bound in
+             javai-vector/pom.xml, which explains why that module publishes its test tree. -->
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-jar-plugin</artifactId>
+          <version>3.4.2</version>
         </plugin>
         <!-- Build-time self-weaving, currently only bound in javai-tagging/pom.xml (the first module
              shipping its own pre-built @JavAIVectorizable classes); see JavAIBuildTimeWeaverPlugin's own

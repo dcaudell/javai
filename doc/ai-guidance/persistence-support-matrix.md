@@ -41,6 +41,7 @@ Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupporte
 | `@Column`, `@Table`, `@Basic`, `@Enumerated`, `@Temporal`, `@Lob`, `@Version` | ✅ | ⚠️ | ⚠️ | Postgres: honored by Hibernate as usual. Neo4j/Mongo: ignored — scalar conversion is fixed (`enum`→`name()`, `Instant`/`UUID`→string, etc.), column/table names don't apply. |
 | *Implicit* column/table naming (no `@Column`/`@Table`) | ✅ snake_case | n/a | n/a | **Postgres, since 0.1.5 (OMI-145):** `CamelCaseToUnderscoresNamingStrategy` is the default — `emailVerified` → `email_verified`, entity `TestCrew` → table `test_crew` — matching Spring Boot's default. Up to 0.1.4 the bare Hibernate default applied (`emailverified`), so **an existing pre-0.1.5 schema with multi-word names needs migrating or pinning**: `JavAIPersistenceConfig.Builder.physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())` restores the old naming, and `.hibernateProperty(k, v)`/`.hibernateProperties(map)` passes through any other Hibernate setting. Neo4j/Mongo have no JPA column naming at all, so both knobs are inert there. |
 | `@Embedded` / `@Embeddable` | ✅ | ❌ | ❌ | Postgres maps an embeddable's columns (and Criteria can navigate into them). Neo4j/Mongo have no embeddable concept — such a field is skipped. |
+| `@Any` (+ `@AnyDiscriminator`, `@AnyDiscriminatorValue`, `@AnyKeyJavaClass`) | ✅ | ❌ | ❌ | A **polymorphic to-one** whose target may be any of several *unrelated* entities, resolved by a discriminator column. **Postgres:** ordinary Hibernate mapping; the concrete types named in `@AnyDiscriminatorValue(entity = …)` are registered automatically, so you don't need a repository for each one. Add `@Cascade` if the owner should save its target — `@Any` doesn't cascade by default. **Two things to know before choosing it:** the target's id column points into several tables, so `@Any` **cannot carry a foreign key** — you trade referential integrity for the polymorphism, and nothing at the database level will stop a dangling reference. And the discriminator values are strings in your data, so renaming or moving a target class is a data migration, not a refactor. **Neo4j/Mongo:** rejected at registration with a clear error. Their mapping has no discriminator concept, and reference detection keys off the declared field type — which for `@Any` is deliberately a plain interface, so the field previously fell into the "silently skipped" boundary and the association came back `null` after a successful save. Refusing it loudly is better than losing it quietly. |
 
 > The JavAI vector/graph annotations (`@Vectorize`, `@Summary`, `@SearchVisibility`, `@JavAIVectorizable`,
 > `@JavAIGraphNode`/`@JavAIEdge`, `@Taggable`) are orthogonal to this table and behave the same on all three
@@ -121,8 +122,80 @@ Notes:
 - **Adding a field?** Scalar → fine on all three. A *single* related entity → `@OneToOne`/`@ManyToOne`
   (Postgres) or just the declared type (Neo4j/Mongo). *Many* related entities → a **JavAI collection**, never
   `@OneToMany`. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
-- **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Embedded`, and nested/ to-many *sort*)
-  if the same entity must run on more than one backend.
+  A **polymorphic to-one** (the target may be any of several unrelated entities) → `@Any`, Postgres only.
+- **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Any`, `@Embedded`, and nested/to-many
+  *sort*) if the same entity must run on more than one backend. Note that `KnowledgeGraph` and `@Any` pull in
+  opposite directions — one is Neo4j-only, the other Postgres-only — so an entity declaring both cannot be
+  persisted on any single backend at all.
+
+---
+
+## Registering entity types (and why ordering used to matter)
+
+JavAI learns about an entity when you realize a repository for it — or for anything that *references* it,
+since related types are registered recursively. On **Postgres** the backend then builds one Hibernate
+`SessionFactory`, lazily, at the first actual repository call (or at `JavAIPI.sessionFactory(config)`, which
+builds it too). Hibernate's metadata is immutable once built, so a type genuinely unknown at that moment can
+never be mapped. Neo4j and MongoDB have no boot-time metadata and no equivalent constraint.
+
+**Name your entity packages and the problem disappears:**
+
+```java
+JavAIPersistenceConfig.builder()
+    .backend(Backend.POSTGRES)
+    .postgresUrl(url).postgresUsername(user).postgresPassword(password)
+    .entityPackages("com.example.domain")     // every @Entity under here, scanned up front
+    .entityType(SomeTypeElsewhere.class)      // for anything outside those packages
+    .build();
+```
+
+The entity set is then a property of the **configuration**, complete before anything can be built — so
+repositories may be realized in any order, at any time, and no startup ordering has to be arranged or
+maintained. In Spring, that means repository `@Bean`s need no `@DependsOn` on the factory bean.
+
+Scanning reads class metadata rather than loading classes, so a broad package is cheap and initializes
+nothing. It does **validate everything it finds**, and registration fails naming both the type and the
+package it came from. Only three things are refused, all about JavAI-owned field types rather than about
+vectors:
+
+1. a **JavAI collection field keyed by something other than `String`** (`JavAIMap<UUID, X>`); a plain
+   `Map<UUID, X>` is unaffected;
+2. a **`KnowledgeGraph`-typed field**, which is Neo4j-only and already refused on Postgres/Mongo however the
+   type was registered;
+3. a **collection field that is unmapped** (no `@OneToMany`/`@ManyToMany`/`@ManyToAny`/`@ElementCollection`/
+   `@Transient`), or a **concrete-typed** JavAI collection (`JavAIArrayList<X>`) carrying an association
+   annotation Hibernate cannot honour.
+
+An entity has to be using JavAI's own collection types, or a Neo4j-only feature, to be refused at all. This
+is deliberate rather than lenient: an entity Hibernate maps but JavAI cannot is worse than one that is
+refused, because the failure surfaces later and far from its cause.
+
+**Excluding something from a scan.** Occasionally an `@Entity` sits inside a scanned package but belongs to a
+*different* persistence unit or `SessionFactory`. Three ways to keep it out, all scanning-only:
+
+```java
+.excludeEntityType(ReportingRow.class)              // by class
+.excludeEntityPackages("com.example.reporting.*")   // by package (and everything beneath it)
+```
+```java
+@Entity @PersistenceIgnore                          // by declaration, at the class itself
+class ReportingRow { }
+```
+
+**Being non-vectorized is never a reason to exclude anything.** A plain `@Entity` with no
+`@JavAIVectorizable` is a first-class citizen of a `JavAIRepository` — registered, mapped and served exactly
+like a vectorized one, it simply has no vectors. Serving both kinds through one repository type is the point
+of the design; excluding an entity for being non-vectorized would drop it from persistence entirely.
+
+Exclusion affects **scanning only**. A type named by `entityType(...)` is registered regardless (naming a
+class outright is unambiguous intent), and so is one reached through a registered entity's own fields —
+Hibernate cannot map the referencing entity without it.
+
+**If you don't name packages or types**, ordering still matters on Postgres: realize every repository before
+invoking a method on any of them. Note that a late `JavAIPI.repository(...)` is **harmless** when it
+introduces nothing new — re-realizing one, or asking for a type another entity already pulled in, is a no-op.
+It fails only when the type is genuinely unknown, and the error then names *what built the factory*, because
+that call is the thing to move.
 
 ---
 

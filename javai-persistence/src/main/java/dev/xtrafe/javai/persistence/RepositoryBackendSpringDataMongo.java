@@ -117,6 +117,19 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     RepositoryBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
+        // Types the caller named explicitly, plus every @Entity under any package they asked us to scan.
+        // Registered up front so the entity set is complete before anything can be built -- which is what
+        // removes registration ordering as a concern for the caller (OMI-214).
+        for (Class<?> scanned : EntityPackageScanner.scan(
+                config.entityPackages(), Thread.currentThread().getContextClassLoader() != null
+                        ? Thread.currentThread().getContextClassLoader()
+                        : getClass().getClassLoader(),
+                config.excludedEntityTypes(), config.excludedEntityPackages())) {
+            registerEntityType(scanned);
+        }
+        for (Class<?> additional : config.additionalEntityTypes()) {
+            registerEntityType(additional);
+        }
     }
 
     @Override
@@ -134,6 +147,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
         if (registeredEntityTypes.add(entityType)) {
             validateMapKeyTypesAreSupported(entityType);
+        validateNoAnyFields(entityType);
             validateNoKnowledgeGraphFields(entityType);
         }
         for (Field field : EntityReflection.allFields(entityType)) {
@@ -165,6 +179,34 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     /** Fails fast, at registration time, for a {@code Map} reference field keyed by anything other than
      *  {@code String} -- mirrors both other backends' identical limitation/validation for the same
      *  round-trip reason. */
+    /**
+     * Rejects {@code @Any} fields at registration, rather than silently dropping them at save time.
+     *
+     * <p>{@code @Any} is a Hibernate mapping: a to-one association whose target may be any of several
+     * unrelated entities, resolved through a discriminator column. This backend's mapping is hand-rolled and
+     * has no discriminator concept, and its reference detection keys off the declared field type -- which for
+     * {@code @Any} is deliberately a plain interface. So such a field matched neither the reference path nor
+     * the simple-value path and fell into the documented "anything else is silently skipped" boundary:
+     * measured empirically, the save succeeded and the association came back {@code null}. Silent data loss
+     * is a considerably worse outcome than an unsupported-feature error, and it is invisible until someone
+     * notices the field is empty.
+     *
+     * <p>Mirrors {@code validateNoKnowledgeGraphFields}, which is this codebase's established treatment of a
+     * feature one backend supports and another does not: fail loudly, at registration, naming the backend
+     * that does support it. {@code @Any} is Postgres-only for the same kind of reason
+     * {@code KnowledgeGraph} is Neo4j-only -- see doc/ai-guidance/persistence-support-matrix.md (OMI-212).
+     */
+    private static void validateNoAnyFields(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (field.isAnnotationPresent(org.hibernate.annotations.Any.class)) {
+                throw new IllegalArgumentException("MongoDB persistence does not support @Any fields -- "
+                        + entityType.getName() + "." + field.getName() + " is annotated @Any. Polymorphic "
+                        + "discriminator associations are Postgres-only in this phase; use "
+                        + "JavAIPersistenceConfig.Backend.POSTGRES for any entity type that declares one.");
+            }
+        }
+    }
+
     private static void validateMapKeyTypesAreSupported(Class<?> entityType) {
         for (Field field : EntityReflection.allFields(entityType)) {
             if (!Map.class.isAssignableFrom(field.getType())) {
@@ -263,6 +305,14 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     @Override
     public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
         return findNearest(entityType, "summaryVector", reference, limit);
+    }
+
+    @Override
+    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
+            int limit) {
+        // Same per-entity property shape as the summary vector above, so this needs no special handling
+        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
+        return findNearest(entityType, "concatenatedTextVector", reference, limit);
     }
 
     private List<Object> findNearest(
@@ -765,6 +815,8 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         Class<?> entityType = entity.getClass();
 
         Map<String, Object> updates = new HashMap<>();
+
+        Set<String> removals = new LinkedHashSet<>();
         for (Field field : EntityReflection.allFields(entityType)) {
             String fieldName = field.getName();
             if (isIdField(field)) {
@@ -789,28 +841,75 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets its plain
         // fields written above, it just has no vector fields to add here.
         if (entity instanceof JavAIVectorizable vectorizable) {
+            // An absent vector (EmbeddingVector.absent(), OMI-187) carries no content and no dimensions, so
+            // it gets no field rather than an empty array under a synthetic "<absent>" model id -- and any
+            // field a previous save wrote is $unset, so a field that loses its content cannot keep matching
+            // vector searches for content it no longer has.
+            String currentModelId = JavAIRuntime.currentModelId();
             for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
                 EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                if (vector.isAbsent()) {
+                    clearVectorField(removals, fieldName + "Vector", currentModelId);
+                    continue;
+                }
                 String qualified = qualify(fieldName + "Vector", vector.modelId());
                 updates.put(qualified, toDoubleList(vector.values()));
                 updates.put(qualified + "ComputedAt", vector.computedAt().toString());
             }
             EmbeddingVector combined = vectorizable.vector();
-            String qualifiedCombined = qualify("vector", combined.modelId());
-            updates.put(qualifiedCombined, toDoubleList(combined.values()));
-            updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            if (combined.isAbsent()) {
+                clearVectorField(removals, "vector", currentModelId);
+            } else {
+                String qualifiedCombined = qualify("vector", combined.modelId());
+                updates.put(qualifiedCombined, toDoubleList(combined.values()));
+                updates.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            }
 
             EmbeddingVector summary = vectorizable.summaryVector();
-            String qualifiedSummary = qualify("summaryVector", summary.modelId());
-            updates.put(qualifiedSummary, toDoubleList(summary.values()));
-            updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            if (summary.isAbsent()) {
+                clearVectorField(removals, "summaryVector", currentModelId);
+            } else {
+                String qualifiedSummary = qualify("summaryVector", summary.modelId());
+                updates.put(qualifiedSummary, toDoubleList(summary.values()));
+                updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            }
+
+            // Concatenated text and its vector (OMI-191). Per-document fields, exactly like summaryVector
+            // above -- no grain problem here, unlike Postgres' field table. The text is stored alongside so
+            // re-embedding under another model needs no walk of the object graph. $unset when concatenation
+            // is switched off, so a stale text vector cannot outlive the opt-in.
+            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+            if (concatenated.isAbsent()) {
+                clearVectorField(removals, "concatenatedTextVector", currentModelId);
+                if (currentModelId != null) {
+                    removals.add(qualify("concatenatedText", currentModelId));
+                }
+            } else {
+                String qualifiedConcat = qualify("concatenatedTextVector", concatenated.modelId());
+                updates.put(qualifiedConcat, toDoubleList(concatenated.values()));
+                updates.put(qualifiedConcat + "ComputedAt", concatenated.computedAt().toString());
+                String text = vectorizable.concatenatedText();
+                String qualifiedText = qualify("concatenatedText", concatenated.modelId());
+                if (text == null) {
+                    // $unset rather than $set-to-null: concatenatedText() returns null for "there is no
+                    // text", and a BSON null would be a stored value claiming otherwise.
+                    removals.add(qualifiedText);
+                } else {
+                    updates.put(qualifiedText, text);
+                }
+            }
         }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
         // ("Writes are additive") for why a replace would destroy older models' already-written vectors.
-        List<Bson> setOps = new ArrayList<>(updates.size());
+        List<Bson> setOps = new ArrayList<>(updates.size() + removals.size());
         for (Map.Entry<String, Object> entry : updates.entrySet()) {
             setOps.add(Updates.set(entry.getKey(), entry.getValue()));
+        }
+        // $unset for vectors that no longer exist. Paired with the additive $set above rather than replacing
+        // it: only the named fields go, so another model's vectors are untouched.
+        for (String field : removals) {
+            setOps.add(Updates.unset(field));
         }
         collectionFor(entityType).updateOne(
                 Filters.eq("_id", id.toString()), Updates.combine(setOps), new UpdateOptions().upsert(true));
@@ -886,7 +985,69 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 hydrateReferenceField(entity, field, doc.get(field.getName()), hydrated);
             }
         }
+        hydrateVectors(entityType, entity, doc);
         return entity;
+    }
+
+    /**
+     * Serves each {@code @Vectorize} field's already-stored vector straight into the materialized
+     * instance's cache slots, so reading it costs nothing instead of a fresh model call (OMI-187).
+     *
+     * <p>Free here, as on Neo4j: JavAI's vectors are ordinary document fields, so they came back with the
+     * document this method is already reading -- no extra query. Only the currently-configured model's
+     * fields are read (they are qualified per model so several models' vectors can coexist), and
+     * {@code JavAIRuntime.hydrateFieldVector} declines any slot a setter has touched, so a real mutation
+     * still wins over the stored value.
+     */
+    /** Marks a vector field (and its timestamp) for {@code $unset} under the current model. */
+    private static void clearVectorField(Set<String> removals, String baseName, String modelId) {
+        if (modelId == null) {
+            return; // no model named, so no field name to target -- see JavAIEmbeddingProvider.modelId()
+        }
+        String qualified = qualify(baseName, modelId);
+        removals.add(qualified);
+        removals.add(qualified + "ComputedAt");
+    }
+
+    @SuppressWarnings("unchecked")
+    private void hydrateVectors(Class<?> entityType, Object entity, Document doc) {
+        if (!(entity instanceof JavAIVectorizable)) {
+            return;
+        }
+        String modelId = JavAIRuntime.currentModelId();
+        if (modelId == null) {
+            return;
+        }
+        for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+            String qualified = qualify(fieldName + "Vector", modelId);
+            Object raw = doc.get(qualified);
+            if (!(raw instanceof List<?> stored)) {
+                continue;
+            }
+            float[] values = new float[stored.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) stored.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualified + "ComputedAt");
+            JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
+                    values, modelId, values.length,
+                    computedAt == null ? Instant.now() : Instant.parse(computedAt)));
+        }
+
+        // The concatenated text vector is a real embedding, not arithmetic over field vectors, so skipping
+        // this would mean a live model call on every load of every participating entity (OMI-191).
+        if (JavAIRuntime.participatesInConcatenation(entityType)
+                && doc.get(qualify("concatenatedTextVector", modelId)) instanceof List<?> storedConcat) {
+            String qualifiedConcat = qualify("concatenatedTextVector", modelId);
+            float[] values = new float[storedConcat.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) storedConcat.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualifiedConcat + "ComputedAt");
+            JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
+                    values, modelId, values.length,
+                    computedAt == null ? Instant.now() : Instant.parse(computedAt)));
+        }
     }
 
     @SuppressWarnings("unchecked")

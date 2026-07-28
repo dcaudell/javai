@@ -112,15 +112,34 @@ public final class JavAITagRepository {
 
     /** Binary "has the tag" -- affinity left {@code null}. */
     public void addTag(Object instance, Tag tag) {
+        requireSlug(tag);
         TaggableRef ref = refOf(instance);
         backend.addTag(ref, tag.getId(), null, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
     }
 
     public void addTag(Object instance, Tag tag, double affinity) {
+        requireSlug(tag);
         TaggableRef ref = refOf(instance);
         backend.addTag(ref, tag.getId(), affinity, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
+    }
+
+    /**
+     * Refuses to index a tag with no slug (OMI-201).
+     *
+     * <p>A backstop, not the main defence: {@link Tag}'s constructors already refuse to produce a slugless
+     * tag, so the only way to hold one is to hydrate a row written before that rule existed. Applying it
+     * would put a tag with an absent vector into the tag-summary index, where it would contribute nothing
+     * and be findable by nothing -- so this fails at the point of use rather than storing something inert.
+     */
+    private static void requireSlug(Tag tag) {
+        if (tag.getSlug() == null || tag.getSlug().isBlank()) {
+            throw new IllegalStateException("Tag " + tag.getId() + " has no slug, so it has no vector and"
+                    + " cannot be indexed or searched. Tags created through this library's constructors"
+                    + " always have one; this tag was most likely hydrated from a row written before that"
+                    + " was enforced. Re-create it with a localized name that yields a slug.");
+        }
     }
 
     public void removeTag(Object instance, Tag tag) {
@@ -253,28 +272,38 @@ public final class JavAITagRepository {
             backend.deleteTagSummaryVector(ref);
             return;
         }
-        float[] sum = null;
-        String modelId = null;
-        int dims = 0;
+        // Each tag's summary vector, weighted by its association's affinity (OMI-218). Hand-rolled before,
+        // which is how it came to crash on an absent tag summary: a bare float[] cannot say "there is no
+        // vector here", so an absent tag either sized the accumulator to zero dimensions (yielding a
+        // zero-dim vector that then got stored as a real tag-summary) or, if it arrived after a present one,
+        // blew up with ArrayIndexOutOfBoundsException from inside the add loop. VectorMath skips absent
+        // terms, so a tag with no embeddable content simply contributes nothing.
+        List<VectorMath.WeightedVector> terms = new ArrayList<>(associations.size());
         for (TagAssociation association : associations) {
             Tag tag = delegate.findById(association.tagId())
                     .orElseThrow(() -> new IllegalStateException(
                             "Tag " + association.tagId() + " referenced by a Tagging on " + ref + " no longer exists"));
             // Tag doesn't declare `implements JavAIVectorizable` in source -- the weaver adds it at build
             // time (see Tag's own javadoc) -- so summaryVector() is only reachable through the interface.
-            EmbeddingVector tagSummary = ((JavAIVectorizable) tag).summaryVector();
-            if (sum == null) {
-                modelId = tagSummary.modelId();
-                dims = tagSummary.dims();
-                sum = new float[dims];
-            } else if (!tagSummary.modelId().equals(modelId)) {
-                throw new IllegalStateException("Cannot combine tag summary vectors from different models ("
-                        + modelId + " vs " + tagSummary.modelId() + ") into one tag-summary vector for " + ref);
-            }
-            float weight = association.affinity() != null ? association.affinity().floatValue() : 1f;
-            VectorMath.addWeighted(sum, tagSummary.values(), weight);
+            double weight = association.affinity() != null ? association.affinity() : 1.0;
+            terms.add(new VectorMath.WeightedVector(((JavAIVectorizable) tag).summaryVector(), weight));
         }
-        EmbeddingVector combined = new EmbeddingVector(VectorMath.normalize(sum), modelId, dims, Instant.now());
+
+        EmbeddingVector combined;
+        try {
+            combined = VectorMath.normalize(VectorMath.weightedSum(terms));
+        } catch (IllegalArgumentException e) {
+            throw new IllegalStateException(
+                    "Cannot combine tag summary vectors into one tag-summary vector for " + ref
+                            + ": " + e.getMessage(), e);
+        }
+        if (combined.isAbsent()) {
+            // Every tag on this ref had an absent summary, so there is nothing to index. Delete rather than
+            // store a content-free vector that would sit in an ANN index matching arbitrary queries -- the
+            // same rule the zero-associations case above already follows.
+            backend.deleteTagSummaryVector(ref);
+            return;
+        }
         backend.upsertTagSummaryVector(ref, combined);
     }
 

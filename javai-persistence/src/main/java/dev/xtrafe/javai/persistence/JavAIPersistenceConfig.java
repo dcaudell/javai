@@ -5,10 +5,14 @@ import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.neo4j.driver.Driver;
 import org.springframework.data.mongodb.core.MongoTemplate;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Backend selection + connection settings for {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}. Self-contained by
@@ -45,6 +49,10 @@ public final class JavAIPersistenceConfig {
     private final String mongoUri;
     private final String mongoDatabase;
     private final MongoTemplate externalMongoTemplate;
+    private final Set<Class<?>> additionalEntityTypes;
+    private final Set<String> entityPackages;
+    private final Set<Class<?>> excludedEntityTypes;
+    private final Set<String> excludedEntityPackages;
 
     private JavAIPersistenceConfig(Builder builder) {
         this.backend = builder.backend;
@@ -61,6 +69,13 @@ public final class JavAIPersistenceConfig {
         this.mongoUri = builder.mongoUri;
         this.mongoDatabase = builder.mongoDatabase;
         this.externalMongoTemplate = builder.externalMongoTemplate;
+        this.additionalEntityTypes =
+                Collections.unmodifiableSet(new LinkedHashSet<>(builder.additionalEntityTypes));
+        this.entityPackages = Collections.unmodifiableSet(new LinkedHashSet<>(builder.entityPackages));
+        this.excludedEntityTypes =
+                Collections.unmodifiableSet(new LinkedHashSet<>(builder.excludedEntityTypes));
+        this.excludedEntityPackages =
+                Collections.unmodifiableSet(new LinkedHashSet<>(builder.excludedEntityPackages));
     }
 
     public static JavAIPersistenceConfig fromSystemProperties() {
@@ -130,6 +145,29 @@ public final class JavAIPersistenceConfig {
         return hibernateProperties;
     }
 
+    /**
+     * Entity types to register in addition to whatever JavAI discovers on its own -- see
+     * {@link Builder#entityType(Class)}.
+     */
+    public Set<Class<?>> additionalEntityTypes() {
+        return additionalEntityTypes;
+    }
+
+    /** Packages to scan for {@code @Entity} types -- see {@link Builder#entityPackages(String...)}. */
+    public Set<String> entityPackages() {
+        return entityPackages;
+    }
+
+    /** Classes scanning must not sweep in -- see {@link Builder#excludeEntityType(Class...)}. */
+    public Set<Class<?>> excludedEntityTypes() {
+        return excludedEntityTypes;
+    }
+
+    /** Packages scanning must not sweep in -- see {@link Builder#excludeEntityPackages(String...)}. */
+    public Set<String> excludedEntityPackages() {
+        return excludedEntityPackages;
+    }
+
     public String neo4jUri() {
         return neo4jUri;
     }
@@ -173,6 +211,10 @@ public final class JavAIPersistenceConfig {
         private String mongoUri;
         private String mongoDatabase;
         private MongoTemplate externalMongoTemplate;
+        private final Set<Class<?>> additionalEntityTypes = new LinkedHashSet<>();
+        private final Set<String> entityPackages = new LinkedHashSet<>();
+        private final Set<Class<?>> excludedEntityTypes = new LinkedHashSet<>();
+        private final Set<String> excludedEntityPackages = new LinkedHashSet<>();
 
         private Builder() {
         }
@@ -239,6 +281,146 @@ public final class JavAIPersistenceConfig {
         /** Bulk form of {@link #hibernateProperty(String, Object)}, applied in the map's own iteration order. */
         public Builder hibernateProperties(Map<String, ?> properties) {
             this.hibernateProperties.putAll(properties);
+            return this;
+        }
+
+        /**
+         * Registers {@code entityType} explicitly, in addition to everything JavAI discovers by walking
+         * entities' fields.
+         *
+         * <p>An escape hatch for types JavAI's own discovery cannot see, added with OMI-212. Discovery
+         * finds related types through declared field types, which is complete for ordinary associations and
+         * silently blind to anything reached another way. {@code @Any} was the case that surfaced it -- its
+         * targets are named only in {@code @AnyDiscriminatorValue}, and are now registered automatically --
+         * but the general problem outlives that one fix: a type discovery cannot reach was previously
+         * unreachable full stop, with no workaround but contriving a repository nobody wanted.
+         *
+         * <p>Failures of this kind land at {@code SessionFactory} build time, so they take out every
+         * repository call in the configuration rather than only the one that touched the missing type,
+         * which makes them considerably more confusing than their cause. Reaching for this is a reasonable
+         * response to that; if a whole *category* of type is being missed, that is worth reporting as a
+         * discovery gap rather than papering over per type.
+         *
+         * <p>Registration is recursive and idempotent, exactly as for a discovered type: naming one type
+         * pulls in everything reachable from it, and naming an already-known type does nothing.
+         */
+        public Builder entityType(Class<?> entityType) {
+            this.additionalEntityTypes.add(entityType);
+            return this;
+        }
+
+        /** {@link #entityType(Class)} for several types at once. */
+        public Builder entityTypes(Collection<Class<?>> entityTypes) {
+            this.additionalEntityTypes.addAll(entityTypes);
+            return this;
+        }
+
+        /**
+         * Registers every {@code @Entity} found under {@code packages}, scanning the classpath recursively.
+         *
+         * <p>This is what makes registration ordering stop being a thing to think about (OMI-214). JavAI
+         * otherwise learns about an entity only when someone realizes a repository for it (or for something
+         * that references it), and the Postgres backend freezes Hibernate's metadata at the first actual
+         * repository call -- so "did I register everything before anything got used?" became a property of
+         * global startup order that nothing local could verify. Downstream that cost {@code omiai-platform}
+         * a hand-maintained 18-name {@code @DependsOn} list which had already drifted out of sync with its
+         * own bean declarations.
+         *
+         * <p>Naming the packages instead makes the entity set a property of the <em>configuration</em>: it
+         * is complete before anything can be built, so no ordering discipline is required of the caller and
+         * a repository may be realized whenever it is convenient.
+         *
+         * <pre>{@code
+         * JavAIPersistenceConfig.builder()
+         *     .backend(Backend.POSTGRES)
+         *     .entityPackages("com.example.domain")
+         *     .build();
+         * }</pre>
+         *
+         * <p>Scanning reads class metadata rather than loading classes, so naming a broad package is cheap
+         * and does not initialize anything. Combines freely with {@link #entityType(Class)} -- use that for
+         * a type living outside the scanned packages.
+         *
+         * <p><b>Every scanned type is validated, exactly as a named one is.</b> Registering an entity JavAI
+         * cannot map would be worse than refusing it: Hibernate maps it regardless, leaving JavAI's half of
+         * the mapping wrong. Being non-vectorized is <em>not</em> a reason for refusal -- a plain
+         * {@code @Entity} is a first-class citizen of a {@code JavAIRepository} and is registered, mapped and
+         * served exactly like a vectorized one, it simply has no vectors. Only three conditions are refused,
+         * all of them about JavAI-owned field types rather than about vectors:
+         *
+         * <ol>
+         *   <li>a <b>JavAI collection field keyed by something other than {@code String}</b>
+         *       ({@code JavAIMap<UUID, X>}); a plain {@code Map<UUID, X>} is unaffected;</li>
+         *   <li>a <b>{@code KnowledgeGraph}-typed field</b>, which is Neo4j-only and already rejected on
+         *       Postgres and MongoDB however the type was registered;</li>
+         *   <li>a <b>collection field that is unmapped</b> (no {@code @OneToMany}/{@code @ManyToMany}/
+         *       {@code @ManyToAny}/{@code @ElementCollection}/{@code @Transient}), or a <b>concrete-typed</b>
+         *       JavAI collection ({@code JavAIArrayList<X>}) carrying an association annotation Hibernate
+         *       cannot honour.</li>
+         * </ol>
+         *
+         * <p>So an entity has to be using JavAI's own collection types, or a Neo4j-only feature, to be
+         * refused at all. If a scanned type genuinely belongs to a different persistence unit rather than
+         * needing a fix, exclude it with {@link #excludeEntityType(Class...)},
+         * {@link #excludeEntityPackages(String...)}, or {@code @PersistenceIgnore} on the class.
+         */
+        public Builder entityPackages(String... packages) {
+            return entityPackages(List.of(packages));
+        }
+
+        /** {@link #entityPackages(String...)} taking a collection. */
+        public Builder entityPackages(Collection<String> packages) {
+            this.entityPackages.addAll(packages);
+            return this;
+        }
+
+        /**
+         * Keeps specific classes out of what {@link #entityPackages(String...)} sweeps in.
+         *
+         * <p>For an {@code @Entity} that sits inside a scanned package but belongs to a <em>different</em>
+         * persistence unit or {@code SessionFactory}. Being non-vectorized is not a reason to exclude
+         * anything: a plain {@code @Entity} is a first-class citizen of a {@code JavAIRepository} and is
+         * registered and served exactly like a vectorized one, it simply has no vectors.
+         *
+         * <p>Excludes from <b>scanning only</b>. A type named by {@link #entityType(Class)} is registered
+         * regardless -- naming a class outright is unambiguous intent -- and so is one reached through a
+         * registered entity's own fields, since Hibernate cannot map the referencing entity without it.
+         */
+        public Builder excludeEntityType(Class<?>... entityTypes) {
+            this.excludedEntityTypes.addAll(List.of(entityTypes));
+            return this;
+        }
+
+        /** {@link #excludeEntityType(Class...)} taking a collection. */
+        public Builder excludeEntityTypes(Collection<Class<?>> entityTypes) {
+            this.excludedEntityTypes.addAll(entityTypes);
+            return this;
+        }
+
+        /**
+         * Keeps whole packages out of what {@link #entityPackages(String...)} sweeps in.
+         *
+         * <p>A name matches that package and everything beneath it, so
+         * {@code excludeEntityPackages("com.example.reporting")} covers {@code com.example.reporting.audit}
+         * as well. A trailing {@code .*} is accepted and means the same thing, since that is the obvious way
+         * to write it. Matching is on package boundaries: excluding {@code com.example.foo} does not touch
+         * {@code com.example.foobar}.
+         *
+         * <pre>{@code
+         * .entityPackages("com.example")
+         * .excludeEntityPackages("com.example.reporting.*")
+         * }</pre>
+         *
+         * <p>Excludes from scanning only, with the same two carve-outs as
+         * {@link #excludeEntityType(Class...)}.
+         */
+        public Builder excludeEntityPackages(String... packages) {
+            return excludeEntityPackages(List.of(packages));
+        }
+
+        /** {@link #excludeEntityPackages(String...)} taking a collection. */
+        public Builder excludeEntityPackages(Collection<String> packages) {
+            this.excludedEntityPackages.addAll(packages);
             return this;
         }
 

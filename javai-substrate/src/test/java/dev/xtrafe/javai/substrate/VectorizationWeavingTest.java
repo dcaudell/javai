@@ -9,6 +9,7 @@ import dev.xtrafe.javai.substrate.fixtures.VectorizableWidget;
 import dev.xtrafe.javai.substrate.fixtures.VectorizeIgnoreWidget;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import net.bytebuddy.agent.ByteBuddyAgent;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.agent.builder.ResettableClassFileTransformer;

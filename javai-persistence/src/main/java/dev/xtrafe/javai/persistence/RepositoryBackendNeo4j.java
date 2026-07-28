@@ -96,6 +96,19 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
 
     RepositoryBackendNeo4j(JavAIPersistenceConfig config) {
         this.config = config;
+        // Types the caller named explicitly, plus every @Entity under any package they asked us to scan.
+        // Registered up front so the entity set is complete before anything can be built -- which is what
+        // removes registration ordering as a concern for the caller (OMI-214).
+        for (Class<?> scanned : EntityPackageScanner.scan(
+                config.entityPackages(), Thread.currentThread().getContextClassLoader() != null
+                        ? Thread.currentThread().getContextClassLoader()
+                        : getClass().getClassLoader(),
+                config.excludedEntityTypes(), config.excludedEntityPackages())) {
+            registerEntityType(scanned);
+        }
+        for (Class<?> additional : config.additionalEntityTypes()) {
+            registerEntityType(additional);
+        }
     }
 
     @Override
@@ -106,6 +119,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         // need before using it" rule as the Postgres backend: a related entity type has to have its own
         // repository() call made at some point before traversal-hydration needs to resolve its label.
         validateMapKeyTypesAreSupported(entityType);
+        validateNoAnyFields(entityType);
         typesByLabel.put(label(entityType), entityType);
     }
 
@@ -114,6 +128,34 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
      *  {@link #saveRelationship}), so a stringified non-{@code String} key could never correctly round-trip
      *  back to its original type on hydration. Mirrors {@code RepositoryBackendHibernatePostgres}'s own
      *  identical limitation/validation for the same reason. */
+    /**
+     * Rejects {@code @Any} fields at registration, rather than silently dropping them at save time.
+     *
+     * <p>{@code @Any} is a Hibernate mapping: a to-one association whose target may be any of several
+     * unrelated entities, resolved through a discriminator column. This backend's mapping is hand-rolled and
+     * has no discriminator concept, and its reference detection keys off the declared field type -- which for
+     * {@code @Any} is deliberately a plain interface. So such a field matched neither the reference path nor
+     * the simple-value path and fell into the documented "anything else is silently skipped" boundary:
+     * measured empirically, the save succeeded and the association came back {@code null}. Silent data loss
+     * is a considerably worse outcome than an unsupported-feature error, and it is invisible until someone
+     * notices the field is empty.
+     *
+     * <p>Mirrors {@code validateNoKnowledgeGraphFields}, which is this codebase's established treatment of a
+     * feature one backend supports and another does not: fail loudly, at registration, naming the backend
+     * that does support it. {@code @Any} is Postgres-only for the same kind of reason
+     * {@code KnowledgeGraph} is Neo4j-only -- see doc/ai-guidance/persistence-support-matrix.md (OMI-212).
+     */
+    private static void validateNoAnyFields(Class<?> entityType) {
+        for (Field field : EntityReflection.allFields(entityType)) {
+            if (field.isAnnotationPresent(org.hibernate.annotations.Any.class)) {
+                throw new IllegalArgumentException("Neo4j persistence does not support @Any fields -- "
+                        + entityType.getName() + "." + field.getName() + " is annotated @Any. Polymorphic "
+                        + "discriminator associations are Postgres-only in this phase; use "
+                        + "JavAIPersistenceConfig.Backend.POSTGRES for any entity type that declares one.");
+            }
+        }
+    }
+
     private static void validateMapKeyTypesAreSupported(Class<?> entityType) {
         for (Field field : EntityReflection.allFields(entityType)) {
             if (!Map.class.isAssignableFrom(field.getType())) {
@@ -223,6 +265,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     @Override
     public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
         return findNearest(entityType, "summaryVector", reference, limit);
+    }
+
+    @Override
+    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
+            int limit) {
+        // Same per-entity property shape as the summary vector above, so this needs no special handling
+        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
+        return findNearest(entityType, "concatenatedTextVector", reference, limit);
     }
 
     private List<Object> findNearest(
@@ -665,21 +715,59 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         // own; see javai-tagging's own doc/spec/tagging.md "Orthogonality" section) still gets a real node
         // with its plain properties above, it just has no vector properties to add here.
         if (entity instanceof JavAIVectorizable vectorizable) {
+            // An absent vector (EmbeddingVector.absent(), OMI-187) carries no content and no dimensions, so
+            // it gets no property rather than an empty array under a synthetic "<absent>" model id -- and
+            // any property a previous save wrote is removed, so a field that loses its content cannot keep
+            // matching vector searches for content it no longer has. A null in a `SET n += $props` map is
+            // Cypher's property removal, so this needs no separate REMOVE clause.
+            String currentModelId = JavAIRuntime.currentModelId();
             for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
                 EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+                if (vector.isAbsent()) {
+                    clearVectorProperty(properties, fieldName + "Vector", currentModelId);
+                    continue;
+                }
                 String qualified = qualify(fieldName + "Vector", vector.modelId());
                 properties.put(qualified, vector.values());
                 properties.put(qualified + "ComputedAt", vector.computedAt().toString());
             }
             EmbeddingVector combined = vectorizable.vector();
-            String qualifiedCombined = qualify("vector", combined.modelId());
-            properties.put(qualifiedCombined, combined.values());
-            properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            if (combined.isAbsent()) {
+                clearVectorProperty(properties, "vector", currentModelId);
+            } else {
+                String qualifiedCombined = qualify("vector", combined.modelId());
+                properties.put(qualifiedCombined, combined.values());
+                properties.put(qualifiedCombined + "ComputedAt", combined.computedAt().toString());
+            }
 
             EmbeddingVector summary = vectorizable.summaryVector();
-            String qualifiedSummary = qualify("summaryVector", summary.modelId());
-            properties.put(qualifiedSummary, summary.values());
-            properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            if (summary.isAbsent()) {
+                clearVectorProperty(properties, "summaryVector", currentModelId);
+            } else {
+                String qualifiedSummary = qualify("summaryVector", summary.modelId());
+                properties.put(qualifiedSummary, summary.values());
+                properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
+            }
+
+            // Concatenated text and its vector (OMI-191). No grain problem here, unlike Postgres: these are
+            // per-entity properties on the node, exactly like summaryVector above. The text itself is stored
+            // alongside so re-embedding under another model needs no walk of the object graph. Nulling both
+            // when concatenation is switched off is what stops a stale text vector outliving the opt-in.
+            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+            if (concatenated.isAbsent()) {
+                clearVectorProperty(properties, "concatenatedTextVector", currentModelId);
+                if (currentModelId != null) {
+                    properties.put(qualify("concatenatedText", currentModelId), null);
+                }
+            } else {
+                String qualifiedConcat = qualify("concatenatedTextVector", concatenated.modelId());
+                properties.put(qualifiedConcat, concatenated.values());
+                properties.put(qualifiedConcat + "ComputedAt", concatenated.computedAt().toString());
+                // A null text removes the property, which is exactly right: concatenatedText() returns
+                // null for "there is no text", and Neo4j has no separate unset step to make.
+                properties.put(qualify("concatenatedText", concatenated.modelId()),
+                        vectorizable.concatenatedText());
+            }
         }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
@@ -848,7 +936,75 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 hydrateRelationshipField(session, entity, field.getName(), hydrated);
             }
         }
+        hydrateVectors(entityType, entity, node);
         return entity;
+    }
+
+    /**
+     * Serves each {@code @Vectorize} field's already-stored vector straight into the materialized
+     * instance's cache slots, so reading it costs nothing instead of a fresh model call (OMI-187).
+     *
+     * <p>Cheaper here than on any other backend: JavAI's vectors are ordinary node properties, so they
+     * arrived with the node this method is already reading. There is no extra query -- an entity loaded
+     * from Neo4j has literally always been carrying its vectors, and until now threw them away and
+     * re-embedded.
+     *
+     * <p>Only the currently-configured model's properties are read (they are qualified per model, exactly
+     * so that vectors from different models can coexist), and {@code JavAIRuntime.hydrateFieldVector}
+     * declines any slot a setter has already touched, so a genuine mutation still wins.
+     */
+    /** Marks a vector property (and its timestamp) for removal under the current model -- {@code null} in a
+     *  {@code SET n += $props} map deletes the property rather than storing a null. */
+    private static void clearVectorProperty(Map<String, Object> properties, String baseName, String modelId) {
+        if (modelId == null) {
+            return; // no model named, so no property name to target -- see JavAIEmbeddingProvider.modelId()
+        }
+        String qualified = qualify(baseName, modelId);
+        properties.put(qualified, null);
+        properties.put(qualified + "ComputedAt", null);
+    }
+
+    private void hydrateVectors(Class<?> entityType, Object entity, Node node) {
+        if (!(entity instanceof JavAIVectorizable)) {
+            return;
+        }
+        String modelId = JavAIRuntime.currentModelId();
+        if (modelId == null) {
+            return;
+        }
+        for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+            String qualified = qualify(fieldName + "Vector", modelId);
+            if (!node.containsKey(qualified)) {
+                continue;
+            }
+            List<Object> raw = node.get(qualified).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualified + "ComputedAt")
+                    ? Instant.parse(node.get(qualified + "ComputedAt").asString())
+                    : Instant.now();
+            JavAIRuntime.hydrateFieldVector(entity, fieldName,
+                    new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+
+        // The concatenated text vector is a real embedding, not arithmetic over field vectors, so skipping
+        // this would mean a live model call on every load of every participating entity (OMI-191).
+        String qualifiedConcat = qualify("concatenatedTextVector", modelId);
+        if (JavAIRuntime.participatesInConcatenation(entityType) && node.containsKey(qualifiedConcat)
+                && !node.get(qualifiedConcat).isNull()) {
+            List<Object> raw = node.get(qualifiedConcat).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualifiedConcat + "ComputedAt")
+                    ? Instant.parse(node.get(qualifiedConcat + "ComputedAt").asString())
+                    : Instant.now();
+            JavAIRuntime.hydrateConcatenatedTextVector(entity,
+                    new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
     }
 
     /** One related node reached via a relationship, plus that relationship's {@code mapKey} property

@@ -252,10 +252,10 @@ means there's no "mutation" to eagerly react to — only ever a new instance).
 - **`vector()`** — the compositional aggregate: centroid of each `@Vectorize` field's own `fieldVector()`.
   Free to evolve independently as more modalities are added (e.g. a future per-modality centroid rather than
   one flattened text embedding).
-- **`concatenatedTextVector()`** — a single embedding of every field's current value concatenated into one
-  concatenated text block, exactly what `vector()` computed before per-field caching existed. Kept under its
-  own name specifically so `vector()` remains free to change shape for a multi-modal future without losing
-  this simpler, holistic embedding as an option.
+- **`concatenatedTextVector()`** — a single embedding of real text assembled from the object graph. Kept
+  under its own name specifically so `vector()` remains free to change shape for a multi-modal future without
+  losing this simpler, holistic embedding as an option. **Opt-in as of OMI-191** — see "Concatenated text
+  vectoring" below; it returns an absent vector, costing nothing, for a type that has not asked for it.
 - **`summaryVector()`** — the hierarchical, decay-weighted aggregate over the object's contained/referenced
   graph (see the formula below) — unrelated to either of the above except that it uses `vector()` as its own
   base term.
@@ -416,3 +416,192 @@ is exercised by the same test code but has not been separately run on those plat
 TEI wiring already proven correct in an earlier version of this test (against a different model, before the
 Qwen3/Candle bug was tracked down), so nothing about the container startup or HTTP contract is new or
 unverified, only the specific model being requested.
+
+## Maximum input size (OMI-216, not in the whitepaper)
+
+Every embedding model has a maximum input length, and before this each provider did something different when
+a text exceeded it. Measured, not assumed: a 324,000-character input — roughly 80,000 tokens against
+`qwen3-embedding:0.6b`'s 32,768-token context — sent to a live Ollama instance returned **HTTP 200 and an
+ordinary 1024-dimension vector**. It had been truncated, and nothing in the response said so. TEI does the
+same by design; OpenAI rejects the request outright. So identical text yielded a correct vector, a quietly
+partial one, or an exception, depending only on which provider happened to be configured — and the quiet
+partial vector is the worst of the three, because a truncated vector is by construction indistinguishable
+from a complete one. It is a plausible embedding of a document prefix, and it will sit in the index scoring
+against queries forever without ever looking wrong.
+
+This matters more here than in `javai-completion`, where the analogous limit is handled by
+`Cortex.contextWindowTokens()`/`PromptContext.render(int)`: an over-long prompt usually produces a visibly
+degraded answer, whereas an over-long embedding produces a *silently* wrong one.
+
+`JavAIEmbeddingProvider.maxInputTokens()` is the SPI addition — a `default` method, so no existing
+implementation breaks. It resolves through three tiers, most authoritative first:
+
+1. **An explicit override**, when the caller supplied one — a constructor parameter on Ollama/TEI/vLLM/
+   OpenAI, `Builder.maxInputTokens(int)` on Replicate.
+2. **Runtime discovery**, where the backend's API can actually answer:
+
+   | Provider | Endpoint | Field |
+   |---|---|---|
+   | `EmbeddingProviderOllama` | `/api/show` | `<architecture>.context_length` |
+   | `EmbeddingProviderTextEmbeddingsInference` | `/info` | `max_input_length` |
+   | `EmbeddingProviderVLlm` | `/v1/models` | `max_model_len` |
+   | `EmbeddingProviderOpenAI`, `EmbeddingProviderReplicate` | — | neither vendor publishes one |
+
+   Note Ollama's key is named for the model's *architecture* (`qwen3.context_length`), not a fixed name, so
+   a constant-name lookup finds nothing and silently falls back. Discovery is cached per provider instance —
+   a limit lookup must not become a per-embedding tax — and any failure (unreachable, unparseable, absent
+   field) falls back to the next tier rather than throwing. Not knowing the limit precisely is a reason to be
+   conservative, never a reason to refuse to embed at all.
+3. **`EmbeddingModelLimits`**, a best-effort table of published limits, whose fallback for an unrecognized
+   model is **512 tokens** — deliberately not the completion side's 8192. Embedding models run far tighter
+   than chat models (many sentence-transformer models cap at 512 and several at 256), so a generous default
+   would produce partial vectors for exactly the models most likely to be missing from the table.
+
+Limits are in tokens; JavAI holds characters and has no tokenizer. `EmbeddingInputLimits` converts at a fixed
+**3 characters per token** — under the ~4 typical of English prose, because giving up a little of a long input
+is recoverable and sailing past the real limit is not. Truncation cuts at a word boundary when one falls
+within the last tenth of the budget, and at the budget exactly when one doesn't (JSON, a URL, a long
+identifier), so text with no whitespace near the cut loses only what the budget requires.
+
+Enforcement is client-side on **all five providers uniformly**, including the two that already truncate
+server-side. That is a deliberate trade: TEI and Ollama truncate *exactly*, having real tokenizers, so
+deferring to them would preserve more text. Uniformity wins anyway — the complaint being fixed is that the
+outcome depended on the provider, and cutting at the same estimated boundary everywhere makes results
+reproducible across a provider swap, which the SPI treats as a configuration change (§4.5.4). TEI keeps its
+own `"truncate": true` as a server-side backstop regardless. Batched inputs are bounded per member, so one
+over-long entry neither shortens its neighbours nor fails the batch.
+
+**Truncation is currently silent**, and that is a known, deliberately-deferred gap rather than a settled
+design. Signalling it would mean either a breaking change to the `EmbeddingVector` record (45 construction
+sites) or introducing the project's first logging mechanism — this codebase has none — and both are larger
+decisions than this fix. It is not a regression (Ollama and TEI already did this with no limit knowledge at
+all), but it is the invisible-failure shape this project has twice rejected elsewhere, and it should be
+closed once a project-wide logging mechanism is chosen.
+
+## Batched embedding (OMI-187, OMI-213, not in the whitepaper)
+
+`JavAIEmbeddingProvider.embedAll(List<String>)` embeds several texts in one request. Its `default` loops over
+`embed`, so every provider is correct without it and overriding it is a pure latency optimization with no
+semantic difference — callers can use it unconditionally rather than branching on provider capability.
+
+The motivation is latency, not call count, and it is a different problem from the waste OMI-187 removed.
+Lazy computation discovers one text at a time, deep inside a read, so seeding 1,400 tags is 1,400
+*sequential* round trips (~14s at the ~10ms per embed measured there) even when every one of them is
+warranted. `JavAIRuntime.precomputeVectors(Collection<?>)` is the caller-side half: it gathers texts across a
+collection first, de-duplicates them (a value shared by several objects is embedded once), and issues chunked
+`embedAll` calls — 100 per call by default.
+
+| Provider | Batched | Wire shape |
+|---|---|---|
+| Ollama | yes | `"input"` array → `{"embeddings": [[…], […]]}` |
+| OpenAI | yes | `"input"` array → `{"data": [{index, embedding}, …]}` |
+| vLLM | yes | identical to OpenAI |
+| TEI | yes | `"inputs"` array → `[[…], […]]` |
+| Replicate | **no**, deliberately | see below |
+
+**The one thing an implementation can get wrong invisibly** is which vector belongs to which text. OpenAI
+documents that `data` entries carry an explicit `index` and are *not* guaranteed to arrive in request order;
+vLLM, serving the same contract, schedules across continuous batches for reasons of its own. An
+implementation that reads rows by array position therefore pairs every text with the wrong vector — and
+nothing fails: each vector is well-formed and correctly dimensioned, and the only symptom is a semantic index
+that returns subtly wrong neighbours forever. `OpenAiCompatibleEmbeddings` (shared by both providers rather
+than duplicated) treats the ordering as a checked invariant: it places rows by `index` and refuses a response
+whose indices are not exactly one each of `0..n-1`. TEI needs none of this — its response is a bare array
+whose position *is* the correspondence — but its row count is still checked, that being the only way it could
+misalign. A slow loop beats a fast wrong answer.
+
+**Replicate deliberately keeps the looping default.** Not because it is hard, but because there is nothing to
+implement against: Replicate's `input` object is shaped by each model's own `cog predict()` signature rather
+than by Replicate, so there is no vendor-wide contract to code to. Investigating the bundled default model
+(`beautyyuyanli/multilingual-e5-large`) found it *does* take several texts at once — but through a field named
+`texts`, not the `text` this provider defaults to, and described only as "formatted as a JSON list of
+strings", which leaves it ambiguous between a native JSON array and a JSON-encoded string (the usual way a
+`cog` model expresses a list, given cog's scalar input types). Both the field name and the encoding would
+have been guesses. A wrong guess either errors loudly or silently embeds the string `["a","b"]` instead of
+`a` and `b` — the second being exactly the failure shape this work exists to prevent.
+
+**Gate accounting:** a batched call takes **one** permit from
+`JavAIRuntime.configureMaxConcurrentEmbeddingCalls`'s semaphore, not one per text. That gate bounds concurrent
+*calls into the provider*, and a batch is one call on one connection however many texts it carries. Charging
+per text would make the gate throttle batching itself — and a 100-text batch against a gate of 8 could never
+acquire enough permits, so bulk seeding would deadlock rather than be bounded. Taking a permit at all is also
+new in OMI-213: `precomputeVectors` previously called the provider without touching the gate, so a bulk seed
+ran entirely outside the bound that is documented as applying to every provider call in every consistency
+mode.
+
+## Concatenated text vectoring (OMI-191, not in the whitepaper)
+
+`concatenatedTextVector()` is the other kind of aggregate: where `summaryVector()` does arithmetic over
+already-computed vectors, this assembles **real text** from an object graph into one string and embeds that
+once. An embedding model can capture relationships across a whole document that combining separately-embedded
+fields arithmetically cannot.
+
+It was woven onto every `@JavAIVectorizable` from the start, but nothing stored it, no query reached it, and
+every JavAI collection threw `UnsupportedOperationException` when asked for one. It was computed on demand at
+the price of a real model call, and thrown away. This makes it a real feature and, in the same move, makes it
+**opt-in** — a type that says nothing gets an absent vector, assembles no text, and never reaches the
+provider.
+
+### Three independent opt-ins
+
+Nothing is accumulated unless asked for. The library cannot know whether folding a `Song`'s lyrics into an
+`Album` is meaningful for a given domain, so it must not guess.
+
+| Placement | Meaning |
+|---|---|
+| `@Summary(concatenate = true)` on a **TYPE** | This class produces text from its own `@Vectorize` fields |
+| `@Summary(concatenate = true)` on a **FIELD** referencing a vectorizable | Absorb that child's text into mine |
+| `@Summary(concatenate = true)` on a **FIELD** holding a JavAI collection | Aggregate its members' text into mine |
+
+`concatenate` defaults to `false`, so nothing changes for existing consumers. The three are genuinely
+independent: a container may absorb its children without contributing its own fields, which is what you want
+when its own fields are bookkeeping. A JavAI collection always *can* aggregate; whether it does is decided by
+the **owning field**, never by the collection.
+
+Note this **adds to** `@Summary`'s existing meaning rather than replacing it — such a field still contributes
+to `summaryVector()`. There is deliberately no way to absorb a child's text while excluding it from the
+summary vector; no use case demanded it, and a second orthogonal flag is a worse default than an honest
+restriction.
+
+Before this, `@Summary` on a TYPE was inert: the target was declared, every reader was field-only. That is
+what left the TYPE placement free to be given this meaning.
+
+### Assembly: parent first, each node exactly once
+
+Text is assembled parent-first, newline-separated, with each node contributing **exactly once per assembly**.
+
+That last part is a deliberate divergence from `summaryVector()`, which lets a node reachable by two paths
+stack additively — adding a vector twice is a meaningful weighting. The same paragraph appearing twice in one
+string is not a weighting; it just skews the embedding toward whatever it happens to say. The colouring also
+supplies cycle safety, so a diamond, a cycle and a self-reference all fall out of one mechanism rather than
+three.
+
+`concatenatedText()` returns **`null`, never `""`**, when there is no text -- a type that declined, or one that participates but has nothing in its fields. The empty string is a *value*, and a value is something a provider will embed; that is precisely the wasted call (and the space-shaped vector real providers return for an empty input) that OMI-187 removed from the collection path. `null` maps straight onto `EmbeddingVector.absent()`, so "there is nothing here" stays representable rather than approximated all the way down.
+
+Assembly is **pure string work** — no embedding happens while walking the graph. That is what makes the
+batched pass possible: `precomputeVectors` builds every text first and only then reaches the network, so a
+graph of any size or shape costs one embedding per participating object, in batches, rather than one call
+discovered at a time inside a read. The concatenated pass runs *after* the field pass, so assembly never
+interleaves with per-field embedding.
+
+### Staleness, and a propagation bug this surfaced
+
+The concatenated text has its own `VectorCacheSlot`, so it gets independent validity by generation — the same
+mechanism that gives each `@Vectorize` field its own. A descendant's mutation bumps its ancestors' slots
+through the existing dependent walk.
+
+Making that work required fixing `propagateDirty`, which had pruned at the first already-`SummaryDirty` node.
+That prune is sound for a monotone boolean whose clearer also clears its descendants, which holds on the path
+`summaryVector()` itself takes. **It does not hold for concatenated text**: assembling an ancestor's text
+calls `concatenatedText()` on its descendants, which is pure string work committing nothing, so the ancestor
+goes clean while its descendants stay dirty. A later mutation down there would prune at the dirty descendant
+and leave the clean ancestor holding silently stale text. The walk now visits each reachable dependent once
+via an identity set. It is the *walk* that was overfitted to a single reader, not just the flag — OMI-187's
+lesson one level up.
+
+### Storage and query
+
+Persisted on the entity-grain table alongside the summary vector; see `doc/spec/persistence-bridge.md`.
+`findNearestByConcatenatedTextVector(EmbeddingVector, int)` searches it, and is **rejected at
+repository-creation time** for an entity type that does not participate — otherwise it would return an empty
+list forever, indistinguishable from "nothing was similar".

@@ -83,8 +83,9 @@ class ResearchTopic implements JavAIVectorizable {
 }
 
 JavAIPersistenceConfig config = JavAIPersistenceConfig.builder().backend(Backend.NEO4J)./* ... */.build();
-JavAIPI.repository(ConceptRepository.class, config); // register the node type first, same rule as any
-                                                       // relationship target Neo4j needs to resolve by label
+JavAIPI.repository(ConceptRepository.class, config); // Neo4j needs the node type registered to resolve it
+                                                       // by label; entityPackages(...) on the config does
+                                                       // this for a whole package (OMI-214)
 ResearchTopicRepository repo = JavAIPI.repository(ResearchTopicRepository.class, config);
 
 repo.save(topic);                                     // writes nodes + edges in one shot
@@ -113,6 +114,53 @@ value proposition is different: native multi-hop traversal combined with similar
 MongoDB don't — building an equivalent would mean hand-rolling a real graph-traversal engine on top of a
 relational/document store, a substantial undertaking deliberately out of scope for this project's Phase 0
 (proving the design space), not an oversight or a temporary gap.
+
+## Entity registration: a property of the configuration, not of call order
+
+JavAI learns about an entity when a repository is realized for it, or for anything that references it --
+related types reachable through an already-registered type's own fields are discovered recursively. On
+**Postgres** the backend then builds one Hibernate `SessionFactory`, lazily, at the first actual repository
+call (`JavAIPI.sessionFactory(config)` builds it too). Hibernate's metadata is immutable once built.
+
+Left there, that makes correctness a property of *global startup ordering*: whether an application boots
+depends on the order its repositories happen to be created in, which nothing local can check and no compiler
+can verify. It failed at boot, non-deterministically, blaming the repository that arrived late rather than
+whatever built the factory early — and because there is one shared factory, it took the whole application's
+persistence down rather than one repository. Downstream it cost a consumer a hand-maintained 18-name
+`@DependsOn` list that had already drifted out of sync with its own bean declarations (OMI-214).
+
+**The resolution is to make the entity set a property of the configuration**, complete before anything can be
+built:
+
+```java
+JavAIPersistenceConfig.builder()
+    .backend(Backend.POSTGRES)./* ... */
+    .entityPackages("com.example.domain")
+    .build();
+```
+
+Ordering then stops existing as a concept. Two further properties keep the residue small:
+
+- A late `repository(...)` call **is a no-op when it introduces nothing new** — the type is already
+  registered, directly or transitively. Only a genuinely unknown type fails, and the error names the call
+  that built the factory.
+- **Neo4j and MongoDB have no such constraint at all.** They hold no boot-time metadata; the ordering
+  question is Postgres-specific.
+
+Scanning validates everything it finds, deliberately: an entity Hibernate maps but JavAI cannot is worse
+than one that is refused, because the failure would surface later and far from its cause. Only three
+conditions are refused, all about JavAI-owned field types rather than about vectors — a JavAI collection
+keyed by something other than `String`, a `KnowledgeGraph` field (Neo4j-only), and a collection field that is
+unmapped or is a concrete-typed JavAI collection carrying an association annotation. **Being non-vectorized
+is never one of them**: a plain `@Entity` is a first-class citizen of a `JavAIRepository`, mapped and served
+exactly like a vectorized one, it simply has no vectors. Serving both from one repository type is the design
+intent, not a concession.
+
+For an `@Entity` inside a scanned package that this configuration should not own, use
+`excludeEntityType(...)`/`excludeEntityPackages(...)` (per-configuration — the right tool for a
+backend-specific type such as a `KnowledgeGraph` owner belonging to Neo4j) or `@PersistenceIgnore` on the
+class (global). Exclusion affects scanning only: a type named outright, or reached through a registered
+entity's fields, is registered regardless, since Hibernate cannot map the referencing entity without it.
 
 ## Persisting one entity type to more than one store at once
 
@@ -243,3 +291,54 @@ are meaningless on a converted value, e.g. `>` on a UUID string, are permitted b
 A repository query (`findNearestByBodyVector`) is scoped to the whole persisted store; an object-level
 `query()` (Vector Core) is scoped to one object's reachable graph. See whitepaper §6.6–§6.7 for the full
 worked contrast and the comparison table for which one to reach for.
+
+## Concatenated text: the entity-grain table holds two vectors (OMI-191)
+
+`concatenatedTextVector()` (see `doc/spec/vector-core.md`) is **entity-level**, not field-level, so it is
+stored on `javai_summary_vectors__<model>` — keyed `(owner_type, owner_id)`, exactly the right grain. The
+field table is keyed `(owner_type, owner_id, field_name)`, so a per-entity value there would be null on every
+row but one, with an arbitrary convention for which row carries it.
+
+```sql
+-- javai_summary_vectors__<model>
+owner_type, owner_id, model_id, dims,
+vector                        vector(N) NOT NULL,   -- summary vector, unchanged
+concatenated_text             text        NULL,     -- new
+concatenated_text_vector      vector(N)   NULL,     -- new
+concatenated_text_computed_at timestamptz NULL,     -- new
+computed_at                   timestamptz NOT NULL,
+PRIMARY KEY (owner_type, owner_id)
+```
+
+**The table keeps its name.** Renaming it would be a migration bought for cosmetics. Read it as *entity-level
+vectors*, of which the summary vector is one and the concatenated text vector another, as against the field
+table's per-field grain.
+
+**Three things worth knowing:**
+
+- **The text is stored, not just its vector.** Text is model-independent, so re-embedding under a different
+  model becomes a pure re-embed rather than a fresh walk of the object graph. Postgres TOASTs a `text`
+  column automatically — compressed and stored out-of-line when large — which is the right behaviour for
+  accumulated subtree text with nothing to configure.
+- **The row now serves two independent opt-ins.** Write when *either* value is present; delete only when both
+  are absent; write the concatenated columns as NULL when concatenation is switched off, so a stale text
+  vector cannot outlive the opt-in and keep matching searches.
+- **`ensureSummaryVectorTable` is `CREATE TABLE IF NOT EXISTS`**, which does nothing to a table that already
+  exists — a pre-OMI-191 deployment would keep a three-column-short table and fail on first write. The three
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements alongside it are the migration, and are idempotent.
+
+`vector NOT NULL` means a row cannot hold concatenated text without a summary vector. Reasoning says the two
+always co-occur (text implies content, content implies a non-absent summary contribution), but that is
+inference, so the write path **refuses loudly** if it ever meets the combination rather than silently
+dropping the text or tripping a bare constraint violation. If it ever fires, the fix is to make `vector`
+nullable, not to skip the write.
+
+**Neo4j and MongoDB need no special handling.** Both already store `summaryVector__<model>` as a per-entity
+property/field; `concatenatedText__<model>` and `concatenatedTextVector__<model>` are the same shape, and
+neither has a grain problem to solve.
+
+**Hydration matters more here than for a field vector.** A loaded entity's `summaryVector()` is arithmetic
+over field vectors hydration already restored, so recomputing costs nothing; the concatenated text vector is
+a real embedding, so not restoring it would mean a live model call on every load of every participating
+entity. All three backends read it back into the entity's slot under the same pristine-slot rule that governs
+field hydration.

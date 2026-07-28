@@ -35,6 +35,33 @@ import java.time.Instant;
  * <p><b>Not yet verified against a live endpoint</b> -- no API token was available at implementation time,
  * and (per the caveats above) the exact model schema itself is unconfirmed. Covered by hermetic tests
  * (request/option-mapping, wait-then-poll behavior, both output shapes) against a fake HTTP server only.
+ *
+ * <h2>Why this provider alone does not batch (OMI-213)</h2>
+ *
+ * The other four bundled providers override {@link JavAIEmbeddingProvider#embedAll} to send one request per
+ * batch. This one deliberately keeps the SPI's looping {@code default}, so it remains one round trip per
+ * text.
+ *
+ * <p>The reason is not that Replicate is slow to implement -- it is that <b>there is nothing to implement
+ * against</b>. Batching requires knowing that the input field accepts several texts, and on Replicate the
+ * {@code input} object's shape is defined by each model's own {@code cog predict()} signature rather than by
+ * Replicate. There is no vendor-wide contract to code to, which is the same reason this class already has to
+ * be told {@link Builder#inputFieldName(String)}.
+ *
+ * <p>What was actually established while investigating, rather than assumed: the default model
+ * ({@code beautyyuyanli/multilingual-e5-large}) does take several texts at once, but through a field named
+ * {@code texts} -- <em>not</em> the {@code text} this class defaults to -- described in its own schema as
+ * "formatted as a JSON list of strings". That phrasing leaves the encoding genuinely ambiguous: a native
+ * JSON array, or a JSON-encoded <em>string</em>, which is the usual way a {@code cog} model expresses a list
+ * given cog's scalar input types. The two are indistinguishable from documentation and were not resolvable
+ * without a live API token.
+ *
+ * <p>So a batching implementation here could only guess at both the field name and its encoding, and would
+ * be wrong for any model that named or encoded things differently -- while appearing to work. A wrong batch
+ * either errors loudly (the good case) or silently embeds a JSON string literal, producing vectors of the
+ * text {@code ["a","b"]} rather than of {@code a} and {@code b}. That second outcome is precisely the
+ * silent-wrong-answer shape OMI-213 exists to avoid, so the honest implementation is the slow one. See the
+ * ticket for the follow-up on the {@code text}/{@code texts} default mismatch.
  */
 public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider {
 
@@ -49,9 +76,11 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
     private final String apiToken;
     private final String model;
     private final String inputFieldName;
+    private final Integer maxInputTokensOverride;
 
     private EmbeddingProviderReplicate(HttpClient httpClient, String baseUrl, String apiToken, String model,
-            String inputFieldName) {
+            String inputFieldName, Integer maxInputTokensOverride) {
+        this.maxInputTokensOverride = maxInputTokensOverride;
         this.httpClient = httpClient;
         this.predictionsEndpoint = URI.create(baseUrl).resolve("/v1/models/" + model + "/predictions");
         this.apiToken = apiToken;
@@ -63,9 +92,21 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         return new Builder();
     }
 
+    /** The builder's value when given, else {@link EmbeddingModelLimits}'s table -- a Replicate model's
+     *  input schema is per-model, so there is no endpoint that could report a limit. */
+    @Override
+    public int maxInputTokens() {
+        return maxInputTokensOverride != null ? maxInputTokensOverride : EmbeddingModelLimits.lookup(model);
+    }
+
     @Override
     public EmbeddingVector embed(String text) {
-        String effectiveText = text.isEmpty() ? " " : text;
+        // Truncated client-side like every other provider (OMI-216), so identical text produces the same
+        // outcome whichever provider is configured -- see EmbeddingProviderOllama.embed for the full
+        // reasoning. Replicate has no way to report a limit -- its input schema is per-model -- so
+        // this leans entirely on the table or an explicit override.
+        String effectiveText =
+                EmbeddingInputLimits.truncateToBudget(text.isEmpty() ? " " : text, maxInputTokens());
         String responseBody = createPrediction(effectiveText);
         String status = extractStringField(responseBody, "status");
         String pollUrl = extractStringField(responseBody, "get");
@@ -245,9 +286,22 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         private String apiToken;
         private String model = DEFAULT_MODEL;
         private String inputFieldName = DEFAULT_INPUT_FIELD_NAME;
+        private Integer maxInputTokens;
         private HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         private Builder() {
+        }
+
+        /**
+         * Pins the model's maximum input size, overriding {@link EmbeddingModelLimits}'s best-effort table.
+         *
+         * <p>Worth setting here more than anywhere else: a Replicate model's input schema is per-model, so
+         * there is no endpoint to ask and the table is unlikely to know your model. Without this, a
+         * deliberately conservative default applies and long inputs lose more text than they need to.
+         */
+        public Builder maxInputTokens(int maxInputTokens) {
+            this.maxInputTokens = maxInputTokens;
+            return this;
         }
 
         /** Override only for testing against a fake server -- real usage never needs this. */
@@ -281,7 +335,8 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         }
 
         public EmbeddingProviderReplicate build() {
-            return new EmbeddingProviderReplicate(httpClient, baseUrl, apiToken, model, inputFieldName);
+            return new EmbeddingProviderReplicate(httpClient, baseUrl, apiToken, model, inputFieldName,
+                    maxInputTokens);
         }
     }
 
@@ -293,5 +348,10 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         EmbeddingProviderException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    @Override
+    public String modelId() {
+        return model;
     }
 }

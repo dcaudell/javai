@@ -31,6 +31,26 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
 
     private volatile boolean fieldDirty = true;
     private volatile boolean summaryDirty = true;
+
+    /**
+     * Staleness of a JavAI <em>collection</em>'s own centroid ({@code CollectionVectorSupport.vector}),
+     * tracked separately from {@link #summaryDirty} even though both are set by exactly the same events.
+     *
+     * <p>Why it needs its own bit (OMI-187): a collection's centroid is stale under two conditions --
+     * membership changed ({@code FieldDirty}) or an element mutated ({@code SummaryDirty}, reaching this
+     * collection through {@code propagateDirty}'s dependent walk). So the centroid legitimately has to
+     * recompute on {@code SummaryDirty}. But {@code SummaryDirty} is *also* the collection's summary
+     * vector's staleness signal, and only {@code summaryVector()} clears it -- so a collection read through
+     * {@code vector()} alone recomputed its centroid on <b>every single read, forever</b>. For a populated
+     * collection that is O(n) wasted arithmetic per read; for an empty one it was a live embedding call per
+     * read, which is how this surfaced.
+     *
+     * <p>One flag cannot serve two independent readers: whichever one clears it starves the other. Two
+     * flags set by the same events, each cleared by the reader that consumes it, is the whole fix -- the
+     * same shape {@link VectorCacheSlot} already uses to give each {@code @Vectorize} field independent
+     * cache validity.
+     */
+    private volatile boolean centroidDirty = true;
     private volatile EmbeddingVector vector;
     private volatile EmbeddingVector summaryVector;
     private final Set<IdentityWeakReference> dependents = ConcurrentHashMap.newKeySet();
@@ -91,6 +111,13 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
         return fieldSlots.computeIfAbsent(fieldName, name -> new VectorCacheSlot());
     }
 
+    /** Which fields have a slot so far -- slots are created lazily, so this is "what has been asked for",
+     *  not "every {@code @Vectorize} field". Used to carry already-computed vectors from one instance of a
+     *  logical entity to another (see {@code JavAIRuntime.transferComputedVectors}). */
+    public Set<String> fieldSlotNames() {
+        return Set.copyOf(fieldSlots.keySet());
+    }
+
     public VectorCacheSlot concatenatedTextSlot() {
         return concatenatedTextSlot;
     }
@@ -111,6 +138,8 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
     @Override
     public void markFieldDirty() {
         fieldDirty = true;
+        // A collection's membership changing invalidates its centroid too -- see centroidDirty's javadoc.
+        centroidDirty = true;
     }
 
     @Override
@@ -126,11 +155,38 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
     @Override
     public void markSummaryDirty() {
         summaryDirty = true;
+        // An element mutating reaches a containing collection only as SummaryDirty (propagateDirty marks
+        // dependents, never their FieldDirty), and that same event invalidates the centroid.
+        centroidDirty = true;
+        // ...and it invalidates any concatenated text this object absorbed from that descendant (OMI-191).
+        //
+        // Deliberately a slot generation bump rather than a fourth boolean flag alongside fieldDirty/
+        // summaryDirty/centroidDirty. OMI-187's lesson was that one boolean cannot serve two independent
+        // readers -- whichever reader clears it starves the other -- and the fix it points at is exactly
+        // what VectorCacheSlot already provides: per-reader validity, tracked by generation. The
+        // concatenated text has its own slot, so bumping it here gives it independent staleness for free,
+        // and does so in the currency the read path already speaks: a bumped generation is what makes the
+        // slot dirty, drives COALESCED/EVENTUAL dispatch, and single-flights correctly. A separate boolean
+        // would sit outside all of that and have to be reconciled with it by hand.
+        //
+        // Harmless for an object that does not participate in concatenation: its concatenatedTextVector()
+        // returns absent without ever consulting this slot, so the bump is simply never read.
+        concatenatedTextSlot.bumpGeneration();
     }
 
     @Override
     public void clearSummaryDirty() {
         summaryDirty = false;
+    }
+
+    /** True when a JavAI collection's own centroid needs recomputing -- see {@link #centroidDirty}'s javadoc. */
+    public boolean isCentroidDirty() {
+        return centroidDirty;
+    }
+
+    /** Cleared only by {@code CollectionVectorSupport.vector}, the sole consumer of this flag. */
+    public void clearCentroidDirty() {
+        centroidDirty = false;
     }
 
     public EmbeddingVector cachedVector() {

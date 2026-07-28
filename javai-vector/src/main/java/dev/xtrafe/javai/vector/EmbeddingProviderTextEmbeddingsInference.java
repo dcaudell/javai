@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Phase 0's real {@link JavAIEmbeddingProvider}: a thin HTTP client against Hugging Face's
@@ -23,21 +25,94 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
 
     private final HttpClient httpClient;
     private final URI embedEndpoint;
+    private final URI infoEndpoint;
     private final String modelId;
+    private final Integer maxInputTokensOverride;
+
+    /** Discovered once from /info, then reused. Zero means "asked, and the answer was unusable". */
+    private volatile Integer discoveredMaxInputTokens;
 
     public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId) {
-        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId);
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId, null);
+    }
+
+    /**
+     * Pins the model's maximum input size instead of discovering or guessing it, for when correctness
+     * matters more than convenience -- the same escape hatch {@code Cortex.Builder.contextWindowTokens(int)}
+     * offers on the completion side. Wins over both runtime discovery and the {@link EmbeddingModelLimits}
+     * table.
+     */
+    public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId, int maxInputTokens) {
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId,
+                maxInputTokens);
     }
 
     EmbeddingProviderTextEmbeddingsInference(HttpClient httpClient, URI baseUri, String modelId) {
+        this(httpClient, baseUri, modelId, null);
+    }
+
+    EmbeddingProviderTextEmbeddingsInference(HttpClient httpClient, URI baseUri, String modelId,
+            Integer maxInputTokensOverride) {
         this.httpClient = httpClient;
         this.embedEndpoint = baseUri.resolve("/embed");
+        this.infoEndpoint = baseUri.resolve("/info");
         this.modelId = modelId;
+        this.maxInputTokensOverride = maxInputTokensOverride;
+    }
+
+    /**
+     * Asks TEI's {@code /info}, once, then falls back to {@link EmbeddingModelLimits}.
+     *
+     * <p>TEI reports {@code max_input_length} directly, which makes it the one bundled provider whose limit
+     * is both discoverable and exact. A failed lookup falls through to the table rather than throwing: not
+     * knowing the limit precisely is a reason to be conservative, never a reason to refuse to embed.
+     */
+    @Override
+    public int maxInputTokens() {
+        if (maxInputTokensOverride != null) {
+            return maxInputTokensOverride;
+        }
+        Integer discovered = discoveredMaxInputTokens;
+        if (discovered == null) {
+            discovered = discoverMaxInputTokens();
+            discoveredMaxInputTokens = discovered;
+        }
+        return discovered > 0 ? discovered : EmbeddingModelLimits.lookup(modelId);
+    }
+
+    private int discoverMaxInputTokens() {
+        HttpRequest request = HttpRequest.newBuilder(infoEndpoint)
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() == 200 ? parseMaxInputLength(response.body()) : 0;
+        } catch (IOException | RuntimeException e) {
+            return 0;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return 0;
+        }
+    }
+
+    /** {@code "max_input_length": N} from TEI's /info, or 0 when absent or unparseable. */
+    static int parseMaxInputLength(String responseBody) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("\"max_input_length\"\\s*:\\s*(\\d+)")
+                .matcher(responseBody);
+        return matcher.find() ? Integer.parseInt(matcher.group(1)) : 0;
     }
 
     @Override
     public EmbeddingVector embed(String text) {
-        String requestBody = "{\"inputs\":\"" + JsonStrings.escape(text) + "\",\"truncate\":true}";
+        // Truncated client-side like every other provider (OMI-216), so identical text produces the same
+        // outcome whichever provider is configured -- see EmbeddingProviderOllama.embed for the full
+        // reasoning. TEI's own "truncate": true stays as a
+        // server-side backstop: it truncates exactly, having a real tokenizer, so it catches anything this
+        // conservative estimate lets through.
+        String effectiveText = EmbeddingInputLimits.truncateToBudget(text, maxInputTokens());
+        String requestBody = "{\"inputs\":\"" + JsonStrings.escape(effectiveText) + "\",\"truncate\":true}";
         HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(30))
@@ -54,6 +129,54 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
 
         float[] values = parseSingleRow(responseBody);
         return new EmbeddingVector(values, modelId, values.length, Instant.now());
+    }
+
+    /**
+     * One request for every text, rather than one request per text (OMI-213). TEI's {@code /embed} already
+     * accepts {@code "inputs"} as an array and answers {@code [[...], [...]]} -- one row per input, in
+     * request order.
+     *
+     * <p>Unlike the OpenAI-compatible providers there is no {@code index} field to order by, and none is
+     * needed: TEI's response is a bare array whose position <em>is</em> the correspondence. The row count is
+     * still checked against the request, since that is the only remaining way this could silently
+     * misalign.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        // Resolved once for the batch, applied per member: one over-long text must not shorten its
+        // neighbours. TEI's own "truncate": true stays on as the exact server-side backstop.
+        int budget = maxInputTokens();
+        String inputs = JsonStrings.stringArray(EmbeddingInputLimits.truncateEach(texts, budget));
+        String requestBody = "{\"inputs\":" + inputs + ",\"truncate\":true}";
+        HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = parseAllRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("TEI returned " + rows.size() + " embeddings for "
+                    + texts.size() + " inputs; the batch response must line up with the request: "
+                    + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+        return vectors;
     }
 
     private String send(HttpRequest request) {
@@ -82,13 +205,43 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
 
     /** TEI's response to a single-string {@code /embed} request: one row, {@code [[float, ...]]}. */
     static float[] parseSingleRow(String responseBody) {
-        String trimmed = responseBody.strip();
-        String row = unwrapBrackets(trimmed, "response");
-        String elements = unwrapBrackets(row, "embedding row");
-        if (elements.isBlank()) {
+        List<float[]> rows = parseAllRows(responseBody);
+        if (rows.isEmpty()) {
+            throw new EmbeddingProviderException("Unexpected TEI response shape: " + responseBody);
+        }
+        return rows.get(0);
+    }
+
+    /**
+     * Every row of TEI's {@code [[...], [...]]} response, in order -- one per batched input.
+     *
+     * <p>Position is the whole correspondence here; TEI reports no per-row index, and needs none, because it
+     * answers in request order.
+     */
+    static List<float[]> parseAllRows(String responseBody) {
+        String inner = unwrapBrackets(responseBody.strip(), "response");
+        List<float[]> rows = new ArrayList<>();
+        int cursor = 0;
+        while (true) {
+            int rowStart = inner.indexOf('[', cursor);
+            if (rowStart < 0) {
+                return rows;
+            }
+            int rowEnd = inner.indexOf(']', rowStart);
+            if (rowEnd < 0) {
+                throw new EmbeddingProviderException("Unexpected TEI embedding row shape: " + responseBody);
+            }
+            rows.add(parseFloats(inner.substring(rowStart + 1, rowEnd)));
+            cursor = rowEnd + 1;
+        }
+    }
+
+    private static float[] parseFloats(String elements) {
+        String trimmed = elements.strip();
+        if (trimmed.isBlank()) {
             return new float[0];
         }
-        String[] parts = elements.split(",");
+        String[] parts = trimmed.split(",");
         float[] values = new float[parts.length];
         for (int i = 0; i < parts.length; i++) {
             values[i] = Float.parseFloat(parts[i].strip());
@@ -111,5 +264,10 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
         EmbeddingProviderException(String message, Throwable cause) {
             super(message, cause);
         }
+    }
+
+    @Override
+    public String modelId() {
+        return modelId;
     }
 }

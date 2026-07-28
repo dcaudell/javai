@@ -6,6 +6,8 @@ import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
 import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
+import jakarta.persistence.DiscriminatorType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.Id;
@@ -18,6 +20,13 @@ import jakarta.persistence.OneToOne;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.hibernate.annotations.Any;
+import org.hibernate.annotations.AnyDiscriminator;
+import org.hibernate.annotations.AnyDiscriminatorValue;
+import org.hibernate.annotations.AnyKeyJavaClass;
+import org.hibernate.annotations.Cascade;
+import org.hibernate.annotations.ManyToAny;
+
 import java.util.UUID;
 
 /**
@@ -136,12 +145,133 @@ public class AssocHub {
     @JoinTable(name = "assoc_hub_javai_collection")
     private JavAIList<AssocLeaf> summaryJavAICollection = new JavAIArrayList<>();
 
+    // ---- @Any: polymorphic to-one, added with OMI-212 -------------------------------------------
+    //
+    // Every field below can resolve to EITHER a vectorizable target (AssocAnyVectorizable) or a plain one
+    // (AssocAnyPlain), decided per row by the discriminator. That is strictly harder than anything above:
+    // the rest of this matrix pairs lazy against eager for a *known* target type, whereas here the vector
+    // walk cannot know whether the thing it just resolved needs vectors written until it has resolved it.
+    //
+    // All of them are @Cascade(PERSIST, MERGE) because @Any does not cascade by default. That also keeps the
+    // target types reachable ONLY through their discriminators -- saving them through their own repositories
+    // instead would register them by the ordinary field walk and quietly defeat what OMI-212 tests.
+
+    /** Eager polymorphic to-one -- the control, matching {@link #eagerManyToOne}'s role. */
+    @Cascade({org.hibernate.annotations.CascadeType.PERSIST, org.hibernate.annotations.CascadeType.MERGE})
+    @Any(fetch = FetchType.EAGER)
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "vectorizable", entity = AssocAnyVectorizable.class)
+    @AnyDiscriminatorValue(discriminator = "plain", entity = AssocAnyPlain.class)
+    @AnyKeyJavaClass(UUID.class)
+    @Column(name = "eager_any_type")
+    @JoinColumn(name = "eager_any_id")
+    private AssocAnyTarget eagerAny;
+
+    /** Eager polymorphic to-one resolving to a <em>non</em>-vectorizable target -- {@link #eagerAny}'s pair
+     *  on the other axis, so "resolves to the right concrete type" is proven for both kinds of target
+     *  without a session being required to read either. */
+    @Cascade({org.hibernate.annotations.CascadeType.PERSIST, org.hibernate.annotations.CascadeType.MERGE})
+    @Any(fetch = FetchType.EAGER)
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "vectorizable", entity = AssocAnyVectorizable.class)
+    @AnyDiscriminatorValue(discriminator = "plain", entity = AssocAnyPlain.class)
+    @AnyKeyJavaClass(UUID.class)
+    @Column(name = "eager_any_plain_type")
+    @JoinColumn(name = "eager_any_plain_id")
+    private AssocAnyTarget eagerAnyPlain;
+
+    /**
+     * Lazy polymorphic to-one -- the OMI-161 shape and the OMI-212 shape at once. A lazy {@code @Any} to a
+     * vectorizable target resolves to a proxy that satisfies {@code instanceof JavAIVectorizable} while
+     * holding no field state, which is precisely what broke the vector write for fixed-type lazy
+     * associations; there is no reason to assume the polymorphic form is immune without checking.
+     */
+    @Cascade({org.hibernate.annotations.CascadeType.PERSIST, org.hibernate.annotations.CascadeType.MERGE})
+    @Any(fetch = FetchType.LAZY)
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "vectorizable", entity = AssocAnyVectorizable.class)
+    @AnyDiscriminatorValue(discriminator = "plain", entity = AssocAnyPlain.class)
+    @AnyKeyJavaClass(UUID.class)
+    @Column(name = "lazy_any_type")
+    @JoinColumn(name = "lazy_any_id")
+    private AssocAnyTarget lazyAny;
+
+    /**
+     * {@code @Summary} <em>and</em> polymorphic: the association contributes to this hub's
+     * {@code summaryVector()}, so the summary walk has to resolve a proxy whose concrete type is only known
+     * from a discriminator -- and cope with that type sometimes not being vectorizable at all.
+     */
+    @Summary
+    @Cascade({org.hibernate.annotations.CascadeType.PERSIST, org.hibernate.annotations.CascadeType.MERGE})
+    @Any(fetch = FetchType.LAZY)
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "vectorizable", entity = AssocAnyVectorizable.class)
+    @AnyDiscriminatorValue(discriminator = "plain", entity = AssocAnyPlain.class)
+    @AnyKeyJavaClass(UUID.class)
+    @Column(name = "summary_any_type")
+    @JoinColumn(name = "summary_any_id")
+    private AssocAnyTarget summaryLazyAny;
+
+    /**
+     * The to-<em>many</em> polymorphic form. A different discovery path from the singular case: the field's
+     * declared type is a {@code Collection}, whose element type is the same non-entity interface, so
+     * neither the field type nor the generic argument names anything registrable -- only the discriminator
+     * does. One collection may mix concrete types row by row.
+     */
+    @ManyToAny
+    @Cascade({org.hibernate.annotations.CascadeType.PERSIST, org.hibernate.annotations.CascadeType.MERGE})
+    @AnyDiscriminator(DiscriminatorType.STRING)
+    @AnyDiscriminatorValue(discriminator = "vectorizable", entity = AssocAnyVectorizable.class)
+    @AnyDiscriminatorValue(discriminator = "plain", entity = AssocAnyPlain.class)
+    @AnyKeyJavaClass(UUID.class)
+    @Column(name = "member_type")
+    @JoinTable(name = "assoc_hub_many_to_any",
+            joinColumns = @JoinColumn(name = "hub_id"),
+            inverseJoinColumns = @JoinColumn(name = "member_id"))
+    private List<AssocAnyTarget> manyToAny = new ArrayList<>();
+
     public AssocHub() {
     }
 
     public AssocHub(String label, AssocLeaf mandatoryLazyManyToOne) {
         this.label = label;
         this.mandatoryLazyManyToOne = mandatoryLazyManyToOne;
+    }
+
+    public AssocAnyTarget getEagerAny() {
+        return eagerAny;
+    }
+
+    public void setEagerAny(AssocAnyTarget value) {
+        this.eagerAny = value;
+    }
+
+    public AssocAnyTarget getEagerAnyPlain() {
+        return eagerAnyPlain;
+    }
+
+    public void setEagerAnyPlain(AssocAnyTarget value) {
+        this.eagerAnyPlain = value;
+    }
+
+    public AssocAnyTarget getLazyAny() {
+        return lazyAny;
+    }
+
+    public void setLazyAny(AssocAnyTarget value) {
+        this.lazyAny = value;
+    }
+
+    public AssocAnyTarget getSummaryLazyAny() {
+        return summaryLazyAny;
+    }
+
+    public void setSummaryLazyAny(AssocAnyTarget value) {
+        this.summaryLazyAny = value;
+    }
+
+    public List<AssocAnyTarget> getManyToAny() {
+        return manyToAny;
     }
 
     public UUID getId() {

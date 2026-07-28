@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Slug derivation/immutability -- the state-machine-style claims doc/spec/tagging.md makes about {@link Tag}
@@ -34,6 +36,25 @@ class TagTest {
         Tag tag = new Tag(tagSet, "en", "  Urgent!  ");
 
         assertEquals("urgent", tag.getSlug());
+    }
+
+    /**
+     * A display name with no alphanumerics yields no slug, and is now <b>refused at construction</b>
+     * (OMI-201).
+     *
+     * <p>This used to succeed and produce a tag whose only {@code @Vectorize} field was blank -- and whose
+     * vector was therefore absent, making it unsearchable and unclassifiable while looking like a real tag.
+     * OMI-218 pinned that the input was reachable through the ordinary public constructor; OMI-201 makes it
+     * an error, at the input that caused it rather than at some later read.
+     */
+    @Test
+    void aDisplayNameThatYieldsNoSlugIsRefused() {
+        TagSet tagSet = new TagSet("topics");
+
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new Tag(tagSet, "en", "!!!"));
+
+        assertTrue(failure.getMessage().contains("slug"), failure.getMessage());
     }
 
     @Test

@@ -10,12 +10,17 @@ import dev.xtrafe.javai.vector.VectorCacheSlot;
 import dev.xtrafe.javai.vector.VectorCacheSlot.PendingComputation;
 import dev.xtrafe.javai.vector.VectorMath;
 
+import dev.xtrafe.javai.annotations.Summary;
+import dev.xtrafe.javai.annotations.Vectorize;
+
 import java.lang.reflect.Field;
 import java.net.URI;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Comparator;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -24,6 +29,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
@@ -111,13 +117,30 @@ public final class JavAIRuntime {
      *  calls and {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}'s eager background dispatches acquire
      *  a permit from the same gate before ever calling into the configured provider. Under a burst of rapid
      *  mutation this is what makes the system degrade to "slower" rather than "unboundedly many concurrent
-     *  HTTP calls" -- callers simply block on the gate until a permit frees up. */
+     *  HTTP calls" -- callers simply block on the gate until a permit frees up.
+     *
+     *  <p>A batched {@link #precomputeVectors(Collection, int)} call takes <b>one</b> permit for the whole
+     *  batch, not one per text: this bounds calls into the provider, and a batch is one call however many
+     *  texts it carries (OMI-213). */
     public static void configureMaxConcurrentEmbeddingCalls(int max) {
         embeddingCallGate = new Semaphore(max);
     }
 
     static Semaphore embeddingCallGate() {
         return embeddingCallGate;
+    }
+
+    /**
+     * The configured provider's model, or {@code null} if there is no provider or it cannot name one.
+     *
+     * <p>Public where {@link #embeddingProvider()} is deliberately not: {@code javai-persistence} needs to
+     * know which model's stored vectors are still valid before deciding whether to reuse them rather than
+     * re-embed (see {@link #hydrateFieldVector}), and that is a strictly narrower thing to expose than the
+     * provider itself.
+     */
+    public static String currentModelId() {
+        JavAIEmbeddingProvider provider = embeddingProvider();
+        return provider == null ? null : provider.modelId();
     }
 
     static JavAIEmbeddingProvider embeddingProvider() {
@@ -156,12 +179,32 @@ public final class JavAIRuntime {
      * swallows it and returns {@code null}. Either way, {@code slot} is left dirty -- see
      * {@link VectorCacheSlot#commitFailure}.
      */
+    /**
+     * The one place a field's text becomes a provider call -- and the one place "there is no text" is
+     * decided.
+     *
+     * <p>A {@code @Vectorize} field holding null, "", or only whitespace has no content to embed, so it
+     * yields {@link EmbeddingVector#absent()} rather than a vector of nothing. This was the last of
+     * OMI-187's {@code embed("")} sources: {@code fieldTextOf} renders a null field as {@code ""}, real
+     * providers substitute a single space for an empty input, and the result was a live model call whose
+     * answer was the embedding of a space -- then stored, and mixed into every ancestor's summary.
+     *
+     * <p>It also makes "this field lost its content" representable at rest, which is what lets the
+     * persistence backends delete a vector row instead of leaving a stale one behind.
+     */
+    private static EmbeddingVector embedText(String text) {
+        if (text == null || text.isBlank()) {
+            return EmbeddingVector.absent();
+        }
+        return embeddingProvider().embed(text);
+    }
+
     static EmbeddingVector computeBlocking(VectorCacheSlot slot, long targetGeneration, String text) {
         acquireUninterruptibly(embeddingCallGate());
         try {
             EmbeddingVector result;
             try {
-                result = embeddingProvider().embed(text);
+                result = embedText(text);
             } catch (RuntimeException e) {
                 slot.commitFailure(targetGeneration, failureMode() == EmbeddingFailureMode.RETURN_NULL);
                 if (failureMode() == EmbeddingFailureMode.THROW) {
@@ -199,7 +242,7 @@ public final class JavAIRuntime {
             try {
                 EmbeddingVector result;
                 try {
-                    result = embeddingProvider().embed(text);
+                    result = embedText(text);
                 } catch (RuntimeException e) {
                     boolean nullOut = failureMode() == EmbeddingFailureMode.RETURN_NULL;
                     slot.commitFailure(targetGeneration, nullOut);
@@ -371,10 +414,30 @@ public final class JavAIRuntime {
                 pending.add(dependentTracked);
             }
         }
+        // Visit each reachable dependent once, rather than stopping at the first already-SummaryDirty node.
+        //
+        // The old short-circuit was "if it's already dirty, its ancestors must be too". That holds for a
+        // monotone boolean whenever clearing an ancestor also clears its descendants -- which is the case on
+        // the path summaryVector() itself takes, since it recurses into each @Summary child and clears it on
+        // the way. (Whether it holds for *every* dependent edge is a separate question: dependents() is a
+        // back-edge set that a mutation registers, not only the @Summary graph. Not investigated here, and
+        // moot below, since this walk no longer relies on the invariant either way.)
+        //
+        // Concatenated text broke that invariant (OMI-191). Assembling an ancestor's text calls
+        // concatenatedText() on its descendants, which is pure string work and commits nothing -- so the
+        // ancestor's slot becomes clean while its descendants' stay dirty. A later mutation down there would
+        // then hit an already-SummaryDirty node, prune, and leave the clean ancestor holding text that is
+        // silently out of date. Pruning on either consumer's state is unsound once two consumers clear
+        // independently, which is the same lesson OMI-187 learned about sharing one flag, one level up: it
+        // is the *walk* that was overfitted to a single reader, not just the flag.
+        //
+        // Cost: each mutation now walks its full reachable dependent set instead of stopping early. The set
+        // is ancestors, not descendants -- typically shallow -- and each node is visited exactly once.
+        Set<Object> visited = Collections.newSetFromMap(new IdentityHashMap<>());
         while (!pending.isEmpty()) {
             JavAIDirtyTracking current = pending.remove(pending.size() - 1);
-            if (current.isSummaryDirty()) {
-                continue;
+            if (!visited.add(current)) {
+                continue; // already handled on this walk -- also what makes a dependency cycle terminate
             }
             current.markSummaryDirty();
             for (Object dependent : current.dependents()) {
@@ -400,11 +463,11 @@ public final class JavAIRuntime {
      */
     public static EmbeddingVector vector(Object self, String vectorizeFieldNames) {
         if (vectorizeFieldNames.isBlank()) {
-            // No @Vectorize fields at all -- still a real, correctly-dimensioned vector from the current
-            // model, never a fabricated zero vector, so combining it arithmetically elsewhere never hits a
-            // dims mismatch. Rare enough (an @JavAIVectorizable class with no vectorized fields) not to
-            // warrant its own cache slot.
-            return embeddingProvider().embed("");
+            // No @Vectorize fields at all -- no content, so no vector. Absent rather than a fabricated one,
+            // and free rather than a live embedding call: this used to embed("") on every single read, with
+            // no cache slot, on the reasoning that a real dimensioned vector was needed for arithmetic
+            // elsewhere. Arithmetic now skips absent vectors instead (OMI-187).
+            return EmbeddingVector.absent();
         }
         List<EmbeddingVector> fieldVectors = new ArrayList<>();
         for (String fieldName : vectorizeFieldNames.split(",")) {
@@ -422,10 +485,130 @@ public final class JavAIRuntime {
      * several concatenated fields changed), and mode-aware exactly like {@link #fieldVector}.
      */
     public static EmbeddingVector concatenatedTextVector(Object self, String vectorizeFieldNames) {
+        // Opt-in, and free when declined (OMI-191): no slot touched, no text assembled, no embedding call.
+        // This method used to run for every vectorizable that was ever asked, at the cost of a real model
+        // call, producing something no backend stored and no query could reach.
+        if (!participatesInConcatenation(self.getClass())) {
+            return EmbeddingVector.absent();
+        }
         DirtyTrackingSupport state = stateOf(self);
         VectorCacheSlot slot = state.concatenatedTextSlot();
-        return readSlot(state, slot, () -> concatenatedFieldText(self, vectorizeFieldNames));
+        return readSlot(state, slot, () -> concatenatedText(self, vectorizeFieldNames));
     }
+
+    /**
+     * Assembles the text behind {@link #concatenatedTextVector} -- this object's own {@code @Vectorize}
+     * fields (if its type opted in), then each {@code @Summary(concatenate = true)} field's contribution,
+     * parent-first, newline-separated.
+     *
+     * <p><b>Each node contributes exactly once per assembly</b>, tracked by {@link #CONCATENATION_PATH}.
+     * This is a deliberate divergence from {@link #summaryVector}, where a node reachable by two paths
+     * stacks additively: that is meaningful vector arithmetic, whereas the same paragraph appearing twice in
+     * one text merely skews its embedding toward whatever it happens to say. The colouring doubles as cycle
+     * safety, so no separate guard is needed.
+     */
+    public static String concatenatedText(Object self, String vectorizeFieldNames) {
+        return assembleColoured(self, () -> {
+            StringBuilder text = new StringBuilder();
+            if (concatenatesOwnFields(self.getClass())) {
+                text.append(concatenatedFieldText(self, vectorizeFieldNames));
+            }
+            for (String fieldName : concatenateFieldNames(self.getClass())) {
+                Object value = readField(self, fieldName);
+                if (value instanceof JavAIVectorizable child) {
+                    // The child assembles its own contribution, using its own knowledge of its own fields --
+                    // and, if it is a JavAI collection, of its members. Never re-derived from out here.
+                    append(text, child.concatenatedText());
+                }
+            }
+            // null, not "": no text is not the same as empty text. See JavAIVectorizable.concatenatedText.
+            return text.isEmpty() ? null : text.toString();
+        });
+    }
+
+    /**
+     * A JavAI collection's contribution: its members' text, in iteration order.
+     *
+     * <p>A collection aggregates whenever it is asked, and is never asked unless the <b>owning field</b>
+     * carries {@code @Summary(concatenate = true)} -- a collection never decides for itself whether folding
+     * its members into its container is meaningful. Members still each decide whether they produce text at
+     * all, via their own type-level opt-in.
+     */
+    public static String concatenatedTextOfCollection(Object collection, Collection<?> elements) {
+        return assembleColoured(collection, () -> {
+            StringBuilder text = new StringBuilder();
+            for (Object element : elements) {
+                if (element instanceof JavAIVectorizable member) {
+                    append(text, member.concatenatedText());
+                }
+            }
+            // A collection whose members contribute nothing has no text of its own to offer.
+            return text.isEmpty() ? null : text.toString();
+        });
+    }
+
+    /**
+     * Runs {@code body} with {@code node} coloured, so it contributes exactly once per assembly.
+     *
+     * <p>The colouring is what makes a diamond contribute its shared node once and what makes a cycle
+     * terminate; both fall out of the same set rather than needing separate handling.
+     */
+    private static String assembleColoured(Object node, Supplier<String> body) {
+        Set<Object> path = CONCATENATION_PATH.get();
+        boolean root = path.isEmpty();
+        if (!path.add(node)) {
+            // Already contributed somewhere in this assembly -- a diamond's shared node, or a cycle. Nothing
+            // more to add from here, which is null rather than "" for the reason given on
+            // JavAIVectorizable.concatenatedText.
+            return null;
+        }
+        try {
+            return body.get();
+        } finally {
+            // Only the root clears. Removing each node on exit -- the way exitSummaryComputation does --
+            // would let a node reached again by a later path contribute a second time, which is exactly the
+            // stacking this must not do. Clearing the ThreadLocal outright (not just emptying the set) keeps
+            // pooled and virtual threads from retaining an identity set between unrelated assemblies.
+            if (root) {
+                CONCATENATION_PATH.remove();
+            }
+        }
+    }
+
+    /**
+     * A collection's own {@code concatenatedTextVector()} -- the embedding of {@link
+     * #concatenatedTextOfCollection}, cached in the collection's own slot and mode-aware exactly like every
+     * other vector read.
+     *
+     * <p>These used to throw {@code UnsupportedOperationException("has no @Vectorize fields of its own")},
+     * which was true and beside the point: a collection's concatenated text was never going to come from
+     * fields it doesn't have, it comes from its members (OMI-191).
+     */
+    public static EmbeddingVector collectionConcatenatedTextVector(DirtyTrackingSupport state, Object collection,
+            Collection<?> elements) {
+        return readSlot(state, state.concatenatedTextSlot(),
+                () -> concatenatedTextOfCollection(collection, elements));
+    }
+
+    /** Appends {@code addition} as its own block, keeping exactly one newline between contributions. */
+    private static void append(StringBuilder text, String addition) {
+        if (addition == null || addition.isBlank()) {
+            return;
+        }
+        if (!text.isEmpty() && text.charAt(text.length() - 1) != '\n') {
+            text.append('\n');
+        }
+        text.append(addition);
+    }
+
+    /**
+     * Which nodes have already contributed to the concatenated text currently being assembled on this
+     * thread. Identity-based, like {@link #SUMMARY_COMPUTATION_PATH}, but with the opposite lifetime: that
+     * one is a stack (entries leave on exit, so a node reachable twice contributes twice), this one is a
+     * colouring that survives for the whole assembly.
+     */
+    private static final ThreadLocal<Set<Object>> CONCATENATION_PATH =
+            ThreadLocal.withInitial(() -> Collections.newSetFromMap(new IdentityHashMap<>()));
 
     /**
      * A single {@code @Vectorize} field's own cached vector -- real per-field caching (unlike this method's
@@ -438,6 +621,286 @@ public final class JavAIRuntime {
         DirtyTrackingSupport state = stateOf(self);
         VectorCacheSlot slot = state.fieldSlot(fieldName);
         return readSlot(state, slot, () -> fieldTextOf(self, fieldName));
+    }
+
+    /**
+     * Computes every not-yet-computed {@code @Vectorize} field vector across {@code objects} in as few
+     * provider calls as the provider supports, then seeds each field's cache slot with the result.
+     *
+     * <p>This is OMI-187's "bulk-seed path" ask, and it is where {@link JavAIEmbeddingProvider#embedAll}
+     * earns its keep. Ordinary lazy computation discovers one text at a time, deep inside a read, which
+     * makes batching impossible however fast the provider is -- seeding 1,400 tags means 1,400 sequential
+     * round trips no matter what. Gathering first turns that into a handful of requests. Nothing else about
+     * the object model changes: this only pre-fills caches that a later read (or {@code save()}) would have
+     * filled one at a time, so calling it is always optional and never changes a result.
+     *
+     * <p>Recommended shape for seeding a large reference set:
+     * <pre>{@code
+     * JavAIRuntime.precomputeVectors(allTags);        // one batched round trip per chunk
+     * for (Tag tag : allTags) tagRepository.save(tag); // finds every vector already on file
+     * }</pre>
+     *
+     * <p>Texts are de-duplicated across the whole batch, so a value shared by several objects is embedded
+     * once and seeded into every slot holding it. Fields whose slot is already clean are skipped entirely --
+     * including anything a previous call already warmed -- so this is safely re-runnable.
+     *
+     * @param objects the objects to warm; non-{@link JavAIVectorizable} entries are ignored
+     * @param batchSize maximum texts per provider call, so one enormous request is never built
+     */
+    public static void precomputeVectors(Collection<?> objects, int batchSize) {
+        if (batchSize < 1) {
+            throw new IllegalArgumentException("batchSize must be at least 1, was " + batchSize);
+        }
+        // Distinct text -> every (object, field) slot waiting on it. LinkedHashMap so the batch order is
+        // deterministic, which keeps a failure reproducible.
+        Map<String, List<FieldRef>> pending = new LinkedHashMap<>();
+        for (Object object : objects) {
+            if (!(object instanceof JavAIVectorizable)) {
+                continue;
+            }
+            for (Field field : allFields(object.getClass())) {
+                if (!field.isAnnotationPresent(Vectorize.class)) {
+                    continue;
+                }
+                String fieldName = field.getName();
+                VectorCacheSlot slot = stateOf(object).fieldSlot(fieldName);
+                if (!slot.isDirty()) {
+                    continue; // already accurate; nothing to compute
+                }
+                String text = fieldTextOf(object, fieldName);
+                if (text == null || text.isBlank()) {
+                    continue; // no content: absent, and nothing to batch -- see embedText
+                }
+                pending.computeIfAbsent(text, key -> new ArrayList<>())
+                        .add(new FieldRef(object, fieldName));
+            }
+        }
+        if (pending.isEmpty()) {
+            return;
+        }
+
+        List<String> texts = new ArrayList<>(pending.keySet());
+        JavAIEmbeddingProvider provider = embeddingProvider();
+        for (int start = 0; start < texts.size(); start += batchSize) {
+            List<String> chunk = texts.subList(start, Math.min(start + batchSize, texts.size()));
+            // One batched request costs one permit, not one per text (OMI-213). The gate bounds concurrent
+            // *calls into the provider* -- it exists so a burst degrades to "slower" rather than to
+            // unboundedly many concurrent HTTP calls -- and a batch is one call on one connection however
+            // many texts it carries. Charging it per text would instead make the gate throttle batching
+            // itself, penalising the very thing that reduces load on the endpoint: a 100-text batch against a
+            // gate of 8 would block outright, since no batch could ever acquire enough permits.
+            //
+            // Taking a permit at all is the point. Before this, precomputeVectors called the provider without
+            // touching the gate, so a bulk seed ran entirely outside the bound this class documents as
+            // applying to every provider call in every consistency mode.
+            List<EmbeddingVector> vectors;
+            acquireUninterruptibly(embeddingCallGate());
+            try {
+                vectors = provider.embedAll(chunk);
+            } finally {
+                embeddingCallGate().release();
+            }
+            if (vectors.size() != chunk.size()) {
+                throw new IllegalStateException("embedAll returned " + vectors.size() + " vectors for "
+                        + chunk.size() + " texts; a provider must answer one vector per input, in order");
+            }
+            for (int i = 0; i < chunk.size(); i++) {
+                for (FieldRef ref : pending.get(chunk.get(i))) {
+                    hydrateFieldVector(ref.owner(), ref.fieldName(), vectors.get(i));
+                }
+            }
+        }
+
+        // The concatenated-text pass runs last, after every field vector is warm (OMI-191). Order matters:
+        // assembling an object's text reads its descendants, and doing that while their own field vectors
+        // were still cold would interleave text assembly with per-field embedding calls -- the very
+        // one-at-a-time discovery this method exists to avoid.
+        precomputeConcatenatedTextVectors(objects, batchSize);
+    }
+
+    /**
+     * Warms the concatenated-text slot of every participating object, in as few provider calls as possible
+     * (OMI-191).
+     *
+     * <p>This is why assembly is deliberately pure string work with no embedding in it: the whole subtree
+     * walk can finish for every object first, and only then does anything reach the network. So a graph of
+     * any size and shape costs one embedding per participating object, in batches -- rather than one call
+     * discovered at a time, deep inside a read.
+     *
+     * <p>Texts are de-duplicated across the batch exactly like the field pass, so two objects that assemble
+     * to the same text are embedded once between them.
+     */
+    private static void precomputeConcatenatedTextVectors(Collection<?> objects, int batchSize) {
+        // Distinct text -> every slot waiting on it, each paired with the generation its text was read at.
+        Map<String, List<PendingConcatenation>> pending = new LinkedHashMap<>();
+        for (Object object : objects) {
+            if (!(object instanceof JavAIVectorizable vectorizable)
+                    || !participatesInConcatenation(object.getClass())) {
+                continue;
+            }
+            VectorCacheSlot slot = stateOf(object).concatenatedTextSlot();
+            if (!slot.isDirty()) {
+                continue; // already accurate; nothing to compute
+            }
+            // Captured *before* assembling, so a mutation racing this pass makes the commit below lose
+            // rather than land a vector computed from text that is already out of date.
+            long generation = slot.currentGeneration();
+            String text = vectorizable.concatenatedText();
+            if (text == null || text.isBlank()) {
+                continue; // nothing to embed -- absent, exactly as an unread slot already is
+            }
+            pending.computeIfAbsent(text, key -> new ArrayList<>())
+                    .add(new PendingConcatenation(slot, generation));
+        }
+        if (pending.isEmpty()) {
+            return;
+        }
+
+        List<String> texts = new ArrayList<>(pending.keySet());
+        JavAIEmbeddingProvider provider = embeddingProvider();
+        for (int start = 0; start < texts.size(); start += batchSize) {
+            List<String> chunk = texts.subList(start, Math.min(start + batchSize, texts.size()));
+            List<EmbeddingVector> vectors;
+            acquireUninterruptibly(embeddingCallGate()); // one permit per batch -- see the field pass above
+            try {
+                vectors = provider.embedAll(chunk);
+            } finally {
+                embeddingCallGate().release();
+            }
+            if (vectors.size() != chunk.size()) {
+                throw new IllegalStateException("embedAll returned " + vectors.size() + " vectors for "
+                        + chunk.size() + " texts; a provider must answer one vector per input, in order");
+            }
+            for (int i = 0; i < chunk.size(); i++) {
+                for (PendingConcatenation waiting : pending.get(chunk.get(i))) {
+                    waiting.slot().commitSuccess(waiting.generation(), vectors.get(i));
+                }
+            }
+        }
+    }
+
+    /** {@link #precomputeVectors(Collection, int)} with a batch size most provider APIs accept comfortably. */
+    public static void precomputeVectors(Collection<?> objects) {
+        precomputeVectors(objects, 100);
+    }
+
+    /** One object's one {@code @Vectorize} field, awaiting a batched embedding. */
+    private record FieldRef(Object owner, String fieldName) {
+    }
+
+    /** One object's concatenated-text slot, and the generation its text was assembled at. */
+    private record PendingConcatenation(VectorCacheSlot slot, long generation) {
+    }
+
+    /**
+     * Carries every already-computed, still-accurate field vector from one instance of a logical entity to
+     * another -- the fix for what {@code merge()} otherwise destroys (OMI-187).
+     *
+     * <p>JavAI's dirty-tracking state lives in a woven {@code $javai$state} field, which is exactly the kind
+     * of transient state {@code merge()} does not reconcile: Hibernate copies the mapped field <em>values</em>
+     * onto its managed copy and leaves the tracking state behind on the caller's instance. The managed copy
+     * therefore looks brand new and re-embeds values the caller had already computed. {@code javai-persistence}
+     * already reads {@code @Transient} collection and geo-point state off the original instance for precisely
+     * this reason; vectors are the same situation and get the same treatment.
+     *
+     * <p><b>A dirty source slot is skipped, and that is the whole safety argument.</b> If the caller mutated
+     * a field, their own slot is dirty -- the setter bumped its generation -- so nothing is transferred and
+     * the target computes the new value. If the caller did not mutate it, their slot holds a vector that is
+     * accurate by definition, and handing it over costs a reference instead of a model call.
+     *
+     * <p>Deliberately not a hash comparison against the stored text. Field content is not necessarily small
+     * or cheap to digest -- vectorizing large binary content is a plausible future -- so validity is decided
+     * from cache state that is already maintained, never by re-reading and re-hashing the value itself.
+     */
+    public static void transferComputedVectors(Object from, Object to) {
+        if (from == to || from == null || to == null) {
+            return;
+        }
+        // Guarded here rather than at each call site: a persisted @Entity is not necessarily
+        // @JavAIVectorizable (a @Taggable-only entity is the standard example), and such a class has no
+        // woven $javai$state for stateOf to find. Callers walking a collection of entities shouldn't each
+        // have to remember that.
+        if (!(from instanceof JavAIVectorizable) || !(to instanceof JavAIVectorizable)) {
+            return;
+        }
+        DirtyTrackingSupport source = stateOf(from);
+        DirtyTrackingSupport target = stateOf(to);
+        for (String fieldName : source.fieldSlotNames()) {
+            VectorCacheSlot sourceSlot = source.fieldSlot(fieldName);
+            // Dirty or never-computed: the caller has nothing trustworthy to hand over. Let `to` compute.
+            if (sourceSlot.isDirty() || !sourceSlot.everComputed()) {
+                continue;
+            }
+            hydrateFieldVector(to, fieldName, sourceSlot.cachedValue());
+        }
+    }
+
+    /**
+     * Seeds {@code fieldName}'s cache slot with an already-known vector, so the next read serves it instead
+     * of paying a model call to recompute a value we already have.
+     *
+     * <p>Exists for the persistence layer (OMI-187). Every vector caching structure in this runtime hangs
+     * off {@link #stateOf}, which resolves a woven <em>instance</em> field -- so vector caches are keyed to
+     * object identity and cannot survive a persistence round trip, which by nature hands back a different
+     * instance of the same logical entity. Meanwhile the vectors themselves were already written to the
+     * database, keyed by {@code (owner_type, owner_id, field_name)}: precisely this slot's identity. A
+     * loaded entity re-embedding a field whose vector is sitting in the row it was just loaded from is pure
+     * waste, and this is how a backend hands it back instead.
+     *
+     * <p>Not a cache and not memoization -- there is no new store, no eviction policy, and no invalidation
+     * question beyond the one persistence already answers: vectors are stored per model, so a caller must
+     * only hydrate from the model it would embed with now (see {@link JavAIEmbeddingProvider#modelId()}).
+     * Hydrating an {@link EmbeddingVector#isAbsent() absent} vector is a no-op, since absence is the state
+     * a fresh slot is already in.
+     */
+    public static void hydrateFieldVector(Object self, String fieldName, EmbeddingVector vector) {
+        if (vector == null || vector.isAbsent()) {
+            return;
+        }
+        VectorCacheSlot slot = stateOf(self).fieldSlot(fieldName);
+        // Only into a pristine slot: nothing computed, and no JavAI-visible mutation since construction
+        // (a fresh slot sits at generation 1; every vectorizeFieldMutated bumps it). This is what keeps
+        // eager hydration from ever overwriting a real change -- load an entity, call a setter, save it,
+        // and the setter's bump puts the slot past generation 1, so the stored vector is ignored and the
+        // new value is embedded, exactly as it should be.
+        //
+        // The remaining case -- a field mutated *behind* JavAI's back, bypassing the woven setter -- will
+        // be served its stored vector, which is now stale. That is deliberate and is JavAI's standing
+        // assumption everywhere, not a gap introduced here: nothing but JavAI is expected to mutate a
+        // @Vectorize field, and code that does so has already opted out of automatic re-embedding.
+        if (slot.everComputed() || slot.currentGeneration() != 1) {
+            return;
+        }
+        slot.commitSuccess(slot.currentGeneration(), vector);
+    }
+
+    /**
+     * The {@link #hydrateFieldVector} counterpart for the concatenated-text slot (OMI-191).
+     *
+     * <p>Worth more here than for a field vector. A loaded entity's {@code summaryVector()} is arithmetic
+     * over field vectors that hydration already restored, so it costs nothing to recompute; a concatenated
+     * text vector is a real embedding of assembled text, so <em>not</em> hydrating it would mean a model call
+     * on every load of every participating entity -- precisely the waste OMI-187 existed to remove.
+     *
+     * <p>Same pristine-slot rule, and the same standing assumption behind it: hydrate only when nothing has
+     * been computed and no JavAI-visible mutation has happened, so a real change always wins over a stored
+     * value.
+     *
+     * <p>One gap worth naming, inherited rather than introduced: this object's text depends on its
+     * descendants, which are separate entities with their own rows. If a descendant changed in some earlier
+     * session and this entity was never re-saved, the stored text -- and so this vector -- is already stale
+     * on disk, and hydration will faithfully serve that staleness. Recomputation would not have discovered
+     * it either, since it reads the same graph.
+     */
+    public static void hydrateConcatenatedTextVector(Object self, EmbeddingVector vector) {
+        if (vector == null || vector.isAbsent()) {
+            return;
+        }
+        VectorCacheSlot slot = stateOf(self).concatenatedTextSlot();
+        if (slot.everComputed() || slot.currentGeneration() != 1) {
+            return;
+        }
+        slot.commitSuccess(slot.currentGeneration(), vector);
     }
 
     /**
@@ -593,25 +1056,33 @@ public final class JavAIRuntime {
                 return vector(self, vectorizeFieldNames);
             }
             try {
-                EmbeddingVector own = vector(self, vectorizeFieldNames);
-                float[] sum = own.values().clone();
+                // This object's own vector at full weight, plus each @Summary child's summary at the decay
+                // factor. An absent own-vector (no @Vectorize fields) doesn't make this object's summary
+                // absent -- its @Summary children may still have content -- and an absent child contributes
+                // nothing rather than being a dimension mismatch to report. VectorMath.weightedSum applies
+                // both of those rules, so they are stated once there rather than re-derived here (OMI-218).
+                List<VectorMath.WeightedVector> terms = new ArrayList<>();
+                terms.add(new VectorMath.WeightedVector(vector(self, vectorizeFieldNames), 1.0));
                 if (!summaryFieldNames.isBlank()) {
                     for (String fieldName : summaryFieldNames.split(",")) {
                         Object value = readField(self, fieldName);
                         if (value instanceof JavAIVectorizable child) {
-                            EmbeddingVector childSummary = child.summaryVector();
-                            if (childSummary.dims() != sum.length) {
-                                throw new IllegalStateException(
-                                        "summaryVector() dimension mismatch: " + self.getClass() + "'s own vector has "
-                                                + sum.length + " dims but @Summary field " + fieldName + " contributed "
-                                                + childSummary.dims() + " -- are they using the same model?");
-                            }
-                            VectorMath.addWeighted(sum, childSummary.values(), DEFAULT_SUMMARY_DECAY);
+                            terms.add(new VectorMath.WeightedVector(
+                                    child.summaryVector(), DEFAULT_SUMMARY_DECAY));
                         }
                     }
                 }
-                EmbeddingVector recomputed =
-                        new EmbeddingVector(VectorMath.normalize(sum), own.modelId(), sum.length, Instant.now());
+                EmbeddingVector recomputed;
+                try {
+                    recomputed = VectorMath.normalize(VectorMath.weightedSum(terms));
+                } catch (IllegalArgumentException e) {
+                    // Rethrown with the context VectorMath cannot have: which class, and which fields were
+                    // in play. (The specific offending field name is no longer singled out -- the cost of
+                    // having one implementation of the compatibility rule instead of three.)
+                    throw new IllegalStateException("summaryVector() for " + self.getClass().getName()
+                            + " cannot combine its own vector with its @Summary fields ["
+                            + summaryFieldNames + "]: " + e.getMessage(), e);
+                }
                 state.cacheSummaryVector(recomputed);
                 state.clearSummaryDirty();
                 // vector()'s own cache no longer clears this (it has no cache of its own to gate on
@@ -862,6 +1333,65 @@ public final class JavAIRuntime {
     }
 
     // ---- shared reflection helpers -------------------------------------------------------------
+
+    // ---- concatenated-text opt-in, read from annotations once per class (OMI-191) ----------------
+
+    /**
+     * Whether a class produces concatenated text of its own {@code @Vectorize} fields --
+     * {@code @Summary(concatenate = true)} on the type.
+     *
+     * <p>Read reflectively rather than baked in at weave time, deliberately. The weaver bakes the
+     * {@code @Vectorize} field list because deriving it needs {@code @VectorizeIgnore} precedence rules that
+     * would be a second implementation to keep in sync; these opt-ins have no such subtlety, and reading
+     * them here keeps the whole feature in one place. Cached per class, so it costs one map lookup per read
+     * rather than an annotation scan.
+     */
+    private static boolean concatenatesOwnFields(Class<?> type) {
+        return CONCATENATION_OPT_INS.computeIfAbsent(type, JavAIRuntime::readConcatenationOptIns).own();
+    }
+
+    /** The {@code @Summary(concatenate = true)} field names of a class, in declaration order. */
+    private static List<String> concatenateFieldNames(Class<?> type) {
+        return CONCATENATION_OPT_INS.computeIfAbsent(type, JavAIRuntime::readConcatenationOptIns).fields();
+    }
+
+    /**
+     * Whether a class participates in concatenated text vectoring at all, by either opt-in.
+     *
+     * <p>Note the two are independent: a class may absorb its children's text without contributing its own
+     * fields, which is exactly what you want for a container whose own fields are bookkeeping.
+     *
+     * <p>Public for {@code javai-persistence}, which needs it twice: to skip reading a stored text vector
+     * for an entity that could not have one, and to reject {@code findNearestByConcatenatedTextVector} at
+     * repository-creation time for an entity type that never participates.
+     */
+    public static boolean participatesInConcatenation(Class<?> type) {
+        ConcatenationOptIns optIns = CONCATENATION_OPT_INS.computeIfAbsent(type, JavAIRuntime::readConcatenationOptIns);
+        return optIns.own() || !optIns.fields().isEmpty();
+    }
+
+    private static ConcatenationOptIns readConcatenationOptIns(Class<?> type) {
+        Summary typeLevel = type.getAnnotation(Summary.class);
+        boolean own = typeLevel != null && typeLevel.concatenate();
+
+        List<String> fields = new ArrayList<>();
+        // Walk the hierarchy so an inherited field's opt-in is honoured, matching how field discovery
+        // works elsewhere in this class.
+        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
+            for (Field field : current.getDeclaredFields()) {
+                Summary summary = field.getAnnotation(Summary.class);
+                if (summary != null && summary.concatenate() && !fields.contains(field.getName())) {
+                    fields.add(field.getName());
+                }
+            }
+        }
+        return new ConcatenationOptIns(own, List.copyOf(fields));
+    }
+
+    private record ConcatenationOptIns(boolean own, List<String> fields) {
+    }
+
+    private static final Map<Class<?>, ConcatenationOptIns> CONCATENATION_OPT_INS = new ConcurrentHashMap<>();
 
     private static String concatenatedFieldText(Object self, String vectorizeFieldNames) {
         if (vectorizeFieldNames.isBlank()) {

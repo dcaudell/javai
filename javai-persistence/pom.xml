@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.6</version>
+    <version>0.1.7</version>
   </parent>
 
   <artifactId>javai-persistence</artifactId>
@@ -21,6 +21,15 @@
   -->
 
   <dependencies>
+    <!-- Shared test fixtures: dev.xtrafe.javai.vector.testsupport's FakeEmbeddingProvider (one copy,
+         replacing this module's own former private duplicate) and OMI-187's instrumented
+         RecordingEmbeddingProvider/EmbeddingLedger. -->
+    <dependency>
+      <groupId>io.github.dcaudell</groupId>
+      <artifactId>javai-vector</artifactId>
+      <classifier>tests</classifier>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>io.github.dcaudell</groupId>
       <artifactId>javai-collections</artifactId>
@@ -55,6 +64,15 @@
       <!-- MongoTemplate as the configured connection holder for RepositoryBackendSpringDataMongo. -->
       <groupId>org.springframework.data</groupId>
       <artifactId>spring-data-mongodb</artifactId>
+    </dependency>
+    <dependency>
+      <!-- ClassPathScanningCandidateComponentProvider, which backs entityPackages(...) (OMI-214): it reads
+           @Entity from class metadata rather than loading classes, and handles directories and jars alike.
+           Present transitively via spring-data-mongodb already, but named explicitly since it is now a
+           first-class dependency of this module's own code, same reasoning as spring-data-commons below.
+           Deliberately NOT <optional>: registration is core, not a Spring-only bridge the way spring-orm is. -->
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-context</artifactId>
     </dependency>
     <dependency>
       <!-- PartTree, the Spring-Data derived-query name parser, is used directly by DerivedFinderQuery to

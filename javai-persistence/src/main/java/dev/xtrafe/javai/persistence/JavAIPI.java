@@ -49,11 +49,22 @@ import java.util.function.Supplier;
  * resolved against the entity's own mapped columns. Only a name matching neither convention is rejected
  * here, at repository-creation time, not on first call.
  *
- * <p><b>Registration-before-use</b>: call {@link #repository(Class, JavAIPersistenceConfig)} for every
- * repository interface an application needs *before* invoking methods on any of them. The Postgres
- * backend's internal {@code SessionFactory} accumulates entity classes across these calls and is built,
- * once, lazily, on first actual method invocation -- Hibernate's metadata is immutable once built, so an
- * entity type registered only after that point would never be picked up.
+ * <p><b>Registration</b>: the Postgres backend accumulates entity classes and builds its internal
+ * {@code SessionFactory} once, lazily, on the first actual repository method call (or on
+ * {@link #sessionFactory(JavAIPersistenceConfig)}). Hibernate's metadata is immutable once built, so a type
+ * genuinely unknown at that point can never be mapped.
+ *
+ * <p><b>The recommended way to make that a non-issue is to let the configuration name its own entity
+ * types</b> -- {@code JavAIPersistenceConfig.Builder.entityPackages("your.domain")}, or
+ * {@code entityType(...)} for individual classes. The entity set is then complete before anything can be
+ * built, so repositories may be realized in any order, at any time, and no startup-ordering discipline is
+ * required of the caller (OMI-214).
+ *
+ * <p>Without that, ordering still matters: realize every repository before invoking a method on any of them.
+ * A late {@code repository(...)} call is <em>harmless</em> whenever it introduces nothing new -- the type is
+ * already registered, directly or because another entity referenced it -- and fails only when it would
+ * genuinely add an unknown type, in which case the error names the call that built the factory, since that
+ * is the thing to move.
  */
 public final class JavAIPI {
 

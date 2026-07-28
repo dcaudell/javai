@@ -95,6 +95,8 @@ have to live together upstream of everything else. Don't be surprised to find `P
 |---|---|---|---|
 | `EmbeddingVector vector()` | `JavAIVectorizable` | Yes | This object's own embedding, from its `@Vectorize` fields. Recomputes lazily on next read after any of them changes. |
 | `EmbeddingVector summaryVector()` | `JavAIVectorizable` | Yes | Decay-weighted combination of `vector()` and every `@Summary`-marked child's own `summaryVector()`. Cycle-safe. |
+| `EmbeddingVector concatenatedTextVector()` | `JavAIVectorizable` | Yes | One embedding of real text assembled across the object graph, as against `summaryVector()`'s arithmetic over vectors. **Opt-in**: absent, and free, unless you add `@Summary(concatenate = true)`. |
+| `String concatenatedText()` | `JavAIVectorizable` | Yes | The assembled text itself, before embedding — useful for seeing exactly what got vectorized. **`null`** (not `""`) when there is no text: not opted in, or nothing to contribute. |
 | `double similarityTo(JavAIVectorizable other)` | `JavAIVectorizable` | Yes | Cosine similarity between this object's `vector()` and `other`'s. |
 | `double similarityTo(EmbeddingVector reference)` | `JavAIVectorizable` | Yes | Cosine similarity against an arbitrary vector (e.g. a query embedding). |
 | `<T> JavAIList<T> query(EmbeddingVector reference, Class<T> type)` | `JavAIVectorizable` | Yes | Walks the reachable object graph for instances of `type`, ranked by similarity to `reference`. Unbounded depth, cycle-safe. Respects `@SearchVisibility(PRIVATE)`. |
@@ -125,6 +127,7 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@Vectorize` | field | This field contributes to the declaring object's own `vector()`. Also gets a synthesized `<field>Vector()` accessor. |
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
 | `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. |
+| `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
@@ -246,6 +249,24 @@ Tag urgent = new Tag(securitySet, "en", "Urgent");   // slug ("urgent") derived 
                                                        // there is no setSlug; renaming is delete-and-recreate
 tagRepo.save(urgent);
 ```
+
+**Localizing a whole taxonomy at once.** A `Tag` or `TagSet` takes its entire translation bundle in one go,
+as a `Map` or as JSON — which is what you want when the catalog lives in translation files:
+
+```java
+Tag zeroDay = Tag.fromLocalizedNamesJson(securitySet, """
+        {"en": "Zero-day", "fr": "Faille zero-day", "de": "Zero-Day-Lücke", "ja": "ゼロデイ"}""");
+
+zeroDay.setLocalizedNames(Map.of("es", "Día cero"));   // merges; every existing locale is left alone
+```
+
+Three things to know. The slug is derived from **the English entry** (`en`, or a variety like `en-US`) if
+there is one, else the first entry that yields a usable slug — so identity doesn't depend on which key
+happened to lead the JSON. `getSlugLocale()` tells you which one it used. And the slug is **required**: a
+bundle where nothing slugifies (all CJK, say — this library doesn't transliterate) is rejected at
+construction, because the slug is a tag's only vectorized field and without one it can never be found.
+
+`getLocalizedNames()` returns an **unmodifiable** snapshot; use `setLocalizedNames(...)` to change anything.
 
 `Tag`/`TagSet` are ordinary `@Entity @JavAIVectorizable` classes persisted through the same
 `JavAIPI.repository(...)` mechanism as any other JavAI entity — `TagRepository`/`TagSetRepository` are
@@ -404,7 +425,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.6` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.7` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -412,42 +433,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.6</version>
+  <version>0.1.7</version>
 </dependency>
 ```
 
@@ -458,14 +479,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.6")
-    implementation("io.github.dcaudell:javai-model:0.1.6")
-    implementation("io.github.dcaudell:javai-substrate:0.1.6")
-    implementation("io.github.dcaudell:javai-supervision:0.1.6")
-    implementation("io.github.dcaudell:javai-collections:0.1.6")
-    implementation("io.github.dcaudell:javai-persistence:0.1.6")
-    implementation("io.github.dcaudell:javai-completion:0.1.6")
-    implementation("io.github.dcaudell:javai-tagging:0.1.6")
+    implementation("io.github.dcaudell:javai-vector:0.1.7")
+    implementation("io.github.dcaudell:javai-model:0.1.7")
+    implementation("io.github.dcaudell:javai-substrate:0.1.7")
+    implementation("io.github.dcaudell:javai-supervision:0.1.7")
+    implementation("io.github.dcaudell:javai-collections:0.1.7")
+    implementation("io.github.dcaudell:javai-persistence:0.1.7")
+    implementation("io.github.dcaudell:javai-completion:0.1.7")
+    implementation("io.github.dcaudell:javai-tagging:0.1.7")
 }
 ```
 
@@ -511,6 +532,37 @@ code again.
   `-javaagent` shipped — self-attach via `ByteBuddyAgent.install()` is the real, current mechanism. If you
   see a build-time plugin described as available somewhere, verify against `javai-substrate`'s own current
   README before relying on it — the design docs describe it as a future option, not a Phase 0 deliverable.
+
+## Registering entity types
+
+A `JavAIRepository` is realized with `JavAIPI.repository(YourRepository.class, config)`. That call registers
+the repository's entity type, and recursively anything it references.
+
+On the **Postgres** backend, the first actual repository call builds a Hibernate `SessionFactory` whose
+metadata is then immutable — so a type nothing knew about by that point can never be mapped. The simplest way
+to never think about this is to let the configuration declare its own entities:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+    .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+    .postgresUrl(url).postgresUsername(user).postgresPassword(password)
+    .entityPackages("com.example.domain")   // scanned for @Entity, up front
+    .build();
+```
+
+With that, repositories can be created in any order, at any time — including lazily, long after the
+application has started. Use `.entityType(Foo.class)` / `.entityTypes(...)` for a type living outside the
+scanned packages.
+
+If an `@Entity` under a scanned package belongs to a *different* persistence unit, keep it out with
+`.excludeEntityType(Foo.class)`, `.excludeEntityPackages("com.example.reporting.*")`, or `@PersistenceIgnore`
+on the class. Being non-vectorized is not a reason to exclude anything — a plain `@Entity` is registered and
+served exactly like a vectorized one, it just has no vectors.
+
+Without it, realize every repository before calling a method on any of them. A late call that introduces
+nothing new is harmless; one that introduces an unknown type fails, and says which call built the factory.
+
+Neo4j and MongoDB have no such constraint at all — they hold no boot-time metadata.
 
 ## Runtime backends
 
@@ -562,6 +614,75 @@ JavAIRuntime.configureEmbeddingProvider(
 Without an explicit call, `JavAIRuntime` falls back to the `javai.embedding.endpoint`/`javai.embedding.model`
 system properties (constructing an `EmbeddingProviderTextEmbeddingsInference`); with neither the call nor
 those properties set, the first `vector()` call throws `IllegalStateException`.
+
+**Input size is handled for you.** Every embedding model caps how much text it will accept, and providers
+disagree about what happens past that cap — some truncate silently, some reject. JavAI bounds text before
+sending it, identically on every provider, so an over-long field yields a vector rather than an exception on
+one provider and a quietly partial vector on another. Each provider discovers its model's real limit where
+the backend can report it (Ollama's `/api/show`, TEI's `/info`, vLLM's `/v1/models`), falling back to a table
+of published limits, and to a conservative 512 tokens for a model it doesn't recognize:
+
+```java
+// Nothing required in the common case. Pin the limit when you know better than the table --
+// worth doing for OpenAI/Replicate, which publish no endpoint to discover it from:
+new EmbeddingProviderOpenAI(apiKey, "text-embedding-3-small", 8_191);
+new EmbeddingProviderOllama(URI.create("http://localhost:11434"), "your-model", 32_768);
+EmbeddingProviderReplicate.builder().apiToken(token).model("owner/model").maxInputTokens(512).build();
+```
+
+**Want one embedding of a whole document rather than of each field?** That is
+`concatenatedTextVector()` — it assembles real text across an object graph and embeds it once, where
+`summaryVector()` combines already-computed vectors arithmetically. An embedding model can pick up
+relationships across a whole document that vector arithmetic cannot.
+
+It is opt-in, in three independent places, because only you know whether folding a `Song`'s lyrics into an
+`Album` means anything in your domain:
+
+```java
+@JavAIVectorizable
+@Summary(concatenate = true)               // 1. embed my own @Vectorize fields as text
+public class Chapter {
+    @Vectorize private String heading;
+    @Vectorize private String prose;
+
+    @Summary(concatenate = true)           // 2. absorb this child's text into mine
+    private Chapter continuation;
+
+    @Summary(concatenate = true)           // 3. aggregate these members' text into mine
+    private final JavAIArrayList<Footnote> footnotes = new JavAIArrayList<>();
+}
+```
+
+Then search it with `List<Chapter> findNearestByConcatenatedTextVector(EmbeddingVector, int)` on your
+repository. If the entity does not participate, that method is rejected when the repository is created — not
+silently returning nothing forever.
+
+Three things worth knowing. Text is assembled **parent first**, and each object contributes **exactly once**
+even if reachable by several paths (unlike `summaryVector()`, where a node reachable twice deliberately
+counts twice). Cycles are safe. And a type that says nothing costs nothing: no text, no embedding, no stored
+columns.
+
+**Seeding a lot of objects at once?** Vectors are normally computed lazily, one text per HTTP round trip,
+discovered deep inside a read — which is fine for ordinary use and slow for bulk loads: a 1,400-item
+reference set is 1,400 sequential round trips. `JavAIRuntime.precomputeVectors` gathers the texts first,
+de-duplicates them, and sends them in batches instead:
+
+```java
+List<Tag> allTags = loadTagCatalog();
+JavAIRuntime.precomputeVectors(allTags);        // a few batched round trips, not 1,400 sequential ones
+// ...every vector() read afterwards is served from cache
+```
+
+Batching is a pure speed-up with no behavioural difference, so it is always safe to call. Ollama, OpenAI,
+vLLM and TEI send one request per batch; Replicate falls back to a loop (its request shape is defined per
+model, so there is nothing generic to batch against) and is simply no faster than before.
+
+Two things to know about the current behaviour. Truncation is **silent** — text past the limit is dropped
+with no exception and no log line, so if you are embedding documents that may run long and you need to know
+when that happens, check length yourself before handing text to JavAI. And because JavAI has no tokenizer,
+the token limit is converted to characters at a deliberately pessimistic 3 chars/token; a text near the
+boundary may lose a little it did not strictly have to. Supplying an explicit `maxInputTokens` does not
+change the estimate — it changes only which limit is being estimated against.
 
 There's no `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq` alongside `Cortex`'s Anthropic/Groq
 implementations — neither vendor has a native embeddings API (Anthropic recommends Voyage AI instead;

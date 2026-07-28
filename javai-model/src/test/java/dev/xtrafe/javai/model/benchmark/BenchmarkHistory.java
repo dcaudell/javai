@@ -23,9 +23,14 @@ import java.util.Map;
  *
  * <p>Deliberately generic ({@code String -> Double} metrics, not vectorization-specific) so a future
  * persistence-performance or substrate-optimization benchmark -- in this module or another -- can reuse
- * this exact pattern (copy this class, same as this project already duplicates small test-only fixtures
- * like {@code FakeEmbeddingProvider} per module rather than sharing test code across module boundaries)
- * without needing to invent its own comparison/persistence logic.
+ * this exact pattern without needing to invent its own comparison/persistence logic.
+ *
+ * <p>Copying this class into another module is fine; sharing it via the test-jar is now also an option.
+ * This used to cite {@code FakeEmbeddingProvider}'s per-module duplication as settled precedent for
+ * copying, but OMI-187 consolidated those six copies into {@code javai-vector}'s test-jar
+ * ({@code dev.xtrafe.javai.vector.testsupport}). The rule that replaced the precedent: share a fixture
+ * when separate copies drifting apart would be a bug (anything that measures), copy it when independence
+ * is the point (anything that isolates).
  *
  * <p>Results live in a plain top-level {@code benchmark-results/} directory -- not under {@code src/},
  * since it's generated data, but checked into git (unlike {@code target/}) so history survives a clean

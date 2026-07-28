@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.model;
 
+import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.vector.DirtyTrackingSupport;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
@@ -20,6 +21,7 @@ final class TestNode implements JavAIVectorizable, JavAIDirtyTracking {
     @SuppressWarnings("unused") // reflectively accessed via JavAIRuntime.STATE_FIELD
     private DirtyTrackingSupport $javai$state;
 
+    @Vectorize
     private String text;
 
     TestNode(String text) {
