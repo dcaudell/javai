@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A real {@link JavAIEmbeddingProvider} backed by OpenAI's hosted {@code /v1/embeddings} endpoint -- a
@@ -122,6 +124,59 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
         return new EmbeddingVector(values, model, values.length, Instant.now());
     }
 
+    /**
+     * One request for every text, rather than one request per text (OMI-213). {@code /v1/embeddings} already
+     * accepts {@code "input"} as an array and answers with one {@code data} entry per input.
+     *
+     * <p><b>Rows are placed by their {@code index} field, not by array position.</b> OpenAI documents that
+     * {@code data} entries carry their input index and are not guaranteed to arrive in request order, and
+     * trusting position would pair every text with the wrong vector without anything failing -- see
+     * {@link OpenAiCompatibleEmbeddings} for why that is the one failure this implementation is built around.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        // Resolved once for the batch, then applied per member: one over-long text must not shorten its
+        // neighbours. Same empty-input substitution as embed().
+        int budget = maxInputTokens();
+        List<String> substituted = new ArrayList<>(texts.size());
+        for (String text : texts) {
+            substituted.add(text.isEmpty() ? " " : text);
+        }
+        String inputs = JsonStrings.stringArray(EmbeddingInputLimits.truncateEach(substituted, budget));
+        String requestBody =
+                "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":" + inputs + "}";
+        HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .header("Authorization", "Bearer " + (apiKey == null ? "" : apiKey))
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = OpenAiCompatibleEmbeddings.parseIndexedRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("Embedding endpoint " + embedEndpoint + " returned "
+                    + rows.size() + " embeddings for " + texts.size()
+                    + " inputs; the batch response must line up with the request: " + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, model, values.length, computedAt));
+        }
+        return vectors;
+    }
+
     private String send(HttpRequest request) {
         HttpResponse<String> response;
         try {
@@ -147,33 +202,15 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
     }
 
     /**
-     * Extracts the first {@code "embedding":[...]} array nested inside {@code "data":[{...}]} -- OpenAI's
-     * response shape (and, sharing the identical wire contract, {@link EmbeddingProviderVLlm}'s own
-     * OpenAI-compatible response too). Ignores every other field ({@code object}, {@code index},
-     * {@code model}, {@code usage}).
+     * The first {@code "embedding":[...]} array nested inside {@code "data":[{...}]} -- OpenAI's response
+     * shape (and, sharing the identical wire contract, {@link EmbeddingProviderVLlm}'s own OpenAI-compatible
+     * response too). Ignores every other field ({@code object}, {@code index}, {@code model}, {@code usage}).
+     *
+     * <p>Delegates to {@link OpenAiCompatibleEmbeddings}, which both providers now share for the batched path
+     * as well -- the single-row case is just the batched parse with one row (OMI-213).
      */
     static float[] parseEmbeddingField(String responseBody) {
-        String key = "\"embedding\"";
-        int keyIndex = responseBody.indexOf(key);
-        if (keyIndex < 0) {
-            throw new EmbeddingProviderException("Response missing \"embedding\" field: " + responseBody);
-        }
-        int colonIndex = responseBody.indexOf(':', keyIndex + key.length());
-        int arrayStart = responseBody.indexOf('[', colonIndex);
-        int arrayEnd = responseBody.indexOf(']', arrayStart);
-        if (colonIndex < 0 || arrayStart < 0 || arrayEnd < 0) {
-            throw new EmbeddingProviderException("Unexpected response shape: " + responseBody);
-        }
-        String row = responseBody.substring(arrayStart + 1, arrayEnd).strip();
-        if (row.isBlank()) {
-            return new float[0];
-        }
-        String[] parts = row.split(",");
-        float[] values = new float[parts.length];
-        for (int i = 0; i < parts.length; i++) {
-            values[i] = Float.parseFloat(parts[i].strip());
-        }
-        return values;
+        return OpenAiCompatibleEmbeddings.parseFirstRow(responseBody);
     }
 
     public static final class EmbeddingProviderException extends RuntimeException {

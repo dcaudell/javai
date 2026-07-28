@@ -115,7 +115,11 @@ public final class JavAIRuntime {
      *  calls and {@link EmbeddingConsistencyMode#EVENTUAL_CONSISTENCY}'s eager background dispatches acquire
      *  a permit from the same gate before ever calling into the configured provider. Under a burst of rapid
      *  mutation this is what makes the system degrade to "slower" rather than "unboundedly many concurrent
-     *  HTTP calls" -- callers simply block on the gate until a permit frees up. */
+     *  HTTP calls" -- callers simply block on the gate until a permit frees up.
+     *
+     *  <p>A batched {@link #precomputeVectors(Collection, int)} call takes <b>one</b> permit for the whole
+     *  batch, not one per text: this bounds calls into the provider, and a batch is one call however many
+     *  texts it carries (OMI-213). */
     public static void configureMaxConcurrentEmbeddingCalls(int max) {
         embeddingCallGate = new Semaphore(max);
     }
@@ -555,7 +559,23 @@ public final class JavAIRuntime {
         JavAIEmbeddingProvider provider = embeddingProvider();
         for (int start = 0; start < texts.size(); start += batchSize) {
             List<String> chunk = texts.subList(start, Math.min(start + batchSize, texts.size()));
-            List<EmbeddingVector> vectors = provider.embedAll(chunk);
+            // One batched request costs one permit, not one per text (OMI-213). The gate bounds concurrent
+            // *calls into the provider* -- it exists so a burst degrades to "slower" rather than to
+            // unboundedly many concurrent HTTP calls -- and a batch is one call on one connection however
+            // many texts it carries. Charging it per text would instead make the gate throttle batching
+            // itself, penalising the very thing that reduces load on the endpoint: a 100-text batch against a
+            // gate of 8 would block outright, since no batch could ever acquire enough permits.
+            //
+            // Taking a permit at all is the point. Before this, precomputeVectors called the provider without
+            // touching the gate, so a bulk seed ran entirely outside the bound this class documents as
+            // applying to every provider call in every consistency mode.
+            List<EmbeddingVector> vectors;
+            acquireUninterruptibly(embeddingCallGate());
+            try {
+                vectors = provider.embedAll(chunk);
+            } finally {
+                embeddingCallGate().release();
+            }
             if (vectors.size() != chunk.size()) {
                 throw new IllegalStateException("embedAll returned " + vectors.size() + " vectors for "
                         + chunk.size() + " texts; a provider must answer one vector per input, in order");

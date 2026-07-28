@@ -609,6 +609,21 @@ new EmbeddingProviderOllama(URI.create("http://localhost:11434"), "your-model", 
 EmbeddingProviderReplicate.builder().apiToken(token).model("owner/model").maxInputTokens(512).build();
 ```
 
+**Seeding a lot of objects at once?** Vectors are normally computed lazily, one text per HTTP round trip,
+discovered deep inside a read — which is fine for ordinary use and slow for bulk loads: a 1,400-item
+reference set is 1,400 sequential round trips. `JavAIRuntime.precomputeVectors` gathers the texts first,
+de-duplicates them, and sends them in batches instead:
+
+```java
+List<Tag> allTags = loadTagCatalog();
+JavAIRuntime.precomputeVectors(allTags);        // a few batched round trips, not 1,400 sequential ones
+// ...every vector() read afterwards is served from cache
+```
+
+Batching is a pure speed-up with no behavioural difference, so it is always safe to call. Ollama, OpenAI,
+vLLM and TEI send one request per batch; Replicate falls back to a loop (its request shape is defined per
+model, so there is nothing generic to batch against) and is simply no faster than before.
+
 Two things to know about the current behaviour. Truncation is **silent** — text past the limit is dropped
 with no exception and no log line, so if you are embedding documents that may run long and you need to know
 when that happens, check length yourself before handing text to JavAI. And because JavAI has no tokenizer,

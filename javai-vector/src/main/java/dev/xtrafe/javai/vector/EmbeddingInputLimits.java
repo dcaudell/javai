@@ -67,4 +67,19 @@ public final class EmbeddingInputLimits {
         // (JSON, a URL, a long identifier) would lose far more than the budget required.
         return lastBreak > budget - budget / 10 ? cut.substring(0, lastBreak) : cut;
     }
+
+    /**
+     * Every text shortened to the same budget -- the batched counterpart of {@link #truncateToBudget}.
+     *
+     * <p>Bounded <b>per member, never per batch</b>: one over-long entry must not shorten its neighbours, and
+     * must not fail the whole request. The limit is resolved once by the caller and passed in, so a batch
+     * costs one limit lookup rather than one per text.
+     */
+    public static java.util.List<String> truncateEach(java.util.List<String> texts, int maxInputTokens) {
+        java.util.List<String> truncated = new java.util.ArrayList<>(texts.size());
+        for (String text : texts) {
+            truncated.add(truncateToBudget(text, maxInputTokens));
+        }
+        return truncated;
+    }
 }

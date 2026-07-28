@@ -14,6 +14,19 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-model`: a bulk `precomputeVectors` seed no longer bypasses the embedding concurrency gate
+  (OMI-213).** It called the configured provider without acquiring a permit at all, so a bulk seed ran
+  entirely outside the bound `JavAIRuntime.configureMaxConcurrentEmbeddingCalls` documents as applying to
+  every provider call in every consistency mode. A batched call now takes **one** permit for the whole batch
+  — the gate bounds concurrent *calls*, and a batch is one call on one connection however many texts it
+  carries. Charging per text would have made the gate throttle batching itself: a 100-text batch against a
+  gate of 8 could never acquire enough permits, so bulk seeding would deadlock rather than be bounded.
+
+- **`javai-vector`: `embedAll`'s contract documentation was silently discarded.** OMI-216 inserted
+  `maxInputTokens`' javadoc between `embedAll`'s javadoc and `embedAll` itself, so the block bound to nothing
+  and the method shipped undocumented. Reattached, and extended to state the ordering requirement that the
+  batching work below depends on.
+
 - **`javai-persistence`: realizing a repository after the `SessionFactory` was built no longer fails when it
   introduces nothing new (OMI-214).** `registerEntityType` threw whenever the factory existed, *regardless of
   whether the type was already registered* — so even re-realizing the same repository twice was an error.
@@ -102,6 +115,29 @@ version -- a given release usually changes only one or two of them.
   now absent, which both removes the call and makes "this field has no content" representable at rest.
 
 ### Added
+
+- **`javai-vector`: batched `embedAll` on OpenAI, vLLM and TEI (OMI-213).** Ollama was the only bundled
+  provider genuinely batching; the other four fell back to the SPI's looping `default` and remained one HTTP
+  round trip per text. Batching is a pure latency optimization — `embedAll`'s `default` loops and is already
+  correct — so this changes speed, not semantics: at the ~10ms per embed measured in OMI-187, a 1,400-item
+  seed is ~14s of *sequential* HTTP versus roughly a dozen batched round trips.
+
+  **The hazard this is built around:** OpenAI's response entries carry an explicit `index` and are documented
+  as *not* guaranteed to arrive in request order (vLLM, serving the same contract, schedules across continuous
+  batches for its own reasons). Reading rows by array position pairs every text with the wrong vector while
+  nothing fails — each vector is well-formed and correctly dimensioned, and the only symptom is a semantic
+  index returning subtly wrong neighbours forever. The shared `OpenAiCompatibleEmbeddings` parser therefore
+  places rows by `index` and refuses a response whose indices are not exactly one each of `0..n-1`, rather
+  than treating the ordering as an assumption. TEI needs no index — its bare array's position *is* the
+  correspondence — but its row count is checked, that being its only way to misalign.
+
+  **`EmbeddingProviderReplicate` deliberately keeps the loop.** Its `input` object is shaped by each model's
+  own `cog predict()` signature rather than by Replicate, so there is no vendor-wide contract to batch
+  against. The bundled default model does accept several texts, but via a field named `texts` (not the `text`
+  this provider defaults to) documented only as "formatted as a JSON list of strings" — ambiguous between a
+  native array and a JSON-encoded string. Guessing wrong would either error loudly or silently embed the
+  literal `["a","b"]` instead of `a` and `b`, and a batching implementation that works for only some models,
+  silently, is worse than none.
 
 - **`javai-vector`: embedding providers now know and respect their model's maximum input size (OMI-216).**
   `JavAIEmbeddingProvider.maxInputTokens()` is a new `default` method — no existing implementation breaks —

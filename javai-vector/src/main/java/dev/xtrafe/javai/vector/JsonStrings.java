@@ -11,6 +11,22 @@ final class JsonStrings {
     private JsonStrings() {
     }
 
+    /**
+     * A JSON array literal of escaped strings -- {@code ["a","b"]} -- for the batched embedding requests
+     * (OMI-213). Every batching provider needs exactly this and nothing more, so it lives here rather than
+     * being rebuilt inline four times.
+     */
+    static String stringArray(java.util.List<String> values) {
+        StringBuilder array = new StringBuilder("[");
+        for (int i = 0; i < values.size(); i++) {
+            if (i > 0) {
+                array.append(',');
+            }
+            array.append('"').append(escape(values.get(i))).append('"');
+        }
+        return array.append(']').toString();
+    }
+
     static String escape(String value) {
         StringBuilder escaped = new StringBuilder(value.length() + 16);
         for (int i = 0; i < value.length(); i++) {

@@ -35,6 +35,33 @@ import java.time.Instant;
  * <p><b>Not yet verified against a live endpoint</b> -- no API token was available at implementation time,
  * and (per the caveats above) the exact model schema itself is unconfirmed. Covered by hermetic tests
  * (request/option-mapping, wait-then-poll behavior, both output shapes) against a fake HTTP server only.
+ *
+ * <h2>Why this provider alone does not batch (OMI-213)</h2>
+ *
+ * The other four bundled providers override {@link JavAIEmbeddingProvider#embedAll} to send one request per
+ * batch. This one deliberately keeps the SPI's looping {@code default}, so it remains one round trip per
+ * text.
+ *
+ * <p>The reason is not that Replicate is slow to implement -- it is that <b>there is nothing to implement
+ * against</b>. Batching requires knowing that the input field accepts several texts, and on Replicate the
+ * {@code input} object's shape is defined by each model's own {@code cog predict()} signature rather than by
+ * Replicate. There is no vendor-wide contract to code to, which is the same reason this class already has to
+ * be told {@link Builder#inputFieldName(String)}.
+ *
+ * <p>What was actually established while investigating, rather than assumed: the default model
+ * ({@code beautyyuyanli/multilingual-e5-large}) does take several texts at once, but through a field named
+ * {@code texts} -- <em>not</em> the {@code text} this class defaults to -- described in its own schema as
+ * "formatted as a JSON list of strings". That phrasing leaves the encoding genuinely ambiguous: a native
+ * JSON array, or a JSON-encoded <em>string</em>, which is the usual way a {@code cog} model expresses a list
+ * given cog's scalar input types. The two are indistinguishable from documentation and were not resolvable
+ * without a live API token.
+ *
+ * <p>So a batching implementation here could only guess at both the field name and its encoding, and would
+ * be wrong for any model that named or encoded things differently -- while appearing to work. A wrong batch
+ * either errors loudly (the good case) or silently embeds a JSON string literal, producing vectors of the
+ * text {@code ["a","b"]} rather than of {@code a} and {@code b}. That second outcome is precisely the
+ * silent-wrong-answer shape OMI-213 exists to avoid, so the honest implementation is the slow one. See the
+ * ticket for the follow-up on the {@code text}/{@code texts} default mismatch.
  */
 public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider {
 

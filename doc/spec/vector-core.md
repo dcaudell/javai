@@ -477,3 +477,54 @@ sites) or introducing the project's first logging mechanism — this codebase ha
 decisions than this fix. It is not a regression (Ollama and TEI already did this with no limit knowledge at
 all), but it is the invisible-failure shape this project has twice rejected elsewhere, and it should be
 closed once a project-wide logging mechanism is chosen.
+
+## Batched embedding (OMI-187, OMI-213, not in the whitepaper)
+
+`JavAIEmbeddingProvider.embedAll(List<String>)` embeds several texts in one request. Its `default` loops over
+`embed`, so every provider is correct without it and overriding it is a pure latency optimization with no
+semantic difference — callers can use it unconditionally rather than branching on provider capability.
+
+The motivation is latency, not call count, and it is a different problem from the waste OMI-187 removed.
+Lazy computation discovers one text at a time, deep inside a read, so seeding 1,400 tags is 1,400
+*sequential* round trips (~14s at the ~10ms per embed measured there) even when every one of them is
+warranted. `JavAIRuntime.precomputeVectors(Collection<?>)` is the caller-side half: it gathers texts across a
+collection first, de-duplicates them (a value shared by several objects is embedded once), and issues chunked
+`embedAll` calls — 100 per call by default.
+
+| Provider | Batched | Wire shape |
+|---|---|---|
+| Ollama | yes | `"input"` array → `{"embeddings": [[…], […]]}` |
+| OpenAI | yes | `"input"` array → `{"data": [{index, embedding}, …]}` |
+| vLLM | yes | identical to OpenAI |
+| TEI | yes | `"inputs"` array → `[[…], […]]` |
+| Replicate | **no**, deliberately | see below |
+
+**The one thing an implementation can get wrong invisibly** is which vector belongs to which text. OpenAI
+documents that `data` entries carry an explicit `index` and are *not* guaranteed to arrive in request order;
+vLLM, serving the same contract, schedules across continuous batches for reasons of its own. An
+implementation that reads rows by array position therefore pairs every text with the wrong vector — and
+nothing fails: each vector is well-formed and correctly dimensioned, and the only symptom is a semantic index
+that returns subtly wrong neighbours forever. `OpenAiCompatibleEmbeddings` (shared by both providers rather
+than duplicated) treats the ordering as a checked invariant: it places rows by `index` and refuses a response
+whose indices are not exactly one each of `0..n-1`. TEI needs none of this — its response is a bare array
+whose position *is* the correspondence — but its row count is still checked, that being the only way it could
+misalign. A slow loop beats a fast wrong answer.
+
+**Replicate deliberately keeps the looping default.** Not because it is hard, but because there is nothing to
+implement against: Replicate's `input` object is shaped by each model's own `cog predict()` signature rather
+than by Replicate, so there is no vendor-wide contract to code to. Investigating the bundled default model
+(`beautyyuyanli/multilingual-e5-large`) found it *does* take several texts at once — but through a field named
+`texts`, not the `text` this provider defaults to, and described only as "formatted as a JSON list of
+strings", which leaves it ambiguous between a native JSON array and a JSON-encoded string (the usual way a
+`cog` model expresses a list, given cog's scalar input types). Both the field name and the encoding would
+have been guesses. A wrong guess either errors loudly or silently embeds the string `["a","b"]` instead of
+`a` and `b` — the second being exactly the failure shape this work exists to prevent.
+
+**Gate accounting:** a batched call takes **one** permit from
+`JavAIRuntime.configureMaxConcurrentEmbeddingCalls`'s semaphore, not one per text. That gate bounds concurrent
+*calls into the provider*, and a batch is one call on one connection however many texts it carries. Charging
+per text would make the gate throttle batching itself — and a 100-text batch against a gate of 8 could never
+acquire enough permits, so bulk seeding would deadlock rather than be bounded. Taking a permit at all is also
+new in OMI-213: `precomputeVectors` previously called the provider without touching the gate, so a bulk seed
+ran entirely outside the bound that is documented as applying to every provider call in every consistency
+mode.
