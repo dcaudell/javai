@@ -34,22 +34,6 @@ public interface JavAIEmbeddingProvider {
     }
 
     /**
-     * Embeds several texts in one go, returning one vector per input, in order.
-     *
-     * <p>The reason this exists is latency, not call count. {@link #embed} is one text per HTTP round trip,
-     * and every real embedding API accepts an array -- so seeding 1,400 tags is 1,400 sequential round trips
-     * (~14s at the ~10ms per embed measured in OMI-187) versus roughly a dozen batched ones. That is worth
-     * considerably more than the 3x constant-factor waste OMI-187 removed, and it is why the ticket asked
-     * for a documented bulk-seed path rather than only a fix.
-     *
-     * <p>The {@code default} loops, so a provider that has not implemented batching stays correct and simply
-     * gains nothing; overriding it is a pure latency optimization with no semantic difference. Callers can
-     * therefore use this unconditionally rather than branching on provider capability.
-     *
-     * @param texts the texts to embed, in order
-     * @return one vector per input text, same order, same size
-     */
-    /**
      * The largest input this provider's model will actually consider, in tokens.
      *
      * <p>Resolved most-authoritative-first: a provider that can ask its own endpoint should do that and
@@ -75,6 +59,30 @@ public interface JavAIEmbeddingProvider {
         return EmbeddingModelLimits.lookup(modelId());
     }
 
+    /**
+     * Embeds several texts in one go, returning one vector per input, in order.
+     *
+     * <p>The reason this exists is latency, not call count. {@link #embed} is one text per HTTP round trip,
+     * and every real embedding API accepts an array -- so seeding 1,400 tags is 1,400 sequential round trips
+     * (~14s at the ~10ms per embed measured in OMI-187) versus roughly a dozen batched ones. That is worth
+     * considerably more than the 3x constant-factor waste OMI-187 removed, and it is why the ticket asked
+     * for a documented bulk-seed path rather than only a fix.
+     *
+     * <p>The {@code default} loops, so a provider that has not implemented batching stays correct and simply
+     * gains nothing; overriding it is a pure latency optimization with no semantic difference. Callers can
+     * therefore use this unconditionally rather than branching on provider capability.
+     *
+     * <p><b>One vector per input, in the order the inputs were given</b> -- the whole contract, and the one
+     * an implementation can plausibly get wrong. Some APIs (OpenAI's, and vLLM's copy of it) return their
+     * rows carrying an explicit index and do not promise to emit them in request order, so an implementation
+     * that trusts array position pairs every text with the wrong vector. That failure is silent: each vector
+     * is individually well-formed, and the mistake only ever surfaces as inexplicably poor search results.
+     * An implementation must order by whatever the API says the order is, and must refuse a response whose
+     * row count doesn't match the request rather than returning a short or padded list.
+     *
+     * @param texts the texts to embed, in order
+     * @return one vector per input text, same order, same size
+     */
     @Nondeterministic
     @Costly
     default java.util.List<EmbeddingVector> embedAll(java.util.List<String> texts) {

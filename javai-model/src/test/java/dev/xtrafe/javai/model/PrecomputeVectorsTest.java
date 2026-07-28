@@ -14,6 +14,7 @@ import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -110,6 +111,91 @@ class PrecomputeVectorsTest {
                 "250 texts at a batch size of 100 is three provider calls, not 250: " + counting.batchSizes);
         assertEquals(250, counting.batchSizes.stream().mapToInt(Integer::intValue).sum(),
                 "every text must still be embedded exactly once");
+    }
+
+    /**
+     * A batched call takes exactly one permit from the concurrency gate (OMI-213).
+     *
+     * <p>Two things are being pinned. First, that a permit is taken <b>at all</b>: this path previously called
+     * the provider without touching the gate, so a bulk seed ran entirely outside the bound {@link
+     * JavAIRuntime#configureMaxConcurrentEmbeddingCalls} documents as applying to every provider call in every
+     * consistency mode.
+     *
+     * <p>Second, that it is <b>one</b> permit rather than one per text. The gate bounds concurrent calls into
+     * the provider, and a batch is one call on one connection however many texts it carries. Charging per text
+     * would make the gate throttle batching itself -- and a batch larger than the gate could never acquire
+     * enough permits to proceed at all, which the next test covers.
+     */
+    @Test
+    void aBatchedCallCostsExactlyOnePermitFromTheConcurrencyGate() {
+        List<Integer> permitsDuringCall = new ArrayList<>();
+        JavAIRuntime.configureMaxConcurrentEmbeddingCalls(4);
+        try {
+            JavAIRuntime.configureEmbeddingProvider(new JavAIEmbeddingProvider() {
+                private final FakeEmbeddingProvider delegate = new FakeEmbeddingProvider();
+
+                @Override
+                public EmbeddingVector embed(String text) {
+                    return delegate.embed(text);
+                }
+
+                @Override
+                public List<EmbeddingVector> embedAll(List<String> texts) {
+                    permitsDuringCall.add(JavAIRuntime.embeddingCallGate().availablePermits());
+                    List<EmbeddingVector> vectors = new ArrayList<>(texts.size());
+                    for (String text : texts) {
+                        vectors.add(delegate.embed(text));
+                    }
+                    return vectors;
+                }
+
+                @Override
+                public String modelId() {
+                    return FakeEmbeddingProvider.MODEL_ID;
+                }
+            });
+
+            List<TestNode> nodes = new ArrayList<>();
+            for (int i = 0; i < 10; i++) {
+                nodes.add(new TestNode(unique("gated")));
+            }
+            JavAIRuntime.precomputeVectors(nodes, 100);
+
+            assertEquals(List.of(3), permitsDuringCall,
+                    "one batched call must hold exactly one of the four permits while it runs");
+            assertEquals(4, JavAIRuntime.embeddingCallGate().availablePermits(),
+                    "and must give it back afterwards");
+        } finally {
+            JavAIRuntime.configureMaxConcurrentEmbeddingCalls(
+                    JavAIRuntime.DEFAULT_MAX_CONCURRENT_EMBEDDING_CALLS);
+        }
+    }
+
+    /**
+     * A batch far larger than the gate still completes. This is the consequence of the decision above: were a
+     * batch charged one permit per text, a 50-text batch against a gate of 2 could never acquire enough
+     * permits and would block forever -- the gate would have made bulk seeding impossible rather than bounded.
+     */
+    @Test
+    void aBatchLargerThanTheGateStillCompletes() {
+        JavAIRuntime.configureMaxConcurrentEmbeddingCalls(2);
+        try {
+            BatchCountingProvider counting = new BatchCountingProvider();
+            JavAIRuntime.configureEmbeddingProvider(counting);
+
+            List<TestNode> nodes = new ArrayList<>();
+            for (int i = 0; i < 50; i++) {
+                nodes.add(new TestNode(unique("oversized-batch")));
+            }
+
+            assertTimeoutPreemptively(java.time.Duration.ofSeconds(10),
+                    () -> JavAIRuntime.precomputeVectors(nodes, 100),
+                    "a batch bigger than the gate must not deadlock");
+            assertEquals(1, counting.batchSizes.size(), "still one round trip: " + counting.batchSizes);
+        } finally {
+            JavAIRuntime.configureMaxConcurrentEmbeddingCalls(
+                    JavAIRuntime.DEFAULT_MAX_CONCURRENT_EMBEDDING_CALLS);
+        }
     }
 
     /**

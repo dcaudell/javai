@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Phase 0's real {@link JavAIEmbeddingProvider}: a thin HTTP client against Hugging Face's
@@ -129,6 +131,54 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
         return new EmbeddingVector(values, modelId, values.length, Instant.now());
     }
 
+    /**
+     * One request for every text, rather than one request per text (OMI-213). TEI's {@code /embed} already
+     * accepts {@code "inputs"} as an array and answers {@code [[...], [...]]} -- one row per input, in
+     * request order.
+     *
+     * <p>Unlike the OpenAI-compatible providers there is no {@code index} field to order by, and none is
+     * needed: TEI's response is a bare array whose position <em>is</em> the correspondence. The row count is
+     * still checked against the request, since that is the only remaining way this could silently
+     * misalign.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        // Resolved once for the batch, applied per member: one over-long text must not shorten its
+        // neighbours. TEI's own "truncate": true stays on as the exact server-side backstop.
+        int budget = maxInputTokens();
+        String inputs = JsonStrings.stringArray(EmbeddingInputLimits.truncateEach(texts, budget));
+        String requestBody = "{\"inputs\":" + inputs + ",\"truncate\":true}";
+        HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody))
+                .build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = parseAllRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("TEI returned " + rows.size() + " embeddings for "
+                    + texts.size() + " inputs; the batch response must line up with the request: "
+                    + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+        return vectors;
+    }
+
     private String send(HttpRequest request) {
         HttpResponse<String> response;
         try {
@@ -155,13 +205,43 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
 
     /** TEI's response to a single-string {@code /embed} request: one row, {@code [[float, ...]]}. */
     static float[] parseSingleRow(String responseBody) {
-        String trimmed = responseBody.strip();
-        String row = unwrapBrackets(trimmed, "response");
-        String elements = unwrapBrackets(row, "embedding row");
-        if (elements.isBlank()) {
+        List<float[]> rows = parseAllRows(responseBody);
+        if (rows.isEmpty()) {
+            throw new EmbeddingProviderException("Unexpected TEI response shape: " + responseBody);
+        }
+        return rows.get(0);
+    }
+
+    /**
+     * Every row of TEI's {@code [[...], [...]]} response, in order -- one per batched input.
+     *
+     * <p>Position is the whole correspondence here; TEI reports no per-row index, and needs none, because it
+     * answers in request order.
+     */
+    static List<float[]> parseAllRows(String responseBody) {
+        String inner = unwrapBrackets(responseBody.strip(), "response");
+        List<float[]> rows = new ArrayList<>();
+        int cursor = 0;
+        while (true) {
+            int rowStart = inner.indexOf('[', cursor);
+            if (rowStart < 0) {
+                return rows;
+            }
+            int rowEnd = inner.indexOf(']', rowStart);
+            if (rowEnd < 0) {
+                throw new EmbeddingProviderException("Unexpected TEI embedding row shape: " + responseBody);
+            }
+            rows.add(parseFloats(inner.substring(rowStart + 1, rowEnd)));
+            cursor = rowEnd + 1;
+        }
+    }
+
+    private static float[] parseFloats(String elements) {
+        String trimmed = elements.strip();
+        if (trimmed.isBlank()) {
             return new float[0];
         }
-        String[] parts = elements.split(",");
+        String[] parts = trimmed.split(",");
         float[] values = new float[parts.length];
         for (int i = 0; i < parts.length; i++) {
             values[i] = Float.parseFloat(parts[i].strip());

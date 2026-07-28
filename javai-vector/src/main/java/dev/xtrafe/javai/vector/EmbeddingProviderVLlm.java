@@ -7,6 +7,8 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A real {@link JavAIEmbeddingProvider} backed by a self-hosted {@code vLLM} server: vLLM exposes an
@@ -147,6 +149,60 @@ public final class EmbeddingProviderVLlm implements JavAIEmbeddingProvider {
 
         float[] values = EmbeddingProviderOpenAI.parseEmbeddingField(responseBody);
         return new EmbeddingVector(values, model, values.length, Instant.now());
+    }
+
+    /**
+     * One request for every text, rather than one request per text (OMI-213) -- vLLM serves the same
+     * OpenAI-compatible {@code /v1/embeddings} contract, so this is deliberately the same implementation
+     * shape as {@link EmbeddingProviderOpenAI#embedAll}, sharing {@link OpenAiCompatibleEmbeddings} for the
+     * response rather than duplicating a second copy of the index-ordering logic.
+     *
+     * <p>The index ordering matters here for a reason of vLLM's own, not merely inherited from OpenAI: vLLM
+     * schedules batched inputs across continuous batches, so response order genuinely need not match request
+     * order.
+     */
+    @Override
+    public List<EmbeddingVector> embedAll(List<String> texts) {
+        if (texts.isEmpty()) {
+            return List.of();
+        }
+        // Resolved once for the batch, applied per member -- see EmbeddingProviderOpenAI.embedAll.
+        int budget = maxInputTokens();
+        List<String> substituted = new ArrayList<>(texts.size());
+        for (String text : texts) {
+            substituted.add(text.isEmpty() ? " " : text);
+        }
+        String inputs = JsonStrings.stringArray(EmbeddingInputLimits.truncateEach(substituted, budget));
+        String requestBody = "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":" + inputs + "}";
+        HttpRequest.Builder requestBuilder = HttpRequest.newBuilder(embedEndpoint)
+                .header("Content-Type", "application/json")
+                .timeout(Duration.ofSeconds(60))
+                .POST(HttpRequest.BodyPublishers.ofString(requestBody));
+        if (apiKey != null && !apiKey.isEmpty()) {
+            requestBuilder.header("Authorization", "Bearer " + apiKey);
+        }
+        HttpRequest request = requestBuilder.build();
+
+        String responseBody;
+        try {
+            responseBody = RetrySupport.withRetry(embedEndpoint.toString(), () -> send(request));
+        } catch (TooManyRequestsException e) {
+            throw new EmbeddingProviderException(
+                    "Embedding endpoint " + embedEndpoint + " rate-limited too many times", e);
+        }
+
+        List<float[]> rows = OpenAiCompatibleEmbeddings.parseIndexedRows(responseBody);
+        if (rows.size() != texts.size()) {
+            throw new EmbeddingProviderException("Embedding endpoint " + embedEndpoint + " returned "
+                    + rows.size() + " embeddings for " + texts.size()
+                    + " inputs; the batch response must line up with the request: " + responseBody);
+        }
+        Instant computedAt = Instant.now();
+        List<EmbeddingVector> vectors = new ArrayList<>(rows.size());
+        for (float[] values : rows) {
+            vectors.add(new EmbeddingVector(values, model, values.length, computedAt));
+        }
+        return vectors;
     }
 
     private String send(HttpRequest request) {
