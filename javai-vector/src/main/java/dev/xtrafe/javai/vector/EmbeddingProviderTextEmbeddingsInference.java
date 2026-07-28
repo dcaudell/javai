@@ -23,21 +23,94 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
 
     private final HttpClient httpClient;
     private final URI embedEndpoint;
+    private final URI infoEndpoint;
     private final String modelId;
+    private final Integer maxInputTokensOverride;
+
+    /** Discovered once from /info, then reused. Zero means "asked, and the answer was unusable". */
+    private volatile Integer discoveredMaxInputTokens;
 
     public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId) {
-        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId);
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId, null);
+    }
+
+    /**
+     * Pins the model's maximum input size instead of discovering or guessing it, for when correctness
+     * matters more than convenience -- the same escape hatch {@code Cortex.Builder.contextWindowTokens(int)}
+     * offers on the completion side. Wins over both runtime discovery and the {@link EmbeddingModelLimits}
+     * table.
+     */
+    public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId, int maxInputTokens) {
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId,
+                maxInputTokens);
     }
 
     EmbeddingProviderTextEmbeddingsInference(HttpClient httpClient, URI baseUri, String modelId) {
+        this(httpClient, baseUri, modelId, null);
+    }
+
+    EmbeddingProviderTextEmbeddingsInference(HttpClient httpClient, URI baseUri, String modelId,
+            Integer maxInputTokensOverride) {
         this.httpClient = httpClient;
         this.embedEndpoint = baseUri.resolve("/embed");
+        this.infoEndpoint = baseUri.resolve("/info");
         this.modelId = modelId;
+        this.maxInputTokensOverride = maxInputTokensOverride;
+    }
+
+    /**
+     * Asks TEI's {@code /info}, once, then falls back to {@link EmbeddingModelLimits}.
+     *
+     * <p>TEI reports {@code max_input_length} directly, which makes it the one bundled provider whose limit
+     * is both discoverable and exact. A failed lookup falls through to the table rather than throwing: not
+     * knowing the limit precisely is a reason to be conservative, never a reason to refuse to embed.
+     */
+    @Override
+    public int maxInputTokens() {
+        if (maxInputTokensOverride != null) {
+            return maxInputTokensOverride;
+        }
+        Integer discovered = discoveredMaxInputTokens;
+        if (discovered == null) {
+            discovered = discoverMaxInputTokens();
+            discoveredMaxInputTokens = discovered;
+        }
+        return discovered > 0 ? discovered : EmbeddingModelLimits.lookup(modelId);
+    }
+
+    private int discoverMaxInputTokens() {
+        HttpRequest request = HttpRequest.newBuilder(infoEndpoint)
+                .timeout(Duration.ofSeconds(10))
+                .GET()
+                .build();
+        try {
+            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+            return response.statusCode() == 200 ? parseMaxInputLength(response.body()) : 0;
+        } catch (IOException | RuntimeException e) {
+            return 0;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return 0;
+        }
+    }
+
+    /** {@code "max_input_length": N} from TEI's /info, or 0 when absent or unparseable. */
+    static int parseMaxInputLength(String responseBody) {
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("\"max_input_length\"\\s*:\\s*(\\d+)")
+                .matcher(responseBody);
+        return matcher.find() ? Integer.parseInt(matcher.group(1)) : 0;
     }
 
     @Override
     public EmbeddingVector embed(String text) {
-        String requestBody = "{\"inputs\":\"" + JsonStrings.escape(text) + "\",\"truncate\":true}";
+        // Truncated client-side like every other provider (OMI-216), so identical text produces the same
+        // outcome whichever provider is configured -- see EmbeddingProviderOllama.embed for the full
+        // reasoning. TEI's own "truncate": true stays as a
+        // server-side backstop: it truncates exactly, having a real tokenizer, so it catches anything this
+        // conservative estimate lets through.
+        String effectiveText = EmbeddingInputLimits.truncateToBudget(text, maxInputTokens());
+        String requestBody = "{\"inputs\":\"" + JsonStrings.escape(effectiveText) + "\",\"truncate\":true}";
         HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
                 .header("Content-Type", "application/json")
                 .timeout(Duration.ofSeconds(30))

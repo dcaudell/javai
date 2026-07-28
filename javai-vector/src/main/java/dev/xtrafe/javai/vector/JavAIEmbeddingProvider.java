@@ -49,6 +49,32 @@ public interface JavAIEmbeddingProvider {
      * @param texts the texts to embed, in order
      * @return one vector per input text, same order, same size
      */
+    /**
+     * The largest input this provider's model will actually consider, in tokens.
+     *
+     * <p>Resolved most-authoritative-first: a provider that can ask its own endpoint should do that and
+     * cache the answer; otherwise {@link EmbeddingModelLimits}'s best-effort table applies; and an explicit
+     * per-provider override always wins over both.
+     *
+     * <p><b>Why any of this is needed.</b> Providers disagree completely about what an over-long input
+     * means, and the disagreement is invisible. Measured against a real Ollama instance (OMI-216): 324,000
+     * characters -- roughly 80,000 tokens against {@code qwen3-embedding:0.6b}'s 32,768-token context --
+     * returned HTTP 200 and an ordinary 1024-dimension vector. Silently truncated, with nothing in the
+     * response saying so. TEI does the same by design ({@code "truncate": true}). OpenAI, by contrast,
+     * rejects the request outright. So the same text yields a correct vector, a quietly wrong one, or an
+     * exception depending only on which provider is configured.
+     *
+     * <p><b>This is a token count, and JavAI has no tokenizer.</b> Any enforcement built on it is therefore
+     * approximate and must err small -- see {@link EmbeddingInputLimits}. Stated plainly rather than
+     * implying a precision this cannot deliver.
+     *
+     * <p>A {@code default} returning the table's answer, so no existing implementation breaks and a
+     * third-party provider gets conservative behaviour for free.
+     */
+    default int maxInputTokens() {
+        return EmbeddingModelLimits.lookup(modelId());
+    }
+
     @Nondeterministic
     @Costly
     default java.util.List<EmbeddingVector> embedAll(java.util.List<String> texts) {

@@ -416,3 +416,64 @@ is exercised by the same test code but has not been separately run on those plat
 TEI wiring already proven correct in an earlier version of this test (against a different model, before the
 Qwen3/Candle bug was tracked down), so nothing about the container startup or HTTP contract is new or
 unverified, only the specific model being requested.
+
+## Maximum input size (OMI-216, not in the whitepaper)
+
+Every embedding model has a maximum input length, and before this each provider did something different when
+a text exceeded it. Measured, not assumed: a 324,000-character input — roughly 80,000 tokens against
+`qwen3-embedding:0.6b`'s 32,768-token context — sent to a live Ollama instance returned **HTTP 200 and an
+ordinary 1024-dimension vector**. It had been truncated, and nothing in the response said so. TEI does the
+same by design; OpenAI rejects the request outright. So identical text yielded a correct vector, a quietly
+partial one, or an exception, depending only on which provider happened to be configured — and the quiet
+partial vector is the worst of the three, because a truncated vector is by construction indistinguishable
+from a complete one. It is a plausible embedding of a document prefix, and it will sit in the index scoring
+against queries forever without ever looking wrong.
+
+This matters more here than in `javai-completion`, where the analogous limit is handled by
+`Cortex.contextWindowTokens()`/`PromptContext.render(int)`: an over-long prompt usually produces a visibly
+degraded answer, whereas an over-long embedding produces a *silently* wrong one.
+
+`JavAIEmbeddingProvider.maxInputTokens()` is the SPI addition — a `default` method, so no existing
+implementation breaks. It resolves through three tiers, most authoritative first:
+
+1. **An explicit override**, when the caller supplied one — a constructor parameter on Ollama/TEI/vLLM/
+   OpenAI, `Builder.maxInputTokens(int)` on Replicate.
+2. **Runtime discovery**, where the backend's API can actually answer:
+
+   | Provider | Endpoint | Field |
+   |---|---|---|
+   | `EmbeddingProviderOllama` | `/api/show` | `<architecture>.context_length` |
+   | `EmbeddingProviderTextEmbeddingsInference` | `/info` | `max_input_length` |
+   | `EmbeddingProviderVLlm` | `/v1/models` | `max_model_len` |
+   | `EmbeddingProviderOpenAI`, `EmbeddingProviderReplicate` | — | neither vendor publishes one |
+
+   Note Ollama's key is named for the model's *architecture* (`qwen3.context_length`), not a fixed name, so
+   a constant-name lookup finds nothing and silently falls back. Discovery is cached per provider instance —
+   a limit lookup must not become a per-embedding tax — and any failure (unreachable, unparseable, absent
+   field) falls back to the next tier rather than throwing. Not knowing the limit precisely is a reason to be
+   conservative, never a reason to refuse to embed at all.
+3. **`EmbeddingModelLimits`**, a best-effort table of published limits, whose fallback for an unrecognized
+   model is **512 tokens** — deliberately not the completion side's 8192. Embedding models run far tighter
+   than chat models (many sentence-transformer models cap at 512 and several at 256), so a generous default
+   would produce partial vectors for exactly the models most likely to be missing from the table.
+
+Limits are in tokens; JavAI holds characters and has no tokenizer. `EmbeddingInputLimits` converts at a fixed
+**3 characters per token** — under the ~4 typical of English prose, because giving up a little of a long input
+is recoverable and sailing past the real limit is not. Truncation cuts at a word boundary when one falls
+within the last tenth of the budget, and at the budget exactly when one doesn't (JSON, a URL, a long
+identifier), so text with no whitespace near the cut loses only what the budget requires.
+
+Enforcement is client-side on **all five providers uniformly**, including the two that already truncate
+server-side. That is a deliberate trade: TEI and Ollama truncate *exactly*, having real tokenizers, so
+deferring to them would preserve more text. Uniformity wins anyway — the complaint being fixed is that the
+outcome depended on the provider, and cutting at the same estimated boundary everywhere makes results
+reproducible across a provider swap, which the SPI treats as a configuration change (§4.5.4). TEI keeps its
+own `"truncate": true` as a server-side backstop regardless. Batched inputs are bounded per member, so one
+over-long entry neither shortens its neighbours nor fails the batch.
+
+**Truncation is currently silent**, and that is a known, deliberately-deferred gap rather than a settled
+design. Signalling it would mean either a breaking change to the `EmbeddingVector` record (45 construction
+sites) or introducing the project's first logging mechanism — this codebase has none — and both are larger
+decisions than this fix. It is not a regression (Ollama and TEI already did this with no limit knowledge at
+all), but it is the invisible-failure shape this project has twice rejected elsewhere, and it should be
+closed once a project-wide logging mechanism is chosen.
