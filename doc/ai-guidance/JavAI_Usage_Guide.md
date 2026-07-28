@@ -594,6 +594,28 @@ Without an explicit call, `JavAIRuntime` falls back to the `javai.embedding.endp
 system properties (constructing an `EmbeddingProviderTextEmbeddingsInference`); with neither the call nor
 those properties set, the first `vector()` call throws `IllegalStateException`.
 
+**Input size is handled for you.** Every embedding model caps how much text it will accept, and providers
+disagree about what happens past that cap — some truncate silently, some reject. JavAI bounds text before
+sending it, identically on every provider, so an over-long field yields a vector rather than an exception on
+one provider and a quietly partial vector on another. Each provider discovers its model's real limit where
+the backend can report it (Ollama's `/api/show`, TEI's `/info`, vLLM's `/v1/models`), falling back to a table
+of published limits, and to a conservative 512 tokens for a model it doesn't recognize:
+
+```java
+// Nothing required in the common case. Pin the limit when you know better than the table --
+// worth doing for OpenAI/Replicate, which publish no endpoint to discover it from:
+new EmbeddingProviderOpenAI(apiKey, "text-embedding-3-small", 8_191);
+new EmbeddingProviderOllama(URI.create("http://localhost:11434"), "your-model", 32_768);
+EmbeddingProviderReplicate.builder().apiToken(token).model("owner/model").maxInputTokens(512).build();
+```
+
+Two things to know about the current behaviour. Truncation is **silent** — text past the limit is dropped
+with no exception and no log line, so if you are embedding documents that may run long and you need to know
+when that happens, check length yourself before handing text to JavAI. And because JavAI has no tokenizer,
+the token limit is converted to characters at a deliberately pessimistic 3 chars/token; a text near the
+boundary may lose a little it did not strictly have to. Supplying an explicit `maxInputTokens` does not
+change the estimate — it changes only which limit is being estimated against.
+
 There's no `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq` alongside `Cortex`'s Anthropic/Groq
 implementations — neither vendor has a native embeddings API (Anthropic recommends Voyage AI instead;
 Groq's API has no embeddings endpoint). `EmbeddingProviderReplicate` is also a different case from the

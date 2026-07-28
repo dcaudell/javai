@@ -49,9 +49,11 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
     private final String apiToken;
     private final String model;
     private final String inputFieldName;
+    private final Integer maxInputTokensOverride;
 
     private EmbeddingProviderReplicate(HttpClient httpClient, String baseUrl, String apiToken, String model,
-            String inputFieldName) {
+            String inputFieldName, Integer maxInputTokensOverride) {
+        this.maxInputTokensOverride = maxInputTokensOverride;
         this.httpClient = httpClient;
         this.predictionsEndpoint = URI.create(baseUrl).resolve("/v1/models/" + model + "/predictions");
         this.apiToken = apiToken;
@@ -63,9 +65,21 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         return new Builder();
     }
 
+    /** The builder's value when given, else {@link EmbeddingModelLimits}'s table -- a Replicate model's
+     *  input schema is per-model, so there is no endpoint that could report a limit. */
+    @Override
+    public int maxInputTokens() {
+        return maxInputTokensOverride != null ? maxInputTokensOverride : EmbeddingModelLimits.lookup(model);
+    }
+
     @Override
     public EmbeddingVector embed(String text) {
-        String effectiveText = text.isEmpty() ? " " : text;
+        // Truncated client-side like every other provider (OMI-216), so identical text produces the same
+        // outcome whichever provider is configured -- see EmbeddingProviderOllama.embed for the full
+        // reasoning. Replicate has no way to report a limit -- its input schema is per-model -- so
+        // this leans entirely on the table or an explicit override.
+        String effectiveText =
+                EmbeddingInputLimits.truncateToBudget(text.isEmpty() ? " " : text, maxInputTokens());
         String responseBody = createPrediction(effectiveText);
         String status = extractStringField(responseBody, "status");
         String pollUrl = extractStringField(responseBody, "get");
@@ -245,9 +259,22 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         private String apiToken;
         private String model = DEFAULT_MODEL;
         private String inputFieldName = DEFAULT_INPUT_FIELD_NAME;
+        private Integer maxInputTokens;
         private HttpClient httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
 
         private Builder() {
+        }
+
+        /**
+         * Pins the model's maximum input size, overriding {@link EmbeddingModelLimits}'s best-effort table.
+         *
+         * <p>Worth setting here more than anywhere else: a Replicate model's input schema is per-model, so
+         * there is no endpoint to ask and the table is unlikely to know your model. Without this, a
+         * deliberately conservative default applies and long inputs lose more text than they need to.
+         */
+        public Builder maxInputTokens(int maxInputTokens) {
+            this.maxInputTokens = maxInputTokens;
+            return this;
         }
 
         /** Override only for testing against a fake server -- real usage never needs this. */
@@ -281,7 +308,8 @@ public final class EmbeddingProviderReplicate implements JavAIEmbeddingProvider 
         }
 
         public EmbeddingProviderReplicate build() {
-            return new EmbeddingProviderReplicate(httpClient, baseUrl, apiToken, model, inputFieldName);
+            return new EmbeddingProviderReplicate(httpClient, baseUrl, apiToken, model, inputFieldName,
+                    maxInputTokens);
         }
     }
 

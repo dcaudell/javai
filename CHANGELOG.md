@@ -103,6 +103,36 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **`javai-vector`: embedding providers now know and respect their model's maximum input size (OMI-216).**
+  `JavAIEmbeddingProvider.maxInputTokens()` is a new `default` method — no existing implementation breaks —
+  resolving through an explicit override, then runtime discovery where the backend can answer (Ollama
+  `/api/show`, TEI `/info`, vLLM `/v1/models`), then `EmbeddingModelLimits`, a table of published limits.
+  Discovery is cached per instance and degrades to the table on any failure; not knowing the limit precisely
+  is a reason to be conservative, never a reason to refuse to embed. All five providers accept an explicit
+  limit (a constructor argument, or `Builder.maxInputTokens(int)` on Replicate).
+
+  **What it fixes:** the same text previously produced a correct vector, a quietly partial one, or an
+  exception, depending only on which provider was configured. Measured against a live Ollama instance, a
+  324,000-character input — roughly 80,000 tokens against `qwen3-embedding:0.6b`'s 32,768-token context —
+  returned HTTP 200 and an ordinary 1024-dimension vector, truncated with nothing in the response saying so.
+  A truncated vector is by construction indistinguishable from a complete one: it is a plausible embedding of
+  a document prefix, and it scores against queries forever without ever looking wrong.
+
+  Text is now bounded client-side on **all five providers uniformly**, at a deliberately pessimistic 3
+  characters per token (JavAI has no tokenizer), cutting at a word boundary when one is near. This is a
+  trade, not a free win: TEI and Ollama truncate *exactly*, having real tokenizers, so deferring to them
+  would preserve more text. Uniformity was chosen because the defect being fixed is precisely that the
+  outcome depended on the provider. TEI keeps its `"truncate": true` server-side backstop regardless.
+
+  The fallback for an unrecognized model is **512 tokens**, not the completion side's 8192: embedding models
+  run far tighter than chat models, so a generous default would produce partial vectors for exactly the
+  models most likely to be missing from the table.
+
+  **Known gap:** truncation is *silent*. Signalling it needs either a breaking change to `EmbeddingVector`
+  (45 construction sites) or the project's first logging mechanism — this codebase has none — and both are
+  larger decisions than this fix. Not a regression, since Ollama and TEI already truncated with no limit
+  knowledge at all, but it should be closed once a logging mechanism is chosen.
+
 - **`javai-persistence`: `JavAIPersistenceConfig.Builder.entityPackages(String...)` / `(Collection)`.**
   Scans the classpath for `@Entity` types under the named packages and registers them when the backend is
   created, so the entity set becomes a property of the **configuration** rather than of the order

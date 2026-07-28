@@ -30,21 +30,61 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
     private final URI embedEndpoint;
     private final String apiKey;
     private final String model;
+    private final Integer maxInputTokensOverride;
 
     public EmbeddingProviderOpenAI(String apiKey, String model) {
         this(DEFAULT_BASE_URL, apiKey, model);
     }
 
+    /**
+     * Pins the model's maximum input size against OpenAI's own endpoint.
+     *
+     * <p>Exists so pinning the limit doesn't force a caller to also spell out a base URL they don't want to
+     * change -- and, more importantly, so that writing it out doesn't quietly bind the API key to
+     * {@code baseUrl} via the three-argument {@code (baseUrl, apiKey, model)} overload, which is what the
+     * obvious shorthand would otherwise resolve to.
+     */
+    public EmbeddingProviderOpenAI(String apiKey, String model, int maxInputTokens) {
+        this(DEFAULT_BASE_URL, apiKey, model, maxInputTokens);
+    }
+
     /** Override only for testing against a fake server, or to point at an OpenAI-compatible proxy. */
     public EmbeddingProviderOpenAI(String baseUrl, String apiKey, String model) {
-        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model);
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model,
+                null);
+    }
+
+    /**
+     * Pins the model's maximum input size, overriding {@link EmbeddingModelLimits}'s best-effort table.
+     *
+     * <p>Matters more here than on the self-hosted providers: OpenAI exposes no API reporting a model's
+     * embedding input limit, so the table is the only other source. Reach for this whenever correctness
+     * matters more than the table's convenience -- the same escape hatch
+     * {@code Cortex.Builder.contextWindowTokens(int)} offers on the completion side.
+     */
+    public EmbeddingProviderOpenAI(String baseUrl, String apiKey, String model, int maxInputTokens) {
+        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUrl, apiKey, model,
+                maxInputTokens);
     }
 
     EmbeddingProviderOpenAI(HttpClient httpClient, String baseUrl, String apiKey, String model) {
+        this(httpClient, baseUrl, apiKey, model, null);
+    }
+
+    EmbeddingProviderOpenAI(HttpClient httpClient, String baseUrl, String apiKey, String model,
+            Integer maxInputTokensOverride) {
         this.httpClient = httpClient;
         this.embedEndpoint = URI.create(baseUrl).resolve("/v1/embeddings");
         this.apiKey = apiKey;
         this.model = model;
+        this.maxInputTokensOverride = maxInputTokensOverride;
+    }
+
+    /** The override when given, else {@link EmbeddingModelLimits}'s table -- OpenAI publishes no endpoint
+     *  reporting an embedding model's input limit, so there is nothing to discover. */
+    @Override
+    public int maxInputTokens() {
+        return maxInputTokensOverride != null ? maxInputTokensOverride : EmbeddingModelLimits.lookup(model);
     }
 
     @Override
@@ -52,7 +92,15 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
         // Same defensive substitution as EmbeddingProviderOllama -- see its javadoc for why
         // CollectionVectorSupport.computeCentroid() needs embed("") to still yield a real, dimensioned
         // vector rather than relying on OpenAI's own (unconfirmed) handling of an empty input string.
-        String effectiveText = text.isEmpty() ? " " : text;
+        // Truncated client-side on every provider, not only the ones that would otherwise fail (OMI-216).
+        // TEI and Ollama already truncate server-side -- and do it exactly, having real tokenizers -- so
+        // deferring to them would preserve more text. Uniformity wins anyway: the whole complaint this fixes
+        // is that identical text yields a correct vector, a quietly partial one, or an exception depending
+        // only on which provider is configured. Cutting at the same estimated boundary everywhere makes the
+        // outcome reproducible across providers, which matters more than the last few tokens. TEI keeps its
+        // own "truncate": true as a server-side backstop regardless.
+        String effectiveText =
+                EmbeddingInputLimits.truncateToBudget(text.isEmpty() ? " " : text, maxInputTokens());
         String requestBody = "{\"model\":\"" + JsonStrings.escape(model) + "\",\"input\":\""
                 + JsonStrings.escape(effectiveText) + "\"}";
         HttpRequest request = HttpRequest.newBuilder(embedEndpoint)
