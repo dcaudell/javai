@@ -36,6 +36,29 @@ class TagTest {
         assertEquals("urgent", tag.getSlug());
     }
 
+    /**
+     * A display name with no alphanumerics slugifies to the empty string, so a {@link Tag} whose only
+     * {@code @Vectorize} field is blank -- and whose {@code summaryVector()} is therefore
+     * {@link dev.xtrafe.javai.vector.EmbeddingVector#isAbsent() absent} -- is reachable through the ordinary
+     * public constructor.
+     *
+     * <p>Worth pinning because that is the input that used to break tag-summary recomputation (OMI-218).
+     * {@code JavAITagRepository} accumulated tag summaries into a bare {@code float[]}, which cannot express
+     * absence: such a tag arriving first sized the accumulator to zero dimensions and stored a content-free
+     * vector as a real tag-summary, and arriving after a present one threw
+     * {@link ArrayIndexOutOfBoundsException} from inside the add loop. The arithmetic now goes through
+     * {@code VectorMath}, which skips absent terms -- so what this test establishes is that the input was
+     * never hypothetical.
+     */
+    @Test
+    void aDisplayNameWithNoAlphanumericsSlugifiesToBlank() {
+        TagSet tagSet = new TagSet("topics");
+        Tag tag = new Tag(tagSet, "en", "!!!");
+
+        assertEquals("", tag.getSlug(),
+                "a blank slug means a blank @Vectorize field, which means an absent summary vector");
+    }
+
     @Test
     void slugIsUnaffectedByLaterAddedLocalizedNames() {
         TagSet tagSet = new TagSet("topics");

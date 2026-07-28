@@ -1056,39 +1056,33 @@ public final class JavAIRuntime {
                 return vector(self, vectorizeFieldNames);
             }
             try {
-                EmbeddingVector own = vector(self, vectorizeFieldNames);
-                // An absent own-vector (no @Vectorize fields) doesn't make this object's summary absent --
-                // its @Summary children may still have content. So the accumulator stays null until the
-                // first contributor with real dimensionality appears, and only if none ever does is the
-                // whole summary absent. See EmbeddingVector.absent() (OMI-187).
-                float[] sum = own.isAbsent() ? null : own.values().clone();
-                String modelId = own.isAbsent() ? null : own.modelId();
+                // This object's own vector at full weight, plus each @Summary child's summary at the decay
+                // factor. An absent own-vector (no @Vectorize fields) doesn't make this object's summary
+                // absent -- its @Summary children may still have content -- and an absent child contributes
+                // nothing rather than being a dimension mismatch to report. VectorMath.weightedSum applies
+                // both of those rules, so they are stated once there rather than re-derived here (OMI-218).
+                List<VectorMath.WeightedVector> terms = new ArrayList<>();
+                terms.add(new VectorMath.WeightedVector(vector(self, vectorizeFieldNames), 1.0));
                 if (!summaryFieldNames.isBlank()) {
                     for (String fieldName : summaryFieldNames.split(",")) {
                         Object value = readField(self, fieldName);
                         if (value instanceof JavAIVectorizable child) {
-                            EmbeddingVector childSummary = child.summaryVector();
-                            // A child with no embeddable content contributes nothing at all -- it is not a
-                            // dimension mismatch to report, it is an absence to skip.
-                            if (childSummary.isAbsent()) {
-                                continue;
-                            }
-                            if (sum == null) {
-                                sum = new float[childSummary.dims()];
-                                modelId = childSummary.modelId();
-                            } else if (childSummary.dims() != sum.length) {
-                                throw new IllegalStateException(
-                                        "summaryVector() dimension mismatch: " + self.getClass() + "'s own vector has "
-                                                + sum.length + " dims but @Summary field " + fieldName + " contributed "
-                                                + childSummary.dims() + " -- are they using the same model?");
-                            }
-                            VectorMath.addWeighted(sum, childSummary.values(), DEFAULT_SUMMARY_DECAY);
+                            terms.add(new VectorMath.WeightedVector(
+                                    child.summaryVector(), DEFAULT_SUMMARY_DECAY));
                         }
                     }
                 }
-                EmbeddingVector recomputed = sum == null
-                        ? EmbeddingVector.absent()
-                        : new EmbeddingVector(VectorMath.normalize(sum), modelId, sum.length, Instant.now());
+                EmbeddingVector recomputed;
+                try {
+                    recomputed = VectorMath.normalize(VectorMath.weightedSum(terms));
+                } catch (IllegalArgumentException e) {
+                    // Rethrown with the context VectorMath cannot have: which class, and which fields were
+                    // in play. (The specific offending field name is no longer singled out -- the cost of
+                    // having one implementation of the compatibility rule instead of three.)
+                    throw new IllegalStateException("summaryVector() for " + self.getClass().getName()
+                            + " cannot combine its own vector with its @Summary fields ["
+                            + summaryFieldNames + "]: " + e.getMessage(), e);
+                }
                 state.cacheSummaryVector(recomputed);
                 state.clearSummaryDirty();
                 // vector()'s own cache no longer clears this (it has no cache of its own to gate on
