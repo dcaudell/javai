@@ -250,6 +250,24 @@ Tag urgent = new Tag(securitySet, "en", "Urgent");   // slug ("urgent") derived 
 tagRepo.save(urgent);
 ```
 
+**Localizing a whole taxonomy at once.** A `Tag` or `TagSet` takes its entire translation bundle in one go,
+as a `Map` or as JSON — which is what you want when the catalog lives in translation files:
+
+```java
+Tag zeroDay = Tag.fromLocalizedNamesJson(securitySet, """
+        {"en": "Zero-day", "fr": "Faille zero-day", "de": "Zero-Day-Lücke", "ja": "ゼロデイ"}""");
+
+zeroDay.setLocalizedNames(Map.of("es", "Día cero"));   // merges; every existing locale is left alone
+```
+
+Three things to know. The slug is derived from **the English entry** (`en`, or a variety like `en-US`) if
+there is one, else the first entry that yields a usable slug — so identity doesn't depend on which key
+happened to lead the JSON. `getSlugLocale()` tells you which one it used. And the slug is **required**: a
+bundle where nothing slugifies (all CJK, say — this library doesn't transliterate) is rejected at
+construction, because the slug is a tag's only vectorized field and without one it can never be found.
+
+`getLocalizedNames()` returns an **unmodifiable** snapshot; use `setLocalizedNames(...)` to change anything.
+
 `Tag`/`TagSet` are ordinary `@Entity @JavAIVectorizable` classes persisted through the same
 `JavAIPI.repository(...)` mechanism as any other JavAI entity — `TagRepository`/`TagSetRepository` are
 just plain, empty `JavAIRepository<Tag>`/`JavAIRepository<TagSet>` marker interfaces. A `Tag`'s constructor

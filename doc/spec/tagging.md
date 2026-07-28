@@ -108,6 +108,7 @@ public class Tag implements Taggable {
     private String slug;                          // identity + the only field the classifier ever sees
 
     private Map<String, String> localizedNames;    // locale -> display string; not vectorized, not shown to the classifier
+    private String slugLocale;                     // which locale's string the slug came from (OMI-201)
 
     private String description;                    // optional; not vectorized; classifier context only, see below
 
@@ -128,6 +129,7 @@ public class TagSet {
     private String slug;
 
     private Map<String, String> localizedNames;
+    private String slugLocale;                     // null when the slug was given directly
 
     @Summary
     private final JavAIArrayList<Tag> tags = new JavAIArrayList<>();
@@ -146,13 +148,36 @@ to a tag-on-tag edge instead of an object-graph field edge.
 
 ### Slug derivation and immutability
 
-The slug is derived by slugifying whichever localized string is entered first at Tag creation, and is
-**fixed thereafter** — since it's both the vectorized identity and (see "Tag-summary vector index" below)
+The slug is derived from the localized names, and is **fixed thereafter** — since it's both the vectorized identity and (see "Tag-summary vector index" below)
 load-bearing for the tag-similarity index, changing it in place would leave stale vectors and Taggings
 pointing at a since-changed identity. "Renaming" a tag's slug is a delete-and-recreate operation, not an
 edit.
 
-**Known limitation, accepted, not solved here:** this derivation assumes the first-entered string is
+### Which localized string becomes the slug (OMI-201)
+
+Bulk localization made "whichever string was entered first" too implicit to keep — with a whole bundle
+arriving at once, it would have meant *whichever key led the JSON object*, making a searchable identity
+depend on serialization order. The rule is now explicit, and lives in one place (`LocalizedNames`) that both
+`Tag` and `TagSet` delegate to:
+
+1. **An existing slug is never re-derived.** Later localization only adds names.
+2. **English wins** — `en`, or any variety of it (`en-US`, `en_GB`, any case), preferring a plain `en` when
+   both are present. Preferred rather than merely conventional because the slugifier does not
+   transliterate: a CJK or Arabic string collapses to nothing usable.
+3. **Otherwise the first entry that yields a usable slug**, in the input's own iteration order. Pass an
+   ordered map (or JSON, which decodes into one) if you care which that is.
+
+A candidate that slugifies to blank is **passed over**, not accepted — a blank slug and no slug are the same
+thing. `slugLocale` records which locale the slug actually came from, so the choice is inspectable rather
+than inferred.
+
+**The slug is required, and its absence fails at the input that caused it.** A Tag or TagSet whose names
+yield no slug is refused at construction, rather than being allowed to exist and fail later: the slug is the
+only `@Vectorize` field either type has, so a slugless entity has an absent vector and can be neither
+searched nor classified while still looking like a real tag. `JavAITagRepository.addTag` carries a backstop
+for the one case constructors cannot cover — a row hydrated from before this rule existed.
+
+**Known limitation, accepted, not solved here:** this derivation assumes at least one string is
 Latin-script. A slug derived from a CJK, Arabic, or other non-Latin-script first entry has no clean
 lowercase-and-hyphenate equivalent, and this library deliberately does not attempt transliteration or
 translation — consistent with the project's own "no translation logic in the library" constraint. Authors

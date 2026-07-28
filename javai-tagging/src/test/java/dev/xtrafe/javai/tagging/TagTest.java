@@ -5,6 +5,8 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Slug derivation/immutability -- the state-machine-style claims doc/spec/tagging.md makes about {@link Tag}
@@ -37,26 +39,22 @@ class TagTest {
     }
 
     /**
-     * A display name with no alphanumerics slugifies to the empty string, so a {@link Tag} whose only
-     * {@code @Vectorize} field is blank -- and whose {@code summaryVector()} is therefore
-     * {@link dev.xtrafe.javai.vector.EmbeddingVector#isAbsent() absent} -- is reachable through the ordinary
-     * public constructor.
+     * A display name with no alphanumerics yields no slug, and is now <b>refused at construction</b>
+     * (OMI-201).
      *
-     * <p>Worth pinning because that is the input that used to break tag-summary recomputation (OMI-218).
-     * {@code JavAITagRepository} accumulated tag summaries into a bare {@code float[]}, which cannot express
-     * absence: such a tag arriving first sized the accumulator to zero dimensions and stored a content-free
-     * vector as a real tag-summary, and arriving after a present one threw
-     * {@link ArrayIndexOutOfBoundsException} from inside the add loop. The arithmetic now goes through
-     * {@code VectorMath}, which skips absent terms -- so what this test establishes is that the input was
-     * never hypothetical.
+     * <p>This used to succeed and produce a tag whose only {@code @Vectorize} field was blank -- and whose
+     * vector was therefore absent, making it unsearchable and unclassifiable while looking like a real tag.
+     * OMI-218 pinned that the input was reachable through the ordinary public constructor; OMI-201 makes it
+     * an error, at the input that caused it rather than at some later read.
      */
     @Test
-    void aDisplayNameWithNoAlphanumericsSlugifiesToBlank() {
+    void aDisplayNameThatYieldsNoSlugIsRefused() {
         TagSet tagSet = new TagSet("topics");
-        Tag tag = new Tag(tagSet, "en", "!!!");
 
-        assertEquals("", tag.getSlug(),
-                "a blank slug means a blank @Vectorize field, which means an absent summary vector");
+        IllegalArgumentException failure = assertThrows(IllegalArgumentException.class,
+                () -> new Tag(tagSet, "en", "!!!"));
+
+        assertTrue(failure.getMessage().contains("slug"), failure.getMessage());
     }
 
     @Test

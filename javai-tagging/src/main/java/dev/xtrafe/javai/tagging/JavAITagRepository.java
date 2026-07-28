@@ -112,15 +112,34 @@ public final class JavAITagRepository {
 
     /** Binary "has the tag" -- affinity left {@code null}. */
     public void addTag(Object instance, Tag tag) {
+        requireSlug(tag);
         TaggableRef ref = refOf(instance);
         backend.addTag(ref, tag.getId(), null, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
     }
 
     public void addTag(Object instance, Tag tag, double affinity) {
+        requireSlug(tag);
         TaggableRef ref = refOf(instance);
         backend.addTag(ref, tag.getId(), affinity, Tagging.SOURCE_MANUAL);
         recomputeTagSummaryVector(ref);
+    }
+
+    /**
+     * Refuses to index a tag with no slug (OMI-201).
+     *
+     * <p>A backstop, not the main defence: {@link Tag}'s constructors already refuse to produce a slugless
+     * tag, so the only way to hold one is to hydrate a row written before that rule existed. Applying it
+     * would put a tag with an absent vector into the tag-summary index, where it would contribute nothing
+     * and be findable by nothing -- so this fails at the point of use rather than storing something inert.
+     */
+    private static void requireSlug(Tag tag) {
+        if (tag.getSlug() == null || tag.getSlug().isBlank()) {
+            throw new IllegalStateException("Tag " + tag.getId() + " has no slug, so it has no vector and"
+                    + " cannot be indexed or searched. Tags created through this library's constructors"
+                    + " always have one; this tag was most likely hydrated from a row written before that"
+                    + " was enforced. Re-create it with a localized name that yields a slug.");
+        }
     }
 
     public void removeTag(Object instance, Tag tag) {

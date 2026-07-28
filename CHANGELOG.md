@@ -12,7 +12,48 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Added
+
+- **`javai-tagging`: a whole translation bundle can be given to a `Tag` or `TagSet` at once (OMI-201).**
+  Localization was one locale per call, and each call decoded the JSON blob, put one key, and re-encoded it —
+  so a catalog loaded from translation files meant a loop, and the codec itself was package-private, so a
+  consumer holding a bundle could not hand it over at all.
+
+  ```java
+  Tag tag = Tag.fromLocalizedNamesJson(tagSet, """
+          {"en": "Zero-day", "fr": "Faille zero-day", "ja": "ゼロデイ"}""");
+  tag.setLocalizedNames(Map.of("de", "Zero-Day-Lücke"));   // merges; existing locales stay
+  ```
+
+  Both `Map` and JSON forms, on both types, merging rather than replacing. Malformed JSON surfaces as this
+  library's own `IllegalArgumentException` rather than leaking Gson's `JsonSyntaxException` out of an API
+  that says nothing about Gson.
+
+  **Slug derivation is now explicit**, because bulk entry made the old rule ("whichever string was entered
+  first") mean *whichever key led the JSON object* — a searchable identity depending on serialization order.
+  An existing slug is never re-derived; otherwise English wins (`en`, or a variety like `en-US`/`en_GB`, any
+  case, preferring plain `en`); otherwise the first entry that yields a usable slug. A candidate that
+  slugifies to blank is passed over rather than accepted. The new `slugLocale` field records which locale was
+  actually used, so the choice is inspectable rather than inferred.
+
+  `Tag` and `TagSet` share one implementation of all of this (`LocalizedNames`, plus `Slugs` extracted from
+  `Tag`); each entity holds only the three fields. They cannot share a superclass — both are JPA `@Entity`
+  types and a mapped superclass would change their schema for no benefit.
+
 ### Changed
+
+- **`javai-tagging`: a `Tag` or `TagSet` with no derivable slug is now refused at construction (OMI-201).**
+  Previously a display name with no alphanumerics (`"!!!"`, or any non-Latin script — this library does not
+  transliterate) produced an entity whose only `@Vectorize` field was blank, and therefore whose vector was
+  absent: unsearchable, unclassifiable, and indistinguishable from a real tag from the outside. OMI-218
+  pinned that this input was reachable through the ordinary public constructor; it is now an error at the
+  input that caused it. `JavAITagRepository.addTag` carries a backstop for the one case constructors cannot
+  cover — a row hydrated from before the rule existed. `TagSet(String slug)` likewise rejects a null or blank
+  slug.
+
+- **`javai-tagging`: `getLocalizedNames()` returns an unmodifiable snapshot.** It returned a mutable copy, so
+  `tag.getLocalizedNames().put(...)` compiled, read correctly, and silently did nothing — exactly the call
+  bulk localization invites. It now throws `UnsupportedOperationException`; use `setLocalizedNames(...)`.
 
 - **`javai-vector`: `VectorMath`'s public surface is now `EmbeddingVector`-only (OMI-218).** It exposed
   `normalize(float[])` and `addWeighted(float[], float[], float)` alongside its vector-level methods, and
