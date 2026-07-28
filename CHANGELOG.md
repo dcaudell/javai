@@ -12,6 +12,8 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-07-28
+
 ### Added
 
 - **`javai-tagging`: a whole translation bundle can be given to a `Tag` or `TagSet` at once (OMI-201).**
@@ -579,6 +581,7 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.6...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/dcaudell/javai/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dcaudell/javai/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dcaudell/javai/compare/v0.1.4...v0.1.5
