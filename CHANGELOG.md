@@ -14,6 +14,29 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-persistence` (Postgres): Hibernate's `@Any` mapping no longer fails to boot (OMI-212).** Building
+  the `SessionFactory` threw `UnknownEntityTypeException` for any entity type named only by
+  `@AnyDiscriminatorValue(entity = …)`. Because that failure is at boot rather than at first use of the
+  association, it took out *every* repository call in the configuration -- five unrelated integration test
+  classes at once, downstream.
+
+  **Mechanism:** related-type discovery walks each field's declared type. An `@Any` field's declared type is
+  deliberately a plain interface with no shared table -- that is the entire point of the mapping -- so the
+  walk learned nothing and the concrete targets were never registered. Nothing about the mapping itself was
+  missing; JavAI registers entities through ordinary Hibernate annotation scanning, so `@Any` worked as soon
+  as the targets were known. The gap was purely discovery.
+
+  Discovery now also registers the types named by `@AnyDiscriminatorValue` (and its repeatable container).
+  Note that `@Any` does not cascade by default -- add `@Cascade` if the owner should save its target.
+
+- **`javai-persistence` (Neo4j, MongoDB): an `@Any` field is rejected at registration instead of being
+  silently dropped.** Measured before the change: Neo4j saved the owning entity happily and returned `null`
+  for the association on reload. Both backends' mapping is hand-rolled with no discriminator concept, and
+  reference detection keys off the declared field type -- a plain interface matches neither the reference
+  nor the simple-value path, so the field fell into the documented "silently skipped" boundary. Losing data
+  quietly is worse than refusing the mapping, so both now fail loudly and name the backend that does support
+  it, mirroring how `KnowledgeGraph` fields are already rejected in the opposite direction.
+
 - **`javai-model`, `javai-vector`, `javai-persistence`: JavAI made roughly three embedding calls where one
   was correct (OMI-187).** Reported as untenably slow seeding of a large `TagSet` (~1,400 tags could not be
   seeded in ten minutes). Instrumenting the embedding provider showed 36 calls to seed 12 tags -- 12 correct,
@@ -68,6 +91,13 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **`javai-persistence`: `JavAIPersistenceConfig.Builder.entityType(Class)` / `.entityTypes(Collection)`.**
+  An escape hatch for types JavAI's discovery cannot see. Registering `@Any` targets fixes the reported bug;
+  this fixes the class it belongs to -- discovery finds related types through declared field types, which is
+  complete for ordinary associations and silently blind to anything reached another way, and there was
+  previously no way at all to say "also register this type". Honoured by all three backends; registration is
+  recursive and idempotent, exactly as for a discovered type.
+
 - **`javai-vector`: `EmbeddingVector.absent()`** -- the vector of *nothing*, for an object or collection with
   no embeddable content. Zero dimensions ("all dimensions and none"), so arithmetic skips it, similarity
   ranks it last, and persistence writes no row for it. A value rather than a null, so nothing has to
@@ -109,6 +139,15 @@ version -- a given release usually changes only one or two of them.
   than correctness requires. Consumable from every module and from `e2e-client-test`.
 
 ### Changed
+
+- **`doc/ai-guidance/persistence-support-matrix.md`: added an `@Any` row.** It was previously in the worst
+  category for a consumer -- not documented as unsupported, and *nearly* working, so it read as a usage
+  error rather than a library gap. The row also records two things that are inherent to the mapping rather
+  than to JavAI: `@Any` cannot carry a foreign key (its id column points into several tables, so referential
+  integrity is traded for the polymorphism), and its discriminator values are strings in your data, so
+  renaming a target class is a data migration. The portability note now also points out that `KnowledgeGraph`
+  and `@Any` pull in opposite directions -- Neo4j-only and Postgres-only respectively -- so an entity
+  declaring both cannot be persisted on any single backend.
 
 - **`javai-vector`: `VectorMath.centroid(List.of())` returns `EmbeddingVector.absent()` instead of throwing
   `IllegalStateException`.** That throw was the reason callers fabricated a vector for the empty case in the

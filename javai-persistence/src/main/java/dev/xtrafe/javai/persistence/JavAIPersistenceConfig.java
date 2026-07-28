@@ -5,10 +5,13 @@ import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.neo4j.driver.Driver;
 import org.springframework.data.mongodb.core.MongoTemplate;
 
+import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * Backend selection + connection settings for {@link JavAIPI#repository(Class, JavAIPersistenceConfig)}. Self-contained by
@@ -45,6 +48,7 @@ public final class JavAIPersistenceConfig {
     private final String mongoUri;
     private final String mongoDatabase;
     private final MongoTemplate externalMongoTemplate;
+    private final Set<Class<?>> additionalEntityTypes;
 
     private JavAIPersistenceConfig(Builder builder) {
         this.backend = builder.backend;
@@ -61,6 +65,8 @@ public final class JavAIPersistenceConfig {
         this.mongoUri = builder.mongoUri;
         this.mongoDatabase = builder.mongoDatabase;
         this.externalMongoTemplate = builder.externalMongoTemplate;
+        this.additionalEntityTypes =
+                Collections.unmodifiableSet(new LinkedHashSet<>(builder.additionalEntityTypes));
     }
 
     public static JavAIPersistenceConfig fromSystemProperties() {
@@ -130,6 +136,14 @@ public final class JavAIPersistenceConfig {
         return hibernateProperties;
     }
 
+    /**
+     * Entity types to register in addition to whatever JavAI discovers on its own -- see
+     * {@link Builder#entityType(Class)}.
+     */
+    public Set<Class<?>> additionalEntityTypes() {
+        return additionalEntityTypes;
+    }
+
     public String neo4jUri() {
         return neo4jUri;
     }
@@ -173,6 +187,7 @@ public final class JavAIPersistenceConfig {
         private String mongoUri;
         private String mongoDatabase;
         private MongoTemplate externalMongoTemplate;
+        private final Set<Class<?>> additionalEntityTypes = new LinkedHashSet<>();
 
         private Builder() {
         }
@@ -239,6 +254,37 @@ public final class JavAIPersistenceConfig {
         /** Bulk form of {@link #hibernateProperty(String, Object)}, applied in the map's own iteration order. */
         public Builder hibernateProperties(Map<String, ?> properties) {
             this.hibernateProperties.putAll(properties);
+            return this;
+        }
+
+        /**
+         * Registers {@code entityType} explicitly, in addition to everything JavAI discovers by walking
+         * entities' fields.
+         *
+         * <p>An escape hatch for types JavAI's own discovery cannot see, added with OMI-212. Discovery
+         * finds related types through declared field types, which is complete for ordinary associations and
+         * silently blind to anything reached another way. {@code @Any} was the case that surfaced it -- its
+         * targets are named only in {@code @AnyDiscriminatorValue}, and are now registered automatically --
+         * but the general problem outlives that one fix: a type discovery cannot reach was previously
+         * unreachable full stop, with no workaround but contriving a repository nobody wanted.
+         *
+         * <p>Failures of this kind land at {@code SessionFactory} build time, so they take out every
+         * repository call in the configuration rather than only the one that touched the missing type,
+         * which makes them considerably more confusing than their cause. Reaching for this is a reasonable
+         * response to that; if a whole *category* of type is being missed, that is worth reporting as a
+         * discovery gap rather than papering over per type.
+         *
+         * <p>Registration is recursive and idempotent, exactly as for a discovered type: naming one type
+         * pulls in everything reachable from it, and naming an already-known type does nothing.
+         */
+        public Builder entityType(Class<?> entityType) {
+            this.additionalEntityTypes.add(entityType);
+            return this;
+        }
+
+        /** {@link #entityType(Class)} for several types at once. */
+        public Builder entityTypes(Collection<Class<?>> entityTypes) {
+            this.additionalEntityTypes.addAll(entityTypes);
             return this;
         }
 

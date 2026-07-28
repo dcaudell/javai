@@ -41,6 +41,7 @@ Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupporte
 | `@Column`, `@Table`, `@Basic`, `@Enumerated`, `@Temporal`, `@Lob`, `@Version` | ✅ | ⚠️ | ⚠️ | Postgres: honored by Hibernate as usual. Neo4j/Mongo: ignored — scalar conversion is fixed (`enum`→`name()`, `Instant`/`UUID`→string, etc.), column/table names don't apply. |
 | *Implicit* column/table naming (no `@Column`/`@Table`) | ✅ snake_case | n/a | n/a | **Postgres, since 0.1.5 (OMI-145):** `CamelCaseToUnderscoresNamingStrategy` is the default — `emailVerified` → `email_verified`, entity `TestCrew` → table `test_crew` — matching Spring Boot's default. Up to 0.1.4 the bare Hibernate default applied (`emailverified`), so **an existing pre-0.1.5 schema with multi-word names needs migrating or pinning**: `JavAIPersistenceConfig.Builder.physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())` restores the old naming, and `.hibernateProperty(k, v)`/`.hibernateProperties(map)` passes through any other Hibernate setting. Neo4j/Mongo have no JPA column naming at all, so both knobs are inert there. |
 | `@Embedded` / `@Embeddable` | ✅ | ❌ | ❌ | Postgres maps an embeddable's columns (and Criteria can navigate into them). Neo4j/Mongo have no embeddable concept — such a field is skipped. |
+| `@Any` (+ `@AnyDiscriminator`, `@AnyDiscriminatorValue`, `@AnyKeyJavaClass`) | ✅ | ❌ | ❌ | A **polymorphic to-one** whose target may be any of several *unrelated* entities, resolved by a discriminator column. **Postgres:** ordinary Hibernate mapping; the concrete types named in `@AnyDiscriminatorValue(entity = …)` are registered automatically, so you don't need a repository for each one. Add `@Cascade` if the owner should save its target — `@Any` doesn't cascade by default. **Two things to know before choosing it:** the target's id column points into several tables, so `@Any` **cannot carry a foreign key** — you trade referential integrity for the polymorphism, and nothing at the database level will stop a dangling reference. And the discriminator values are strings in your data, so renaming or moving a target class is a data migration, not a refactor. **Neo4j/Mongo:** rejected at registration with a clear error. Their mapping has no discriminator concept, and reference detection keys off the declared field type — which for `@Any` is deliberately a plain interface, so the field previously fell into the "silently skipped" boundary and the association came back `null` after a successful save. Refusing it loudly is better than losing it quietly. |
 
 > The JavAI vector/graph annotations (`@Vectorize`, `@Summary`, `@SearchVisibility`, `@JavAIVectorizable`,
 > `@JavAIGraphNode`/`@JavAIEdge`, `@Taggable`) are orthogonal to this table and behave the same on all three
@@ -121,8 +122,11 @@ Notes:
 - **Adding a field?** Scalar → fine on all three. A *single* related entity → `@OneToOne`/`@ManyToOne`
   (Postgres) or just the declared type (Neo4j/Mongo). *Many* related entities → a **JavAI collection**, never
   `@OneToMany`. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
-- **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Embedded`, and nested/ to-many *sort*)
-  if the same entity must run on more than one backend.
+  A **polymorphic to-one** (the target may be any of several unrelated entities) → `@Any`, Postgres only.
+- **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Any`, `@Embedded`, and nested/to-many
+  *sort*) if the same entity must run on more than one backend. Note that `KnowledgeGraph` and `@Any` pull in
+  opposite directions — one is Neo4j-only, the other Postgres-only — so an entity declaring both cannot be
+  persisted on any single backend at all.
 
 ---
 
