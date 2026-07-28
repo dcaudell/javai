@@ -306,6 +306,16 @@
         <version>${spring-data-commons.version}</version>
       </dependency>
       <dependency>
+        <!-- javai-persistence only: ClassPathScanningCandidateComponentProvider backs
+             JavAIPersistenceConfig.Builder.entityPackages(...) (OMI-214). Already on that module's compile
+             classpath transitively via spring-data-mongodb, but named because the module's own code now
+             uses it directly, the same reason spring-data-commons is named above. Version tracks
+             spring-framework.version, as spring-orm's own comment below explains. -->
+        <groupId>org.springframework</groupId>
+        <artifactId>spring-context</artifactId>
+        <version>${spring-framework.version}</version>
+      </dependency>
+      <dependency>
         <!-- javai-persistence only, and declared <optional> there: it is what lets a JavAIRepository call
              join a Spring @Transactional unit of work instead of always opening its own session (OMI-146).
              spring-tx/spring-core/spring-context are already on that module's compile classpath transitively

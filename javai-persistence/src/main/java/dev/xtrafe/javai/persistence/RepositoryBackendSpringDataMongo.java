@@ -117,8 +117,16 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     RepositoryBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
-        // Types the caller named explicitly, registered up front so they are known before any discovery
-        // runs -- see JavAIPersistenceConfig.Builder.entityType (OMI-212).
+        // Types the caller named explicitly, plus every @Entity under any package they asked us to scan.
+        // Registered up front so the entity set is complete before anything can be built -- which is what
+        // removes registration ordering as a concern for the caller (OMI-214).
+        for (Class<?> scanned : EntityPackageScanner.scan(
+                config.entityPackages(), Thread.currentThread().getContextClassLoader() != null
+                        ? Thread.currentThread().getContextClassLoader()
+                        : getClass().getClassLoader(),
+                config.excludedEntityTypes(), config.excludedEntityPackages())) {
+            registerEntityType(scanned);
+        }
         for (Class<?> additional : config.additionalEntityTypes()) {
             registerEntityType(additional);
         }

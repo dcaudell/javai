@@ -115,15 +115,38 @@ identical field values on every invocation would silently multiply backends inst
 developer would already call directly on a woven object. `findNearestByVector`/`findNearestBySummaryVector`
 are the whole-object variants, for the object's own combined `vector()`/`summaryVector()`.
 
-**Register every repository before using any of them.** `JavAIPI.repository(...)` accumulates entity types
-under the hood; the Postgres backend's internal `SessionFactory` is built, once, lazily, on the *first*
-actual method call across any repository -- Hibernate's boot-time metadata is immutable afterward, so an
-entity type registered later would never be mapped. On Postgres and MongoDB, this is narrower than it
-sounds in practice: `JavAIPI.repository(ArticleRepository.class)` alone is enough even if `Article`
-references `Comment`/`Attachment` (singly or through a collection) -- related entity types reachable through
-an already-registered type's own fields are discovered and registered automatically, recursively. You only
-need to separately call `JavAIPI.repository(...)` for a type you intend to query *directly and
-independently* (Neo4j is the exception here -- see below).
+**Let the config name its entity types, and registration ordering stops mattering (OMI-214).**
+`JavAIPI.repository(...)` accumulates entity types under the hood; the Postgres backend's internal
+`SessionFactory` is built, once, lazily, on the *first* actual method call across any repository (or on
+`JavAIPI.sessionFactory(config)`, which builds it too) -- and Hibernate's boot-time metadata is immutable
+afterward. Rather than choreograph startup around that, declare the entities on the configuration:
+
+```java
+JavAIPersistenceConfig.builder()
+    .backend(Backend.POSTGRES)./* ... */
+    .entityPackages("com.example.domain")   // every @Entity under here, scanned up front
+    .entityType(SomethingElsewhere.class)   // for a type outside those packages
+    .build();
+```
+
+The entity set is then complete before anything can be built, so repositories may be realized in any order,
+at any time -- including lazily, long after startup. A Spring application needs no `@DependsOn` on its
+factory bean.
+
+Registration is also **recursive**: `JavAIPI.repository(ArticleRepository.class)` alone is enough even if
+`Article` references `Comment`/`Attachment` (singly or through a collection), since related types reachable
+through an already-registered type's own fields are discovered automatically. And a late `repository(...)`
+call is **harmless whenever it introduces nothing new** -- re-realizing one, or asking for a type something
+else already pulled in, is a no-op. It fails only for a genuinely unknown type, and the error then names the
+call that *built the factory*, since that is the thing to move.
+
+**Excluding a type from a scan.** For an `@Entity` inside a scanned package that this configuration should
+not own: `excludeEntityType(Foo.class)`, `excludeEntityPackages("com.example.reporting.*")`, or
+`@PersistenceIgnore` on the class. The first two are per-configuration ("not *this* config's" -- the right
+tool for a type that is merely backend-specific, such as a `KnowledgeGraph` owner that belongs to Neo4j);
+the annotation is global ("never JavAI's"). **Being non-vectorized is never a reason to exclude anything** --
+a plain `@Entity` is a first-class citizen of a `JavAIRepository`, registered and served exactly like a
+vectorized one, it simply has no vectors.
 
 ## Transactions: joining a caller's unit of work (Postgres)
 

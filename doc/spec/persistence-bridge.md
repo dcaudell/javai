@@ -83,8 +83,9 @@ class ResearchTopic implements JavAIVectorizable {
 }
 
 JavAIPersistenceConfig config = JavAIPersistenceConfig.builder().backend(Backend.NEO4J)./* ... */.build();
-JavAIPI.repository(ConceptRepository.class, config); // register the node type first, same rule as any
-                                                       // relationship target Neo4j needs to resolve by label
+JavAIPI.repository(ConceptRepository.class, config); // Neo4j needs the node type registered to resolve it
+                                                       // by label; entityPackages(...) on the config does
+                                                       // this for a whole package (OMI-214)
 ResearchTopicRepository repo = JavAIPI.repository(ResearchTopicRepository.class, config);
 
 repo.save(topic);                                     // writes nodes + edges in one shot
@@ -113,6 +114,53 @@ value proposition is different: native multi-hop traversal combined with similar
 MongoDB don't — building an equivalent would mean hand-rolling a real graph-traversal engine on top of a
 relational/document store, a substantial undertaking deliberately out of scope for this project's Phase 0
 (proving the design space), not an oversight or a temporary gap.
+
+## Entity registration: a property of the configuration, not of call order
+
+JavAI learns about an entity when a repository is realized for it, or for anything that references it --
+related types reachable through an already-registered type's own fields are discovered recursively. On
+**Postgres** the backend then builds one Hibernate `SessionFactory`, lazily, at the first actual repository
+call (`JavAIPI.sessionFactory(config)` builds it too). Hibernate's metadata is immutable once built.
+
+Left there, that makes correctness a property of *global startup ordering*: whether an application boots
+depends on the order its repositories happen to be created in, which nothing local can check and no compiler
+can verify. It failed at boot, non-deterministically, blaming the repository that arrived late rather than
+whatever built the factory early — and because there is one shared factory, it took the whole application's
+persistence down rather than one repository. Downstream it cost a consumer a hand-maintained 18-name
+`@DependsOn` list that had already drifted out of sync with its own bean declarations (OMI-214).
+
+**The resolution is to make the entity set a property of the configuration**, complete before anything can be
+built:
+
+```java
+JavAIPersistenceConfig.builder()
+    .backend(Backend.POSTGRES)./* ... */
+    .entityPackages("com.example.domain")
+    .build();
+```
+
+Ordering then stops existing as a concept. Two further properties keep the residue small:
+
+- A late `repository(...)` call **is a no-op when it introduces nothing new** — the type is already
+  registered, directly or transitively. Only a genuinely unknown type fails, and the error names the call
+  that built the factory.
+- **Neo4j and MongoDB have no such constraint at all.** They hold no boot-time metadata; the ordering
+  question is Postgres-specific.
+
+Scanning validates everything it finds, deliberately: an entity Hibernate maps but JavAI cannot is worse
+than one that is refused, because the failure would surface later and far from its cause. Only three
+conditions are refused, all about JavAI-owned field types rather than about vectors — a JavAI collection
+keyed by something other than `String`, a `KnowledgeGraph` field (Neo4j-only), and a collection field that is
+unmapped or is a concrete-typed JavAI collection carrying an association annotation. **Being non-vectorized
+is never one of them**: a plain `@Entity` is a first-class citizen of a `JavAIRepository`, mapped and served
+exactly like a vectorized one, it simply has no vectors. Serving both from one repository type is the design
+intent, not a concession.
+
+For an `@Entity` inside a scanned package that this configuration should not own, use
+`excludeEntityType(...)`/`excludeEntityPackages(...)` (per-configuration — the right tool for a
+backend-specific type such as a `KnowledgeGraph` owner belonging to Neo4j) or `@PersistenceIgnore` on the
+class (global). Exclusion affects scanning only: a type named outright, or reached through a registered
+entity's fields, is registered regardless, since Hibernate cannot map the referencing entity without it.
 
 ## Persisting one entity type to more than one store at once
 
