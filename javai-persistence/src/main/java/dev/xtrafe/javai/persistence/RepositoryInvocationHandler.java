@@ -64,6 +64,8 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             return switch (parsed.kind()) {
                 case FIELD, COMBINED -> backend.findNearestByFieldVector(entityType, parsed.fieldName(), reference, limit);
                 case SUMMARY -> backend.findNearestBySummaryVector(entityType, reference, limit);
+                case CONCATENATED_TEXT ->
+                        backend.findNearestByConcatenatedTextVector(entityType, reference, limit);
             };
         }
         // Ordinary Spring-Data-style derived finder (OMI-138) -- checked after findNearestBy* since the two

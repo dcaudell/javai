@@ -14,6 +14,24 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-model`: dirty propagation stopped early and could leave an ancestor holding stale state
+  (OMI-191).** `propagateDirty` pruned its walk at the first already-`SummaryDirty` node, on the reasoning
+  that a dirty node implies dirty ancestors. That holds for a monotone boolean whose clearer also clears its
+  descendants — true on the path `summaryVector()` takes, since it recurses into each `@Summary` child and
+  clears it on the way — but it is not true for concatenated text: assembling an ancestor's text calls
+  `concatenatedText()` on its descendants, which is pure string work committing nothing, so the ancestor goes
+  clean while its descendants stay dirty. A later mutation then pruned at the dirty descendant and left the
+  clean ancestor silently out of date. The walk now visits each reachable dependent once via an identity set,
+  which also makes cycles terminate. It was the *walk* that was overfitted to a single reader, not just the
+  flag — OMI-187's lesson one level up.
+
+  Cost: no early exit. The set walked is ancestors (typically shallow) and each is visited exactly once.
+
+- **`javai-model`: `hydrateFieldVector` shipped undocumented.** Its javadoc was stranded when
+  `precomputeVectors` was inserted between the block and its method — javadoc binds only the nearest
+  preceding block. Reattached. (Same defect class as `embedAll`'s, fixed in OMI-213; worth noticing that this
+  has now happened twice in this file.)
+
 - **`javai-model`: a bulk `precomputeVectors` seed no longer bypasses the embedding concurrency gate
   (OMI-213).** It called the configured provider without acquiring a permit at all, so a bulk seed ran
   entirely outside the bound `JavAIRuntime.configureMaxConcurrentEmbeddingCalls` documents as applying to
@@ -115,6 +133,44 @@ version -- a given release usually changes only one or two of them.
   now absent, which both removes the call and makes "this field has no content" representable at rest.
 
 ### Added
+
+- **Concatenated text vectoring is now a real, opt-in feature (OMI-191).** `concatenatedTextVector()` was
+  woven onto every `@JavAIVectorizable` from the start, but no backend stored it, no query reached it, every
+  JavAI collection threw `UnsupportedOperationException` when asked for one, and it never recursed — a
+  child's text never reached a parent. It was computed on demand at the price of a real model call, and
+  thrown away.
+
+  It now assembles real text across an object graph and embeds it once, which an embedding model can read
+  relationships out of in a way arithmetic over separately-embedded fields cannot. Opting in is
+  `@Summary(concatenate = true)`, in three independent places: on a **type** (embed my own `@Vectorize`
+  fields), on a **field** referencing a vectorizable (absorb that child's text), or on a **field** holding a
+  JavAI collection (aggregate its members' text). Default `false`, so nothing changes for existing consumers,
+  and a type that declines assembles nothing, embeds nothing, and stores nothing.
+
+  **Assembly is parent-first, and each node contributes exactly once** — a deliberate divergence from
+  `summaryVector()`, where a node reachable by two paths stacks additively. Adding a vector twice is a
+  meaningful weighting; the same paragraph appearing twice in a string is not, it just skews the embedding.
+  The colouring also supplies cycle safety, so diamonds, cycles and self-reference all fall out of one
+  mechanism.
+
+  **Assembly is pure string work**, which is what makes the batched pass possible: `precomputeVectors` builds
+  every text first and only then reaches the network, so a graph of any shape costs one embedding per
+  participating object, in batches. The concatenated pass runs after the field pass so the two never
+  interleave.
+
+  **Storage** is on the entity-grain table (`javai_summary_vectors__<model>`), which keeps its name — that
+  table now holds two entity-level vectors, and renaming it would be a migration bought for cosmetics. The
+  assembled text is stored alongside its vector, so re-embedding under a different model is a pure re-embed
+  rather than a fresh walk of the object graph. Idempotent `ALTER TABLE … ADD COLUMN IF NOT EXISTS` covers
+  already-deployed tables, which `CREATE TABLE IF NOT EXISTS` would silently skip. Neo4j and MongoDB store
+  the same per-entity properties they already use for the summary vector, so neither has a grain problem.
+
+  **`findNearestByConcatenatedTextVector(EmbeddingVector, int)`** searches it, and is rejected at
+  repository-creation time for a type that never participates — otherwise it would return an empty list
+  forever, indistinguishable from "nothing was similar".
+
+  Every JavAI collection now aggregates its members' text instead of throwing. A collection always *can*
+  aggregate; whether it does is the owning field's decision, never the collection's.
 
 - **`javai-vector`: batched `embedAll` on OpenAI, vLLM and TEI (OMI-213).** Ollama was the only bundled
   provider genuinely batching; the other four fell back to the SPI's looping `default` and remained one HTTP

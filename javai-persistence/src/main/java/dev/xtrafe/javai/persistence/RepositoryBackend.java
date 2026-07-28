@@ -83,6 +83,12 @@ interface RepositoryBackend {
 
     List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit);
 
+    /** Searches the concatenated text vector -- the embedding of assembled subtree text, as against
+     *  {@link #findNearestBySummaryVector}'s arithmetic over already-computed vectors (OMI-191). Only ever
+     *  reached for an entity type that participates; {@code DerivedQueryMethods} rejects the rest at
+     *  repository-creation time. */
+    List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference, int limit);
+
     // ---- ordinary Spring-Data-style derived finders (OMI-138) --------------------------------------
     // These four primitives + validation are all a backend implements; DerivedFinderQuery owns the method
     // name grammar, return-type adaptation, and Pageable/Sort/Limit handling. A backend only translates the

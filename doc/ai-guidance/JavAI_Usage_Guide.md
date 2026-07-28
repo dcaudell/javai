@@ -95,6 +95,8 @@ have to live together upstream of everything else. Don't be surprised to find `P
 |---|---|---|---|
 | `EmbeddingVector vector()` | `JavAIVectorizable` | Yes | This object's own embedding, from its `@Vectorize` fields. Recomputes lazily on next read after any of them changes. |
 | `EmbeddingVector summaryVector()` | `JavAIVectorizable` | Yes | Decay-weighted combination of `vector()` and every `@Summary`-marked child's own `summaryVector()`. Cycle-safe. |
+| `EmbeddingVector concatenatedTextVector()` | `JavAIVectorizable` | Yes | One embedding of real text assembled across the object graph, as against `summaryVector()`'s arithmetic over vectors. **Opt-in**: absent, and free, unless you add `@Summary(concatenate = true)`. |
+| `String concatenatedText()` | `JavAIVectorizable` | Yes | The assembled text itself, before embedding — useful for seeing exactly what got vectorized. **`null`** (not `""`) when there is no text: not opted in, or nothing to contribute. |
 | `double similarityTo(JavAIVectorizable other)` | `JavAIVectorizable` | Yes | Cosine similarity between this object's `vector()` and `other`'s. |
 | `double similarityTo(EmbeddingVector reference)` | `JavAIVectorizable` | Yes | Cosine similarity against an arbitrary vector (e.g. a query embedding). |
 | `<T> JavAIList<T> query(EmbeddingVector reference, Class<T> type)` | `JavAIVectorizable` | Yes | Walks the reachable object graph for instances of `type`, ranked by similarity to `reference`. Unbounded depth, cycle-safe. Respects `@SearchVisibility(PRIVATE)`. |
@@ -125,6 +127,7 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@Vectorize` | field | This field contributes to the declaring object's own `vector()`. Also gets a synthesized `<field>Vector()` accessor. |
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
 | `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. |
+| `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
@@ -608,6 +611,38 @@ new EmbeddingProviderOpenAI(apiKey, "text-embedding-3-small", 8_191);
 new EmbeddingProviderOllama(URI.create("http://localhost:11434"), "your-model", 32_768);
 EmbeddingProviderReplicate.builder().apiToken(token).model("owner/model").maxInputTokens(512).build();
 ```
+
+**Want one embedding of a whole document rather than of each field?** That is
+`concatenatedTextVector()` — it assembles real text across an object graph and embeds it once, where
+`summaryVector()` combines already-computed vectors arithmetically. An embedding model can pick up
+relationships across a whole document that vector arithmetic cannot.
+
+It is opt-in, in three independent places, because only you know whether folding a `Song`'s lyrics into an
+`Album` means anything in your domain:
+
+```java
+@JavAIVectorizable
+@Summary(concatenate = true)               // 1. embed my own @Vectorize fields as text
+public class Chapter {
+    @Vectorize private String heading;
+    @Vectorize private String prose;
+
+    @Summary(concatenate = true)           // 2. absorb this child's text into mine
+    private Chapter continuation;
+
+    @Summary(concatenate = true)           // 3. aggregate these members' text into mine
+    private final JavAIArrayList<Footnote> footnotes = new JavAIArrayList<>();
+}
+```
+
+Then search it with `List<Chapter> findNearestByConcatenatedTextVector(EmbeddingVector, int)` on your
+repository. If the entity does not participate, that method is rejected when the repository is created — not
+silently returning nothing forever.
+
+Three things worth knowing. Text is assembled **parent first**, and each object contributes **exactly once**
+even if reachable by several paths (unlike `summaryVector()`, where a node reachable twice deliberately
+counts twice). Cycles are safe. And a type that says nothing costs nothing: no text, no embedding, no stored
+columns.
 
 **Seeding a lot of objects at once?** Vectors are normally computed lazily, one text per HTTP round trip,
 discovered deep inside a read — which is fine for ordinary use and slow for bulk loads: a 1,400-item

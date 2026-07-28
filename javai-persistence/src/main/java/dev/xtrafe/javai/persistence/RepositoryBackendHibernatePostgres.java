@@ -783,6 +783,16 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return hydrate(entityType, rankedIds);
     }
 
+    @Override
+    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
+            int limit) {
+        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
+            String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
+            return rankIds(connection, table, entityType, null, reference, limit, "concatenated_text_vector");
+        }));
+        return hydrate(entityType, rankedIds);
+    }
+
     // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
 
     /** Rejects, at repository-creation time, a derived finder this backend can't translate. Nested filter
@@ -1439,12 +1449,28 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 upsertVector(connection, combinedTable, ownerType, id, COMBINED_VECTOR_FIELD, combined);
             }
 
+            // The entity-grain row now serves two independent opt-ins (OMI-191): write when *either* value
+            // is present, delete only when both are absent. Writing the concatenated columns as NULL when
+            // concatenation is switched off is what stops a stale text vector outliving the opt-in -- the
+            // same stale-row-in-an-ANN-index problem the summary vector's own delete already guards.
             EmbeddingVector summary = vectorizable.summaryVector();
-            if (summary.isAbsent()) {
+            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+            if (summary.isAbsent() && concatenated.isAbsent()) {
                 deleteSummaryVectorRow(connection, currentModelId, ownerType, id);
+            } else if (summary.isAbsent()) {
+                // The `vector` column is NOT NULL, so a row cannot hold concatenated text without a summary
+                // vector. Reasoning says the two always co-occur -- text implies content, and content
+                // implies a non-absent summary contribution -- but that is inference, so this refuses
+                // loudly rather than silently dropping the text or tripping a bare constraint violation.
+                // If this ever fires, the fix is to make `vector` nullable, not to skip the write.
+                throw new IllegalStateException("Entity " + ownerType + "#" + id + " has a concatenated text"
+                        + " vector but an absent summary vector, which the entity-grain table cannot"
+                        + " represent (its `vector` column is NOT NULL). This combination was believed"
+                        + " impossible; please report it with the entity's shape.");
             } else {
                 String summaryTable = ensureSummaryVectorTable(connection, summary.modelId(), summary.dims());
-                upsertSummaryVector(connection, summaryTable, ownerType, id, summary);
+                upsertSummaryVector(connection, summaryTable, ownerType, id, summary, concatenated,
+                        concatenated.isAbsent() ? null : vectorizable.concatenatedText());
             }
         });
     }
@@ -1966,16 +1992,22 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             return;
         }
         Class<?> entityType = entity.getClass();
-        Set<String> fieldNames = EntityReflection.vectorizeFieldNames(entityType);
-        if (fieldNames.isEmpty()) {
-            return;
-        }
         UUID ownerId = EntityReflection.readId(entity);
         if (ownerId == null) {
             return;
         }
-        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
         String ownerType = entityType.getName();
+        // Before the @Vectorize short-circuit below, deliberately: an entity can participate in
+        // concatenation while having no @Vectorize fields of its own (a container that only absorbs its
+        // children -- see @Summary.concatenate's field-level opt-in), and that entity still has a stored
+        // text vector worth restoring.
+        hydrateConcatenatedTextVector(session, entity, modelId, ownerType, ownerId);
+
+        Set<String> fieldNames = EntityReflection.vectorizeFieldNames(entityType);
+        if (fieldNames.isEmpty()) {
+            return;
+        }
+        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
         session.doWork(connection -> {
             if (!tableExists(connection, table)) {
                 // Nothing has been written for this model yet -- a first run, or a model switch. Recompute.
@@ -1999,6 +2031,47 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                                 values, rows.getString("model_id"), rows.getInt("dims"),
                                 rows.getTimestamp("computed_at").toInstant()));
                     }
+                }
+            }
+        });
+    }
+
+    /**
+     * Restores a loaded entity's concatenated text vector from its stored row (OMI-191).
+     *
+     * <p>Matters more than hydrating a field vector. A loaded entity's {@code summaryVector()} is arithmetic
+     * over field vectors hydration already restored, so recomputing costs nothing; the concatenated text
+     * vector is a real embedding, so skipping this would mean a live model call on every load of every
+     * participating entity.
+     */
+    private void hydrateConcatenatedTextVector(Session session, Object entity, String modelId, String ownerType,
+            UUID ownerId) {
+        if (!JavAIRuntime.participatesInConcatenation(entity.getClass())) {
+            return;
+        }
+        String table = SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        session.doWork(connection -> {
+            if (!tableExists(connection, table)) {
+                return;
+            }
+            String sql = "SELECT model_id, dims, concatenated_text_computed_at,"
+                    + " concatenated_text_vector::text FROM " + table
+                    + " WHERE owner_type = ? AND owner_id = ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ownerType);
+                statement.setObject(2, ownerId);
+                try (ResultSet rows = statement.executeQuery()) {
+                    if (!rows.next()) {
+                        return;
+                    }
+                    String literal = rows.getString(4);
+                    Timestamp computedAt = rows.getTimestamp("concatenated_text_computed_at");
+                    if (literal == null || computedAt == null) {
+                        return; // stored without concatenation, or the opt-in was switched off
+                    }
+                    float[] values = parseVectorLiteral(literal);
+                    JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
+                            values, rows.getString("model_id"), values.length, computedAt.toInstant()));
                 }
             }
         });
@@ -2085,12 +2158,25 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
+    /**
+     * Writes the entity-grain row: the summary vector, plus the concatenated text and its vector when the
+     * entity participates (OMI-191).
+     *
+     * <p>The concatenated columns are always assigned, never left alone -- passing an absent
+     * {@code concatenated} writes NULLs, which is how turning {@code @Summary(concatenate = true)} off
+     * clears a previously-stored text vector instead of leaving it to keep matching searches.
+     */
     private static void upsertSummaryVector(Connection connection, String table, String ownerType, UUID ownerId,
-            EmbeddingVector vector) throws SQLException {
-        String sql = "INSERT INTO " + table + " (owner_type, owner_id, model_id, dims, vector, computed_at) "
-                + "VALUES (?, ?, ?, ?, ?::vector, ?) "
+            EmbeddingVector vector, EmbeddingVector concatenated, String concatenatedText) throws SQLException {
+        String sql = "INSERT INTO " + table + " (owner_type, owner_id, model_id, dims, vector, computed_at,"
+                + " concatenated_text, concatenated_text_vector, concatenated_text_computed_at) "
+                + "VALUES (?, ?, ?, ?, ?::vector, ?, ?, ?::vector, ?) "
                 + "ON CONFLICT (owner_type, owner_id) "
-                + "DO UPDATE SET dims = EXCLUDED.dims, vector = EXCLUDED.vector, computed_at = EXCLUDED.computed_at";
+                + "DO UPDATE SET dims = EXCLUDED.dims, vector = EXCLUDED.vector,"
+                + " computed_at = EXCLUDED.computed_at,"
+                + " concatenated_text = EXCLUDED.concatenated_text,"
+                + " concatenated_text_vector = EXCLUDED.concatenated_text_vector,"
+                + " concatenated_text_computed_at = EXCLUDED.concatenated_text_computed_at";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, ownerType);
             statement.setObject(2, ownerId);
@@ -2098,6 +2184,15 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             statement.setInt(4, vector.dims());
             statement.setString(5, toVectorLiteral(vector.values()));
             statement.setTimestamp(6, Timestamp.from(vector.computedAt()));
+            if (concatenated == null || concatenated.isAbsent()) {
+                statement.setNull(7, java.sql.Types.VARCHAR);
+                statement.setNull(8, java.sql.Types.VARCHAR);
+                statement.setNull(9, java.sql.Types.TIMESTAMP);
+            } else {
+                statement.setString(7, concatenatedText);
+                statement.setString(8, toVectorLiteral(concatenated.values()));
+                statement.setTimestamp(9, Timestamp.from(concatenated.computedAt()));
+            }
             statement.executeUpdate();
         }
     }
@@ -2139,12 +2234,20 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  table, which has no per-field dimension. */
     private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
             EmbeddingVector reference, int limit) throws SQLException {
+        return rankIds(connection, table, entityType, fieldName, reference, limit, "vector");
+    }
+
+    /** {@code vectorColumn} names which vector to rank by -- the entity-grain table holds two (OMI-191).
+     *  Rows where it is NULL are excluded, so a non-participating entity never surfaces as a match. */
+    private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
+            EmbeddingVector reference, int limit, String vectorColumn) throws SQLException {
         StringBuilder sql = new StringBuilder("SELECT owner_id FROM ").append(table)
                 .append(" WHERE owner_type = ?");
         if (fieldName != null) {
             sql.append(" AND field_name = ?");
         }
-        sql.append(" ORDER BY vector <=> ?::vector LIMIT ?");
+        sql.append(" AND ").append(vectorColumn).append(" IS NOT NULL");
+        sql.append(" ORDER BY ").append(vectorColumn).append(" <=> ?::vector LIMIT ?");
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
             int index = 1;
             statement.setString(index++, entityType.getName());
@@ -2223,6 +2326,21 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return table;
     }
 
+    /**
+     * The <b>entity-grain</b> vector table: one row per {@code (owner_type, owner_id)}.
+     *
+     * <p>Despite its name it holds more than the summary vector (OMI-191). The concatenated text vector is
+     * also entity-level, and this is exactly the right grain for it -- the field table is keyed
+     * {@code (owner_type, owner_id, field_name)}, so a per-entity value there would be null on every row but
+     * one, with an arbitrary convention for which row carries it. The table keeps its name deliberately:
+     * renaming it would be a migration bought for cosmetics. Read it as "entity-level vectors", of which the
+     * summary vector is one and the concatenated text vector another.
+     *
+     * <p>{@code concatenated_text} is stored alongside its vector so that re-embedding under a different
+     * model is a pure re-embed rather than a fresh walk of the object graph -- text is model-independent.
+     * Postgres TOASTs a {@code text} column automatically, compressing and storing it out-of-line when
+     * large, which is the right behaviour for accumulated subtree text with nothing to configure.
+     */
     private static String ensureSummaryVectorTable(Connection connection, String modelId, int dims) throws SQLException {
         String table = SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
         try (Statement statement = connection.createStatement()) {
@@ -2232,10 +2350,24 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     + "model_id     varchar(128) NOT NULL,"
                     + "dims         integer      NOT NULL,"
                     + "vector       vector(" + dims + ") NOT NULL,"
+                    + "concatenated_text             text        NULL,"
+                    + "concatenated_text_vector      vector(" + dims + ") NULL,"
+                    + "concatenated_text_computed_at timestamptz NULL,"
                     + "computed_at  timestamptz  NOT NULL,"
                     + "PRIMARY KEY (owner_type, owner_id))");
+            // CREATE TABLE IF NOT EXISTS does nothing to a table that already exists, so a deployment that
+            // ran before OMI-191 would keep a three-column-short table and fail on first write. Adding the
+            // columns separately is the migration, and it is idempotent.
+            statement.execute("ALTER TABLE " + table
+                    + " ADD COLUMN IF NOT EXISTS concatenated_text text NULL");
+            statement.execute("ALTER TABLE " + table
+                    + " ADD COLUMN IF NOT EXISTS concatenated_text_vector vector(" + dims + ") NULL");
+            statement.execute("ALTER TABLE " + table
+                    + " ADD COLUMN IF NOT EXISTS concatenated_text_computed_at timestamptz NULL");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_lookup ON " + table + " (owner_type)");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
+            statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_concat_hnsw ON " + table
+                    + " USING hnsw (concatenated_text_vector vector_cosine_ops)");
         }
         return table;
     }

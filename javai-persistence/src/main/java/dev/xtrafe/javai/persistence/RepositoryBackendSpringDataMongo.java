@@ -307,6 +307,14 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         return findNearest(entityType, "summaryVector", reference, limit);
     }
 
+    @Override
+    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
+            int limit) {
+        // Same per-entity property shape as the summary vector above, so this needs no special handling
+        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
+        return findNearest(entityType, "concatenatedTextVector", reference, limit);
+    }
+
     private List<Object> findNearest(
             Class<?> entityType, String basePropertyName, EmbeddingVector reference, int limit) {
         String collectionName = collectionName(entityType);
@@ -865,6 +873,31 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 updates.put(qualifiedSummary, toDoubleList(summary.values()));
                 updates.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
             }
+
+            // Concatenated text and its vector (OMI-191). Per-document fields, exactly like summaryVector
+            // above -- no grain problem here, unlike Postgres' field table. The text is stored alongside so
+            // re-embedding under another model needs no walk of the object graph. $unset when concatenation
+            // is switched off, so a stale text vector cannot outlive the opt-in.
+            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+            if (concatenated.isAbsent()) {
+                clearVectorField(removals, "concatenatedTextVector", currentModelId);
+                if (currentModelId != null) {
+                    removals.add(qualify("concatenatedText", currentModelId));
+                }
+            } else {
+                String qualifiedConcat = qualify("concatenatedTextVector", concatenated.modelId());
+                updates.put(qualifiedConcat, toDoubleList(concatenated.values()));
+                updates.put(qualifiedConcat + "ComputedAt", concatenated.computedAt().toString());
+                String text = vectorizable.concatenatedText();
+                String qualifiedText = qualify("concatenatedText", concatenated.modelId());
+                if (text == null) {
+                    // $unset rather than $set-to-null: concatenatedText() returns null for "there is no
+                    // text", and a BSON null would be a stored value claiming otherwise.
+                    removals.add(qualifiedText);
+                } else {
+                    updates.put(qualifiedText, text);
+                }
+            }
         }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
@@ -997,6 +1030,21 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             }
             String computedAt = doc.getString(qualified + "ComputedAt");
             JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
+                    values, modelId, values.length,
+                    computedAt == null ? Instant.now() : Instant.parse(computedAt)));
+        }
+
+        // The concatenated text vector is a real embedding, not arithmetic over field vectors, so skipping
+        // this would mean a live model call on every load of every participating entity (OMI-191).
+        if (JavAIRuntime.participatesInConcatenation(entityType)
+                && doc.get(qualify("concatenatedTextVector", modelId)) instanceof List<?> storedConcat) {
+            String qualifiedConcat = qualify("concatenatedTextVector", modelId);
+            float[] values = new float[storedConcat.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) storedConcat.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualifiedConcat + "ComputedAt");
+            JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
                     values, modelId, values.length,
                     computedAt == null ? Instant.now() : Instant.parse(computedAt)));
         }
