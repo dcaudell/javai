@@ -512,6 +512,37 @@ code again.
   see a build-time plugin described as available somewhere, verify against `javai-substrate`'s own current
   README before relying on it — the design docs describe it as a future option, not a Phase 0 deliverable.
 
+## Registering entity types
+
+A `JavAIRepository` is realized with `JavAIPI.repository(YourRepository.class, config)`. That call registers
+the repository's entity type, and recursively anything it references.
+
+On the **Postgres** backend, the first actual repository call builds a Hibernate `SessionFactory` whose
+metadata is then immutable — so a type nothing knew about by that point can never be mapped. The simplest way
+to never think about this is to let the configuration declare its own entities:
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+    .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+    .postgresUrl(url).postgresUsername(user).postgresPassword(password)
+    .entityPackages("com.example.domain")   // scanned for @Entity, up front
+    .build();
+```
+
+With that, repositories can be created in any order, at any time — including lazily, long after the
+application has started. Use `.entityType(Foo.class)` / `.entityTypes(...)` for a type living outside the
+scanned packages.
+
+If an `@Entity` under a scanned package belongs to a *different* persistence unit, keep it out with
+`.excludeEntityType(Foo.class)`, `.excludeEntityPackages("com.example.reporting.*")`, or `@PersistenceIgnore`
+on the class. Being non-vectorized is not a reason to exclude anything — a plain `@Entity` is registered and
+served exactly like a vectorized one, it just has no vectors.
+
+Without it, realize every repository before calling a method on any of them. A late call that introduces
+nothing new is harmless; one that introduces an unknown type fails, and says which call built the factory.
+
+Neo4j and MongoDB have no such constraint at all — they hold no boot-time metadata.
+
 ## Runtime backends
 
 The full module set needs three external backends: an embedding-model provider (Vector Core), Postgres+

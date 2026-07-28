@@ -52,8 +52,10 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Deque;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
@@ -64,6 +66,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -215,13 +218,45 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private final JavAIPersistenceConfig config;
     private final Set<Class<?>> registeredEntityTypes = ConcurrentHashMap.newKeySet();
+
+    /** Where the call that built {@link #sessionFactory} came from -- see {@link #describeCallingSite}. */
+    private volatile String factoryBuildTrigger;
     private final Object bootstrapLock = new Object();
     private volatile SessionFactory sessionFactory;
 
     RepositoryBackendHibernatePostgres(JavAIPersistenceConfig config) {
         this.config = config;
-        // Types the caller named explicitly, registered up front so they are known before any discovery
-        // runs -- see JavAIPersistenceConfig.Builder.entityType (OMI-212).
+        // Types the caller named explicitly, plus every @Entity under any package they asked us to scan.
+        // Registered up front so the entity set is complete before anything can be built -- which is what
+        // removes registration ordering as a concern for the caller (OMI-214).
+        for (Class<?> scanned : EntityPackageScanner.scan(
+                config.entityPackages(), Thread.currentThread().getContextClassLoader() != null
+                        ? Thread.currentThread().getContextClassLoader()
+                        : getClass().getClassLoader(),
+                config.excludedEntityTypes(), config.excludedEntityPackages())) {
+            try {
+                registerEntityType(scanned);
+            } catch (RuntimeException e) {
+                // Scanned types are validated exactly like named ones -- an entity JavAI cannot map
+                // correctly must not be registered silently, since Hibernate will map it anyway and JavAI's
+                // half will be wrong. But the caller never asked for this type by name, so say where it
+                // came from and how to stop pulling it in; otherwise the message reads as an error about
+                // an unrelated class.
+                throw new IllegalArgumentException("Scanning " + config.entityPackages() + " for @Entity types "
+                        + "found " + scanned.getName() + ", which JavAI cannot map.\n"
+                        + "  Underlying problem: " + e.getMessage() + "\n"
+                        + "Note this is never about an entity being non-vectorized: a plain @Entity with no "
+                        + "@JavAIVectorizable registers and maps exactly like a vectorized one, it just has "
+                        + "no vectors. Only three things are refused -- a JavAI collection field keyed by "
+                        + "something other than String, a KnowledgeGraph field (Neo4j-only), and a "
+                        + "collection field that is either unmapped or a concrete-typed JavAI collection "
+                        + "carrying an association annotation.\n"
+                        + "If this type belongs to a different persistence unit, exclude it: "
+                        + "excludeEntityType(" + scanned.getSimpleName() + ".class), "
+                        + "excludeEntityPackages(\"" + scanned.getPackageName() + "\"), or annotate it "
+                        + "@PersistenceIgnore. Otherwise fix the mapping.", e);
+            }
+        }
         for (Class<?> additional : config.additionalEntityTypes()) {
             registerEntityType(additional);
         }
@@ -229,35 +264,74 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public void registerEntityType(Class<?> entityType) {
+        Set<Class<?>> closure = entityClosure(entityType);
         if (sessionFactory != null) {
-            throw new IllegalStateException("Cannot register " + entityType.getName() + " -- the SessionFactory "
-                    + "was already built from an earlier repository()'s first use. Call JavAIPI.repository(...) "
-                    + "for every repository interface before invoking methods on any of them.");
+            // The window is shut, but that only matters if this call would introduce something Hibernate
+            // has never seen. Re-realizing a repository for an already-known type -- or for one pulled in
+            // by another entity's fields, or named on the config -- asks nothing new of the frozen
+            // metadata, so it is simply a no-op (OMI-214). Before this, ANY registration after the first
+            // repository call threw, which is what made declaring types up front unable to solve the
+            // ordering problem: the late call failed however completely the types had been declared.
+            List<Class<?>> unknown = closure.stream()
+                    .filter(type -> !registeredEntityTypes.contains(type))
+                    .toList();
+            if (unknown.isEmpty()) {
+                return;
+            }
+            throw new IllegalStateException(lateRegistrationMessage(unknown));
         }
-        registerEntityTypeRecursively(entityType, new HashSet<>());
+        for (Class<?> type : closure) {
+            validateMapKeyTypesAreSupported(type);
+            validateNoKnowledgeGraphFields(type);
+            validateCollectionFieldMapping(type);
+            registeredEntityTypes.add(type);
+        }
     }
 
-    /** Registers {@code entityType} and, recursively, every related entity type reachable through its own
-     *  fields -- a singular {@code @Entity}-typed field, or the element/value type of a {@code Collection}/
-     *  {@code Map} field, if that type is itself {@code @Entity}-annotated. See this class's own javadoc
-     *  ("Related entity types are auto-registered too") for why: it removes the need to separately realize
-     *  a repository for every related type just to get it into Hibernate's boot metadata. {@code visited}
-     *  guards against infinite recursion through a cyclic object graph (e.g. two entities each referencing
-     *  the other). */
-    private void registerEntityTypeRecursively(Class<?> entityType, Set<Class<?>> visited) {
-        if (!visited.add(entityType)) {
-            return;
-        }
-        validateMapKeyTypesAreSupported(entityType);
-        validateNoKnowledgeGraphFields(entityType);
-        validateCollectionFieldMapping(entityType);
-        registeredEntityTypes.add(entityType);
-        for (Field field : EntityReflection.allFields(entityType)) {
-            for (Class<?> relatedType : relatedEntityTypes(field)) {
-                registerEntityTypeRecursively(relatedType, visited);
+    /**
+     * Explains a registration that genuinely cannot be honoured, naming <b>what closed the window</b>.
+     *
+     * <p>The old message named only the type that arrived late, which is never the thing a consumer has to
+     * change -- the fix is always to move whatever built the factory, or to stop needing the ordering at
+     * all. Downstream that cost real time twice: {@code omiai-platform} maintains an 18-name
+     * {@code @DependsOn} list purely to control this, and OMI-212's boot failure read as a mapping bug for
+     * the same reason. So this reports the triggering call site and points at the way out (OMI-214).
+     */
+    private String lateRegistrationMessage(List<Class<?>> unknown) {
+        String names = unknown.stream().map(Class::getName).collect(Collectors.joining(", "));
+        return "Cannot register " + names + " -- the SessionFactory is already built, so Hibernate's mapping "
+                + "metadata is frozen and " + (unknown.size() == 1 ? "this type" : "these types")
+                + " would never be mapped.\n"
+                + "  Built by: " + (factoryBuildTrigger == null ? "(unknown)" : factoryBuildTrigger) + "\n"
+                + "That call is what closed the registration window; every JavAIPI.repository(...) has to "
+                + "happen before it. Better still, stop depending on the ordering altogether by naming the "
+                + "types on the configuration, which registers them before anything can be built:\n"
+                + "  JavAIPersistenceConfig.builder().entityType(" + unknown.get(0).getSimpleName()
+                + ".class)  -- or .entityTypes(...) / .entityPackages(\"your.domain.package\")";
+    }
+
+    /**
+     * Every entity type registering {@code root} would pull in: itself, plus everything reachable through
+     * its fields, transitively. Pure -- it registers nothing and validates nothing -- because
+     * {@link #registerEntityType} needs to know what a registration <em>would</em> add before deciding
+     * whether it may proceed.
+     */
+    private static Set<Class<?>> entityClosure(Class<?> root) {
+        Set<Class<?>> closure = new LinkedHashSet<>();
+        Deque<Class<?>> pending = new ArrayDeque<>();
+        pending.add(root);
+        while (!pending.isEmpty()) {
+            Class<?> type = pending.poll();
+            if (!closure.add(type)) {
+                continue; // already seen -- also the cycle guard, for two entities referencing each other
+            }
+            for (Field field : EntityReflection.allFields(type)) {
+                pending.addAll(relatedEntityTypes(field));
             }
         }
+        return closure;
     }
+
 
     /**
      * Every {@code @Entity}-annotated type reachable through {@code field}: its own type for a singular
@@ -2170,6 +2244,41 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     /** Package-private rather than private so {@link JavAIPI#sessionFactory(JavAIPersistenceConfig)} can
      *  hand this exact instance to a caller wiring their own Spring transaction manager (OMI-160). */
+    /**
+     * The nearest caller outside JavAI's own plumbing, as {@code Class.method(File:line)}.
+     *
+     * <p>Used only to explain a failure. The two ways to build the factory -- the first method call on any
+     * repository, and {@code JavAIPI.sessionFactory(config)} -- both reach here through several JavAI
+     * frames (a dynamic proxy, an invocation handler, a backend method), so the useful frame is the first
+     * one past them.
+     *
+     * <p>Skipping is by <em>class</em> rather than by package prefix, deliberately: this project's own
+     * tests live in {@code dev.xtrafe.javai.persistence} too, so a prefix filter would discard the very
+     * frame that identifies the caller and report "unknown" for exactly the case being tested.
+     */
+    private static String describeCallingSite() {
+        Set<String> ourFrames = Set.of(
+                RepositoryBackendHibernatePostgres.class.getName(),
+                RepositoryInvocationHandler.class.getName(),
+                JavAIPI.class.getName());
+        return StackWalker.getInstance()
+                .walk(frames -> frames
+                        .filter(frame -> !ourFrames.contains(frame.getClassName())
+                                && !isGeneratedProxy(frame.getClassName())
+                                && !frame.getClassName().startsWith("java.lang.reflect.")
+                                && !frame.getClassName().startsWith("java.lang.invoke."))
+                        .findFirst()
+                        .map(frame -> frame.getClassName() + "." + frame.getMethodName()
+                                + "(" + frame.getFileName() + ":" + frame.getLineNumber() + ")")
+                        .orElse("(no caller outside JavAI on the stack)"));
+    }
+
+    /** A JDK dynamic proxy frame. Named for the proxied interface's package when that interface is not
+     *  public, so a {@code jdk.proxy} prefix check misses exactly the repositories this project declares. */
+    private static boolean isGeneratedProxy(String className) {
+        return className.startsWith("jdk.proxy") || className.contains(".$Proxy") || className.startsWith("$Proxy");
+    }
+
     SessionFactory sessionFactory() {
         SessionFactory factory = sessionFactory;
         if (factory != null) {
@@ -2177,6 +2286,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
         synchronized (bootstrapLock) {
             if (sessionFactory == null) {
+                // Captured before the build, so a later late-registration failure can name the call that
+                // closed the registration window rather than only the type that arrived after it (OMI-214).
+                factoryBuildTrigger = describeCallingSite();
                 sessionFactory = config.externalSessionFactory() != null
                         ? nativeFactory(config.externalSessionFactory())
                         : buildSessionFactory();

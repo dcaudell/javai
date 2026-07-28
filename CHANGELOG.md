@@ -14,6 +14,18 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-persistence`: realizing a repository after the `SessionFactory` was built no longer fails when it
+  introduces nothing new (OMI-214).** `registerEntityType` threw whenever the factory existed, *regardless of
+  whether the type was already registered* — so even re-realizing the same repository twice was an error.
+  That is also what made "declare your types up front" unable to solve the ordering problem on its own: the
+  late call failed however completely the types had been declared. Registration now computes what a call
+  *would* add and only refuses when that set genuinely contains something unknown.
+
+- **`javai-persistence`: the late-registration error names the call that built the factory.** It previously
+  named only the type that arrived late, which is never the thing a consumer has to change — the fix is
+  always to move whatever built the factory, or to stop needing the ordering. The message now reports the
+  triggering call site and points at declaring types on the configuration.
+
 - **`javai-persistence` (Postgres): Hibernate's `@Any` mapping no longer fails to boot (OMI-212).** Building
   the `SessionFactory` threw `UnknownEntityTypeException` for any entity type named only by
   `@AnyDiscriminatorValue(entity = …)`. Because that failure is at boot rather than at first use of the
@@ -91,6 +103,42 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **`javai-persistence`: `JavAIPersistenceConfig.Builder.entityPackages(String...)` / `(Collection)`.**
+  Scans the classpath for `@Entity` types under the named packages and registers them when the backend is
+  created, so the entity set becomes a property of the **configuration** rather than of the order
+  repositories happen to be realized in. Repositories may then be created in any order, at any time; a Spring
+  application needs no `@DependsOn` on its factory bean.
+
+  Downstream this was costing real maintenance: `omiai-platform` carried a hand-maintained 18-name
+  `@DependsOn` list that had already drifted two entries out of sync with its own bean declarations, and one
+  of the missing registrations happened *inside* a library call (`JavAITagRepository.create`), where no
+  amount of care reading the configuration would have revealed it.
+
+  Scanning reads class metadata rather than loading classes, so a broad package is cheap and initializes
+  nothing. It validates everything it finds, and refusal is deliberate rather than lenient: an entity
+  Hibernate maps but JavAI cannot is worse than one that is refused, because the failure would surface later
+  and far from its cause. Only three conditions are refused, all about JavAI-owned field types rather than
+  about vectors — a JavAI collection field keyed by something other than `String`, a `KnowledgeGraph` field
+  (Neo4j-only), and a collection field that is unmapped or is a concrete-typed JavAI collection carrying an
+  association annotation. **Being non-vectorized is never one of them**: a plain `@Entity` is a first-class
+  citizen of a `JavAIRepository`, registered and served exactly like a vectorized one, it simply has no
+  vectors.
+
+- **`javai-persistence`: three ways to exclude a type from scanning.**
+  `JavAIPersistenceConfig.Builder.excludeEntityType(Class...)` / `.excludeEntityTypes(Collection)` by class,
+  `.excludeEntityPackages(String...)` by package (matching on package boundaries, with a trailing `.*`
+  accepted), and **`@PersistenceIgnore`** (`javai-annotations`) on the class itself for a type whose owner
+  would rather declare it once than maintain a list elsewhere.
+
+  These are for an `@Entity` that sits inside a scanned package but belongs to a *different* persistence unit
+  or `SessionFactory` — never for non-vectorized entities, which are ordinary citizens of a
+  `JavAIRepository`. Exclusion applies to **scanning only**: a type named by `entityType(...)` is registered
+  regardless, and so is one reached through a registered entity's fields, since Hibernate cannot map the
+  referencing entity without it.
+
+  Backed by Spring's `ClassPathScanningCandidateComponentProvider`; `spring-context` is now a declared
+  (non-optional) dependency of `javai-persistence` rather than an inherited one.
+
 - **`javai-persistence`: `JavAIPersistenceConfig.Builder.entityType(Class)` / `.entityTypes(Collection)`.**
   An escape hatch for types JavAI's discovery cannot see. Registering `@Any` targets fixes the reported bug;
   this fixes the class it belongs to -- discovery finds related types through declared field types, which is
@@ -139,6 +187,11 @@ version -- a given release usually changes only one or two of them.
   than correctness requires. Consumable from every module and from `e2e-client-test`.
 
 ### Changed
+
+- **Docs: the registration model is now documented where consumers read.** It previously existed only in
+  `JavAIPI`'s javadoc — invisible to anyone working from the AI-guidance package, which is precisely the
+  audience most likely to add a repository. Now covered in `persistence-support-matrix.md` and
+  `JavAI_Usage_Guide.md`, including the Postgres-only scope and the recommended `entityPackages(...)` shape.
 
 - **`doc/ai-guidance/persistence-support-matrix.md`: added an `@Any` row.** It was previously in the worst
   category for a consumer -- not documented as unsupported, and *nearly* working, so it read as a usage
