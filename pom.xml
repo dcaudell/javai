@@ -147,7 +147,7 @@
          resolve to. A spring-orm on a different line than the spring-tx it collaborates with is exactly
          the kind of split-version classpath the comments above are guarding against. -->
     <spring-framework.version>7.0.8</spring-framework.version>
-    <mongodb-driver.version>5.9.0</mongodb-driver.version>
+    <mongodb-driver.version>5.9.1</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
       and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
