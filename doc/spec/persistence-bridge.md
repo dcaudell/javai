@@ -291,3 +291,54 @@ are meaningless on a converted value, e.g. `>` on a UUID string, are permitted b
 A repository query (`findNearestByBodyVector`) is scoped to the whole persisted store; an object-level
 `query()` (Vector Core) is scoped to one object's reachable graph. See whitepaper §6.6–§6.7 for the full
 worked contrast and the comparison table for which one to reach for.
+
+## Concatenated text: the entity-grain table holds two vectors (OMI-191)
+
+`concatenatedTextVector()` (see `doc/spec/vector-core.md`) is **entity-level**, not field-level, so it is
+stored on `javai_summary_vectors__<model>` — keyed `(owner_type, owner_id)`, exactly the right grain. The
+field table is keyed `(owner_type, owner_id, field_name)`, so a per-entity value there would be null on every
+row but one, with an arbitrary convention for which row carries it.
+
+```sql
+-- javai_summary_vectors__<model>
+owner_type, owner_id, model_id, dims,
+vector                        vector(N) NOT NULL,   -- summary vector, unchanged
+concatenated_text             text        NULL,     -- new
+concatenated_text_vector      vector(N)   NULL,     -- new
+concatenated_text_computed_at timestamptz NULL,     -- new
+computed_at                   timestamptz NOT NULL,
+PRIMARY KEY (owner_type, owner_id)
+```
+
+**The table keeps its name.** Renaming it would be a migration bought for cosmetics. Read it as *entity-level
+vectors*, of which the summary vector is one and the concatenated text vector another, as against the field
+table's per-field grain.
+
+**Three things worth knowing:**
+
+- **The text is stored, not just its vector.** Text is model-independent, so re-embedding under a different
+  model becomes a pure re-embed rather than a fresh walk of the object graph. Postgres TOASTs a `text`
+  column automatically — compressed and stored out-of-line when large — which is the right behaviour for
+  accumulated subtree text with nothing to configure.
+- **The row now serves two independent opt-ins.** Write when *either* value is present; delete only when both
+  are absent; write the concatenated columns as NULL when concatenation is switched off, so a stale text
+  vector cannot outlive the opt-in and keep matching searches.
+- **`ensureSummaryVectorTable` is `CREATE TABLE IF NOT EXISTS`**, which does nothing to a table that already
+  exists — a pre-OMI-191 deployment would keep a three-column-short table and fail on first write. The three
+  `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements alongside it are the migration, and are idempotent.
+
+`vector NOT NULL` means a row cannot hold concatenated text without a summary vector. Reasoning says the two
+always co-occur (text implies content, content implies a non-absent summary contribution), but that is
+inference, so the write path **refuses loudly** if it ever meets the combination rather than silently
+dropping the text or tripping a bare constraint violation. If it ever fires, the fix is to make `vector`
+nullable, not to skip the write.
+
+**Neo4j and MongoDB need no special handling.** Both already store `summaryVector__<model>` as a per-entity
+property/field; `concatenatedText__<model>` and `concatenatedTextVector__<model>` are the same shape, and
+neither has a grain problem to solve.
+
+**Hydration matters more here than for a field vector.** A loaded entity's `summaryVector()` is arithmetic
+over field vectors hydration already restored, so recomputing costs nothing; the concatenated text vector is
+a real embedding, so not restoring it would mean a live model call on every load of every participating
+entity. All three backends read it back into the entity's slot under the same pristine-slot rule that governs
+field hydration.

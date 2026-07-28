@@ -85,6 +85,23 @@ public final class CollectionVectorSupport {
         return state.cachedSummaryVector();
     }
 
+    /**
+     * A collection's aggregated concatenated text: its members' own text, in iteration order (OMI-191).
+     *
+     * <p>Note the asymmetry with {@link #summaryVector}, which treats every element as an implicit summary
+     * contributor. Here each member must itself opt in via {@code @Summary(concatenate = true)} on its type,
+     * because contributing text is a claim about what the text means, not just arithmetic.
+     */
+    public static String concatenatedText(Object collection, Collection<?> elements) {
+        return JavAIRuntime.concatenatedTextOfCollection(collection, elements);
+    }
+
+    /** The embedding of {@link #concatenatedText}, cached in the collection's own slot. */
+    public static EmbeddingVector concatenatedTextVector(DirtyTrackingSupport state, Object collection,
+            Collection<?> elements) {
+        return JavAIRuntime.collectionConcatenatedTextVector(state, collection, elements);
+    }
+
     /** Call after any mutation: invalidates this collection's own caches and notifies its dependents. */
     public static void onMutated(DirtyTrackingSupport state, Object owner) {
         state.markFieldDirty();

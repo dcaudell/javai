@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.lang.reflect.Method;
@@ -24,11 +25,13 @@ final class DerivedQueryMethods {
     private static final String PREFIX = "findNearestBy";
     private static final String SUFFIX = "Vector";
     private static final String SUMMARY_MIDDLE = "Summary";
+    private static final String CONCATENATED_TEXT_MIDDLE = "ConcatenatedText";
 
     enum Kind {
         FIELD,
         COMBINED,
-        SUMMARY
+        SUMMARY,
+        CONCATENATED_TEXT
     }
 
     record ParsedQuery(Kind kind, String fieldName) {
@@ -57,6 +60,24 @@ final class DerivedQueryMethods {
         if (middle.equals(SUMMARY_MIDDLE)) {
             return new ParsedQuery(Kind.SUMMARY, null);
         }
+        if (middle.equals(CONCATENATED_TEXT_MIDDLE)) {
+            // Rejected here, at repository-creation time, rather than returning nothing on first call
+            // (OMI-191). An entity that never opted in has no stored text vector, so this query would
+            // silently return an empty list forever -- indistinguishable from "nothing was similar". Naming
+            // the missing annotation is the whole point; this is the same convention OMI-212/OMI-214
+            // reinforced, and the same one validateSignature above already follows.
+            //
+            // No ambiguity with a @Vectorize field literally named "concatenatedText": the weaver already
+            // refuses that name, because its per-field accessor would collide with concatenatedTextVector().
+            if (!JavAIRuntime.participatesInConcatenation(entityType)) {
+                throw new IllegalArgumentException(method + " needs " + entityType.getName()
+                        + " to participate in concatenated text vectoring, but it does not. Add"
+                        + " @Summary(concatenate = true) to the type (to embed its own @Vectorize fields)"
+                        + " or to a field (to absorb that child's or collection's text). Without it nothing"
+                        + " is ever stored for this query to search.");
+            }
+            return new ParsedQuery(Kind.CONCATENATED_TEXT, null);
+        }
         String fieldName = Character.toLowerCase(middle.charAt(0)) + middle.substring(1);
         Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
         if (!vectorizeFields.contains(fieldName)) {
@@ -81,7 +102,8 @@ final class DerivedQueryMethods {
     private static IllegalArgumentException unsupported(Method method, Class<?> entityType) {
         return new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
                 + entityType.getName() + " -- JavAIRepository only supports the base CRUD contract plus "
-                + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector(EmbeddingVector, int); "
+                + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector/"
+                + "findNearestByConcatenatedTextVector(EmbeddingVector, int); "
                 + "arbitrary derived queries aren't part of Persistence Bridge's contract.");
     }
 }

@@ -158,6 +158,20 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
         // An element mutating reaches a containing collection only as SummaryDirty (propagateDirty marks
         // dependents, never their FieldDirty), and that same event invalidates the centroid.
         centroidDirty = true;
+        // ...and it invalidates any concatenated text this object absorbed from that descendant (OMI-191).
+        //
+        // Deliberately a slot generation bump rather than a fourth boolean flag alongside fieldDirty/
+        // summaryDirty/centroidDirty. OMI-187's lesson was that one boolean cannot serve two independent
+        // readers -- whichever reader clears it starves the other -- and the fix it points at is exactly
+        // what VectorCacheSlot already provides: per-reader validity, tracked by generation. The
+        // concatenated text has its own slot, so bumping it here gives it independent staleness for free,
+        // and does so in the currency the read path already speaks: a bumped generation is what makes the
+        // slot dirty, drives COALESCED/EVENTUAL dispatch, and single-flights correctly. A separate boolean
+        // would sit outside all of that and have to be reconciled with it by hand.
+        //
+        // Harmless for an object that does not participate in concatenation: its concatenatedTextVector()
+        // returns absent without ever consulting this slot, so the bump is simply never read.
+        concatenatedTextSlot.bumpGeneration();
     }
 
     @Override

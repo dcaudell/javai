@@ -76,7 +76,7 @@ public final class JavAIWeaver {
     private static final Set<String> RESERVED_METHOD_NAMES = Set.of(
             "markFieldDirty", "isFieldDirty", "clearFieldDirty", "markSummaryDirty", "isSummaryDirty",
             "clearSummaryDirty", "addDependent", "dependents", "vector", "concatenatedTextVector", "fieldVector",
-            "summaryVector", "similarityTo", "query");
+            "summaryVector", "similarityTo", "query", "concatenatedText");
 
     private static final Method MARK_FIELD_DIRTY = runtimeMethod("markFieldDirty", Object.class);
     private static final Method IS_FIELD_DIRTY = runtimeMethod("isFieldDirty", Object.class);
@@ -88,6 +88,7 @@ public final class JavAIWeaver {
     private static final Method DEPENDENTS = runtimeMethod("dependents", Object.class);
     private static final Method VECTOR = runtimeMethod("vector", Object.class, String.class);
     private static final Method CONCATENATED_TEXT_VECTOR = runtimeMethod("concatenatedTextVector", Object.class, String.class);
+    private static final Method CONCATENATED_TEXT = runtimeMethod("concatenatedText", Object.class, String.class);
     private static final Method FIELD_VECTOR = runtimeMethod("fieldVector", Object.class, String.class);
     private static final Method SUMMARY_VECTOR =
             runtimeMethod("summaryVector", Object.class, String.class, String.class);
@@ -155,6 +156,12 @@ public final class JavAIWeaver {
                 .intercept(MethodCall.invoke(VECTOR).withThis().with(vectorizeFieldsCsv))
                 .defineMethod("concatenatedTextVector", EmbeddingVector.class, Visibility.PUBLIC)
                 .intercept(MethodCall.invoke(CONCATENATED_TEXT_VECTOR).withThis().with(vectorizeFieldsCsv))
+                // Overrides JavAIVectorizable's "" default so each class assembles its own contribution from
+                // its own baked @Vectorize list -- which is exactly what a parent absorbing a child needs
+                // (OMI-191). The concatenate opt-ins themselves are read from annotations at runtime rather
+                // than baked here; see JavAIRuntime.concatenatedText for why.
+                .defineMethod("concatenatedText", String.class, Visibility.PUBLIC)
+                .intercept(MethodCall.invoke(CONCATENATED_TEXT).withThis().with(vectorizeFieldsCsv))
                 .defineMethod("fieldVector", EmbeddingVector.class, Visibility.PUBLIC)
                 .withParameters(String.class)
                 .intercept(MethodCall.invoke(FIELD_VECTOR).withThis().withArgument(0))

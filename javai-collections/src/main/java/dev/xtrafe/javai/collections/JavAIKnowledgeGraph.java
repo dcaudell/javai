@@ -178,7 +178,15 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
 
     @Override
     public EmbeddingVector concatenatedTextVector() {
-        throw new UnsupportedOperationException("JavAIKnowledgeGraph has no @Vectorize fields of its own");
+        return CollectionVectorSupport.concatenatedTextVector($javai$state, this, nodes);
+    }
+
+    /** This collection's members' concatenated text, in iteration order (OMI-191). Aggregating is
+     *  always possible; whether it happens is decided by the owning field's
+     *  {@code @Summary(concatenate = true)}, never by the collection itself. */
+    @Override
+    public String concatenatedText() {
+        return CollectionVectorSupport.concatenatedText(this, nodes);
     }
 
     @Override

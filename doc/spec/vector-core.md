@@ -252,10 +252,10 @@ means there's no "mutation" to eagerly react to — only ever a new instance).
 - **`vector()`** — the compositional aggregate: centroid of each `@Vectorize` field's own `fieldVector()`.
   Free to evolve independently as more modalities are added (e.g. a future per-modality centroid rather than
   one flattened text embedding).
-- **`concatenatedTextVector()`** — a single embedding of every field's current value concatenated into one
-  concatenated text block, exactly what `vector()` computed before per-field caching existed. Kept under its
-  own name specifically so `vector()` remains free to change shape for a multi-modal future without losing
-  this simpler, holistic embedding as an option.
+- **`concatenatedTextVector()`** — a single embedding of real text assembled from the object graph. Kept
+  under its own name specifically so `vector()` remains free to change shape for a multi-modal future without
+  losing this simpler, holistic embedding as an option. **Opt-in as of OMI-191** — see "Concatenated text
+  vectoring" below; it returns an absent vector, costing nothing, for a type that has not asked for it.
 - **`summaryVector()`** — the hierarchical, decay-weighted aggregate over the object's contained/referenced
   graph (see the formula below) — unrelated to either of the above except that it uses `vector()` as its own
   base term.
@@ -528,3 +528,80 @@ acquire enough permits, so bulk seeding would deadlock rather than be bounded. T
 new in OMI-213: `precomputeVectors` previously called the provider without touching the gate, so a bulk seed
 ran entirely outside the bound that is documented as applying to every provider call in every consistency
 mode.
+
+## Concatenated text vectoring (OMI-191, not in the whitepaper)
+
+`concatenatedTextVector()` is the other kind of aggregate: where `summaryVector()` does arithmetic over
+already-computed vectors, this assembles **real text** from an object graph into one string and embeds that
+once. An embedding model can capture relationships across a whole document that combining separately-embedded
+fields arithmetically cannot.
+
+It was woven onto every `@JavAIVectorizable` from the start, but nothing stored it, no query reached it, and
+every JavAI collection threw `UnsupportedOperationException` when asked for one. It was computed on demand at
+the price of a real model call, and thrown away. This makes it a real feature and, in the same move, makes it
+**opt-in** — a type that says nothing gets an absent vector, assembles no text, and never reaches the
+provider.
+
+### Three independent opt-ins
+
+Nothing is accumulated unless asked for. The library cannot know whether folding a `Song`'s lyrics into an
+`Album` is meaningful for a given domain, so it must not guess.
+
+| Placement | Meaning |
+|---|---|
+| `@Summary(concatenate = true)` on a **TYPE** | This class produces text from its own `@Vectorize` fields |
+| `@Summary(concatenate = true)` on a **FIELD** referencing a vectorizable | Absorb that child's text into mine |
+| `@Summary(concatenate = true)` on a **FIELD** holding a JavAI collection | Aggregate its members' text into mine |
+
+`concatenate` defaults to `false`, so nothing changes for existing consumers. The three are genuinely
+independent: a container may absorb its children without contributing its own fields, which is what you want
+when its own fields are bookkeeping. A JavAI collection always *can* aggregate; whether it does is decided by
+the **owning field**, never by the collection.
+
+Note this **adds to** `@Summary`'s existing meaning rather than replacing it — such a field still contributes
+to `summaryVector()`. There is deliberately no way to absorb a child's text while excluding it from the
+summary vector; no use case demanded it, and a second orthogonal flag is a worse default than an honest
+restriction.
+
+Before this, `@Summary` on a TYPE was inert: the target was declared, every reader was field-only. That is
+what left the TYPE placement free to be given this meaning.
+
+### Assembly: parent first, each node exactly once
+
+Text is assembled parent-first, newline-separated, with each node contributing **exactly once per assembly**.
+
+That last part is a deliberate divergence from `summaryVector()`, which lets a node reachable by two paths
+stack additively — adding a vector twice is a meaningful weighting. The same paragraph appearing twice in one
+string is not a weighting; it just skews the embedding toward whatever it happens to say. The colouring also
+supplies cycle safety, so a diamond, a cycle and a self-reference all fall out of one mechanism rather than
+three.
+
+`concatenatedText()` returns **`null`, never `""`**, when there is no text -- a type that declined, or one that participates but has nothing in its fields. The empty string is a *value*, and a value is something a provider will embed; that is precisely the wasted call (and the space-shaped vector real providers return for an empty input) that OMI-187 removed from the collection path. `null` maps straight onto `EmbeddingVector.absent()`, so "there is nothing here" stays representable rather than approximated all the way down.
+
+Assembly is **pure string work** — no embedding happens while walking the graph. That is what makes the
+batched pass possible: `precomputeVectors` builds every text first and only then reaches the network, so a
+graph of any size or shape costs one embedding per participating object, in batches, rather than one call
+discovered at a time inside a read. The concatenated pass runs *after* the field pass, so assembly never
+interleaves with per-field embedding.
+
+### Staleness, and a propagation bug this surfaced
+
+The concatenated text has its own `VectorCacheSlot`, so it gets independent validity by generation — the same
+mechanism that gives each `@Vectorize` field its own. A descendant's mutation bumps its ancestors' slots
+through the existing dependent walk.
+
+Making that work required fixing `propagateDirty`, which had pruned at the first already-`SummaryDirty` node.
+That prune is sound for a monotone boolean whose clearer also clears its descendants, which holds on the path
+`summaryVector()` itself takes. **It does not hold for concatenated text**: assembling an ancestor's text
+calls `concatenatedText()` on its descendants, which is pure string work committing nothing, so the ancestor
+goes clean while its descendants stay dirty. A later mutation down there would prune at the dirty descendant
+and leave the clean ancestor holding silently stale text. The walk now visits each reachable dependent once
+via an identity set. It is the *walk* that was overfitted to a single reader, not just the flag — OMI-187's
+lesson one level up.
+
+### Storage and query
+
+Persisted on the entity-grain table alongside the summary vector; see `doc/spec/persistence-bridge.md`.
+`findNearestByConcatenatedTextVector(EmbeddingVector, int)` searches it, and is **rejected at
+repository-creation time** for an entity type that does not participate — otherwise it would return an empty
+list forever, indistinguishable from "nothing was similar".

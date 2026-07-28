@@ -267,6 +267,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         return findNearest(entityType, "summaryVector", reference, limit);
     }
 
+    @Override
+    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
+            int limit) {
+        // Same per-entity property shape as the summary vector above, so this needs no special handling
+        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
+        return findNearest(entityType, "concatenatedTextVector", reference, limit);
+    }
+
     private List<Object> findNearest(
             Class<?> entityType, String basePropertyName, EmbeddingVector reference, int limit) {
         String label = label(entityType);
@@ -740,6 +748,26 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 properties.put(qualifiedSummary, summary.values());
                 properties.put(qualifiedSummary + "ComputedAt", summary.computedAt().toString());
             }
+
+            // Concatenated text and its vector (OMI-191). No grain problem here, unlike Postgres: these are
+            // per-entity properties on the node, exactly like summaryVector above. The text itself is stored
+            // alongside so re-embedding under another model needs no walk of the object graph. Nulling both
+            // when concatenation is switched off is what stops a stale text vector outliving the opt-in.
+            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+            if (concatenated.isAbsent()) {
+                clearVectorProperty(properties, "concatenatedTextVector", currentModelId);
+                if (currentModelId != null) {
+                    properties.put(qualify("concatenatedText", currentModelId), null);
+                }
+            } else {
+                String qualifiedConcat = qualify("concatenatedTextVector", concatenated.modelId());
+                properties.put(qualifiedConcat, concatenated.values());
+                properties.put(qualifiedConcat + "ComputedAt", concatenated.computedAt().toString());
+                // A null text removes the property, which is exactly right: concatenatedText() returns
+                // null for "there is no text", and Neo4j has no separate unset step to make.
+                properties.put(qualify("concatenatedText", concatenated.modelId()),
+                        vectorizable.concatenatedText());
+            }
         }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
@@ -958,6 +986,23 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                     ? Instant.parse(node.get(qualified + "ComputedAt").asString())
                     : Instant.now();
             JavAIRuntime.hydrateFieldVector(entity, fieldName,
+                    new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+
+        // The concatenated text vector is a real embedding, not arithmetic over field vectors, so skipping
+        // this would mean a live model call on every load of every participating entity (OMI-191).
+        String qualifiedConcat = qualify("concatenatedTextVector", modelId);
+        if (JavAIRuntime.participatesInConcatenation(entityType) && node.containsKey(qualifiedConcat)
+                && !node.get(qualifiedConcat).isNull()) {
+            List<Object> raw = node.get(qualifiedConcat).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualifiedConcat + "ComputedAt")
+                    ? Instant.parse(node.get(qualifiedConcat + "ComputedAt").asString())
+                    : Instant.now();
+            JavAIRuntime.hydrateConcatenatedTextVector(entity,
                     new EmbeddingVector(values, modelId, values.length, computedAt));
         }
     }
