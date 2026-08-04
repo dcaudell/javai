@@ -168,7 +168,7 @@
     <!-- CompletionRequest.render()'s Mustache-compatible templating engine (javai-completion). Current
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
-    <handlebars.version>4.5.3</handlebars.version>
+    <handlebars.version>4.5.4</handlebars.version>
     <!-- Forces jackson-annotations onto the same release line as the jackson-databind Spring AI already
          pulls in transitively (2.21.x). javai-tagging is the first module to combine Hibernate
          (javai-persistence) with Spring AI's own Jackson stack (javai-completion) and Testcontainers'
