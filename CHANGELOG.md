@@ -12,6 +12,55 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Added
+
+- **`javai-persistence`: a vector search can be narrowed by a relational predicate, return each hit's
+  similarity, and be paged (OMI-230).** `findNearestBy<Field>Vector(reference, limit)` took a reference and a
+  limit and nothing else, so *"the nearest N that **also** satisfy X"* was not expressible. The workaround was
+  over-fetching — unbounded, because the ratio depends entirely on the data, and blind, because the ranking
+  information that would have said whether to fetch more was discarded along with the results.
+
+  Two idioms, which compile to the same query (`NearestSpec`) so they cannot answer differently:
+
+  ```java
+  // the method-name convention -- validated at repository-creation time, query visible in the interface
+  List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+  List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(EmbeddingVector r, Kind kind, Limit limit);
+  List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+
+  // ...and the builder, for a predicate composed at runtime
+  notes.nearestBy("caption").to(reference)
+       .where("kind").in(Kind.IMAGE, Kind.SHORT).and("published").isTrue()
+       .offset(20).limit(20).ranked();
+  ```
+
+  Everything after `Vector` is parsed by the same Spring Data `PartTree` the ordinary `findBy…` finders use,
+  and translated by the same backend code — so the full relational vocabulary (operators, `And`/`Or`, nested
+  paths, `IgnoreCase`) is available with no second grammar and identical semantics by construction. The one
+  real ambiguity is that `Vector` can occur inside a field name *or* a predicate property; the parser scans
+  right to left and requires the tail to begin with `And`, which resolves both directions and is tested from
+  both (`findNearestBySubVectorVector`, `findNearestByCaptionVectorAndVectorNameContaining`).
+
+  **The limit applies after the predicate**, which is the entire contract: N matches means N results, not
+  "however many of the nearest N happened to match". Postgres resolves the predicate to an id set and ranks
+  within it; MongoDB hands that id set to `$vectorSearch`'s own `filter`, a genuine pre-filter (its index
+  definition now declares `_id` as a filter field — **an index created by an earlier version lacks that path
+  and must be dropped so it can be recreated**). **Neo4j refuses to narrow**, at repository-creation time for
+  the method-name idiom and at execution for the builder: `db.index.vector.queryNodes` picks its K nearest
+  before Cypher can filter, so narrowing there could only return fewer than the requested limit and silently
+  answer a different question — the same over-fetch, hidden inside the library. Ranked results and paging
+  work on all three backends.
+
+  `Ranked.similarity()` is plain cosine in `[-1, 1]` everywhere — the same number `similarityTo` returns in
+  process, so one threshold means one thing whichever store answered. That is a conversion, not a passthrough:
+  pgvector reports cosine *distance*, while Neo4j and MongoDB both report `(1 + cosine) / 2`, and each backend
+  undoes its own convention where it is known. Asserted numerically per backend rather than by ordering, since
+  an unconverted score still produces a plausible-looking ranking and only the value catches it.
+
+  Internally the three `findNearestBy*` SPI methods collapsed into one `findNearest(entityType, spec)`: they
+  differed only in which stored vector to rank against, and adding a predicate, an offset and a distance to
+  each of three signatures across three backends would have multiplied a difference that was never real.
+
 ### Fixed
 
 - **`javai-persistence`: `@Version` is usable, not merely honored (OMI-254).** Optimistic locking always

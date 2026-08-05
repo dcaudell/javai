@@ -102,7 +102,12 @@ public final class JavAIPI {
                 continue; // the base CRUD contract itself, always fine
             }
             if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
-                DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
+                DerivedQueryMethods.ParsedQuery parsed =
+                        DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
+                // Store-specific feasibility, exactly as the relational half below does it: a backend whose
+                // vector index cannot narrow before it limits must say so now, not on the first call
+                // (OMI-230). The shape is entirely decided by the method name, so no call is needed to know it.
+                backend.validateNearestQuery(entityType, DerivedQueryMethods.shapeOnly(parsed));
                 continue;
             }
             if (DerivedFinderQuery.looksLikeDerivedFinder(method)) {
@@ -112,9 +117,11 @@ public final class JavAIPI {
             }
             throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
                     + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, the "
-                    + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector(EmbeddingVector, int) "
-                    + "vector convention, and ordinary Spring-Data-style derived finders "
-                    + "(findBy/existsBy/countBy/deleteBy...); this name matches none of them.");
+                    + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector vector "
+                    + "convention (optionally narrowed as ...VectorAnd<Predicate>, returning List<Ranked<T>>, "
+                    + "and/or paged with a trailing Pageable/Limit), and ordinary Spring-Data-style derived "
+                    + "finders (findBy/existsBy/countBy/deleteBy...); this name matches none of them. For a "
+                    + "query composed at runtime rather than declared, use nearest()/nearestBy(field) instead.");
         }
     }
 

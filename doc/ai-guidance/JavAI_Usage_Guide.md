@@ -558,6 +558,63 @@ code again.
   see a build-time plugin described as available somewhere, verify against `javai-substrate`'s own current
   README before relying on it — the design docs describe it as a future option, not a Phase 0 deliverable.
 
+## Vector search: narrowing, ranking and paging
+
+The base convention is `findNearestBy<Field>Vector(EmbeddingVector reference, int limit)` — `<Field>` naming
+the woven accessor (`bodyVector()` → `findNearestByBodyVector`), with `findNearestByVector` /
+`findNearestBySummaryVector` / `findNearestByConcatenatedTextVector` for the whole-object variants.
+
+**You can also narrow it by an ordinary relational predicate, keep each hit's similarity, and page it.**
+Two idioms, which compile to the same query, so they cannot disagree:
+
+```java
+public interface MediaNoteRepository extends JavAIRepository<MediaNote> {
+    // narrowed: everything after Vector is the ordinary derived-finder grammar
+    List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+    List<MediaNote> findNearestByCaptionVectorAndKindInAndPublishedTrue(
+            EmbeddingVector reference, int limit, Collection<Kind> kinds);
+
+    // ranked: keeps the similarity each hit was ranked on
+    List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(
+            EmbeddingVector reference, Kind kind, Limit limit);
+
+    // paged: a trailing Pageable supplies the window and the offset (so no int limit is declared)
+    List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+}
+```
+
+```java
+// or build it at runtime, when the predicate isn't known when the interface is written
+List<Ranked<MediaNote>> hits = notes.nearestBy("caption")     // nearest()/nearestBySummary() also exist
+        .to(reference)
+        .where("kind").in(Kind.IMAGE, Kind.SHORT)
+        .and("published").isTrue()
+        .offset(20).limit(20)
+        .ranked();                                            // or .results() for bare entities
+```
+
+Prefer the method-name form when it fits: it is validated when the repository is created rather than when it
+is called, and the query is visible in the interface. Reach for the builder when the predicate is composed at
+runtime, or the shape isn't worth a method.
+
+**Three things to know before relying on it:**
+
+- **The limit applies *after* the predicate.** Asking for the nearest 3 of some kind gives you 3 of them, not
+  "however many of the overall nearest 3 happened to be that kind". This is the difference between the
+  feature and the over-fetch-and-discard it replaces, so don't reintroduce the over-fetch out of habit.
+- **Narrowing is Postgres and MongoDB only. Neo4j refuses it**, and refuses loudly when the repository is
+  created — its vector index answers only "the K nearest", so a predicate could only be applied to what the
+  index already chose. If you are on Neo4j: use `JavAIVectorizable.query(...)` to rank in memory after an
+  ordinary derived finder narrows, or filter in the caller and accept the over-fetch explicitly. Ranked
+  results and paging *do* work on Neo4j.
+- **`Ranked.similarity()` is plain cosine in `[-1, 1]`** on every backend — the same number `similarityTo`
+  gives you in process, so a threshold means the same thing whichever store answered. (`Ranked.distance()` is
+  `1 - similarity` if you would rather think in distances.)
+
+⚠️ **MongoDB only:** a vector search index created before this feature existed lacks the `_id` filter path
+narrowing needs, and index definitions are not amended in place. If a narrowed search fails on an index an
+older version created, drop it and let JavAI recreate it.
+
 ## Registering entity types
 
 A `JavAIRepository` is realized with `JavAIPI.repository(YourRepository.class, config)`. That call registers

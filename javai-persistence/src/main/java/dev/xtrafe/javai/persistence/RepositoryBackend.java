@@ -93,16 +93,44 @@ interface RepositoryBackend {
 
     void deleteById(Class<?> entityType, UUID id);
 
-    /** {@code fieldName} may be {@link #COMBINED_VECTOR_FIELD} for the object's own combined vector. */
-    List<Object> findNearestByFieldVector(Class<?> entityType, String fieldName, EmbeddingVector reference, int limit);
+    // ---- vector search (OMI-230 collapsed the three findNearestBy* methods into one) -----------------
 
-    List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit);
+    /**
+     * Ranks {@code entityType} by similarity to {@code spec}'s reference vector, hydrating each hit exactly
+     * as {@link #findById} would, in nearest-first order.
+     *
+     * <p><b>One method rather than the three this used to be</b> ({@code findNearestByFieldVector}/
+     * {@code …BySummaryVector}/{@code …ByConcatenatedTextVector}). Those differed only in which stored vector
+     * to rank against, which {@link NearestSpec#kind()} now carries, and adding a predicate, an offset and a
+     * distance to each of three signatures across three backends would have multiplied a difference that was
+     * never really there. The kinds still differ in <em>where</em> the vector lives -- notably on Postgres,
+     * where the field-grain and entity-grain tables are separate -- which is a backend's business, not the
+     * SPI's.
+     *
+     * <p>Hits carry their similarity because the caller may have asked for it ({@link Ranked}); a caller who
+     * did not simply gets the entities unwrapped a layer up, so a backend never has to know which idiom or
+     * return type asked. Similarity is normalized to cosine in {@code [-1, 1]} <em>by the backend</em>, since
+     * only the backend knows what its own store's score meant -- see {@link Ranked} for why that conversion
+     * cannot be left to a shared helper.
+     *
+     * @see NearestSpec for the limit-applies-after-the-predicate contract
+     */
+    List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec);
 
-    /** Searches the concatenated text vector -- the embedding of assembled subtree text, as against
-     *  {@link #findNearestBySummaryVector}'s arithmetic over already-computed vectors (OMI-191). Only ever
-     *  reached for an entity type that participates; {@code DerivedQueryMethods} rejects the rest at
-     *  repository-creation time. */
-    List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference, int limit);
+    /**
+     * Rejects, at repository-creation time, a vector search this specific backend structurally cannot serve.
+     *
+     * <p>The case this exists for is narrowing. A store whose vector index answers only "the top K nearest"
+     * cannot apply a relational predicate <em>before</em> that K is chosen, and the two ways to paper over it
+     * are both worse than refusing: over-fetching returns fewer than the caller asked for whenever the
+     * predicate is selective, and post-filtering silently answers a different question. Refusing loudly, at
+     * creation time, is the same bar {@link #validateDerivedQuery} already sets for relational finders and
+     * the same one {@code @Any} and {@code KnowledgeGraph} fields are held to per backend.
+     *
+     * <p>The default accepts everything, since a backend that can narrow has nothing to add.
+     */
+    default void validateNearestQuery(Class<?> entityType, NearestSpec spec) {
+    }
 
     // ---- ordinary Spring-Data-style derived finders (OMI-138) --------------------------------------
     // These four primitives + validation are all a backend implements; DerivedFinderQuery owns the method

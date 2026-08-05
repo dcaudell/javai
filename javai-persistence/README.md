@@ -14,7 +14,9 @@ alongside their ORM.
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
 | `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
-| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call |
+| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call. Optionally narrowed (`…VectorAnd<Predicate>`), ranked (`List<Ranked<T>>`) and paged (trailing `Pageable`/`Limit`) since OMI-230 |
+| `NearestQuery<T>` | Builder, from `nearest()`/`nearestBy(field)`/`nearestBySummary()` | The same vector search composed at runtime instead of declared as a method name -- `where(…)`, `offset`/`limit`, `results()`/`ranked()` |
+| `Ranked<T>` | Result record | A hit plus the cosine similarity it was ranked on, normalized to `[-1, 1]` on every backend |
 | `findBy…` / `existsBy…` / `countBy…` / `deleteBy…` | Ordinary relational derived finders | Full Spring-Data-style finders (parsed via `PartTree`) resolved against the entity's own mapped columns, so one repository serves both an entity's relational access and its vector search; also validated at creation time -- see "Ordinary relational derived finders" below |
 | `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
 | `javai_vectors__<model>` / `javai_summary_vectors__<model>` | Postgres tables, owned by this module, one pair per model | Per-field + combined vectors, and `summaryVector()`, respectively -- never the developer's own entity table |
@@ -114,6 +116,42 @@ identical field values on every invocation would silently multiply backends inst
 (`bodyVector()` -> `findNearestByBodyVector`), not the bare field name -- deliberately the same name a
 developer would already call directly on a woven object. `findNearestByVector`/`findNearestBySummaryVector`
 are the whole-object variants, for the object's own combined `vector()`/`summaryVector()`.
+
+**A vector search can be narrowed, ranked and paged (OMI-230).** `(reference, limit)` and nothing else made
+*"the nearest N that **also** satisfy X"* inexpressible, leaving over-fetch-and-discard as the only recourse
+-- unbounded, since how much to over-fetch depends entirely on the data, and blind, since the ranking
+information that would have said whether to fetch more was discarded with the results. Two idioms now express
+it, and they compile to the same query (`NearestSpec`) so neither can answer differently from the other:
+
+```java
+// the method-name convention, validated at repository-creation time
+List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(EmbeddingVector r, Kind kind, Limit limit);
+List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+
+// ...or the builder, for a predicate composed at runtime
+notes.nearestBy("caption").to(reference)
+     .where("kind").in(Kind.IMAGE, Kind.SHORT).and("published").isTrue()
+     .offset(20).limit(20).ranked();
+```
+
+Everything after `Vector` is parsed by the same Spring Data `PartTree` the ordinary `findBy…` finders use, so
+the whole relational vocabulary -- operators, `And`/`Or`, nested paths, `IgnoreCase` -- is available with no
+second grammar, and is translated by the same backend code, so semantics are identical by construction. The
+one genuine ambiguity is that `Vector` can appear inside a field name *or* a predicate property; the parser
+scans right to left and requires the tail to begin with `And`, which resolves both directions
+(`findNearestBySubVectorVector`, `findNearestByCaptionVectorAndVectorNameContaining`).
+
+**The limit applies after the predicate**, which is the whole contract: N matches means N results, not
+"however many of the nearest N happened to match". Postgres resolves the predicate to an id set and ranks
+within it; MongoDB hands that id set to `$vectorSearch`'s own `filter`, a genuine pre-filter. **Neo4j refuses
+to narrow**, at repository-creation time -- `db.index.vector.queryNodes` picks its K nearest before Cypher can
+filter, so narrowing there could only ever return fewer than the requested limit and quietly answer a
+different question. Ranked results and paging work on all three.
+
+`Ranked.similarity()` is plain cosine in `[-1, 1]` everywhere -- the same number `similarityTo` gives in
+process -- which is a conversion, not a passthrough: pgvector reports cosine *distance*, Neo4j and MongoDB
+both report `(1 + cosine) / 2`. Each backend converts as it reads its own result.
 
 **Let the config name its entity types, and registration ordering stops mattering (OMI-214).**
 `JavAIPI.repository(...)` accumulates entity types under the hood; the Postgres backend's internal

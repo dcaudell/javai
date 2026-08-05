@@ -336,6 +336,56 @@ is why the note is specific to the two reflective backends. (Range comparisons o
 ISO-8601 string, e.g. an `Instant`, remain correct because ISO-8601 sorts lexicographically; comparisons that
 are meaningless on a converted value, e.g. `>` on a UUID string, are permitted but not meaningful.)
 
+## Vector search combined with a relational predicate (OMI-230)
+
+`findNearestBy…Vector(reference, limit)` used to be the whole vector surface, which made *"the nearest N that
+**also** satisfy X"* inexpressible. The only recourse was to over-fetch and discard — unboundedly, since the
+ratio depends entirely on the data, and blindly, since the ranking information that would have said whether
+to fetch more was thrown away with the results. Three things close that, in **two idioms that compile to the
+same query** (`NearestSpec`), so neither can answer differently from the other:
+
+```java
+public interface MediaNoteRepository extends JavAIRepository<MediaNote> {
+    // 1. a predicate: everything after Vector is parsed by the same PartTree the findBy… finders use
+    List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+
+    // 2. a ranked return: each hit keeps the similarity it was ranked on
+    List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(
+            EmbeddingVector reference, Kind kind, Limit limit);
+
+    // 3. paging: a trailing Pageable supplies the window *and* the offset, so no int limit is declared
+    List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+}
+
+// ...or, for a predicate composed at runtime, the builder — same mechanism, no method to declare:
+List<Ranked<MediaNote>> hits = notes.nearestBy("caption")
+        .to(reference)
+        .where("kind").in(Kind.IMAGE, Kind.SHORT)
+        .and("published").isTrue()
+        .offset(20).limit(20)
+        .ranked();
+```
+
+**The contract, and the whole point: the limit applies *after* the predicate.** "The nearest N that also
+satisfy X" is a different question from "the ones among the nearest N that satisfy X", and only the first is
+answerable without over-fetching. A backend that cannot honor that ordering **refuses the query** rather than
+approximating it (`RepositoryBackend.validateNearestQuery`) — for the method-name idiom at repository-creation
+time, and for the builder when it runs, since its predicate does not exist until then.
+
+Which is why **Neo4j refuses to narrow**, and this is a property of the store rather than a gap: 
+`db.index.vector.queryNodes` chooses its K nearest before Cypher can see them, so a predicate could only ever
+be applied to the index's output. That returns fewer than the requested limit whenever the predicate excludes
+anything — exactly the over-fetch this feature removes, relocated inside the library where the caller can no
+longer see it happening. Postgres resolves the predicate to an id set and ranks within it; MongoDB hands that
+id set to `$vectorSearch`'s own `filter`, which is a genuine pre-filter. Ranked results and paging work on all
+three: neither needs anything a top-K index lacks.
+
+`Ranked.similarity()` is **plain cosine in `[-1, 1]` on every backend** — the same number
+`VectorMath.cosineSimilarity` and `similarityTo` return in process. That is a deliberate normalization, not a
+passthrough: pgvector reports cosine *distance*, while Neo4j and MongoDB both report `(1 + cosine) / 2`. Each
+backend converts as it reads its own result, so a threshold written once means the same thing whichever store
+answers it.
+
 ## A JPA-style query, contrasted with an object-level query
 
 A repository query (`findNearestByBodyVector`) is scoped to the whole persisted store; an object-level

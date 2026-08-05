@@ -7,6 +7,7 @@ import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
 import dev.xtrafe.javai.e2e.domain.PlaceRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
@@ -72,6 +73,11 @@ public final class JavAIEnvironment {
     private static final PlaceRepository NEO4J_PLACE_REPOSITORY;
     private static final PlaceRepository MONGO_PLACE_REPOSITORY;
 
+    // OMI-230: narrowed vector search. Postgres and Mongo only -- Neo4j refuses a narrowed query at
+    // repository-creation time, so registering this there would fail this whole class's static init.
+    private static final MediaNoteRepository POSTGRES_MEDIA_NOTE_REPOSITORY;
+    private static final MediaNoteRepository MONGO_MEDIA_NOTE_REPOSITORY;
+
     private static final TagRepository POSTGRES_TAG_REPOSITORY;
     private static final TagRepository NEO4J_TAG_REPOSITORY;
     private static final TagRepository MONGO_TAG_REPOSITORY;
@@ -112,6 +118,7 @@ public final class JavAIEnvironment {
                 .build();
         POSTGRES_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, postgresConfig);
         POSTGRES_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, postgresConfig);
+        POSTGRES_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, postgresConfig);
         POSTGRES_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, postgresConfig);
         POSTGRES_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, postgresConfig);
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
@@ -152,6 +159,7 @@ public final class JavAIEnvironment {
                 .build();
         MONGO_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, mongoConfig);
         MONGO_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, mongoConfig);
+        MONGO_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, mongoConfig);
         MONGO_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, mongoConfig);
         MONGO_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, mongoConfig);
         MONGO_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, mongoConfig);
@@ -206,6 +214,16 @@ public final class JavAIEnvironment {
 
     public static PlaceRepository neo4jPlaceRepository() {
         return NEO4J_PLACE_REPOSITORY;
+    }
+
+    /** OMI-230's narrowed vector search. No Neo4j counterpart, deliberately -- that backend refuses a
+     *  narrowed query rather than approximating it; see {@code MediaNoteRepository}. */
+    public static MediaNoteRepository postgresMediaNoteRepository() {
+        return POSTGRES_MEDIA_NOTE_REPOSITORY;
+    }
+
+    public static MediaNoteRepository mongoMediaNoteRepository() {
+        return MONGO_MEDIA_NOTE_REPOSITORY;
     }
 
     public static PlaceRepository mongoPlaceRepository() {
