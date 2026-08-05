@@ -16,8 +16,6 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
-import static org.junit.jupiter.api.Assertions.assertEquals;
-
 /**
  * What a save actually costs in embedding calls, split by phase (OMI-255).
  *
@@ -186,25 +184,20 @@ class SummaryDrainEmbeddingCostTest {
     }
 
     /**
-     * ⚠️ <b>Pins a pre-existing defect, and deliberately asserts the wrong answer.</b>
+     * Re-saving an unchanged container embeds <b>nothing</b>: every value involved is already stored (OMI-256).
      *
-     * <p>Re-saving an unchanged container ought to embed nothing: every value is already stored. It embeds
-     * each member of a natively-mapped association once, because {@code findById} hydrates the stored vectors
-     * of the <em>root</em> only -- the members Hibernate loads behind the association arrive with empty cache
-     * slots, and the ensuing save recomputes them.
+     * <p>This test used to pin the opposite, asserting exactly one wasted call. {@code findById} hydrated the
+     * stored vectors of the <em>root</em> only, so the members Hibernate loads behind a natively-mapped
+     * association arrived with empty cache slots and the ensuing save recomputed each one for real -- one
+     * model call per member, scaling with how much the container holds. {@code hydrateAssociatedVectors} now
+     * serves those members their stored vectors on the load path, and the count it pinned is zero.
      *
-     * <p>This is <b>not</b> an OMI-255 regression, and that was verified rather than assumed: the identical
-     * assertion fails the same way on a worktree at the pre-OMI-255 commit ({@code 032dadf}), with the same
-     * single wasted call on the same value. It is asserted here as one wasted call rather than zero so the
-     * gap is pinned and visible: if it is ever fixed, or ever gets worse, this test says so immediately.
-     * Fixing it belongs to hydration on the load path, not to summary recomputation.
-     *
-     * <p>Tracked as <b>OMI-256</b>. When it is fixed, this becomes
-     * {@code assertEmbeddedExactlyOnce()} with no arguments.
+     * <p>It was never an OMI-255 regression, which was verified rather than assumed at the time: the identical
+     * assertion failed the same way on a worktree at the pre-OMI-255 commit ({@code 032dadf}).
      */
     @Test
-    @DisplayName("re-saving an unchanged container re-embeds association members (pre-existing, tracked)")
-    void resavingUnchangedReEmbedsAssociationMembers() {
+    @DisplayName("re-saving an unchanged container embeds nothing")
+    void resavingUnchangedEmbedsNothing() {
         TestShelf shelf = new TestShelf("stable-shelf");
         shelf.getBooks().add(new TestBook("stable-book"));
         shelves.save(shelf);
@@ -212,11 +205,54 @@ class SummaryDrainEmbeddingCostTest {
         provider.ledger().reset();
         shelves.save(shelves.findById(shelf.getId()).orElseThrow());
 
-        assertEquals(1, provider.ledger().totalCalls(),
-                "expected exactly the one pre-existing wasted call. More means something new re-embeds; "
-                        + "none means the load-path hydration gap was fixed and this test should become "
-                        + "assertEmbeddedExactlyOnce() with no arguments.");
-        assertEquals(1, provider.ledger().countOf("stable-book"),
-                "and it must still be the association member, not something else");
+        provider.ledger().assertEmbeddedExactlyOnce();
+    }
+
+    /**
+     * The same invariant where it actually costs something: a container holding several members, all of them
+     * unchanged. The single-member case above cannot tell "hydrates the member" apart from "happens not to
+     * walk that far," and it is the per-member scaling that made this worth fixing -- an album of fifty assets
+     * re-saved to change its title paid fifty embeddings.
+     */
+    @Test
+    @DisplayName("re-saving a multi-member container embeds nothing, per member")
+    void resavingUnchangedMultiMemberContainerEmbedsNothing() {
+        TestShelf shelf = new TestShelf("bulk-shelf");
+        for (int i = 0; i < 5; i++) {
+            shelf.getBooks().add(new TestBook("bulk-book-" + i));
+        }
+        shelves.save(shelf);
+
+        provider.ledger().reset();
+        shelves.save(shelves.findById(shelf.getId()).orElseThrow());
+
+        provider.ledger().assertEmbeddedExactlyOnce();
+    }
+
+    /**
+     * The other half of the invariant, and the one that would catch hydration going too far: what genuinely
+     * is new must still be embedded. Hydration only fills slots that are empty -- it never overwrites one a
+     * setter has marked dirty (see {@code JavAIRuntime.hydrateFieldVector}), and a member that was never
+     * stored has nothing to serve it in the first place.
+     *
+     * <p>Asserted together in one save so the two cannot pass for each other: the changed root and the added
+     * member are embedded exactly once each, and the untouched member -- the one hydration is responsible
+     * for -- is not embedded at all.
+     */
+    @Test
+    @DisplayName("a changed root and an added member are still embedded; the untouched member is not")
+    void genuinelyNewValuesAreStillEmbedded() {
+        TestShelf shelf = new TestShelf("changing-shelf");
+        shelf.getBooks().add(new TestBook("untouched-book"));
+        shelves.save(shelf);
+
+        TestShelf reloaded = shelves.findById(shelf.getId()).orElseThrow();
+        provider.ledger().reset();
+        reloaded.setLabel("changing-shelf, wholly different subject matter");
+        reloaded.getBooks().add(new TestBook("added-book"));
+        shelves.save(reloaded);
+
+        provider.ledger().assertEmbeddedExactlyOnce(
+                "changing-shelf, wholly different subject matter", "added-book");
     }
 }

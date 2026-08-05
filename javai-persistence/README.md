@@ -205,6 +205,27 @@ their own work this way stay composable. It is thread-bound, like Spring's own t
 handed to another thread inside the body is not part of the transaction. Postgres only -- Neo4j and MongoDB
 throw a message saying so rather than pretending to be atomic.
 
+**Optimistic locking (`@Version`) works on Postgres, and `save()` returns an entity you can save again**
+(OMI-254). Detection was never the problem: two concurrent writers to one entity have always produced one
+winner and one `OptimisticLockException`. What made the annotation unusable was the ordinary case.
+`merge()` performs the write on Hibernate's own managed copy and it is *that* copy whose version gets
+incremented, while `save()` deliberately returns the caller's instance (its `@Transient` JavAI collection
+fields are empty on the managed copy, so returning that would hand back an entity whose collections looked
+wrong). The returned object therefore still carried the pre-write version, and saving it a second time --
+no concurrency, no second thread, no second transaction -- collided with the row the first save had just
+written. Any code that saves a graph, mutates it and saves it again was locked out of optimistic locking
+entirely, which is exactly the read-modify-write shape a detached-entity repository encourages.
+
+`save()` now carries the post-write version back onto the caller's instance, for the whole graph rather than
+the root alone (a cascaded child is written in the same flush and has its own version bumped). The invariant:
+**the object `save()` hands back is safe to mutate and save again.** Detection is untouched -- the version a
+concurrent writer collides on is the one `merge()` read off the detached instance beforehand -- and
+`OptimisticLockingTest` asserts both halves together, since fixing the first by weakening the second would be
+a worse defect than the one being fixed. Entities with no `@Version` anywhere pay nothing for this: the
+graph walk is skipped unless something registered with the backend actually declares one. **Neo4j and MongoDB
+have no optimistic locking**; `@Version` is persisted there as an ordinary scalar and never checked, so it
+looks like protection and provides none -- raise the isolation level instead.
+
 ## Physical naming, and configuring the `SessionFactory` JavAI builds (Postgres)
 
 **Columns and tables are snake_cased by default** (OMI-145, 0.1.5): a field `emailVerified` maps to
@@ -389,6 +410,18 @@ written only when its value actually changes**: a value-identical `UPDATE` still
 `REPEATABLE READ`, which is a collision a concurrent writer pays for and nobody gains from. A third table,
 `javai_summary_pending`, records which containers owe a summary recomputation; it exists only in a
 deployment that uses `@Summary`, and is empty except between a write and the drain that follows it.
+
+**Loading serves stored vectors back rather than recomputing them, for the whole loaded graph** -- the root
+and every entity reachable from it (OMI-187 for the root, OMI-256 for the rest). JavAI's vector caches live
+on a woven *instance* field, so they cannot survive a load: Hibernate hands back a different object for the
+same logical entity every time. `findById`/`findAll`/derived finders/vector search therefore read each loaded
+entity's stored vectors straight into its cache slots. Until OMI-256 that covered the root only, so the
+members Hibernate materializes behind a `@OneToMany`/`@ManyToMany` arrived cold and the next save re-embedded
+every one of them -- **one model call per member, per re-save**, so loading an album of fifty assets and
+saving it back to change its title cost fifty embeddings for content that had not changed and whose vectors
+were sitting in the database. The traversal is the one `hydrateGeoPoints` already made on the same paths, so
+it initializes nothing that was not already being initialized: an untouched lazy association is still
+skipped, never loaded on JavAI's initiative.
 
 **Neo4j**: `<field>Vector__<model>` per `@Vectorize` field, plus `vector__<model>`/`summaryVector__<model>`
 for the combined/summary ones (each with a `...ComputedAt__<model>` sibling) -- direct node properties,

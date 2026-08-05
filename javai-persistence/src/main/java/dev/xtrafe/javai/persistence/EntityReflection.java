@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.annotations.Vectorize;
 import jakarta.persistence.Id;
+import jakarta.persistence.Version;
 
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Field;
@@ -51,6 +52,18 @@ final class EntityReflection {
         }
         throw new IllegalArgumentException(
                 type + " has no @Id (jakarta.persistence.Id) field -- required to be persistable");
+    }
+
+    /** The {@code @Version} field anywhere in {@code type}'s hierarchy, or {@code null} -- optimistic locking
+     *  is opt-in, so having none is the ordinary case and not an error (OMI-254). */
+    static Field versionField(Class<?> type) {
+        for (Field field : allFields(type)) {
+            if (field.isAnnotationPresent(Version.class)) {
+                field.setAccessible(true);
+                return field;
+            }
+        }
+        return null;
     }
 
     static UUID readId(Object entity) {

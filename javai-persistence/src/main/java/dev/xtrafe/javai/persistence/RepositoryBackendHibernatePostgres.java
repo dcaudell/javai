@@ -644,6 +644,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // scratch. That is exactly the shape of a seeding loop -- save a TagSet, then save N tags
                 // that each reference the caller's TagSet -- and it was the last of OMI-187's waste.
                 transferVectorState(managed, entity, vectorizablesById(managed));
+                // And the @Version Hibernate just bumped, for the same reason and at the same moment: the
+                // caller keeps `entity`, so anything the write assigned has to be carried back to it or the
+                // instance they hold is already stale the moment save() returns (OMI-254).
+                refreshVersions(entity, managed);
                 // Records, inside this same transaction, which containers now owe a summary recomputation --
                 // an insert per owner, which cannot collide with a concurrent writer's inserts the way the
                 // shared summary row it replaces did. Rolls back with everything else if this save fails,
@@ -751,9 +755,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return inSession(session -> {
             Object entity = session.find(entityType, id);
             if (entity != null) {
-                hydrateCollectionMembers(session, entity);
-                hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                hydrateVectors(session, entity);
+                hydrateLoaded(session, entity);
             }
             return Optional.ofNullable(entity);
         });
@@ -771,10 +773,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             JpaRoot<T> root = query.from(entityType);
             query.select(root);
             List<T> results = session.createQuery(query).list();
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T result : results) {
-                hydrateCollectionMembers(session, result);
-                hydrateGeoPoints(session, result, new IdentityHashMap<>());
-                hydrateVectors(session, result);
+                hydrateLoaded(session, result, hydrated);
             }
             return (List<Object>) (List<?>) results;
         });
@@ -969,10 +970,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             List<T> results = typed.list();
             List<Object> out = new ArrayList<>(results.size());
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T entity : results) {
-                hydrateCollectionMembers(session, entity);
-                hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                hydrateVectors(session, entity);
+                hydrateLoaded(session, entity, hydrated);
                 out.add(entity);
             }
             return out;
@@ -2220,6 +2220,131 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     /**
+     * Carries the {@code @Version} Hibernate assigned during this write back onto the instances the caller
+     * still holds (OMI-254).
+     *
+     * <p>Without this, {@code @Version} is annotatable but unusable. {@code merge()} performs the write on
+     * its own managed copy and it is that copy whose version Hibernate increments, while {@code save()}
+     * deliberately returns the caller's {@code entity} (see the comment at its {@code return}). So the object
+     * handed back still carried the <em>pre-write</em> version, and saving it a second time -- with no
+     * concurrency involved whatsoever, no second thread, no second transaction -- sent a version the database
+     * had already moved past and threw {@link jakarta.persistence.OptimisticLockException}. Any code that
+     * saves a graph, mutates it and saves it again therefore could not adopt optimistic locking at all, which
+     * is precisely the read-modify-write shape a detached-entity repository encourages.
+     *
+     * <p>The invariant this establishes, and the one worth holding onto: <b>the object {@code save()} hands
+     * back is safe to mutate and save again.</b>
+     *
+     * <p>The whole graph, not just the root: a cascaded child is written in this same flush and has its own
+     * version bumped just as the root does, so refreshing only the root would leave the identical defect one
+     * hop down. Matching is by {@code @Id} for the same reason {@link #transferVectorState} matches that way
+     * -- these are two different objects standing for one row.
+     *
+     * <p>Detection is untouched by any of this. The version a concurrent writer collides on is the one
+     * {@code merge()} reads off the detached instance <em>before</em> this runs; two threads that both loaded
+     * version 4 still produce one winner and one {@code OptimisticLockException}, which
+     * {@code OptimisticLockingTest} asserts directly rather than assuming.
+     */
+    private void refreshVersions(Object entity, Object managed) {
+        if (entity == managed || !anyRegisteredTypeIsVersioned()) {
+            return;
+        }
+        Map<UUID, Object> managedById = versionedEntitiesById(managed);
+        if (managedById.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<UUID, Object> target : versionedEntitiesById(entity).entrySet()) {
+            Object source = managedById.get(target.getKey());
+            if (source != null) {
+                copyVersion(source, target.getValue());
+            }
+        }
+    }
+
+    /** Whether anything registered with this backend uses optimistic locking at all -- one check over the
+     *  registry, so a codebase that has never written {@code @Version} pays nothing for it on every save.
+     *  Not cached: the registry is small, and it grows as repositories are created. */
+    private boolean anyRegisteredTypeIsVersioned() {
+        for (Class<?> registered : registeredEntityTypes) {
+            if (EntityReflection.versionField(registered) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Every {@code @Version}-bearing entity reachable from {@code root}, keyed by {@code @Id}.
+     *
+     * <p>Walks entity references directly rather than {@link JavAIRuntime#reachableVectorizables}, because
+     * optimistic locking is orthogonal to vectorization: a plain {@code @Entity} carrying a {@code @Version}
+     * and no {@code @Vectorize} field anywhere is an ordinary thing to save, and the vectorizable walk --
+     * which only ever reflects into nodes that are themselves {@code JavAIVectorizable} -- would find neither
+     * it nor the root.
+     *
+     * <p>It also does not reuse {@link #reachableRelated}, for a specific reason: iterating a lazy collection
+     * initializes it, and this walk runs on the write path where nothing else would have. Uninitialized
+     * proxies and uninitialized lazy collections are therefore skipped rather than resolved. Forcing a load
+     * to refresh a version on an association the caller never touched would trade the defect being fixed for
+     * the one {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} forbids -- and it would buy
+     * nothing, since an untouched association was not written by this save, so its version did not move and
+     * there is nothing to carry back.
+     */
+    private static Map<UUID, Object> versionedEntitiesById(Object root) {
+        Map<UUID, Object> byId = new HashMap<>();
+        collectVersionedEntities(root, byId, Collections.newSetFromMap(new IdentityHashMap<>()));
+        return byId;
+    }
+
+    private static void collectVersionedEntities(Object node, Map<UUID, Object> byId, Set<Object> visited) {
+        if (node == null || !Hibernate.isInitialized(node) || !visited.add(node)) {
+            return;
+        }
+        if (node instanceof Map<?, ?> map) {
+            for (Object value : map.values()) {
+                collectVersionedEntities(value, byId, visited);
+            }
+            return;
+        }
+        if (node instanceof Collection<?> collection) {
+            for (Object element : collection) {
+                collectVersionedEntities(element, byId, visited);
+            }
+            return;
+        }
+        if (!node.getClass().isAnnotationPresent(Entity.class)) {
+            return;
+        }
+        if (EntityReflection.versionField(node.getClass()) != null) {
+            UUID id = idOrNull(node);
+            if (id != null) {
+                byId.put(id, node);
+            }
+        }
+        for (Field field : EntityReflection.allFields(node.getClass())) {
+            field.setAccessible(true);
+            try {
+                collectVersionedEntities(field.get(node), byId, visited);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read field " + field + " on " + node.getClass(), e);
+            }
+        }
+    }
+
+    /** Both sides are the same entity type, so one field object reads and writes both. */
+    private static void copyVersion(Object source, Object target) {
+        Field field = EntityReflection.versionField(target.getClass());
+        if (field == null || !field.getDeclaringClass().isInstance(source)) {
+            return;
+        }
+        try {
+            field.set(target, field.get(source));
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot copy @Version field " + field + " onto " + target.getClass(), e);
+        }
+    }
+
+    /**
      * Hands the caller's already-computed vectors to the managed entity's {@code @Summary} children before
      * anything reads its {@code summaryVector()}.
      *
@@ -2699,6 +2824,65 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         });
     }
 
+    /**
+     * The whole post-load step, in the one place every load path shares (OMI-256).
+     *
+     * <p>{@code findById}, {@code findAll}, the derived-finder path and vector search all have to do exactly
+     * this, and each used to do it by repeating the same three calls in its own body. Deepening the last of
+     * them to cover association members meant changing it in four places, which is the argument for this
+     * method existing: a load path that gets this list wrong does not fail, it silently costs a model call,
+     * so the list is worth stating once rather than four times.
+     *
+     * <p>{@code visited} is shared across every root in a multi-row load deliberately. Two rows of one
+     * {@code findAll} routinely reach the same association target, and it only needs hydrating once -- the
+     * second visit would be a redundant SELECT for a slot already filled.
+     */
+    private void hydrateLoaded(Session session, Object entity, Set<Object> visited) {
+        hydrateCollectionMembers(session, entity);
+        hydrateGeoPoints(session, entity, new IdentityHashMap<>());
+        hydrateAssociatedVectors(session, entity, visited);
+    }
+
+    /** A single-root load, where sharing a visited set across roots has nothing to share. */
+    private void hydrateLoaded(Session session, Object entity) {
+        hydrateLoaded(session, entity, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    /**
+     * Serves stored vectors into the loaded root <em>and every entity reachable from it</em> (OMI-256).
+     *
+     * <p>{@link #hydrateVectors} fills the root's cache slots only. The members Hibernate materializes behind
+     * a {@code @OneToMany}/{@code @ManyToMany} are ordinary loaded entities with stored vectors of their own,
+     * but nothing was serving them, so they arrived cold and the next save re-embedded every one of them --
+     * one model call per member, per re-save, for content that had not changed. Loading a container of fifty
+     * assets and saving it back to change its title cost fifty embeddings; it now costs none.
+     *
+     * <p><b>Traversal is {@link #reachableRelated}'s, not a new one</b>, and that is the load-bearing detail:
+     * {@link #hydrateGeoPoints} already walks exactly this graph on exactly these paths, so this initializes
+     * nothing that was not already going to be initialized a moment earlier. The invariant in
+     * {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} -- an untouched lazy association is
+     * skipped, never loaded on JavAI's initiative -- is therefore untouched by this, which
+     * {@code touchingAnUninitializedLazyAssociationOutsideASessionThrows} keeps honest. An uninitialized
+     * singular proxy is skipped explicitly here as well rather than relying on that, since reading through
+     * one would hydrate the proxy's own empty state rather than the entity's (see {@link #resolve}).
+     *
+     * <p>One SELECT per reachable entity, against an embedding call per reachable entity. That is the same
+     * trade {@link #hydrateSummaryChildren} makes on the recomputation path, for the same reason, and it is
+     * not close: a round trip to Postgres is orders of magnitude cheaper than a round trip to a model.
+     */
+    private void hydrateAssociatedVectors(Session session, Object entity, Set<Object> visited) {
+        if (entity == null || !visited.add(entity)) {
+            return;
+        }
+        hydrateVectors(session, entity);
+        for (Object related : reachableRelated(entity)) {
+            if (!Hibernate.isInitialized(related)) {
+                continue;
+            }
+            hydrateAssociatedVectors(session, Hibernate.unproxy(related), visited);
+        }
+    }
+
     private static boolean tableExists(Connection connection, String table) throws SQLException {
         try (ResultSet tables = connection.getMetaData().getTables(null, null, table, null)) {
             return tables.next();
@@ -2894,12 +3078,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private List<Object> hydrate(Class<?> entityType, List<UUID> rankedIds) {
         return inSession(session -> {
             List<Object> results = new ArrayList<>(rankedIds.size());
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (UUID id : rankedIds) {
                 Object entity = session.find(entityType, id);
                 if (entity != null) {
-                    hydrateCollectionMembers(session, entity);
-                    hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                    hydrateVectors(session, entity);
+                    hydrateLoaded(session, entity, hydrated);
                     results.add(entity);
                 }
             }
