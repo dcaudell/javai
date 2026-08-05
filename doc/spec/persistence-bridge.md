@@ -221,6 +221,56 @@ own bookkeeping, the subgraph is genuinely frozen against mutation for the durat
 protected on the read side. See `javai-persistence/README.md`'s own "What's actually implemented" section
 for the tests proving this holds under all three modes.
 
+## `@Summary` is written after the transaction, not inside it (OMI-255)
+
+The accuracy rule above is about one writer: the database must never see a vector inconsistent with the
+field value committed alongside it. It says nothing about two writers, and for **derived** state the two
+questions have different answers.
+
+A container's `summaryVector()` is stored as one row per `(owner_type, owner_id)`, so every mutation
+anywhere beneath a `@Summary` container writes that same row. Writing it inside the caller's transaction
+therefore made two unrelated writers -- different children, different tables, different primary keys --
+collide on it: `could not serialize access due to concurrent update` at `REPEATABLE READ`, or a silent
+last-writer-wins at `READ COMMITTED` where the surviving summary reflects only one of the two mutations.
+
+**Neither isolation level can be made to give the right answer**, and this is worth stating precisely
+because it rules out the obvious fix. A lock taken inside the writer's transaction cannot help at
+`REPEATABLE READ`: the snapshot is fixed by the transaction's first statement, long before the container is
+known, so a writer that waits for the lock and then updates a row committed after that snapshot is still
+refused. Serialising the writers does not un-take their snapshots.
+
+So the Postgres backend does not write it there at all:
+
+1. **Inside the caller's transaction**, the mutation appends a row to `javai_summary_pending` naming the
+   container. Every enqueue is an insert with its own fresh primary key, so concurrent writers produce
+   distinct rows and cannot conflict at any isolation level. It commits and rolls back with the mutation.
+2. **After that transaction commits** -- immediately when JavAI owns it, from a commit callback when it
+   joined a Spring or `JavAIPI.inTransaction` one -- a short `READ COMMITTED` transaction takes a Postgres
+   advisory lock on `(owner_type, owner_id)`, recomputes the summary *from the committed graph*, writes the
+   one row, and deletes exactly the queue rows it claimed.
+
+Recomputing from committed state rather than folding the writer's in-memory value is what makes step 2
+correct rather than merely serialised: the drain that runs last has read both writers' children, so the
+surviving summary reflects both. `READ COMMITTED` is required here, not incidental -- at `REPEATABLE READ`
+two drains would refuse each other exactly as the writers used to.
+
+**Upward propagation is resolved from the database, not from the object graph.** Vector Core's in-memory
+back-edge walk is correct for a single process holding the whole graph, and insufficient the moment the
+deployment is multi-pod: a pod that loaded a `Shelf` through its own repository holds no `Library`, so there
+is no back-edge to walk and the library's summary silently keeps whatever some other pod last left. The
+drain instead asks which containers *currently* hold the entity, from the declared `@Summary` fields of
+registered types plus the stored relationships -- covering both natively-mapped associations (HQL) and this
+backend's own `javai_collection_members` (SQL) -- and walks up transitively.
+
+Two costs are accepted deliberately. A summary row is **stale within the caller's own transaction**, since
+the write happens after commit. And a drain that fails leaves the recomputation queued rather than
+performed -- durable, retried by the next save of that container or by `JavAIPI.drainPendingSummaries`, and
+logged, but not instantaneous. `SummaryPolicy.QUEUE_ONLY` makes the second case a deliberate choice for
+write-heavy paths.
+
+Entities outside `@Summary` containment entirely -- which is most of an application's entities -- keep the
+inline write and never touch the queue.
+
 ## Ordinary relational derived finders
 
 A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the
@@ -285,6 +335,56 @@ silently match nothing. The Postgres backend needs no such step — Hibernate bi
 is why the note is specific to the two reflective backends. (Range comparisons on a value stored as an
 ISO-8601 string, e.g. an `Instant`, remain correct because ISO-8601 sorts lexicographically; comparisons that
 are meaningless on a converted value, e.g. `>` on a UUID string, are permitted but not meaningful.)
+
+## Vector search combined with a relational predicate (OMI-230)
+
+`findNearestBy…Vector(reference, limit)` used to be the whole vector surface, which made *"the nearest N that
+**also** satisfy X"* inexpressible. The only recourse was to over-fetch and discard — unboundedly, since the
+ratio depends entirely on the data, and blindly, since the ranking information that would have said whether
+to fetch more was thrown away with the results. Three things close that, in **two idioms that compile to the
+same query** (`NearestSpec`), so neither can answer differently from the other:
+
+```java
+public interface MediaNoteRepository extends JavAIRepository<MediaNote> {
+    // 1. a predicate: everything after Vector is parsed by the same PartTree the findBy… finders use
+    List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+
+    // 2. a ranked return: each hit keeps the similarity it was ranked on
+    List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(
+            EmbeddingVector reference, Kind kind, Limit limit);
+
+    // 3. paging: a trailing Pageable supplies the window *and* the offset, so no int limit is declared
+    List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+}
+
+// ...or, for a predicate composed at runtime, the builder — same mechanism, no method to declare:
+List<Ranked<MediaNote>> hits = notes.nearestBy("caption")
+        .to(reference)
+        .where("kind").in(Kind.IMAGE, Kind.SHORT)
+        .and("published").isTrue()
+        .offset(20).limit(20)
+        .ranked();
+```
+
+**The contract, and the whole point: the limit applies *after* the predicate.** "The nearest N that also
+satisfy X" is a different question from "the ones among the nearest N that satisfy X", and only the first is
+answerable without over-fetching. A backend that cannot honor that ordering **refuses the query** rather than
+approximating it (`RepositoryBackend.validateNearestQuery`) — for the method-name idiom at repository-creation
+time, and for the builder when it runs, since its predicate does not exist until then.
+
+Which is why **Neo4j refuses to narrow**, and this is a property of the store rather than a gap: 
+`db.index.vector.queryNodes` chooses its K nearest before Cypher can see them, so a predicate could only ever
+be applied to the index's output. That returns fewer than the requested limit whenever the predicate excludes
+anything — exactly the over-fetch this feature removes, relocated inside the library where the caller can no
+longer see it happening. Postgres resolves the predicate to an id set and ranks within it; MongoDB hands that
+id set to `$vectorSearch`'s own `filter`, which is a genuine pre-filter. Ranked results and paging work on all
+three: neither needs anything a top-K index lacks.
+
+`Ranked.similarity()` is **plain cosine in `[-1, 1]` on every backend** — the same number
+`VectorMath.cosineSimilarity` and `similarityTo` return in process. That is a deliberate normalization, not a
+passthrough: pgvector reports cosine *distance*, while Neo4j and MongoDB both report `(1 + cosine) / 2`. Each
+backend converts as it reads its own result, so a threshold written once means the same thing whichever store
+answers it.
 
 ## A JPA-style query, contrasted with an object-level query
 

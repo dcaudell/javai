@@ -89,6 +89,12 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class RepositoryBackendNeo4j implements RepositoryBackend {
 
+    private static final System.Logger LOG = System.getLogger(RepositoryBackendNeo4j.class.getName());
+
+    /** How long {@code db.awaitIndex} may block waiting for a freshly-created vector index to finish
+     *  populating -- see {@link #awaitIndexOnline}. Paid once per index, by whichever caller creates it. */
+    private static final int INDEX_ONLINE_TIMEOUT_SECONDS = 120;
+
     private final JavAIPersistenceConfig config;
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Map<String, Class<?>> typesByLabel = new ConcurrentHashMap<>();
@@ -256,48 +262,88 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     @Override
-    public List<Object> findNearestByFieldVector(
-            Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        String basePropertyName = fieldName.equals(COMBINED_VECTOR_FIELD) ? "vector" : fieldName + "Vector";
-        return findNearest(entityType, basePropertyName, reference, limit);
+    public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        validateNearestQuery(entityType, spec); // the builder idiom reaches here without a creation-time check
+        return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
+    /** Every kind is one node property here -- the grain problem that made Postgres' field table the wrong
+     *  home for the entity-grain vectors does not arise on a store whose vectors are node properties. */
+    private static String vectorPropertyName(NearestSpec spec) {
+        return switch (spec.kind()) {
+            case SUMMARY -> "summaryVector";
+            case CONCATENATED_TEXT -> "concatenatedTextVector";
+            case COMBINED -> "vector";
+            case FIELD -> spec.fieldName() + "Vector";
+        };
+    }
+
+    /**
+     * Refuses a <b>narrowed</b> vector search, at repository-creation time (OMI-230).
+     *
+     * <p>Not a gap waiting to be filled -- a property of the store. {@code db.index.vector.queryNodes} is a
+     * top-K call: it chooses its K nearest nodes and only then can Cypher see them, so a predicate can only
+     * ever be applied to what the index already picked. That leaves two dishonest options and no honest one.
+     * Filtering after the fact answers a different question than the one asked ("which of the nearest K
+     * match" rather than "the nearest K that match"), and returns fewer than K whenever the predicate is
+     * selective -- which is exactly the over-fetch-and-discard this feature exists to remove, merely moved
+     * inside the library where the caller can no longer see it happening. Over-fetching by some multiple
+     * only moves the same failure further out and makes it data-dependent.
+     *
+     * <p>So Neo4j says so. The unnarrowed search, {@link Ranked} similarities, and paging all work here --
+     * only narrowing refuses, and it refuses when the repository is created rather than on the call that
+     * needed it.
+     */
     @Override
-    public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        return findNearest(entityType, "summaryVector", reference, limit);
+    public void validateNearestQuery(Class<?> entityType, NearestSpec spec) {
+        if (!spec.isNarrowed()) {
+            return;
+        }
+        throw new IllegalArgumentException("The Neo4j backend cannot narrow a vector search by a relational "
+                + "predicate (on " + entityType.getName() + "). Its vector index answers only 'the K nearest "
+                + "nodes', so a predicate could be applied only after K was already chosen -- which would "
+                + "return fewer than the requested limit whenever the predicate excludes anything, and would "
+                + "silently answer a different question than the one asked. Options: use the Postgres or "
+                + "MongoDB backend for this query; run the unnarrowed search and filter in the caller, "
+                + "accepting the over-fetch explicitly; or narrow with an ordinary derived finder and rank "
+                + "in memory via JavAIVectorizable.query(...).");
     }
 
-    @Override
-    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
-            int limit) {
-        // Same per-entity property shape as the summary vector above, so this needs no special handling
-        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
-        return findNearest(entityType, "concatenatedTextVector", reference, limit);
-    }
-
-    private List<Object> findNearest(
-            Class<?> entityType, String basePropertyName, EmbeddingVector reference, int limit) {
+    private List<Ranked<Object>> findNearest(
+            Class<?> entityType, String basePropertyName, NearestSpec spec) {
+        EmbeddingVector reference = spec.reference();
         String label = label(entityType);
         String property = qualify(basePropertyName, reference.modelId());
         ensureVectorIndex(label, property, reference.dims());
         String indexName = vectorIndexName(label, property);
         try (Session session = driver().session()) {
-            List<Node> nodes = session.executeRead(tx -> {
-                var result = tx.run("CALL db.index.vector.queryNodes($indexName, $limit, $reference) YIELD node RETURN node",
-                        Values.parameters("indexName", indexName, "limit", limit, "reference", reference.values()));
-                List<Node> found = new ArrayList<>();
+            // limit + offset, then drop the head: ranking is total, so skipping it is exact -- unlike
+            // narrowing, paging needs nothing from the index that it does not already provide.
+            int fetch = spec.limitIncludingOffset();
+            List<Scored> scored = session.executeRead(tx -> {
+                var result = tx.run("CALL db.index.vector.queryNodes($indexName, $limit, $reference) "
+                                + "YIELD node, score RETURN node, score",
+                        Values.parameters("indexName", indexName, "limit", fetch, "reference", reference.values()));
+                List<Scored> found = new ArrayList<>();
                 for (Record record : result.list()) {
-                    found.add(record.get("node").asNode());
+                    found.add(new Scored(record.get("node").asNode(), record.get("score").asDouble()));
                 }
                 return found;
             });
             Map<UUID, Object> hydrated = new HashMap<>();
-            List<Object> results = new ArrayList<>(nodes.size());
-            for (Node node : nodes) {
-                results.add(hydrate(session, entityType, node, hydrated));
+            List<Ranked<Object>> results = new ArrayList<>();
+            for (int i = spec.offset(); i < scored.size(); i++) {
+                Scored hit = scored.get(i);
+                // Neo4j reports a cosine index's score rescaled into (0, 1] as (1 + cosine) / 2; Ranked
+                // speaks raw cosine, like the rest of JavAI, so undo the rescaling here where it is known.
+                results.add(new Ranked<>(
+                        hydrate(session, entityType, hit.node(), hydrated), 2.0 * hit.score() - 1.0));
             }
             return results;
         }
+    }
+
+    private record Scored(Node node, double score) {
     }
 
     private void ensureVectorIndex(String label, String property, int dims) {
@@ -305,14 +351,52 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (!vectorIndexesEnsured.add(key)) {
             return;
         }
+        String indexName = vectorIndexName(label, property);
         try (Session session = driver().session()) {
             session.executeWrite(tx -> {
-                tx.run("CREATE VECTOR INDEX `" + vectorIndexName(label, property) + "` IF NOT EXISTS "
+                tx.run("CREATE VECTOR INDEX `" + indexName + "` IF NOT EXISTS "
                         + "FOR (n:`" + label + "`) ON n.`" + property + "` "
                         + "OPTIONS {indexConfig: {`vector.dimensions`: $dims, `vector.similarity_function`: 'cosine'}}",
                         Values.parameters("dims", dims));
                 return null;
             });
+            awaitIndexOnline(session, indexName);
+        }
+    }
+
+    /**
+     * Blocks until {@code indexName} is actually usable, rather than merely created.
+     *
+     * <p>A Neo4j index is populated <b>asynchronously</b>: {@code CREATE VECTOR INDEX} returns as soon as the
+     * index exists, in state {@code POPULATING}, and a query issued against it before it reaches
+     * {@code ONLINE} is answered from a partially-built index -- silently, with no error, just fewer or
+     * wrongly-ordered results. On a warm database nothing notices, because the index was built during some
+     * earlier run; on a fresh one it produces a nearest-neighbour search where a node is not its own nearest
+     * neighbour. That is exactly what {@code PersistenceE2ETest.neo4jFindNearestByFieldVectorRanksByRealSimilarity}
+     * hit on a newly-created container, and it reproduced on a build predating any of this ticket's changes.
+     *
+     * <p>This is the same readiness problem {@code RepositoryBackendSpringDataMongo} already solves by polling
+     * {@code listSearchIndexes()} for {@code queryable: true}, and it is solved the same way here -- with
+     * Neo4j's own {@code db.awaitIndex}, which exists for precisely this. Only the creating call pays the
+     * wait, since {@link #vectorIndexesEnsured} admits one caller per index.
+     *
+     * <p>A failure is swallowed deliberately. {@code db.awaitIndex} throws when the index does not come online
+     * inside its timeout, and on a very large store that is a slow index rather than a broken one; refusing
+     * the write in that case would be worse than proceeding, since the index will finish on its own and the
+     * only cost meanwhile is the imprecise ranking this method exists to avoid.
+     */
+    private static void awaitIndexOnline(Session session, String indexName) {
+        try {
+            session.executeWrite(tx -> {
+                tx.run("CALL db.awaitIndex($name, $timeout)",
+                        Values.parameters("name", indexName, "timeout", INDEX_ONLINE_TIMEOUT_SECONDS));
+                return null;
+            });
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, () -> "Vector index '" + indexName + "' did not come online "
+                    + "within " + INDEX_ONLINE_TIMEOUT_SECONDS + "s (" + e.getMessage() + "). Continuing: it "
+                    + "will finish populating on its own, but similarity searches against it may rank "
+                    + "imprecisely until it does.");
         }
     }
 

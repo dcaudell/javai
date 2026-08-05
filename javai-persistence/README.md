@@ -14,7 +14,9 @@ alongside their ORM.
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
 | `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
-| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call |
+| `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call. Optionally narrowed (`…VectorAnd<Predicate>`), ranked (`List<Ranked<T>>`) and paged (trailing `Pageable`/`Limit`) since OMI-230 |
+| `NearestQuery<T>` | Builder, from `nearest()`/`nearestBy(field)`/`nearestBySummary()` | The same vector search composed at runtime instead of declared as a method name -- `where(…)`, `offset`/`limit`, `results()`/`ranked()` |
+| `Ranked<T>` | Result record | A hit plus the cosine similarity it was ranked on, normalized to `[-1, 1]` on every backend |
 | `findBy…` / `existsBy…` / `countBy…` / `deleteBy…` | Ordinary relational derived finders | Full Spring-Data-style finders (parsed via `PartTree`) resolved against the entity's own mapped columns, so one repository serves both an entity's relational access and its vector search; also validated at creation time -- see "Ordinary relational derived finders" below |
 | `JavAIPersistenceConfig` | Value object | Backend selection + connection settings; `fromSystemProperties()` is a pure factory for the old self-contained-default convenience, but it's never auto-applied -- a caller invokes it explicitly and passes the result to `repository(...)` like any other config |
 | `javai_vectors__<model>` / `javai_summary_vectors__<model>` | Postgres tables, owned by this module, one pair per model | Per-field + combined vectors, and `summaryVector()`, respectively -- never the developer's own entity table |
@@ -115,6 +117,42 @@ identical field values on every invocation would silently multiply backends inst
 developer would already call directly on a woven object. `findNearestByVector`/`findNearestBySummaryVector`
 are the whole-object variants, for the object's own combined `vector()`/`summaryVector()`.
 
+**A vector search can be narrowed, ranked and paged (OMI-230).** `(reference, limit)` and nothing else made
+*"the nearest N that **also** satisfy X"* inexpressible, leaving over-fetch-and-discard as the only recourse
+-- unbounded, since how much to over-fetch depends entirely on the data, and blind, since the ranking
+information that would have said whether to fetch more was discarded with the results. Two idioms now express
+it, and they compile to the same query (`NearestSpec`) so neither can answer differently from the other:
+
+```java
+// the method-name convention, validated at repository-creation time
+List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(EmbeddingVector r, Kind kind, Limit limit);
+List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+
+// ...or the builder, for a predicate composed at runtime
+notes.nearestBy("caption").to(reference)
+     .where("kind").in(Kind.IMAGE, Kind.SHORT).and("published").isTrue()
+     .offset(20).limit(20).ranked();
+```
+
+Everything after `Vector` is parsed by the same Spring Data `PartTree` the ordinary `findBy…` finders use, so
+the whole relational vocabulary -- operators, `And`/`Or`, nested paths, `IgnoreCase` -- is available with no
+second grammar, and is translated by the same backend code, so semantics are identical by construction. The
+one genuine ambiguity is that `Vector` can appear inside a field name *or* a predicate property; the parser
+scans right to left and requires the tail to begin with `And`, which resolves both directions
+(`findNearestBySubVectorVector`, `findNearestByCaptionVectorAndVectorNameContaining`).
+
+**The limit applies after the predicate**, which is the whole contract: N matches means N results, not
+"however many of the nearest N happened to match". Postgres resolves the predicate to an id set and ranks
+within it; MongoDB hands that id set to `$vectorSearch`'s own `filter`, a genuine pre-filter. **Neo4j refuses
+to narrow**, at repository-creation time -- `db.index.vector.queryNodes` picks its K nearest before Cypher can
+filter, so narrowing there could only ever return fewer than the requested limit and quietly answer a
+different question. Ranked results and paging work on all three.
+
+`Ranked.similarity()` is plain cosine in `[-1, 1]` everywhere -- the same number `similarityTo` gives in
+process -- which is a conversion, not a passthrough: pgvector reports cosine *distance*, Neo4j and MongoDB
+both report `(1 + cosine) / 2`. Each backend converts as it reads its own result.
+
 **Let the config name its entity types, and registration ordering stops mattering (OMI-214).**
 `JavAIPI.repository(...)` accumulates entity types under the hood; the Postgres backend's internal
 `SessionFactory` is built, once, lazily, on the *first* actual method call across any repository (or on
@@ -204,6 +242,27 @@ Nesting joins rather than nests (Spring's `PROPAGATION_REQUIRED` semantics), so 
 their own work this way stay composable. It is thread-bound, like Spring's own transaction management: work
 handed to another thread inside the body is not part of the transaction. Postgres only -- Neo4j and MongoDB
 throw a message saying so rather than pretending to be atomic.
+
+**Optimistic locking (`@Version`) works on Postgres, and `save()` returns an entity you can save again**
+(OMI-254). Detection was never the problem: two concurrent writers to one entity have always produced one
+winner and one `OptimisticLockException`. What made the annotation unusable was the ordinary case.
+`merge()` performs the write on Hibernate's own managed copy and it is *that* copy whose version gets
+incremented, while `save()` deliberately returns the caller's instance (its `@Transient` JavAI collection
+fields are empty on the managed copy, so returning that would hand back an entity whose collections looked
+wrong). The returned object therefore still carried the pre-write version, and saving it a second time --
+no concurrency, no second thread, no second transaction -- collided with the row the first save had just
+written. Any code that saves a graph, mutates it and saves it again was locked out of optimistic locking
+entirely, which is exactly the read-modify-write shape a detached-entity repository encourages.
+
+`save()` now carries the post-write version back onto the caller's instance, for the whole graph rather than
+the root alone (a cascaded child is written in the same flush and has its own version bumped). The invariant:
+**the object `save()` hands back is safe to mutate and save again.** Detection is untouched -- the version a
+concurrent writer collides on is the one `merge()` read off the detached instance beforehand -- and
+`OptimisticLockingTest` asserts both halves together, since fixing the first by weakening the second would be
+a worse defect than the one being fixed. Entities with no `@Version` anywhere pay nothing for this: the
+graph walk is skipped unless something registered with the backend actually declares one. **Neo4j and MongoDB
+have no optimistic locking**; `@Version` is persisted there as an ordinary scalar and never checked, so it
+looks like protection and provides none -- raise the isolation level instead.
 
 ## Physical naming, and configuring the `SessionFactory` JavAI builds (Postgres)
 
@@ -297,6 +356,14 @@ the same way `RepositoryBackendNeo4jTest`'s equivalent test does.
 referenced document simply becomes unreferenced, not deleted. Documented as a known Phase 0 boundary in
 `RepositoryBackendSpringDataMongo`'s own javadoc, not an oversight.
 
+**On Postgres, `deleteById` detaches the entity from every container holding it first (OMI-255)** -- both
+this backend's own `javai_collection_members` rows and Hibernate's join rows for a natively-mapped
+association. Only the former was handled before, so deleting an entity succeeded or died on a foreign key
+depending purely on which of the two shapes its container declared, which is not a distinction a caller
+deleting something should have to know about. Membership only: no other entity is deleted. A *singular*
+reference at the entity is still refused by the foreign key, deliberately -- clearing someone else's field
+is a change to their data rather than a cleanup, and refusing loudly is the better answer.
+
 **On Postgres, `UserCollectionType` makes interface-typed JavAI collections native JPA associations** --
 see "JavAI collections as native JPA associations (OMI-142)" under "What's actually implemented" below for
 the mechanism and for how the two shapes (native association vs. side table) coexist. Neo4j and MongoDB have no equivalent concept and stay on the
@@ -372,6 +439,27 @@ across the full vector table. `deleteById` removes a given entity's rows from *e
 currently exists (found via `information_schema.tables`, not just tables created during the current
 process's lifetime), so nothing is orphaned when an entity is deleted regardless of how many models have
 ever touched it.
+
+Two Postgres-only details that follow from those tables being *shared* rather than per-entity (OMI-255).
+**The table DDL is provisioned once, on its own connection, outside any caller's transaction** -- it used to
+run before every single vector write, and `CREATE INDEX IF NOT EXISTS` takes a lock conflicting with a
+concurrent transaction's inserts on the same table, so two concurrent saves deadlocked on it. And **a row is
+written only when its value actually changes**: a value-identical `UPDATE` still creates a row version at
+`REPEATABLE READ`, which is a collision a concurrent writer pays for and nobody gains from. A third table,
+`javai_summary_pending`, records which containers owe a summary recomputation; it exists only in a
+deployment that uses `@Summary`, and is empty except between a write and the drain that follows it.
+
+**Loading serves stored vectors back rather than recomputing them, for the whole loaded graph** -- the root
+and every entity reachable from it (OMI-187 for the root, OMI-256 for the rest). JavAI's vector caches live
+on a woven *instance* field, so they cannot survive a load: Hibernate hands back a different object for the
+same logical entity every time. `findById`/`findAll`/derived finders/vector search therefore read each loaded
+entity's stored vectors straight into its cache slots. Until OMI-256 that covered the root only, so the
+members Hibernate materializes behind a `@OneToMany`/`@ManyToMany` arrived cold and the next save re-embedded
+every one of them -- **one model call per member, per re-save**, so loading an album of fifty assets and
+saving it back to change its title cost fifty embeddings for content that had not changed and whose vectors
+were sitting in the database. The traversal is the one `hydrateGeoPoints` already made on the same paths, so
+it initializes nothing that was not already being initialized: an untouched lazy association is still
+skipped, never loaded on JavAI's initiative.
 
 **Neo4j**: `<field>Vector__<model>` per `@Vectorize` field, plus `vector__<model>`/`summaryVector__<model>`
 for the combined/summary ones (each with a `...ComputedAt__<model>` sibling) -- direct node properties,

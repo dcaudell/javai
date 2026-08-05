@@ -126,11 +126,36 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@JavAIVectorizable` | class | Triggers the entire woven method table above. Never also write `implements JavAIVectorizable` by hand. |
 | `@Vectorize` | field | This field contributes to the declaring object's own `vector()`. Also gets a synthesized `<field>Vector()` accessor. |
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
-| `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. |
+| `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. **When persisted, this makes the container a write-coordination point** — see the note below. |
 | `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
+
+### ⚠️ What `@Summary` implies once the container is persisted
+
+A container's summary is stored as **one row per container**. So every write anywhere beneath a `@Summary`
+container changes that one row — whichever child was touched, and however unrelated two writers are to each
+other. Put `@Summary` on a hot container (an album everyone uploads into, a workspace everyone edits) and you
+have declared a point every write underneath it passes through.
+
+**JavAI handles the coordination for you** (OMI-255): on Postgres the summary is not written inside your
+transaction at all. Your write records that the container owes a recomputation — an insert that cannot
+collide with anyone — and the recomputation runs immediately after your transaction commits, from committed
+state, under a lock. Two concurrent writers both succeed, and the container reflects both.
+
+Three consequences worth knowing before you annotate:
+
+- **A summary-vector search inside your own still-open transaction sees the previous summary.** After the
+  commit it is current. Between `save` and `commit`, it is not.
+- **Ancestors are recomputed even if you never loaded them**, because containment is resolved from the
+  database. Adding to a `Shelf` updates the `Library` holding it without your code mentioning a library.
+- **You can defer it per write** with `save(entity, SummaryPolicy.QUEUE_ONLY)` when throughput matters more
+  than currency — then drain with `JavAIPI.drainPendingSummaries(config)`. The queue is durable, so this
+  delays the work; it never loses it. But nothing drains it on your behalf.
+
+Full contract, including what happens when a recomputation fails, is in `persistence-support-matrix.md`'s
+"Concurrency" section. On Neo4j/MongoDB summaries are still written inline.
 
 ### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
 
@@ -425,7 +450,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.7` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.8` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -433,42 +458,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.7</version>
+  <version>0.1.8</version>
 </dependency>
 ```
 
@@ -479,14 +504,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.7")
-    implementation("io.github.dcaudell:javai-model:0.1.7")
-    implementation("io.github.dcaudell:javai-substrate:0.1.7")
-    implementation("io.github.dcaudell:javai-supervision:0.1.7")
-    implementation("io.github.dcaudell:javai-collections:0.1.7")
-    implementation("io.github.dcaudell:javai-persistence:0.1.7")
-    implementation("io.github.dcaudell:javai-completion:0.1.7")
-    implementation("io.github.dcaudell:javai-tagging:0.1.7")
+    implementation("io.github.dcaudell:javai-vector:0.1.8")
+    implementation("io.github.dcaudell:javai-model:0.1.8")
+    implementation("io.github.dcaudell:javai-substrate:0.1.8")
+    implementation("io.github.dcaudell:javai-supervision:0.1.8")
+    implementation("io.github.dcaudell:javai-collections:0.1.8")
+    implementation("io.github.dcaudell:javai-persistence:0.1.8")
+    implementation("io.github.dcaudell:javai-completion:0.1.8")
+    implementation("io.github.dcaudell:javai-tagging:0.1.8")
 }
 ```
 
@@ -532,6 +557,63 @@ code again.
   `-javaagent` shipped — self-attach via `ByteBuddyAgent.install()` is the real, current mechanism. If you
   see a build-time plugin described as available somewhere, verify against `javai-substrate`'s own current
   README before relying on it — the design docs describe it as a future option, not a Phase 0 deliverable.
+
+## Vector search: narrowing, ranking and paging
+
+The base convention is `findNearestBy<Field>Vector(EmbeddingVector reference, int limit)` — `<Field>` naming
+the woven accessor (`bodyVector()` → `findNearestByBodyVector`), with `findNearestByVector` /
+`findNearestBySummaryVector` / `findNearestByConcatenatedTextVector` for the whole-object variants.
+
+**You can also narrow it by an ordinary relational predicate, keep each hit's similarity, and page it.**
+Two idioms, which compile to the same query, so they cannot disagree:
+
+```java
+public interface MediaNoteRepository extends JavAIRepository<MediaNote> {
+    // narrowed: everything after Vector is the ordinary derived-finder grammar
+    List<MediaNote> findNearestByCaptionVectorAndKindIs(EmbeddingVector reference, int limit, Kind kind);
+    List<MediaNote> findNearestByCaptionVectorAndKindInAndPublishedTrue(
+            EmbeddingVector reference, int limit, Collection<Kind> kinds);
+
+    // ranked: keeps the similarity each hit was ranked on
+    List<Ranked<MediaNote>> findNearestByCaptionVectorAndKindIs(
+            EmbeddingVector reference, Kind kind, Limit limit);
+
+    // paged: a trailing Pageable supplies the window and the offset (so no int limit is declared)
+    List<MediaNote> findNearestByCaptionVector(EmbeddingVector reference, Pageable pageable);
+}
+```
+
+```java
+// or build it at runtime, when the predicate isn't known when the interface is written
+List<Ranked<MediaNote>> hits = notes.nearestBy("caption")     // nearest()/nearestBySummary() also exist
+        .to(reference)
+        .where("kind").in(Kind.IMAGE, Kind.SHORT)
+        .and("published").isTrue()
+        .offset(20).limit(20)
+        .ranked();                                            // or .results() for bare entities
+```
+
+Prefer the method-name form when it fits: it is validated when the repository is created rather than when it
+is called, and the query is visible in the interface. Reach for the builder when the predicate is composed at
+runtime, or the shape isn't worth a method.
+
+**Three things to know before relying on it:**
+
+- **The limit applies *after* the predicate.** Asking for the nearest 3 of some kind gives you 3 of them, not
+  "however many of the overall nearest 3 happened to be that kind". This is the difference between the
+  feature and the over-fetch-and-discard it replaces, so don't reintroduce the over-fetch out of habit.
+- **Narrowing is Postgres and MongoDB only. Neo4j refuses it**, and refuses loudly when the repository is
+  created — its vector index answers only "the K nearest", so a predicate could only be applied to what the
+  index already chose. If you are on Neo4j: use `JavAIVectorizable.query(...)` to rank in memory after an
+  ordinary derived finder narrows, or filter in the caller and accept the over-fetch explicitly. Ranked
+  results and paging *do* work on Neo4j.
+- **`Ranked.similarity()` is plain cosine in `[-1, 1]`** on every backend — the same number `similarityTo`
+  gives you in process, so a threshold means the same thing whichever store answered. (`Ranked.distance()` is
+  `1 - similarity` if you would rather think in distances.)
+
+⚠️ **MongoDB only:** a vector search index created before this feature existed lacks the `_id` filter path
+narrowing needs, and index definitions are not amended in place. If a narrowed search fails on an index an
+older version created, drop it and let JavAI recreate it.
 
 ## Registering entity types
 
@@ -737,6 +819,48 @@ Two edges worth knowing: a write inside `readOnly = true` fails loudly (Postgres
 savepoint manager, so Spring refuses it before JavAI is reached. **Neo4j and MongoDB have no equivalent**:
 every call is its own unit of work there, and `JavAIPI.inTransaction` throws rather than pretending, so
 multi-call flows against those backends must be designed to be safely retryable.
+
+**⚠️ Raising the isolation level on a JavAI-owned `SessionFactory` needs two settings, applied together.**
+This is worth knowing before you reach for `@Transactional(isolation = …)`, because the failure is loud,
+immediate, and looks unrelated to isolation: a bare `JpaTransactionManager` uses `DefaultJpaDialect`, which
+cannot prepare a JDBC connection and therefore **refuses every annotated call that asks for a non-default
+isolation level** rather than quietly degrading to the default. Both settings are required — either one
+alone still fails:
+
+```java
+@Bean PlatformTransactionManager transactionManager(SessionFactory factory) {
+    HibernateJpaDialect dialect = new HibernateJpaDialect();
+    dialect.setPrepareConnection(true);              // already Spring's default; see the note below
+    JpaTransactionManager manager = new JpaTransactionManager(factory);
+    manager.setJpaDialect(dialect);                  // (1) the dialect that can prepare a connection
+    return manager;
+}
+
+JavAIPersistenceConfig.builder()
+    .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+    // (2) the dialect prepares the connection once at transaction start and needs it held to the end;
+    //     Hibernate's default releases it after each statement, and Spring refuses the transaction
+    //     rather than run it at an isolation level it could not guarantee.
+    .hibernateProperty("hibernate.connection.handling_mode", "DELAYED_ACQUISITION_AND_HOLD")
+    .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+    .build();
+```
+
+`setPrepareConnection(true)` is **not** a third requirement — it is already Spring's default, verified by
+measurement rather than inherited from the API docs. It is written out above because it is the other half of
+what Spring's own refusal message names (*"make sure that its 'prepareConnection' flag is on … and that the
+Hibernate connection release mode is set to ON_CLOSE"*), so it is worth being explicit if something in your
+configuration might turn it off.
+
+Note the second setting is fixed when the factory is built, so it must be on the `JavAIPersistenceConfig`
+before the first repository call. None of this applies when **Spring** owns the factory — a
+`LocalContainerEntityManagerFactoryBean` already configures a preparing dialect, which is why raised
+isolation works there with no extra wiring. All of the above is pinned by
+`JavAIOwnedSessionFactoryTransactionTest` rather than left as prose.
+
+This matters most as the alternative to `@Version` when you want a concurrency guarantee the caller cannot
+forget: isolation is enforced by the database on every transaction, where optimistic locking depends on each
+writer going through an entity that carries the annotation.
 
 **Postgres schema naming, in detail** — since **0.1.5**, the `SessionFactory` JavAI builds applies
 `CamelCaseToUnderscoresNamingStrategy`, so `emailVerified` maps to the column `email_verified` and an entity

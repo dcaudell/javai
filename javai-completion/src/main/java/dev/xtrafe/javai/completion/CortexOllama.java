@@ -8,11 +8,15 @@ import com.google.gson.JsonSyntaxException;
 import dev.xtrafe.javai.vector.RetrySupport;
 import dev.xtrafe.javai.vector.TooManyRequestsException;
 import org.springframework.ai.ollama.api.OllamaApi;
+import org.springframework.http.client.ClientHttpRequestFactory;
+import org.springframework.http.client.JdkClientHttpRequestFactory;
+import org.springframework.web.client.RestClient;
 import org.springframework.ai.ollama.api.ThinkOption;
 import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -63,14 +67,18 @@ public final class CortexOllama implements Cortex {
     private final WebClient webClient;
     private final Gson gson;
 
-    private CortexOllama(String baseUrl, String model, Integer contextWindowTokensOverride) {
+    private CortexOllama(String baseUrl, String model, Integer contextWindowTokensOverride, Duration readTimeout) {
         this.model = model;
         this.baseUrl = baseUrl;
         this.contextWindowTokensOverride = contextWindowTokensOverride;
-        this.ollamaApi = OllamaApi.builder()
+        OllamaApi.Builder apiBuilder = OllamaApi.builder()
                 .baseUrl(baseUrl)
-                .responseErrorHandler(new TooManyRequestsResponseErrorHandler())
-                .build();
+                .responseErrorHandler(new TooManyRequestsResponseErrorHandler());
+        ClientHttpRequestFactory requestFactory = readTimeoutFactory(readTimeout);
+        if (requestFactory != null) {
+            apiBuilder = apiBuilder.restClientBuilder(RestClient.builder().requestFactory(requestFactory));
+        }
+        this.ollamaApi = apiBuilder.build();
         this.webClient = WebClient.builder()
                 .baseUrl(baseUrl)
                 .filter(TooManyRequestsExchangeFilterFunction.create())
@@ -80,6 +88,31 @@ public final class CortexOllama implements Cortex {
                 .registerTypeAdapter(Instant.class,
                         (JsonDeserializer<Instant>) (json, type, context) -> Instant.parse(json.getAsString()))
                 .create();
+    }
+
+    /**
+     * A request factory carrying an explicitly-requested read timeout, or {@code null} to leave Spring's own
+     * default in place.
+     *
+     * <p><b>Null is the default deliberately, and this connector must not quietly widen it.</b> A timeout
+     * exists to make a provider that has stopped answering look like a failure rather than like slow work;
+     * a connector that ships with a very long one has decided, on the caller's behalf, that a hung endpoint
+     * should keep a thread waiting for a quarter of an hour before anyone finds out. That is a decision for
+     * the application, not the library.
+     *
+     * <p>The knob exists because there is a legitimate case for a long one: an 8B model on CPU working
+     * through a long prompt -- a tag-classification request listing every candidate tag, say -- can spend
+     * minutes generating before the first response byte, and severing that is cutting off real work in
+     * progress. Local development and test harnesses want to wait; a production caller talking to a hosted
+     * endpoint almost certainly does not, and gets the ordinary default unless it says otherwise.
+     */
+    private static ClientHttpRequestFactory readTimeoutFactory(Duration readTimeout) {
+        if (readTimeout == null) {
+            return null;
+        }
+        JdkClientHttpRequestFactory factory = new JdkClientHttpRequestFactory();
+        factory.setReadTimeout(readTimeout);
+        return factory;
     }
 
     public static Builder builder() {
@@ -167,6 +200,7 @@ public final class CortexOllama implements Cortex {
         private String baseUrl = DEFAULT_BASE_URL;
         private String model;
         private Integer contextWindowTokens;
+        private Duration readTimeout;
 
         private Builder() {
         }
@@ -187,6 +221,21 @@ public final class CortexOllama implements Cortex {
             return this;
         }
 
+        /**
+         * How long to wait for a response before giving up. Unset by default, which leaves the underlying
+         * client's own timeout in place -- so a provider that stops answering still surfaces as a failure
+         * rather than as indefinitely slow work.
+         *
+         * <p>Set it when the wait is genuinely justified: a local CPU-hosted model generating a long answer
+         * can legitimately take minutes before its first response byte, and cutting that off severs work in
+         * progress. That is a property of one deployment, not of the connector, which is why it is a
+         * per-instance choice rather than a new default.
+         */
+        public Builder readTimeout(Duration readTimeout) {
+            this.readTimeout = readTimeout;
+            return this;
+        }
+
         /** Overrides {@link ContextWindows}'s best-effort lookup for this model. */
         public Builder contextWindowTokens(int contextWindowTokens) {
             this.contextWindowTokens = contextWindowTokens;
@@ -197,7 +246,7 @@ public final class CortexOllama implements Cortex {
             if (model == null) {
                 throw new IllegalStateException("CortexOllama requires a model -- e.g. \"qwen3:8b\"");
             }
-            return new CortexOllama(baseUrl, model, contextWindowTokens);
+            return new CortexOllama(baseUrl, model, contextWindowTokens, readTimeout);
         }
     }
 }

@@ -1,11 +1,13 @@
 package dev.xtrafe.javai.e2e.environment;
 
+import java.time.Duration;
 import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
 import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
 import dev.xtrafe.javai.e2e.domain.PlaceRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
@@ -50,6 +52,10 @@ import dev.xtrafe.javai.vector.LocalEmbeddingDefaults;
  */
 public final class JavAIEnvironment {
 
+    /** How long this harness waits for the container-hosted model to generate -- see the CORTEX
+     *  assignment below for why it is set here rather than in the connector. */
+    private static final Duration LOCAL_INFERENCE_READ_TIMEOUT = Duration.ofMinutes(15);
+
     private static final ArticleRepository POSTGRES_ARTICLE_REPOSITORY;
     private static final ArticleRepository NEO4J_ARTICLE_REPOSITORY;
     private static final ArticleRepository MONGO_ARTICLE_REPOSITORY;
@@ -66,6 +72,11 @@ public final class JavAIEnvironment {
     private static final PlaceRepository POSTGRES_PLACE_REPOSITORY;
     private static final PlaceRepository NEO4J_PLACE_REPOSITORY;
     private static final PlaceRepository MONGO_PLACE_REPOSITORY;
+
+    // OMI-230: narrowed vector search. Postgres and Mongo only -- Neo4j refuses a narrowed query at
+    // repository-creation time, so registering this there would fail this whole class's static init.
+    private static final MediaNoteRepository POSTGRES_MEDIA_NOTE_REPOSITORY;
+    private static final MediaNoteRepository MONGO_MEDIA_NOTE_REPOSITORY;
 
     private static final TagRepository POSTGRES_TAG_REPOSITORY;
     private static final TagRepository NEO4J_TAG_REPOSITORY;
@@ -107,6 +118,7 @@ public final class JavAIEnvironment {
                 .build();
         POSTGRES_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, postgresConfig);
         POSTGRES_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, postgresConfig);
+        POSTGRES_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, postgresConfig);
         POSTGRES_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, postgresConfig);
         POSTGRES_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, postgresConfig);
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
@@ -147,11 +159,20 @@ public final class JavAIEnvironment {
                 .build();
         MONGO_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, mongoConfig);
         MONGO_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, mongoConfig);
+        MONGO_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, mongoConfig);
         MONGO_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, mongoConfig);
         MONGO_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, mongoConfig);
         MONGO_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, mongoConfig);
 
-        CORTEX = LocalCompletionDefaults.create(MonolithicContainer.completionEndpoint());
+        // Willing to wait, because in this harness a slow answer is real work rather than a stall: the model
+        // runs on CPU inside the test container, and a long classification prompt legitimately takes minutes
+        // to generate. The default timeout severs that mid-generation, which surfaced as
+        // TaggingE2ETest.classifyAll... failing with "Read timed out" while the other twelve tagging tests
+        // passed against the very same endpoint. Deliberately set here, in test infrastructure, and NOT in
+        // the connector's own defaults -- a production caller must keep a timeout that reports a provider
+        // which has genuinely stopped answering.
+        CORTEX = LocalCompletionDefaults.create(
+                MonolithicContainer.completionEndpoint(), LOCAL_INFERENCE_READ_TIMEOUT);
 
         // Built once, after CORTEX exists -- JavAITagRepository takes its Cortex at construction, not via a
         // settable mutator (see that class's own javadoc), so it has to come after CORTEX is ready.
@@ -193,6 +214,16 @@ public final class JavAIEnvironment {
 
     public static PlaceRepository neo4jPlaceRepository() {
         return NEO4J_PLACE_REPOSITORY;
+    }
+
+    /** OMI-230's narrowed vector search. No Neo4j counterpart, deliberately -- that backend refuses a
+     *  narrowed query rather than approximating it; see {@code MediaNoteRepository}. */
+    public static MediaNoteRepository postgresMediaNoteRepository() {
+        return POSTGRES_MEDIA_NOTE_REPOSITORY;
+    }
+
+    public static MediaNoteRepository mongoMediaNoteRepository() {
+        return MONGO_MEDIA_NOTE_REPOSITORY;
     }
 
     public static PlaceRepository mongoPlaceRepository() {

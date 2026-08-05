@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
@@ -54,7 +55,9 @@ import java.sql.Statement;
 import java.sql.Timestamp;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.Deque;
 import java.util.Collections;
 import java.util.HashSet;
@@ -213,11 +216,33 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
+    private static final System.Logger LOG =
+            System.getLogger(RepositoryBackendHibernatePostgres.class.getName());
+
     private static final String FIELD_VECTOR_TABLE_PREFIX = "javai_vectors__";
     private static final String SUMMARY_VECTOR_TABLE_PREFIX = "javai_summary_vectors__";
 
+    /** How many queued owners one maintenance drain claims at a time. Bounded so a large backlog is worked
+     *  through in several short transactions rather than one long one holding advisory locks throughout. */
+    private static final int DRAIN_BATCH_SIZE = 256;
+
+    /** How many times a drain re-runs after a conflict with another pod's drain before giving up and leaving
+     *  the work queued. Small on purpose: the advisory lock already makes a second collision unlikely, and
+     *  the queue means giving up costs a delay, not the recomputation. */
+    private static final int DRAIN_MAX_ATTEMPTS = 3;
+
     private final JavAIPersistenceConfig config;
     private final Set<Class<?>> registeredEntityTypes = ConcurrentHashMap.newKeySet();
+
+    /** Vector tables this backend instance has already provisioned out of band -- see
+     *  {@link #ensureFieldVectorTable} for why this may be cached now when it could not be before.
+     *  Instance-scoped, per this repository's coding standard: two configs against two databases must not
+     *  share one another's belief about what exists. */
+    private final Map<String, Boolean> provisionedTables = new ConcurrentHashMap<>();
+
+    /** The declared {@code @Summary} containment of the registered model -- see {@link #containment()} for
+     *  why it is resolved lazily rather than in the constructor. */
+    private volatile Containment containment;
 
     /** Where the call that built {@link #sessionFactory} came from -- see {@link #describeCallingSite}. */
     private volatile String factoryBuildTrigger;
@@ -566,11 +591,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public Object save(Class<?> entityType, Object entity) {
+        return save(entityType, entity, SummaryPolicy.RECOMPUTE_AFTER_COMMIT);
+    }
+
+    @Override
+    public Object save(Class<?> entityType, Object entity, SummaryPolicy policy) {
         // The whole reachable subgraph is locked (and every field/summary vector forced accurate) for the
         // duration of the flush below -- this is what guarantees writeVectors()/writeVectorsForRelatedEntities()
         // below can never persist a vector that's stale relative to the field value committed in this same
         // transaction, regardless of the ambient EmbeddingConsistencyMode.
         Object[] result = new Object[1];
+        Set<Containment.OwnerRef> touched = new LinkedHashSet<>();
         JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> result[0] = inTransactionalSession(session -> {
             JavAIFlushVectorListener.begin();
             try {
@@ -613,6 +644,16 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // scratch. That is exactly the shape of a seeding loop -- save a TagSet, then save N tags
                 // that each reference the caller's TagSet -- and it was the last of OMI-187's waste.
                 transferVectorState(managed, entity, vectorizablesById(managed));
+                // And the @Version Hibernate just bumped, for the same reason and at the same moment: the
+                // caller keeps `entity`, so anything the write assigned has to be carried back to it or the
+                // instance they hold is already stale the moment save() returns (OMI-254).
+                refreshVersions(entity, managed);
+                // Records, inside this same transaction, which containers now owe a summary recomputation --
+                // an insert per owner, which cannot collide with a concurrent writer's inserts the way the
+                // shared summary row it replaces did. Rolls back with everything else if this save fails,
+                // so a recomputation is never queued for a mutation that never happened (OMI-255).
+                touched.addAll(participatingOwners(entity, managed));
+                enqueueSummaries(session, touched);
                 // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
                 // @Transient collection fields are left empty by merge(), so returning it would hand the
                 // caller back an Article whose in-memory `comments` looks wrong immediately after save().
@@ -623,6 +664,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 JavAIFlushVectorListener.end();
             }
         }));
+        if (policy == SummaryPolicy.RECOMPUTE_AFTER_COMMIT && !touched.isEmpty()) {
+            recomputeAfterCommit(touched);
+        }
         return result[0];
     }
 
@@ -645,11 +689,16 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             return newest == null ? Set.<String>of() : ownerKeys(connection, newest);
         }));
 
+        // QUEUE_ONLY throughout, then one drain at the end (OMI-255). Recomputing after each save would open
+        // a transaction per entity for a value that is about to be superseded by the next entity's save
+        // anyway -- a re-index rewrites the whole store, so every container is going to be recomputed
+        // regardless of how many times it is asked for along the way. The queue collapses those requests.
         for (Class<?> registered : registeredEntityTypes) {
             for (Object entity : findAll(registered)) {
-                save(registered, entity);
+                save(registered, entity, SummaryPolicy.QUEUE_ONLY);
             }
         }
+        drainPendingSummaries();
 
         List<String> missing = inSession(session -> session.doReturningWork(connection -> {
             String newest = newestVectorTable(connection);
@@ -706,9 +755,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return inSession(session -> {
             Object entity = session.find(entityType, id);
             if (entity != null) {
-                hydrateCollectionMembers(session, entity);
-                hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                hydrateVectors(session, entity);
+                hydrateLoaded(session, entity);
             }
             return Optional.ofNullable(entity);
         });
@@ -726,10 +773,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             JpaRoot<T> root = query.from(entityType);
             query.select(root);
             List<T> results = session.createQuery(query).list();
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T result : results) {
-                hydrateCollectionMembers(session, result);
-                hydrateGeoPoints(session, result, new IdentityHashMap<>());
-                hydrateVectors(session, result);
+                hydrateLoaded(session, result, hydrated);
             }
             return (List<Object>) (List<?>) results;
         });
@@ -737,9 +783,21 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public void deleteById(Class<?> entityType, UUID id) {
+        Set<Containment.OwnerRef> containers = new LinkedHashSet<>();
         inTransactionalSession(session -> {
             JavAIFlushVectorListener.begin();
             try {
+                // Resolved BEFORE the removal, necessarily: afterwards the join rows that name these
+                // containers are gone, and there is no way left to discover who used to hold this entity.
+                // Without this a container goes on summarising something it no longer holds -- the exact
+                // drift OMI-255 describes, arriving by deletion rather than by concurrency, and just as
+                // silent (nothing fails; similarity search simply answers with a stale shape).
+                containers.addAll(containment().containersOf(session, entityType, id));
+                // And detached from every container holding it, @Summary or not, before the row goes.
+                // A membership that outlives its member is a dangling reference at best and, on a natively
+                // mapped association, a foreign key the database simply refuses -- so whether deleteById
+                // worked at all used to depend on which storage shape the container happened to use.
+                detachFromContainers(session, entityType, id);
                 Object entity = session.find(entityType, id);
                 if (entity != null) {
                     cascadeDeleteCollectionMembers(session, entityType.getName(), id);
@@ -757,40 +815,84 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     deleteVectors(session, deleted.ownerType(), deleted.id());
                     deleteGeoPoints(session, deleted.ownerType(), deleted.id());
                 }
+                enqueueSummaries(session, containers);
                 return null;
             } finally {
                 JavAIFlushVectorListener.end();
             }
         });
+        if (!containers.isEmpty()) {
+            recomputeAfterCommit(containers);
+        }
     }
 
+    /**
+     * Ranks by similarity, narrowed by an optional relational predicate that is applied <b>before</b> the
+     * limit (OMI-230).
+     *
+     * <p>That ordering is the entire point, and it is why this resolves the predicate to an id set first
+     * rather than filtering the ranked output. Ranking then filtering answers a different question -- "which
+     * of the nearest N happen to match" -- and gives back fewer than N whenever the predicate is selective,
+     * which is precisely the over-fetch-and-discard the caller was trying to escape. Resolving first means
+     * {@code LIMIT} sees only rows that already match, so N nearest matches means N.
+     *
+     * <p>The id set is resolved through the ordinary derived-finder Criteria machinery
+     * ({@link #buildWhere}), not a second predicate translator written for vectors: a predicate expressible
+     * in a {@code findBy…} finder is expressible here, with identical semantics, because it is literally the
+     * same code. The cost is materializing the matching ids -- bounded by how selective the predicate is,
+     * not by the store -- which is the trade this makes deliberately: one id array beats an unbounded number
+     * of round trips, and beats a join this backend would otherwise have to synthesize against a table name
+     * it only knows through Hibernate's mapping.
+     */
     @Override
-    public List<Object> findNearestByFieldVector(
-            Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
-            String table = ensureFieldVectorTable(connection, reference.modelId(), reference.dims());
-            return rankIds(connection, table, entityType, fieldName, reference, limit);
-        }));
-        return hydrate(entityType, rankedIds);
+    public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        EmbeddingVector reference = spec.reference();
+        boolean entityGrain = spec.kind() == DerivedQueryMethods.Kind.SUMMARY
+                || spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT;
+        String table = entityGrain
+                ? ensureSummaryVectorTable(reference.modelId(), reference.dims())
+                : ensureFieldVectorTable(reference.modelId(), reference.dims());
+        String vectorColumn = spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT
+                ? "concatenated_text_vector" : "vector";
+        String fieldName = entityGrain ? null : spec.fieldName();
+
+        List<UUID> allowedIds = null;
+        if (spec.isNarrowed()) {
+            allowedIds = matchingIds(entityType, spec.predicate());
+            if (allowedIds.isEmpty()) {
+                return List.of(); // nothing satisfies the predicate, so nothing can be near and satisfy it
+            }
+        }
+        List<UUID> allowed = allowedIds;
+        List<RankedId> ranked = inSession(session -> session.doReturningWork(connection -> rankIds(connection,
+                table, entityType, fieldName, reference, spec.limitIncludingOffset(), vectorColumn, allowed)));
+        if (spec.offset() > 0) {
+            ranked = ranked.size() <= spec.offset()
+                    ? List.of() : new ArrayList<>(ranked.subList(spec.offset(), ranked.size()));
+        }
+        return hydrateRanked(entityType, ranked);
     }
 
-    @Override
-    public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
-            String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
-            return rankIds(connection, table, entityType, null, reference, limit);
-        }));
-        return hydrate(entityType, rankedIds);
-    }
-
-    @Override
-    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
-            int limit) {
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection -> {
-            String table = ensureSummaryVectorTable(connection, reference.modelId(), reference.dims());
-            return rankIds(connection, table, entityType, null, reference, limit, "concatenated_text_vector");
-        }));
-        return hydrate(entityType, rankedIds);
+    /**
+     * The ids satisfying {@code orGroups}, as an ordinary Criteria query over the entity's own table.
+     *
+     * <p>{@code distinct} unconditionally: a predicate reaching through a to-many association yields one row
+     * per matching member, and an id repeated in the array would rank the same entity several times.
+     */
+    private List<UUID> matchingIds(Class<?> entityType, List<List<DerivedFinderQuery.BoundPart>> orGroups) {
+        String idField = EntityReflection.idField(entityType).getName();
+        return inSession(session -> {
+            HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
+            JpaCriteriaQuery<UUID> cq = cb.createQuery(UUID.class);
+            JpaRoot<?> root = cq.from(entityType);
+            cq.select(root.get(idField));
+            cq.distinct(true);
+            Predicate where = buildWhere(session, cb, root, entityType, orGroups);
+            if (where != null) {
+                cq.where(where);
+            }
+            return session.createQuery(cq).list();
+        });
     }
 
     // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
@@ -911,10 +1013,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             List<T> results = typed.list();
             List<Object> out = new ArrayList<>(results.size());
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T entity : results) {
-                hydrateCollectionMembers(session, entity);
-                hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                hydrateVectors(session, entity);
+                hydrateLoaded(session, entity, hydrated);
                 out.add(entity);
             }
             return out;
@@ -1430,49 +1531,613 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // deleted. Skipping the write alone would leave a stale vector behind, and a stale row in an ANN
         // index is worse than a wasted embedding: the entity keeps matching searches for content it no
         // longer has. Reaching it needs a @Vectorize field to go from populated to null between saves.
+        //
+        // The write is planned first and issued second, so that every table this save needs is provisioned
+        // before the caller's connection is touched at all. Provisioning inside the doWork below would run
+        // DDL while this transaction already holds row locks on the very table being provisioned, which is
+        // how two concurrent saves deadlocked on each other (OMI-255 -- see ensureFieldVectorTable).
+        String currentModelId = JavAIRuntime.currentModelId();
+        Map<String, EmbeddingVector> toWrite = new LinkedHashMap<>();
+        List<String> toDelete = new ArrayList<>();
+        for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
+            EmbeddingVector vector = vectorizable.fieldVector(fieldName);
+            if (vector.isAbsent()) {
+                toDelete.add(fieldName);
+            } else {
+                toWrite.put(fieldName, vector);
+                ensureFieldVectorTable(vector.modelId(), vector.dims());
+            }
+        }
+        EmbeddingVector combined = vectorizable.vector();
+        if (combined.isAbsent()) {
+            toDelete.add(COMBINED_VECTOR_FIELD);
+        } else {
+            toWrite.put(COMBINED_VECTOR_FIELD, combined);
+            ensureFieldVectorTable(combined.modelId(), combined.dims());
+        }
+
         session.doWork(connection -> {
-            String currentModelId = JavAIRuntime.currentModelId();
-            for (String fieldName : EntityReflection.vectorizeFieldNames(entityType)) {
-                EmbeddingVector vector = vectorizable.fieldVector(fieldName);
-                if (vector.isAbsent()) {
-                    deleteFieldVectorRow(connection, currentModelId, ownerType, id, fieldName);
+            // What is already stored, read once for the whole entity. Skipping a write whose value is
+            // unchanged is not a micro-optimisation: at REPEATABLE READ a value-identical UPDATE still
+            // creates a row version, and that version is exactly what a concurrent writer collides with.
+            // Two people adding two different things to one container were refusing each other over rows
+            // neither of them had changed.
+            Map<String, StoredVector> stored = readStoredFieldVectors(connection, ownerType, id, currentModelId);
+            for (Map.Entry<String, EmbeddingVector> entry : toWrite.entrySet()) {
+                EmbeddingVector vector = entry.getValue();
+                if (isUnchanged(stored.get(entry.getKey()), vector)) {
                     continue;
                 }
-                String table = ensureFieldVectorTable(connection, vector.modelId(), vector.dims());
-                upsertVector(connection, table, ownerType, id, fieldName, vector);
+                String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(vector.modelId());
+                upsertVector(connection, table, ownerType, id, entry.getKey(), vector);
             }
-            EmbeddingVector combined = vectorizable.vector();
-            if (combined.isAbsent()) {
-                deleteFieldVectorRow(connection, currentModelId, ownerType, id, COMBINED_VECTOR_FIELD);
-            } else {
-                String combinedTable = ensureFieldVectorTable(connection, combined.modelId(), combined.dims());
-                upsertVector(connection, combinedTable, ownerType, id, COMBINED_VECTOR_FIELD, combined);
-            }
-
-            // The entity-grain row now serves two independent opt-ins (OMI-191): write when *either* value
-            // is present, delete only when both are absent. Writing the concatenated columns as NULL when
-            // concatenation is switched off is what stops a stale text vector outliving the opt-in -- the
-            // same stale-row-in-an-ANN-index problem the summary vector's own delete already guards.
-            EmbeddingVector summary = vectorizable.summaryVector();
-            EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
-            if (summary.isAbsent() && concatenated.isAbsent()) {
-                deleteSummaryVectorRow(connection, currentModelId, ownerType, id);
-            } else if (summary.isAbsent()) {
-                // The `vector` column is NOT NULL, so a row cannot hold concatenated text without a summary
-                // vector. Reasoning says the two always co-occur -- text implies content, and content
-                // implies a non-absent summary contribution -- but that is inference, so this refuses
-                // loudly rather than silently dropping the text or tripping a bare constraint violation.
-                // If this ever fires, the fix is to make `vector` nullable, not to skip the write.
-                throw new IllegalStateException("Entity " + ownerType + "#" + id + " has a concatenated text"
-                        + " vector but an absent summary vector, which the entity-grain table cannot"
-                        + " represent (its `vector` column is NOT NULL). This combination was believed"
-                        + " impossible; please report it with the entity's shape.");
-            } else {
-                String summaryTable = ensureSummaryVectorTable(connection, summary.modelId(), summary.dims());
-                upsertSummaryVector(connection, summaryTable, ownerType, id, summary, concatenated,
-                        concatenated.isAbsent() ? null : vectorizable.concatenatedText());
+            for (String fieldName : toDelete) {
+                deleteFieldVectorRow(connection, currentModelId, ownerType, id, fieldName);
             }
         });
+
+        // The entity-grain row (summary vector + concatenated text) is deliberately NOT written here when
+        // this entity is a @Summary container -- see writeEntityGrainVectors, and OMI-255's own section in
+        // doc/ai-guidance/persistence-support-matrix.md for the contract that follows from it.
+        if (!isSummaryContainer(entityType)) {
+            writeEntityGrainVectors(session, vectorizable, ownerType, id);
+        }
+    }
+
+    /**
+     * Writes {@code javai_summary_vectors__<model>}'s single row for one owner: the summary vector, plus the
+     * concatenated text and its vector when the entity participates (OMI-191).
+     *
+     * <p><b>Who calls this, and when, is the whole of OMI-255.</b> For an entity that declares no
+     * {@code @Summary} field, this runs inline in the caller's transaction exactly as it always has -- such a
+     * row changes only when that entity itself changes, so the only writer that can collide with it is
+     * another write to the same entity, which is a genuine conflict and should be refused.
+     *
+     * <p>For a {@code @Summary} <em>container</em> it runs from the drain instead, after the caller has
+     * committed. That row is shared by every mutation anywhere beneath the container, so leaving it here made
+     * two unrelated writers collide on it -- and no lock taken inside the writer's transaction can fix that
+     * at {@code REPEATABLE READ}, because the snapshot is already fixed by the time the container is known.
+     *
+     * <p>The write itself is unchanged: write when <em>either</em> value is present, delete only when both
+     * are absent, and always assign the concatenated columns rather than leaving them alone, so switching
+     * {@code @Summary(concatenate = true)} off clears a previously-stored text vector instead of leaving it
+     * to keep matching searches.
+     */
+    private void writeEntityGrainVectors(Session session, JavAIVectorizable vectorizable,
+            String ownerType, UUID id) {
+        String currentModelId = JavAIRuntime.currentModelId();
+        EmbeddingVector summary = vectorizable.summaryVector();
+        EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
+        // Provisioned before the connection is borrowed, not inside doWork: provisioning opens a session of
+        // its own, and taking a second connection while holding one is a pool-exhaustion risk under load as
+        // well as the lock-ordering hazard ensureFieldVectorTable documents.
+        String summaryTable = summary.isAbsent() ? null
+                : ensureSummaryVectorTable(summary.modelId(), summary.dims());
+        session.doWork(connection ->
+                writeEntityGrainRow(connection, summaryTable, vectorizable, ownerType, id,
+                        currentModelId, summary, concatenated));
+    }
+
+    private static void writeEntityGrainRow(Connection connection, String summaryTable,
+            JavAIVectorizable vectorizable, String ownerType, UUID id, String currentModelId,
+            EmbeddingVector summary, EmbeddingVector concatenated) throws SQLException {
+        if (summary.isAbsent() && concatenated.isAbsent()) {
+            deleteSummaryVectorRow(connection, currentModelId, ownerType, id);
+            return;
+        }
+        if (summary.isAbsent()) {
+            // The `vector` column is NOT NULL, so a row cannot hold concatenated text without a summary
+            // vector. Reasoning says the two always co-occur -- text implies content, and content implies a
+            // non-absent summary contribution -- but that is inference, so this refuses loudly rather than
+            // silently dropping the text or tripping a bare constraint violation. If this ever fires, the
+            // fix is to make `vector` nullable, not to skip the write.
+            throw new IllegalStateException("Entity " + ownerType + "#" + id + " has a concatenated text"
+                    + " vector but an absent summary vector, which the entity-grain table cannot"
+                    + " represent (its `vector` column is NOT NULL). This combination was believed"
+                    + " impossible; please report it with the entity's shape.");
+        }
+        StoredSummaryRow storedRow = readStoredSummaryRow(connection, summaryTable, ownerType, id);
+        if (storedRow != null && isUnchanged(storedRow.summary(), summary)
+                && isUnchanged(storedRow.concatenated(), concatenated)) {
+            return; // nothing about this row would change -- see the read-then-skip note in writeVectors
+        }
+        upsertSummaryVector(connection, summaryTable, ownerType, id, summary, concatenated,
+                concatenated.isAbsent() ? null : vectorizable.concatenatedText());
+    }
+
+    /** Whether {@code entityType} declares a {@code @Summary} field of its own -- i.e. whether its
+     *  entity-grain row is shared by mutations to other entities, which is what decides where it is
+     *  written. */
+    private static boolean isSummaryContainer(Class<?> entityType) {
+        return !EntityReflection.fieldNamesAnnotatedWith(entityType, Summary.class).isEmpty();
+    }
+
+    // ---- summary recomputation: enqueue inside the transaction, recompute after it (OMI-255) ------
+
+    /**
+     * The declared {@code @Summary} shape of the registered model, built once the entity set is complete.
+     *
+     * <p>Lazily rather than in the constructor because registration is still in progress there --
+     * {@code entityPackages(...)} scanning and every {@code JavAIPI.repository(...)} call add to it. By the
+     * first save the set is necessarily final, since the {@code SessionFactory} has been built and
+     * {@link #registerEntityType} refuses anything new past that point.
+     */
+    private Containment containment() {
+        Containment resolved = containment;
+        if (resolved == null) {
+            synchronized (bootstrapLock) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = Containment.of(registeredEntityTypes);
+                    containment = resolved;
+                }
+            }
+        }
+        return resolved;
+    }
+
+    /**
+     * Which of the entities this save touched take part in {@code @Summary} containment at all.
+     *
+     * <p>Everything else is deliberately excluded, and that exclusion is the reason an ordinary JPA entity
+     * is untouched by any of this: a plain {@code @Entity}, or a vectorized one that neither declares a
+     * {@code @Summary} field nor is held in anyone else's, enqueues nothing, provisions no queue table, and
+     * has its entity-grain row written inline exactly as before.
+     */
+    private Set<Containment.OwnerRef> participatingOwners(Object entity, Object managed) {
+        Containment containment = containment();
+        if (containment.hasNoSummaries()) {
+            return Set.of();
+        }
+        Set<Containment.OwnerRef> owners = new LinkedHashSet<>();
+        Map<UUID, Object> reachable = new HashMap<>(vectorizablesById(entity));
+        reachable.putAll(vectorizablesById(managed));
+        for (Object flushed : JavAIFlushVectorListener.current().persisted()) {
+            Object resolved = resolve(flushed);
+            UUID id = resolved == null ? null : idOrNull(resolved);
+            if (id != null) {
+                reachable.putIfAbsent(id, resolved);
+            }
+        }
+        for (Map.Entry<UUID, Object> entry : reachable.entrySet()) {
+            Class<?> type = entry.getValue().getClass();
+            if (containment.participates(type)) {
+                owners.add(new Containment.OwnerRef(type, entry.getKey()));
+            }
+        }
+        return owners;
+    }
+
+    /** Writes the queue rows on the caller's own connection, so they commit or roll back with the mutation
+     *  that caused them. */
+    private void enqueueSummaries(Session session, Set<Containment.OwnerRef> owners) {
+        if (owners.isEmpty()) {
+            return;
+        }
+        ensurePendingSummaryTable();
+        session.doWork(connection -> {
+            for (Containment.OwnerRef owner : owners) {
+                PendingSummaries.enqueue(connection, owner);
+            }
+        });
+    }
+
+    private void ensurePendingSummaryTable() {
+        provisionTable(PendingSummaries.TABLE, PendingSummaries::createTable);
+    }
+
+    /**
+     * Runs the recomputation once the caller's transaction has actually committed -- immediately when JavAI
+     * owned that transaction, and via a commit callback when it did not.
+     *
+     * <p>The distinction is not cosmetic. Inside {@code JavAIPI.inTransaction} or a Spring
+     * {@code @Transactional} method, {@code save} returns long before anything is committed; recomputing
+     * there would read a graph no other session can see, and would write the shared summary row from inside
+     * the very transaction this fix exists to keep it out of.
+     */
+    private void recomputeAfterCommit(Set<Containment.OwnerRef> owners) {
+        Session ambient = ambientSession();
+        if (ambient == null) {
+            drain(owners);
+            return;
+        }
+        SummaryDrainScope.afterCommit(this, ambient, owners, this::drain);
+    }
+
+    /**
+     * Recomputes and writes the summary row for {@code owners} and everything containing them, transitively.
+     *
+     * <p>Runs in its own short transaction on its own connection: the caller's is committed and gone. Each
+     * owner is recomputed under a Postgres advisory lock keyed on that owner, so two pods recomputing the
+     * same container queue up instead of overwriting -- and because each recomputation reads the graph as
+     * committed rather than folding in whatever the writer happened to hold, the one that runs last is
+     * <em>correct</em>, not merely last. That is the difference between this and a lock inside the writer's
+     * transaction, which cannot produce a correct value at all: it would serialise writers around the stale
+     * snapshots they had already taken.
+     *
+     * <p><b>A failure here does not fail the caller's write, which is already committed.</b> The queue rows
+     * survive, so the recomputation is owed, not lost -- the next save of the same container, an explicit
+     * {@link JavAIPI#drainPendingSummaries}, or a reindex will do it. Silence would be wrong though, so it
+     * is logged with the owners that were left pending.
+     */
+    private void drain(Set<Containment.OwnerRef> owners) {
+        for (int attempt = 1; ; attempt++) {
+            try {
+                drainOnce(owners);
+                return;
+            } catch (RuntimeException e) {
+                // Two pods recomputing the same container is ordinary, not exceptional, and it is precisely
+                // what this whole mechanism is for -- so a conflict between two drains must not surface as a
+                // failure. A retry is trivially correct here in a way it would not be inside the caller's
+                // transaction: the drain derives everything it writes from committed state, so running it
+                // again simply recomputes against whatever is now committed.
+                if (attempt < DRAIN_MAX_ATTEMPTS && isTransientWriteConflict(e)) {
+                    continue;
+                }
+                LOG.log(System.Logger.Level.WARNING, () -> "JavAI could not recompute summary vectors for "
+                        + (owners == null ? "the pending queue" : owners)
+                        + ". The write itself is committed and the recomputation stays queued -- the next save "
+                        + "of the same container, JavAIPI.drainPendingSummaries(config), or a reindex will "
+                        + "retry it. Until then those containers' summary vectors are stale.", e);
+                return;
+            }
+        }
+    }
+
+    /** Whether {@code thrown} is a conflict that simply re-running would resolve -- a serialisation failure
+     *  or a deadlock, as against a genuine error like a missing table or a bad mapping, which retrying would
+     *  only repeat. */
+    private static boolean isTransientWriteConflict(Throwable thrown) {
+        for (Throwable cause = thrown; cause != null; cause = cause.getCause()) {
+            if (cause instanceof SQLException sqlException) {
+                String state = sqlException.getSQLState();
+                if ("40001".equals(state) || "40P01".equals(state)) {
+                    return true; // serialization_failure / deadlock_detected
+                }
+            }
+            if (cause.getCause() == cause) {
+                break;
+            }
+        }
+        return false;
+    }
+
+    private void drainOnce(Set<Containment.OwnerRef> owners) {
+        inOwnTransaction(session -> {
+            PendingSummaries.Claim claim = session.doReturningWork(connection ->
+                    owners == null ? PendingSummaries.claim(connection, DRAIN_BATCH_SIZE)
+                            : PendingSummaries.claimFor(connection, owners));
+            if (claim.isEmpty()) {
+                return null;
+            }
+            Set<Containment.OwnerRef> visited = new LinkedHashSet<>();
+            Deque<Containment.OwnerRef> pending = new ArrayDeque<>();
+            for (PendingSummaries.PendingOwner owner : claim.owners()) {
+                Class<?> type = resolveOwnerType(owner.ownerTypeName());
+                if (type != null) {
+                    pending.add(new Containment.OwnerRef(type, owner.ownerId()));
+                }
+            }
+            while (!pending.isEmpty()) {
+                Containment.OwnerRef owner = pending.poll();
+                if (!visited.add(owner)) {
+                    continue; // already recomputed in this pass -- also the cycle guard
+                }
+                recomputeOwner(session, owner);
+                // Upward, one hop at a time, from what the database says contains this owner -- never
+                // from the saving session's object graph, which may not have held the container at all.
+                pending.addAll(containment().containersOf(session, owner.ownerType(), owner.ownerId()));
+            }
+            session.doWork(connection -> PendingSummaries.delete(connection, claim.rowIds()));
+            return null;
+        });
+    }
+
+    /**
+     * Removes {@code (entityType, id)} from every container currently holding it, so the row can be deleted.
+     *
+     * <p>Done through the mapping rather than by deleting join rows directly: Hibernate owns the association
+     * and knows its table and columns, and removing the element from the loaded collection lets it issue the
+     * right statement. Deleting rows out from under it would also leave any collection already loaded in this
+     * session holding an element that no longer exists.
+     *
+     * <p>This is a <b>membership</b> removal, never a cascade: the container loses its reference, and every
+     * other entity is untouched. That is the same thing {@code cascadeDeleteCollectionMembers} has always
+     * done for this backend's own membership rows -- the natively-mapped half was simply missing, which is
+     * why deleting an entity worked or failed depending on how its container declared the field.
+     */
+    private void detachFromContainers(Session session, Class<?> entityType, UUID id) {
+        List<Containment.Edge> edges = containment().collectionEdgesHolding(entityType);
+        if (edges.isEmpty()) {
+            return;
+        }
+        Object child = session.find(entityType, id);
+        for (Containment.Edge edge : edges) {
+            for (Containment.OwnerRef owner : containment().ownersHolding(session, edge, entityType, id)) {
+                if (edge.kind() == Containment.Kind.JAVAI_COLLECTION) {
+                    session.doWork(connection -> deleteMembershipRow(connection, owner, edge, entityType, id));
+                    continue;
+                }
+                Object container = session.find(owner.ownerType(), owner.ownerId());
+                if (container == null || child == null) {
+                    continue;
+                }
+                Object value = EntityReflection.readField(container, edge.fieldName());
+                if (value instanceof Map<?, ?> map) {
+                    map.values().removeIf(element -> element == child);
+                } else if (value instanceof Collection<?> collection) {
+                    collection.removeIf(element -> element == child);
+                }
+            }
+        }
+        // Flushed here, not left to the caller's own flush: the join rows have to be gone before the DELETE
+        // of the entity itself is issued, and Hibernate is free to order the two either way otherwise.
+        session.flush();
+    }
+
+    /** The {@code javai_collection_members} half of {@link #detachFromContainers} -- this backend owns those
+     *  rows itself, so there is no mapping to go through. */
+    private static void deleteMembershipRow(Connection connection, Containment.OwnerRef owner,
+            Containment.Edge edge, Class<?> childType, UUID childId) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement(
+                "DELETE FROM javai_collection_members WHERE owner_type = ? AND owner_id = ?"
+                        + " AND field_name = ? AND member_type = ? AND member_id = ?")) {
+            statement.setString(1, owner.ownerType().getName());
+            statement.setObject(2, owner.ownerId());
+            statement.setString(3, edge.fieldName());
+            statement.setString(4, childType.getName());
+            statement.setObject(5, childId);
+            statement.executeUpdate();
+        }
+    }
+
+    /** Recomputes one owner's entity-grain row from committed state, under a lock on that owner alone. */
+    private void recomputeOwner(Session session, Containment.OwnerRef owner) {
+        // Only a @Summary container has anything to recompute. Everything else in the queue is there purely
+        // as a starting point for the walk upward -- its own entity-grain row depends on nothing but itself
+        // and was already written, correctly, inline during the save (see writeEntityGrainVectors).
+        //
+        // Recomputing it anyway was not merely wasted work, it was expensive: doing so reloads the entity in
+        // this fresh session and reads its vectors back out, and any leaf whose stored vectors don't make it
+        // into the reloaded instance is then re-embedded for real. AssociationGraphEmbeddingCostE2ETest
+        // counts embed() calls and caught exactly that -- four association *targets* re-embedded per save,
+        // every one of them a leaf, none of them a container (OMI-255).
+        if (!isSummaryContainer(owner.ownerType())) {
+            return;
+        }
+        session.doWork(connection -> lockOwner(connection, owner));
+        Object entity = session.find(owner.ownerType(), owner.ownerId());
+        if (entity == null) {
+            return; // deleted since it was enqueued; deleteById already removed its vector rows
+        }
+        if (!(entity instanceof JavAIVectorizable vectorizable)) {
+            return;
+        }
+        hydrateCollectionMembers(session, entity);
+        hydrateVectors(session, entity);
+        // The children's stored vectors too, not just this owner's: summaryVector() reads each @Summary
+        // child's own summary, and an unhydrated child recomputes its vector from scratch -- a real
+        // embedding call, per child, on every recomputation. One SELECT each is the cheaper half of that
+        // trade by a wide margin.
+        hydrateSummaryChildren(session, entity, Collections.newSetFromMap(new IdentityHashMap<>()));
+        writeEntityGrainVectors(session, vectorizable, owner.ownerType().getName(), owner.ownerId());
+    }
+
+    private void hydrateSummaryChildren(Session session, Object entity, Set<Object> visited) {
+        if (entity == null || !visited.add(entity)) {
+            return;
+        }
+        for (String fieldName : EntityReflection.fieldNamesAnnotatedWith(entity.getClass(), Summary.class)) {
+            Object value = EntityReflection.readField(entity, fieldName);
+            for (Object child : expandToEntities(value)) {
+                Object resolved = Hibernate.unproxy(child);
+                hydrateVectors(session, resolved);
+                hydrateSummaryChildren(session, resolved, visited);
+            }
+        }
+    }
+
+    private static List<Object> expandToEntities(Object value) {
+        if (value instanceof Map<?, ?> map) {
+            return new ArrayList<>(map.values());
+        }
+        if (value instanceof Collection<?> collection) {
+            return new ArrayList<>(collection);
+        }
+        return value == null ? List.of() : List.of(value);
+    }
+
+    /**
+     * A Postgres advisory lock keyed on {@code (owner_type, owner_id)}, held to the end of this drain's
+     * transaction.
+     *
+     * <p>Advisory rather than row-level because the row may not exist yet -- a container being summarised
+     * for the first time has nothing to lock -- and because it is held across the read-recompute-write
+     * sequence rather than only across the write. It is a database lock, so it serialises pods, not merely
+     * threads: JavAI's own in-process locking has no bearing on a second pod doing the same work.
+     */
+    private static void lockOwner(Connection connection, Containment.OwnerRef owner) throws SQLException {
+        // The two-key form is (int, int), and hashtext() returns exactly int -- no cast, which is what the
+        // (bigint, bigint) overload this first reached for does not have. Two keys rather than one hashed
+        // string keeps types from colliding with each other's ids in the lock space.
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT pg_advisory_xact_lock(hashtext(?), hashtext(?))")) {
+            statement.setString(1, owner.ownerType().getName());
+            statement.setString(2, owner.ownerId().toString());
+            statement.executeQuery().close();
+        }
+    }
+
+    /** The registered entity class a queue row names, or null when this pod has no such class -- a row
+     *  written by a deployment that knows a type this one doesn't is left alone rather than discarded. */
+    private Class<?> resolveOwnerType(String typeName) {
+        for (Class<?> type : registeredEntityTypes) {
+            if (type.getName().equals(typeName)) {
+                return type;
+            }
+        }
+        return null;
+    }
+
+    /** A transaction of this backend's own, never the caller's -- the drain runs after the caller's has
+     *  already committed, so there is nothing to join even when a scope is still bound to this thread. */
+    private <T> T inOwnTransaction(Function<Session, T> work) {
+        try (Session session = sessionFactory().openSession()) {
+            Transaction tx = session.beginTransaction();
+            try {
+                readCommitted(session);
+                T result = work.apply(session);
+                tx.commit();
+                return result;
+            } catch (RuntimeException e) {
+                if (tx.isActive()) {
+                    tx.rollback();
+                }
+                throw e;
+            }
+        }
+    }
+
+    /**
+     * Runs the drain's transaction at {@code READ COMMITTED}, whatever the application configured for its
+     * own work.
+     *
+     * <p>Not a relaxation of anything -- it is what makes the recomputation correct. At
+     * {@code REPEATABLE READ} a transaction's snapshot is fixed by its first statement, so a second pod's
+     * drain would read the container as it was <em>before</em> the first pod's drain committed, and then be
+     * refused when it tried to write the row: {@code could not serialize access due to concurrent update},
+     * the very error this ticket started from, merely relocated. The advisory lock orders the two drains but
+     * cannot move a snapshot that was already taken.
+     *
+     * <p>{@code READ COMMITTED} is exactly right for derived state: each drain wants the latest committed
+     * graph, not a stable historical view of it. Statement-level snapshots mean the second drain sees the
+     * first's work and folds in both writers' children. The retry in {@link #drain} remains as a backstop for
+     * the case where the level cannot be set at all.
+     */
+    private static void readCommitted(Session session) {
+        session.doWork(connection -> {
+            try (Statement statement = connection.createStatement()) {
+                // Plain SQL rather than Connection.setTransactionIsolation: the transaction has already
+                // begun by this point, and the JDBC setter refuses that, while SET TRANSACTION is defined
+                // precisely for it -- valid as the first statement of a transaction, which this is.
+                statement.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED");
+            }
+        });
+    }
+
+    /** Drains everything queued, for a caller running this as maintenance rather than as part of a save.
+     *  Loops until the queue is empty, since one pass claims at most {@link #DRAIN_BATCH_SIZE} owners. */
+    void drainPendingSummaries() {
+        if (containment().hasNoSummaries()) {
+            return;
+        }
+        ensurePendingSummaryTable();
+        while (pendingCount() > 0) {
+            int before = pendingCount();
+            drain(null);
+            if (pendingCount() >= before) {
+                // No progress -- either a drain is failing (already logged) or another pod is enqueueing at
+                // least as fast as this one drains. Either way, spinning here would not help.
+                return;
+            }
+        }
+    }
+
+    private int pendingCount() {
+        return inSession(session -> session.doReturningWork(connection -> {
+            try (Statement statement = connection.createStatement();
+                 ResultSet rows = statement.executeQuery("SELECT count(*) FROM " + PendingSummaries.TABLE)) {
+                return rows.next() ? rows.getInt(1) : 0;
+            }
+        }));
+    }
+
+    @Override
+    public void reindex(Class<?> entityType) {
+        for (Object entity : findAll(entityType)) {
+            save(entityType, entity, SummaryPolicy.QUEUE_ONLY);
+        }
+        drainPendingSummaries();
+    }
+
+    /** A vector as the database currently holds it, for comparison against the one about to be written. */
+    private record StoredVector(String modelId, int dims, float[] values) {
+    }
+
+    /** The entity-grain row's two vectors, either of which may be absent. */
+    private record StoredSummaryRow(StoredVector summary, StoredVector concatenated) {
+    }
+
+    /**
+     * Whether writing {@code vector} would change the stored value at all -- including the two "both absent"
+     * and "one absent" cases, so an entity that never had a concatenated text vector and still doesn't
+     * counts as unchanged rather than as a difference between {@code null} and absent.
+     *
+     * <p>Values are compared exactly, not within a tolerance: these are the same floats that were stored,
+     * round-tripped through pgvector's own shortest-round-trippable text form, so anything but an exact
+     * match is a real difference. A tolerance would silently suppress small genuine changes -- which, for a
+     * vector whose whole purpose is to rank by cosine distance, is the one error that would never surface.
+     */
+    private static boolean isUnchanged(StoredVector stored, EmbeddingVector vector) {
+        if (vector == null || vector.isAbsent()) {
+            return stored == null;
+        }
+        return stored != null
+                && stored.dims() == vector.dims()
+                && stored.modelId().equals(vector.modelId())
+                && Arrays.equals(stored.values(), vector.values());
+    }
+
+    /** Every field vector already stored for one owner under the current model, in a single query. Returns
+     *  empty when the table does not exist yet, which simply means nothing can be unchanged. */
+    private static Map<String, StoredVector> readStoredFieldVectors(
+            Connection connection, String ownerType, UUID ownerId, String modelId) throws SQLException {
+        if (modelId == null) {
+            return Map.of();
+        }
+        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        if (!tableExists(connection, table)) {
+            return Map.of();
+        }
+        Map<String, StoredVector> stored = new HashMap<>();
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT field_name, model_id, dims, vector::text FROM " + table
+                        + " WHERE owner_type = ? AND owner_id = ?")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, ownerId);
+            try (ResultSet rows = statement.executeQuery()) {
+                while (rows.next()) {
+                    stored.put(rows.getString(1), new StoredVector(
+                            rows.getString(2), rows.getInt(3), parseVectorLiteral(rows.getString(4))));
+                }
+            }
+        }
+        return stored;
+    }
+
+    private static StoredSummaryRow readStoredSummaryRow(
+            Connection connection, String table, String ownerType, UUID ownerId) throws SQLException {
+        if (!tableExists(connection, table)) {
+            return null;
+        }
+        try (PreparedStatement statement = connection.prepareStatement(
+                "SELECT model_id, dims, vector::text, concatenated_text_vector::text FROM " + table
+                        + " WHERE owner_type = ? AND owner_id = ?")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, ownerId);
+            try (ResultSet rows = statement.executeQuery()) {
+                if (!rows.next()) {
+                    return null;
+                }
+                String modelId = rows.getString(1);
+                int dims = rows.getInt(2);
+                String concatenated = rows.getString(4);
+                return new StoredSummaryRow(
+                        new StoredVector(modelId, dims, parseVectorLiteral(rows.getString(3))),
+                        concatenated == null ? null
+                                : new StoredVector(modelId, dims, parseVectorLiteral(concatenated)));
+            }
+        }
     }
 
     // ---- relational fields: singular (ordinary Hibernate @OneToOne) + collection (this backend's own) --
@@ -1594,6 +2259,131 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             if (source != null) {
                 JavAIRuntime.transferComputedVectors(source, target);
             }
+        }
+    }
+
+    /**
+     * Carries the {@code @Version} Hibernate assigned during this write back onto the instances the caller
+     * still holds (OMI-254).
+     *
+     * <p>Without this, {@code @Version} is annotatable but unusable. {@code merge()} performs the write on
+     * its own managed copy and it is that copy whose version Hibernate increments, while {@code save()}
+     * deliberately returns the caller's {@code entity} (see the comment at its {@code return}). So the object
+     * handed back still carried the <em>pre-write</em> version, and saving it a second time -- with no
+     * concurrency involved whatsoever, no second thread, no second transaction -- sent a version the database
+     * had already moved past and threw {@link jakarta.persistence.OptimisticLockException}. Any code that
+     * saves a graph, mutates it and saves it again therefore could not adopt optimistic locking at all, which
+     * is precisely the read-modify-write shape a detached-entity repository encourages.
+     *
+     * <p>The invariant this establishes, and the one worth holding onto: <b>the object {@code save()} hands
+     * back is safe to mutate and save again.</b>
+     *
+     * <p>The whole graph, not just the root: a cascaded child is written in this same flush and has its own
+     * version bumped just as the root does, so refreshing only the root would leave the identical defect one
+     * hop down. Matching is by {@code @Id} for the same reason {@link #transferVectorState} matches that way
+     * -- these are two different objects standing for one row.
+     *
+     * <p>Detection is untouched by any of this. The version a concurrent writer collides on is the one
+     * {@code merge()} reads off the detached instance <em>before</em> this runs; two threads that both loaded
+     * version 4 still produce one winner and one {@code OptimisticLockException}, which
+     * {@code OptimisticLockingTest} asserts directly rather than assuming.
+     */
+    private void refreshVersions(Object entity, Object managed) {
+        if (entity == managed || !anyRegisteredTypeIsVersioned()) {
+            return;
+        }
+        Map<UUID, Object> managedById = versionedEntitiesById(managed);
+        if (managedById.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<UUID, Object> target : versionedEntitiesById(entity).entrySet()) {
+            Object source = managedById.get(target.getKey());
+            if (source != null) {
+                copyVersion(source, target.getValue());
+            }
+        }
+    }
+
+    /** Whether anything registered with this backend uses optimistic locking at all -- one check over the
+     *  registry, so a codebase that has never written {@code @Version} pays nothing for it on every save.
+     *  Not cached: the registry is small, and it grows as repositories are created. */
+    private boolean anyRegisteredTypeIsVersioned() {
+        for (Class<?> registered : registeredEntityTypes) {
+            if (EntityReflection.versionField(registered) != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Every {@code @Version}-bearing entity reachable from {@code root}, keyed by {@code @Id}.
+     *
+     * <p>Walks entity references directly rather than {@link JavAIRuntime#reachableVectorizables}, because
+     * optimistic locking is orthogonal to vectorization: a plain {@code @Entity} carrying a {@code @Version}
+     * and no {@code @Vectorize} field anywhere is an ordinary thing to save, and the vectorizable walk --
+     * which only ever reflects into nodes that are themselves {@code JavAIVectorizable} -- would find neither
+     * it nor the root.
+     *
+     * <p>It also does not reuse {@link #reachableRelated}, for a specific reason: iterating a lazy collection
+     * initializes it, and this walk runs on the write path where nothing else would have. Uninitialized
+     * proxies and uninitialized lazy collections are therefore skipped rather than resolved. Forcing a load
+     * to refresh a version on an association the caller never touched would trade the defect being fixed for
+     * the one {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} forbids -- and it would buy
+     * nothing, since an untouched association was not written by this save, so its version did not move and
+     * there is nothing to carry back.
+     */
+    private static Map<UUID, Object> versionedEntitiesById(Object root) {
+        Map<UUID, Object> byId = new HashMap<>();
+        collectVersionedEntities(root, byId, Collections.newSetFromMap(new IdentityHashMap<>()));
+        return byId;
+    }
+
+    private static void collectVersionedEntities(Object node, Map<UUID, Object> byId, Set<Object> visited) {
+        if (node == null || !Hibernate.isInitialized(node) || !visited.add(node)) {
+            return;
+        }
+        if (node instanceof Map<?, ?> map) {
+            for (Object value : map.values()) {
+                collectVersionedEntities(value, byId, visited);
+            }
+            return;
+        }
+        if (node instanceof Collection<?> collection) {
+            for (Object element : collection) {
+                collectVersionedEntities(element, byId, visited);
+            }
+            return;
+        }
+        if (!node.getClass().isAnnotationPresent(Entity.class)) {
+            return;
+        }
+        if (EntityReflection.versionField(node.getClass()) != null) {
+            UUID id = idOrNull(node);
+            if (id != null) {
+                byId.put(id, node);
+            }
+        }
+        for (Field field : EntityReflection.allFields(node.getClass())) {
+            field.setAccessible(true);
+            try {
+                collectVersionedEntities(field.get(node), byId, visited);
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot read field " + field + " on " + node.getClass(), e);
+            }
+        }
+    }
+
+    /** Both sides are the same entity type, so one field object reads and writes both. */
+    private static void copyVersion(Object source, Object target) {
+        Field field = EntityReflection.versionField(target.getClass());
+        if (field == null || !field.getDeclaringClass().isInstance(source)) {
+            return;
+        }
+        try {
+            field.set(target, field.get(source));
+        } catch (IllegalAccessException e) {
+            throw new IllegalStateException("Cannot copy @Version field " + field + " onto " + target.getClass(), e);
         }
     }
 
@@ -2077,6 +2867,65 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         });
     }
 
+    /**
+     * The whole post-load step, in the one place every load path shares (OMI-256).
+     *
+     * <p>{@code findById}, {@code findAll}, the derived-finder path and vector search all have to do exactly
+     * this, and each used to do it by repeating the same three calls in its own body. Deepening the last of
+     * them to cover association members meant changing it in four places, which is the argument for this
+     * method existing: a load path that gets this list wrong does not fail, it silently costs a model call,
+     * so the list is worth stating once rather than four times.
+     *
+     * <p>{@code visited} is shared across every root in a multi-row load deliberately. Two rows of one
+     * {@code findAll} routinely reach the same association target, and it only needs hydrating once -- the
+     * second visit would be a redundant SELECT for a slot already filled.
+     */
+    private void hydrateLoaded(Session session, Object entity, Set<Object> visited) {
+        hydrateCollectionMembers(session, entity);
+        hydrateGeoPoints(session, entity, new IdentityHashMap<>());
+        hydrateAssociatedVectors(session, entity, visited);
+    }
+
+    /** A single-root load, where sharing a visited set across roots has nothing to share. */
+    private void hydrateLoaded(Session session, Object entity) {
+        hydrateLoaded(session, entity, Collections.newSetFromMap(new IdentityHashMap<>()));
+    }
+
+    /**
+     * Serves stored vectors into the loaded root <em>and every entity reachable from it</em> (OMI-256).
+     *
+     * <p>{@link #hydrateVectors} fills the root's cache slots only. The members Hibernate materializes behind
+     * a {@code @OneToMany}/{@code @ManyToMany} are ordinary loaded entities with stored vectors of their own,
+     * but nothing was serving them, so they arrived cold and the next save re-embedded every one of them --
+     * one model call per member, per re-save, for content that had not changed. Loading a container of fifty
+     * assets and saving it back to change its title cost fifty embeddings; it now costs none.
+     *
+     * <p><b>Traversal is {@link #reachableRelated}'s, not a new one</b>, and that is the load-bearing detail:
+     * {@link #hydrateGeoPoints} already walks exactly this graph on exactly these paths, so this initializes
+     * nothing that was not already going to be initialized a moment earlier. The invariant in
+     * {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} -- an untouched lazy association is
+     * skipped, never loaded on JavAI's initiative -- is therefore untouched by this, which
+     * {@code touchingAnUninitializedLazyAssociationOutsideASessionThrows} keeps honest. An uninitialized
+     * singular proxy is skipped explicitly here as well rather than relying on that, since reading through
+     * one would hydrate the proxy's own empty state rather than the entity's (see {@link #resolve}).
+     *
+     * <p>One SELECT per reachable entity, against an embedding call per reachable entity. That is the same
+     * trade {@link #hydrateSummaryChildren} makes on the recomputation path, for the same reason, and it is
+     * not close: a round trip to Postgres is orders of magnitude cheaper than a round trip to a model.
+     */
+    private void hydrateAssociatedVectors(Session session, Object entity, Set<Object> visited) {
+        if (entity == null || !visited.add(entity)) {
+            return;
+        }
+        hydrateVectors(session, entity);
+        for (Object related : reachableRelated(entity)) {
+            if (!Hibernate.isInitialized(related)) {
+                continue;
+            }
+            hydrateAssociatedVectors(session, Hibernate.unproxy(related), visited);
+        }
+    }
+
     private static boolean tableExists(Connection connection, String table) throws SQLException {
         try (ResultSet tables = connection.getMetaData().getTables(null, null, table, null)) {
             return tables.next();
@@ -2232,53 +3081,71 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     /** Rank-then-hydrate's first half: ANN search entirely within one model's own vector table, bounded by
      *  LIMIT, before any of the entity's own table is touched. {@code fieldName} is null for the summary
      *  table, which has no per-field dimension. */
-    private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
-            EmbeddingVector reference, int limit) throws SQLException {
-        return rankIds(connection, table, entityType, fieldName, reference, limit, "vector");
+    /** One ranked hit as the vector table answers it, before the entity behind it is loaded. {@code distance}
+     *  is pgvector's own cosine distance; {@link Ranked} carries the similarity it converts to. */
+    private record RankedId(UUID id, double distance) {
     }
 
-    /** {@code vectorColumn} names which vector to rank by -- the entity-grain table holds two (OMI-191).
-     *  Rows where it is NULL are excluded, so a non-participating entity never surfaces as a match. */
-    private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
-            EmbeddingVector reference, int limit, String vectorColumn) throws SQLException {
-        StringBuilder sql = new StringBuilder("SELECT owner_id FROM ").append(table)
+    /**
+     * {@code vectorColumn} names which vector to rank by -- the entity-grain table holds two (OMI-191).
+     * Rows where it is NULL are excluded, so a non-participating entity never surfaces as a match.
+     *
+     * <p>{@code allowedIds} is the narrowing predicate already resolved to the ids that satisfy it, or
+     * {@code null} for an unnarrowed search (OMI-230). Passed as a single {@code uuid[]} rather than an
+     * {@code IN} list built by string concatenation: one bound parameter regardless of how many ids there
+     * are, so the statement text stays constant and re-plannable however selective the predicate was.
+     */
+    private static List<RankedId> rankIds(Connection connection, String table, Class<?> entityType,
+            String fieldName, EmbeddingVector reference, int limit, String vectorColumn, List<UUID> allowedIds)
+            throws SQLException {
+        StringBuilder sql = new StringBuilder("SELECT owner_id, ").append(vectorColumn)
+                .append(" <=> ?::vector AS javai_distance FROM ").append(table)
                 .append(" WHERE owner_type = ?");
         if (fieldName != null) {
             sql.append(" AND field_name = ?");
         }
         sql.append(" AND ").append(vectorColumn).append(" IS NOT NULL");
-        sql.append(" ORDER BY ").append(vectorColumn).append(" <=> ?::vector LIMIT ?");
+        if (allowedIds != null) {
+            sql.append(" AND owner_id = ANY(?)");
+        }
+        sql.append(" ORDER BY javai_distance LIMIT ?");
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
             int index = 1;
+            statement.setString(index++, toVectorLiteral(reference.values()));
             statement.setString(index++, entityType.getName());
             if (fieldName != null) {
                 statement.setString(index++, fieldName);
             }
-            statement.setString(index++, toVectorLiteral(reference.values()));
+            if (allowedIds != null) {
+                statement.setArray(index++, connection.createArrayOf("uuid", allowedIds.toArray()));
+            }
             statement.setInt(index, limit);
             try (ResultSet resultSet = statement.executeQuery()) {
-                List<UUID> ids = new ArrayList<>();
+                List<RankedId> ranked = new ArrayList<>();
                 while (resultSet.next()) {
-                    ids.add((UUID) resultSet.getObject("owner_id"));
+                    ranked.add(new RankedId(
+                            (UUID) resultSet.getObject("owner_id"), resultSet.getDouble("javai_distance")));
                 }
-                return ids;
+                return ranked;
             }
         }
     }
 
     /** Second half: a targeted load of exactly the ranked ids, one {@code find} per id (bounded by
      *  {@code limit}, typically small) -- simpler and just as correct as a batch multi-load API for this
-     *  volume, and trivially preserves rank order without a separate re-sort step. */
-    private List<Object> hydrate(Class<?> entityType, List<UUID> rankedIds) {
+     *  volume, and trivially preserves rank order without a separate re-sort step. Each hit keeps the
+     *  distance it was ranked on, converted to the cosine similarity {@link Ranked} promises. */
+    private List<Ranked<Object>> hydrateRanked(Class<?> entityType, List<RankedId> ranked) {
         return inSession(session -> {
-            List<Object> results = new ArrayList<>(rankedIds.size());
-            for (UUID id : rankedIds) {
-                Object entity = session.find(entityType, id);
+            List<Ranked<Object>> results = new ArrayList<>(ranked.size());
+            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
+            for (RankedId hit : ranked) {
+                Object entity = session.find(entityType, hit.id());
                 if (entity != null) {
-                    hydrateCollectionMembers(session, entity);
-                    hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-                    hydrateVectors(session, entity);
-                    results.add(entity);
+                    hydrateLoaded(session, entity, hydrated);
+                    // pgvector's <=> is cosine distance; Ranked speaks the cosine similarity the rest of
+                    // JavAI does, so a hit's score means the same as VectorMath.cosineSimilarity would.
+                    results.add(new Ranked<>(entity, 1.0 - hit.distance()));
                 }
             }
             return results;
@@ -2299,18 +3166,36 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return literal.append(']').toString();
     }
 
-    /** Creates {@code javai_vectors__<model>} (fixed to {@code dims} from the moment it's created -- known
-     *  upfront now, since only one model's vectors will ever land in this specific table) if it doesn't
-     *  already exist, and returns its name. Deliberately re-checked on every call rather than cached after
-     *  the first success: this DDL runs inside the same transaction as the rest of {@code save()}, and an
-     *  earlier in-memory "already created" cache surviving a *later* failure in that same transaction --
-     *  which rolls the CREATE TABLE back too, DDL being transactional in Postgres -- left the cache
-     *  permanently out of sync with reality, breaking every subsequent save() for the rest of this backend
-     *  instance's lifetime. {@code CREATE TABLE IF NOT EXISTS} is already a cheap, idempotent catalog
-     *  check; there's no correctness-safe way to skip re-running it. */
-    private static String ensureFieldVectorTable(Connection connection, String modelId, int dims) throws SQLException {
+    /**
+     * Creates {@code javai_vectors__<model>} (fixed to {@code dims} from the moment it's created -- known
+     * upfront, since only one model's vectors will ever land in this specific table) if it doesn't already
+     * exist, and returns its name.
+     *
+     * <p><b>Provisioned out of band, not inside the caller's transaction (OMI-255).</b> This DDL used to run
+     * on the caller's own connection, before every single vector write. That is a deadlock generator, and it
+     * fired before any of the contention this ticket was filed about: {@code CREATE INDEX IF NOT EXISTS}
+     * takes a {@code ShareLock} on the table even when there is nothing to create, and {@code ShareLock}
+     * conflicts with the {@code RowExclusiveLock} a concurrent transaction already holds from its own
+     * INSERT into the same table. Two savers, each holding what the other needs:
+     *
+     * <pre>
+     * Process 69 waits for RowExclusiveLock on relation 16875; blocked by process 71.
+     * Process 71 waits for RowExclusiveLock on relation 16875; blocked by process 69.
+     * </pre>
+     *
+     * <p>Running it on its own connection, committed independently, removes the conflict: the DDL
+     * transaction is short, touches no rows, and is over before the caller's INSERT is issued.
+     *
+     * <p><b>And that is what makes memoizing it safe again.</b> The previous implementation re-ran the DDL
+     * every time specifically because it could not cache: DDL is transactional in Postgres, so a later
+     * failure in the caller's transaction rolled the {@code CREATE TABLE} back too and left an in-memory
+     * "already created" flag permanently lying. Committing separately means the table's existence no longer
+     * depends on the caller's outcome, so {@link #provisionedTables} can be trusted -- the cache and the
+     * out-of-band execution are one change, not two.
+     */
+    private String ensureFieldVectorTable(String modelId, int dims) {
         String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
-        try (Statement statement = connection.createStatement()) {
+        provisionTable(table, statement -> {
             statement.execute("CREATE TABLE IF NOT EXISTS " + table + " ("
                     + "owner_type   varchar(255) NOT NULL,"
                     + "owner_id     uuid         NOT NULL,"
@@ -2322,7 +3207,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     + "PRIMARY KEY (owner_type, owner_id, field_name))");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_lookup ON " + table + " (owner_type, field_name)");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
-        }
+        });
         return table;
     }
 
@@ -2341,9 +3226,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * Postgres TOASTs a {@code text} column automatically, compressing and storing it out-of-line when
      * large, which is the right behaviour for accumulated subtree text with nothing to configure.
      */
-    private static String ensureSummaryVectorTable(Connection connection, String modelId, int dims) throws SQLException {
+    private String ensureSummaryVectorTable(String modelId, int dims) {
         String table = SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
-        try (Statement statement = connection.createStatement()) {
+        provisionTable(table, statement -> {
             statement.execute("CREATE TABLE IF NOT EXISTS " + table + " ("
                     + "owner_type   varchar(255) NOT NULL,"
                     + "owner_id     uuid         NOT NULL,"
@@ -2368,8 +3253,90 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_concat_hnsw ON " + table
                     + " USING hnsw (concatenated_text_vector vector_cosine_ops)");
-        }
+        }, "concatenated_text", "concatenated_text_vector", "concatenated_text_computed_at");
         return table;
+    }
+
+    /** The DDL a {@link #provisionTable} call runs, on a connection this backend opened for that purpose
+     *  alone. Separate from {@code SQLConsumer}-style generality on purpose: nothing else may run here. */
+    private interface TableDdl {
+        void run(Statement statement) throws SQLException;
+    }
+
+    /**
+     * Runs {@code ddl} once per table name, on its own connection and its own committed transaction --
+     * never the caller's. See {@link #ensureFieldVectorTable} for why both halves of that matter.
+     *
+     * <p><b>Two processes may reach this at the same moment,</b> and {@code IF NOT EXISTS} is not atomic
+     * against a concurrent creator: Postgres checks the catalog, then inserts into it, and a second creator
+     * landing between those two steps gets a unique-violation on {@code pg_class}/{@code pg_type} rather than
+     * the silent no-op the syntax implies. Losing that race means the table now exists, which is the outcome
+     * this method exists to produce -- so it is a success, not a failure, and is verified as one rather than
+     * assumed.
+     */
+    private void provisionTable(String table, TableDdl ddl, String... requiredColumns) {
+        provisionedTables.computeIfAbsent(table, name -> {
+            // Steady state: the table is already there and already migrated, so issue no DDL at all. This is
+            // not only an optimisation. A ShareLock request against a table some other pod is mid-INSERT
+            // into would block until that pod committed -- harmless but pointless, and paid on every
+            // process start. Reading the catalog takes no lock anything else can conflict with.
+            if (isAlreadyProvisioned(name, requiredColumns)) {
+                return Boolean.TRUE;
+            }
+            try (Session session = sessionFactory().openSession()) {
+                Transaction tx = session.beginTransaction();
+                try {
+                    session.doWork(connection -> {
+                        try (Statement statement = connection.createStatement()) {
+                            ddl.run(statement);
+                        }
+                    });
+                    tx.commit();
+                } catch (RuntimeException e) {
+                    if (tx.isActive()) {
+                        tx.rollback();
+                    }
+                    if (!tableExistsInOwnTransaction(name)) {
+                        throw e;
+                    }
+                    // Lost the creation race; the table is there, which is all this call promised.
+                }
+            }
+            return Boolean.TRUE;
+        });
+    }
+
+    /** Existence checked on a connection of its own, so a rolled-back provisioning attempt cannot leave the
+     *  answer entangled with the transaction that failed. */
+    private boolean tableExistsInOwnTransaction(String table) {
+        try (Session session = sessionFactory().openSession()) {
+            return session.doReturningWork(connection -> tableExists(connection, table));
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** Whether {@code table} exists <em>and</em> already carries every column the current DDL would add --
+     *  the second half is what keeps a pre-OMI-191 table (created before the concatenated-text columns
+     *  existed) from being mistaken for an up-to-date one and never migrated. */
+    private boolean isAlreadyProvisioned(String table, String... requiredColumns) {
+        try (Session session = sessionFactory().openSession()) {
+            return session.doReturningWork(connection -> {
+                if (!tableExists(connection, table)) {
+                    return false;
+                }
+                for (String column : requiredColumns) {
+                    try (ResultSet columns = connection.getMetaData().getColumns(null, null, table, column)) {
+                        if (!columns.next()) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            });
+        } catch (RuntimeException e) {
+            return false; // can't tell -- fall through to the idempotent DDL, which is safe either way
+        }
     }
 
     // ---- lazy bootstrap -----------------------------------------------------------------------

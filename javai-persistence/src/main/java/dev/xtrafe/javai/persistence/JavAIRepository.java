@@ -32,6 +32,22 @@ public interface JavAIRepository<T> {
      *  and persisted alongside the entity itself, in the same transaction where the backend supports one. */
     T save(T entity);
 
+    /**
+     * {@link #save(Object)} with an explicit choice of when the {@code @Summary} containers above this
+     * entity are brought up to date (OMI-255).
+     *
+     * <p>{@code save(entity)} is exactly {@code save(entity, SummaryPolicy.RECOMPUTE_AFTER_COMMIT)} -- this
+     * overload exists only to offer the other option, and changes nothing else about the write. The entity
+     * and its own vectors are persisted identically either way.
+     *
+     * <p>Postgres is the only backend where the choice is meaningful in this phase; Neo4j and MongoDB
+     * recompute inline and accept the argument without acting on it, rather than refusing a call whose
+     * result would in fact be correct.
+     *
+     * @see SummaryPolicy
+     */
+    T save(T entity, SummaryPolicy summaryPolicy);
+
     Optional<T> findById(UUID id);
 
     List<T> findAll();
@@ -71,4 +87,40 @@ public interface JavAIRepository<T> {
      * {@code reindexAll()}'s completeness validation.
      */
     void reindex();
+
+    // ---- vector search as a builder (OMI-230) ------------------------------------------------------
+    //
+    // The counterpart to the findNearestBy<Field>Vector… method-name convention, for the searches a method
+    // name cannot carry: a predicate composed at runtime, a page offset, or a one-off shape not worth
+    // declaring a method for. Both idioms compile to the same query -- see NearestQuery.
+
+    /**
+     * Starts a search against each entity's own combined {@code vector()}.
+     *
+     * @see NearestQuery
+     */
+    NearestQuery<T> nearest();
+
+    /**
+     * Starts a search against one {@code @Vectorize} field's own vector.
+     *
+     * @param vectorizeField the field's name as declared (e.g. {@code "caption"}), not the woven accessor's
+     * @throws IllegalArgumentException if the entity has no such {@code @Vectorize} field -- naming the ones
+     *                                  it does have, the same way an invalid {@code findNearestBy…Vector}
+     *                                  method is rejected at repository-creation time
+     */
+    NearestQuery<T> nearestBy(String vectorizeField);
+
+    /** Starts a search against the summary vector -- the decay-weighted arithmetic over the entity and its
+     *  {@code @Summary} descendants. */
+    NearestQuery<T> nearestBySummary();
+
+    /**
+     * Starts a search against the concatenated text vector -- a real embedding of assembled subtree text,
+     * as against {@link #nearestBySummary()}'s arithmetic over already-computed vectors.
+     *
+     * @throws IllegalArgumentException if the entity type does not participate in concatenated text
+     *                                  vectoring, since nothing would ever be stored for this to search
+     */
+    NearestQuery<T> nearestByConcatenatedText();
 }

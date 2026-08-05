@@ -102,7 +102,12 @@ public final class JavAIPI {
                 continue; // the base CRUD contract itself, always fine
             }
             if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
-                DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
+                DerivedQueryMethods.ParsedQuery parsed =
+                        DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
+                // Store-specific feasibility, exactly as the relational half below does it: a backend whose
+                // vector index cannot narrow before it limits must say so now, not on the first call
+                // (OMI-230). The shape is entirely decided by the method name, so no call is needed to know it.
+                backend.validateNearestQuery(entityType, DerivedQueryMethods.shapeOnly(parsed));
                 continue;
             }
             if (DerivedFinderQuery.looksLikeDerivedFinder(method)) {
@@ -112,9 +117,11 @@ public final class JavAIPI {
             }
             throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
                     + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, the "
-                    + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector(EmbeddingVector, int) "
-                    + "vector convention, and ordinary Spring-Data-style derived finders "
-                    + "(findBy/existsBy/countBy/deleteBy...); this name matches none of them.");
+                    + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector vector "
+                    + "convention (optionally narrowed as ...VectorAnd<Predicate>, returning List<Ranked<T>>, "
+                    + "and/or paged with a trailing Pageable/Limit), and ordinary Spring-Data-style derived "
+                    + "finders (findBy/existsBy/countBy/deleteBy...); this name matches none of them. For a "
+                    + "query composed at runtime rather than declared, use nearest()/nearestBy(field) instead.");
         }
     }
 
@@ -172,6 +179,27 @@ public final class JavAIPI {
             body.run();
             return null;
         });
+    }
+
+    /**
+     * Brings every {@code @Summary} container with an outstanding recomputation up to date (OMI-255).
+     *
+     * <p><b>Most applications never need to call this.</b> An ordinary {@code save} already recomputes what
+     * it owes once its transaction commits. This exists for the two cases where nothing else will:
+     * writes made with {@link SummaryPolicy#QUEUE_ONLY}, and recomputations that were queued but whose drain
+     * did not complete -- a pod killed mid-request, a database briefly unreachable. The queue is a table, so
+     * that work is still there to be done and any pod may do it.
+     *
+     * <p>Safe to run on a schedule and safe to run concurrently from several pods: each container is
+     * recomputed under an advisory lock keyed on that container, and finding nothing to do costs one query.
+     *
+     * <p>Postgres only, and a no-op elsewhere rather than an error -- the other backends never defer a
+     * summary, so they have nothing that could be outstanding.
+     */
+    public static void drainPendingSummaries(JavAIPersistenceConfig config) {
+        if (backendFor(config) instanceof RepositoryBackendHibernatePostgres postgres) {
+            postgres.drainPendingSummaries();
+        }
     }
 
     /**

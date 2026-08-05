@@ -296,46 +296,82 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     }
 
     @Override
-    public List<Object> findNearestByFieldVector(
-            Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        String basePropertyName = fieldName.equals(COMBINED_VECTOR_FIELD) ? "vector" : fieldName + "Vector";
-        return findNearest(entityType, basePropertyName, reference, limit);
+    public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
-    @Override
-    public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        return findNearest(entityType, "summaryVector", reference, limit);
+    /** Every kind is one document field here -- the grain problem that made Postgres' field table the wrong
+     *  home for the entity-grain vectors does not arise on a store whose vectors are document fields. */
+    private static String vectorPropertyName(NearestSpec spec) {
+        return switch (spec.kind()) {
+            case SUMMARY -> "summaryVector";
+            case CONCATENATED_TEXT -> "concatenatedTextVector";
+            case COMBINED -> "vector";
+            case FIELD -> spec.fieldName() + "Vector";
+        };
     }
 
-    @Override
-    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
-            int limit) {
-        // Same per-entity property shape as the summary vector above, so this needs no special handling
-        // here -- the grain problem that made Postgres' field table the wrong home does not arise (OMI-191).
-        return findNearest(entityType, "concatenatedTextVector", reference, limit);
-    }
-
-    private List<Object> findNearest(
-            Class<?> entityType, String basePropertyName, EmbeddingVector reference, int limit) {
+    /**
+     * {@code $vectorSearch}, narrowed by {@code filter} when the query asks for it (OMI-230).
+     *
+     * <p><b>{@code filter} is a genuine pre-filter</b>, which is what makes MongoDB able to serve this at all
+     * where Neo4j cannot: Atlas applies it during the search rather than to the search's output, so
+     * {@code limit} counts only documents that already satisfy the predicate. "The nearest N that also match"
+     * therefore returns N of them, not "however many of the nearest N happened to match."
+     *
+     * <p>The predicate is resolved to an id set first and passed as {@code _id ∈ …}, rather than translated
+     * into {@code filter} directly. Not a detour -- the only workable route: {@code $vectorSearch}'s filter
+     * may only touch paths declared as {@code filter} fields in the index definition, and which paths a
+     * predicate will touch is not knowable when the index is created. Routing through {@code _id}, which
+     * {@link #ensureVectorIndex} always declares, means any predicate the ordinary derived finders can
+     * express is usable here, translated by {@link #buildFilter} -- the same code, so identical semantics --
+     * rather than a subset chosen by whatever the index happened to declare.
+     */
+    private List<Ranked<Object>> findNearest(Class<?> entityType, String basePropertyName, NearestSpec spec) {
+        EmbeddingVector reference = spec.reference();
         String collectionName = collectionName(entityType);
         String qualifiedField = qualify(basePropertyName, reference.modelId());
         String indexName = vectorIndexName(collectionName, qualifiedField);
         ensureVectorIndex(collectionName, indexName, qualifiedField, reference.dims());
 
-        List<Bson> pipeline = List.of(new Document("$vectorSearch", new Document()
+        Document search = new Document()
                 .append("index", indexName)
                 .append("path", qualifiedField)
-                .append("queryVector", toDoubleList(reference.values()))
-                .append("numCandidates", Math.max(limit * 10, 100))
-                .append("limit", limit)));
+                .append("queryVector", toDoubleList(reference.values()));
+        int fetch = spec.limitIncludingOffset();
+        if (spec.isNarrowed()) {
+            Set<UUID> allowed = queryIds(entityType, buildFilter(entityType, spec.predicate()));
+            if (allowed.isEmpty()) {
+                return List.of(); // nothing satisfies the predicate, so nothing can be near and satisfy it
+            }
+            search.append("filter", new Document("_id",
+                    new Document("$in", allowed.stream().map(UUID::toString).toList())));
+        }
+        search.append("numCandidates", Math.max(fetch * 10, 100)).append("limit", fetch);
+
+        List<Bson> pipeline = List.of(
+                new Document("$vectorSearch", search),
+                new Document("$addFields", new Document(SCORE_FIELD, new Document("$meta", "vectorSearchScore"))));
 
         Map<UUID, Object> hydrated = new HashMap<>();
-        List<Object> results = new ArrayList<>();
+        List<Ranked<Object>> results = new ArrayList<>();
+        int seen = 0;
         for (Document doc : collectionFor(entityType).aggregate(pipeline)) {
-            results.add(hydrate(entityType, doc, hydrated));
+            if (seen++ < spec.offset()) {
+                continue; // ranking is total, so skipping its head is exact
+            }
+            // Atlas reports a cosine index's score rescaled into (0, 1] as (1 + cosine) / 2; Ranked speaks
+            // raw cosine, like the rest of JavAI, so undo the rescaling here where it is known.
+            double score = doc.get(SCORE_FIELD, Number.class).doubleValue();
+            results.add(new Ranked<>(hydrate(entityType, doc, hydrated), 2.0 * score - 1.0));
         }
         return results;
     }
+
+    /** Where the pipeline parks {@code $meta: "vectorSearchScore"} so it can be read off each hit. Named
+     *  with the same {@code javai_} prefix the backend's other reserved storage uses, so it cannot collide
+     *  with a mapped field. */
+    private static final String SCORE_FIELD = "javai_score";
 
     /** {@code vectorIndexesEnsured} is only updated on full success -- not just after issuing the create
      *  command -- so a failure partway through (e.g. {@link #awaitIndexQueryable} timing out) never leaves
@@ -348,10 +384,18 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         if (vectorIndexesEnsured.contains(indexName)) {
             return;
         }
-        Document definition = new Document("fields", List.of(new Document("type", "vector")
-                .append("path", path)
-                .append("numDimensions", dims)
-                .append("similarity", "cosine")));
+        // The _id filter field is what makes a narrowed vector search possible (OMI-230): $vectorSearch's
+        // own filter may only touch paths the index declares as filter fields, and which paths a caller's
+        // predicate will touch is unknowable here. Declaring _id -- always present, always unique -- lets any
+        // predicate be resolved to an id set and applied as a genuine pre-filter. NOTE: an index created by
+        // a JavAI older than OMI-230 lacks this path, and index definitions are not amended in place; drop
+        // such an index (or the collection) to let this recreate it if narrowed search reports a bad filter.
+        Document definition = new Document("fields", List.of(
+                new Document("type", "vector")
+                        .append("path", path)
+                        .append("numDimensions", dims)
+                        .append("similarity", "cosine"),
+                new Document("type", "filter").append("path", "_id")));
         Document command = new Document("createSearchIndexes", collectionName)
                 .append("indexes", List.of(new Document("name", indexName)
                         .append("type", "vectorSearch")
