@@ -29,7 +29,22 @@ interface RepositoryBackend {
      */
     void registerEntityType(Class<?> entityType);
 
+    /** What a plain {@code JavAIRepository.save(entity)} reaches, unchanged since before OMI-255. Kept
+     *  abstract, rather than defaulted onto the overload below, so the two can never be left defaulting to
+     *  each other -- a backend implementing neither would recurse instead of failing to compile. */
     Object save(Class<?> entityType, Object entity);
+
+    /**
+     * Saves {@code entity}, choosing when the {@code @Summary} containers above it are recomputed.
+     *
+     * <p>Only the Postgres backend defers summary recomputation at all, so only it can honour the argument.
+     * The other two recompute inline and ignore it -- a {@code QUEUE_ONLY} save there is simply already as
+     * up to date as {@code RECOMPUTE_AFTER_COMMIT} would have made it, which is a stronger guarantee than
+     * asked for rather than a silent failure to deliver a weaker one.
+     */
+    default Object save(Class<?> entityType, Object entity, SummaryPolicy summaryPolicy) {
+        return save(entityType, entity);
+    }
 
     /**
      * Re-embeds and re-persists <em>every registered entity type</em> under the currently-configured model.

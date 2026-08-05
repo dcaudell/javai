@@ -175,6 +175,27 @@ public final class JavAIPI {
     }
 
     /**
+     * Brings every {@code @Summary} container with an outstanding recomputation up to date (OMI-255).
+     *
+     * <p><b>Most applications never need to call this.</b> An ordinary {@code save} already recomputes what
+     * it owes once its transaction commits. This exists for the two cases where nothing else will:
+     * writes made with {@link SummaryPolicy#QUEUE_ONLY}, and recomputations that were queued but whose drain
+     * did not complete -- a pod killed mid-request, a database briefly unreachable. The queue is a table, so
+     * that work is still there to be done and any pod may do it.
+     *
+     * <p>Safe to run on a schedule and safe to run concurrently from several pods: each container is
+     * recomputed under an advisory lock keyed on that container, and finding nothing to do costs one query.
+     *
+     * <p>Postgres only, and a no-op elsewhere rather than an error -- the other backends never defer a
+     * summary, so they have nothing that could be outstanding.
+     */
+    public static void drainPendingSummaries(JavAIPersistenceConfig config) {
+        if (backendFor(config) instanceof RepositoryBackendHibernatePostgres postgres) {
+            postgres.drainPendingSummaries();
+        }
+    }
+
+    /**
      * The Hibernate {@link SessionFactory} this module built for {@code config} -- the same instance every
      * repository sharing that config runs on. <b>Postgres only</b>; the other two backends have no such
      * thing and throw rather than return null.

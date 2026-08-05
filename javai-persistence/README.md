@@ -297,6 +297,14 @@ the same way `RepositoryBackendNeo4jTest`'s equivalent test does.
 referenced document simply becomes unreferenced, not deleted. Documented as a known Phase 0 boundary in
 `RepositoryBackendSpringDataMongo`'s own javadoc, not an oversight.
 
+**On Postgres, `deleteById` detaches the entity from every container holding it first (OMI-255)** -- both
+this backend's own `javai_collection_members` rows and Hibernate's join rows for a natively-mapped
+association. Only the former was handled before, so deleting an entity succeeded or died on a foreign key
+depending purely on which of the two shapes its container declared, which is not a distinction a caller
+deleting something should have to know about. Membership only: no other entity is deleted. A *singular*
+reference at the entity is still refused by the foreign key, deliberately -- clearing someone else's field
+is a change to their data rather than a cleanup, and refusing loudly is the better answer.
+
 **On Postgres, `UserCollectionType` makes interface-typed JavAI collections native JPA associations** --
 see "JavAI collections as native JPA associations (OMI-142)" under "What's actually implemented" below for
 the mechanism and for how the two shapes (native association vs. side table) coexist. Neo4j and MongoDB have no equivalent concept and stay on the
@@ -372,6 +380,15 @@ across the full vector table. `deleteById` removes a given entity's rows from *e
 currently exists (found via `information_schema.tables`, not just tables created during the current
 process's lifetime), so nothing is orphaned when an entity is deleted regardless of how many models have
 ever touched it.
+
+Two Postgres-only details that follow from those tables being *shared* rather than per-entity (OMI-255).
+**The table DDL is provisioned once, on its own connection, outside any caller's transaction** -- it used to
+run before every single vector write, and `CREATE INDEX IF NOT EXISTS` takes a lock conflicting with a
+concurrent transaction's inserts on the same table, so two concurrent saves deadlocked on it. And **a row is
+written only when its value actually changes**: a value-identical `UPDATE` still creates a row version at
+`REPEATABLE READ`, which is a collision a concurrent writer pays for and nobody gains from. A third table,
+`javai_summary_pending`, records which containers owe a summary recomputation; it exists only in a
+deployment that uses `@Summary`, and is empty except between a write and the drain that follows it.
 
 **Neo4j**: `<field>Vector__<model>` per `@Vectorize` field, plus `vector__<model>`/`summaryVector__<model>`
 for the combined/summary ones (each with a `...ComputedAt__<model>` sibling) -- direct node properties,

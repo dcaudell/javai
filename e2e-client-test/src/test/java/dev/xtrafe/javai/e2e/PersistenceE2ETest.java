@@ -19,6 +19,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -61,7 +62,13 @@ class PersistenceE2ETest {
      * than asserting on the very first query.
      */
     private static List<Article> awaitNearest(Supplier<List<Article>> query, Article expected) {
-        Instant deadline = Instant.now().plus(Duration.ofSeconds(15));
+        // 15s was tuned for MongoDB Search on an idle machine and is not enough for either backend on a busy
+        // one: index catch-up competes for the same CPU as the model this suite is also driving, and a run
+        // where the tagging classification took 609s instead of its usual 130s left this poll expiring while
+        // the index was still catching up. The loop exits the moment the article appears, so a longer ceiling
+        // costs nothing when things are quick -- it only stops a loaded machine being reported as a ranking
+        // defect.
+        Instant deadline = Instant.now().plus(Duration.ofMinutes(2));
         List<Article> result;
         while (true) {
             result = query.get();
@@ -98,7 +105,11 @@ class PersistenceE2ETest {
 
     @Test
     void postgresFindNearestByFieldVectorRanksByRealSimilarity() {
-        Article security = postgresRepository.save(newArticle("Zero-day disclosed in widely used TLS library",
+        // Unique per run, for the reason spelled out on the Neo4j variant of this test: these stores
+        // are not reset between runs, and two articles with the same title embed identically, making
+        // "nearest to the reference" a tie this assertion cannot decide.
+        Article security = postgresRepository.save(newArticle(
+                "Zero-day disclosed in widely used TLS library " + UUID.randomUUID(),
                 "Researchers disclosed a critical vulnerability prompting an emergency patch cycle."));
         postgresRepository.save(newArticle("Simple weeknight pasta recipes",
                 "Quick, easy pasta dishes you can make in under thirty minutes on a busy weeknight."));
@@ -139,9 +150,23 @@ class PersistenceE2ETest {
         assertEquals("Zero-day disclosed", found.get().getTitle());
     }
 
+    /**
+     * ⚠️ <b>The reference title must be unique across runs, or this test asserts something undecidable.</b>
+     *
+     * <p>This database is not reset between runs, so a fixed title leaves one identically-titled article
+     * behind every time it executes. Identical text embeds to an identical vector, so "nearest to the
+     * reference" becomes an exact tie at distance zero between this run's article and every previous run's,
+     * and {@code limit 1} may legitimately return any of them. The test then fails claiming an article is not
+     * its own nearest neighbour, when what actually happened is that it tied with its own history.
+     *
+     * <p>Confirmed by querying the store directly: 74 articles, with several titles appearing twice. The
+     * failure is intermittent for exactly that reason -- it depends on which side of a tie the index returns,
+     * not on anything the library did. It reproduces on builds predating this ticket.
+     */
     @Test
     void neo4jFindNearestByFieldVectorRanksByRealSimilarity() {
-        Article security = neo4jRepository.save(newArticle("Zero-day disclosed in widely used TLS library",
+        Article security = neo4jRepository.save(newArticle(
+                "Zero-day disclosed in widely used TLS library " + UUID.randomUUID(),
                 "Researchers disclosed a critical vulnerability prompting an emergency patch cycle."));
         neo4jRepository.save(newArticle("Simple weeknight pasta recipes",
                 "Quick, easy pasta dishes you can make in under thirty minutes on a busy weeknight."));
@@ -149,7 +174,12 @@ class PersistenceE2ETest {
                 "A dramatic overtime victory secured the local team a spot in next week's championship."));
 
         EmbeddingVector reference = ((JavAIVectorizable) security).fieldVector("title");
-        List<Article> nearest = neo4jRepository.findNearestByTitleVector(reference, 1);
+        // Polled, exactly as the MongoDB variant of this test already is, and for the same reason: Neo4j's
+        // vector index is updated asynchronously, so a just-saved node is briefly absent from it. Querying
+        // once means asking an index that does not yet contain the article whether the article is in it --
+        // and getting back whichever *older* article happens to be nearest instead, which reads as "an
+        // article is not its own nearest neighbour" rather than as the timing problem it is.
+        List<Article> nearest = awaitNearest(() -> neo4jRepository.findNearestByTitleVector(reference, 1), security);
 
         assertEquals(1, nearest.size());
         assertEquals(security.getId(), nearest.get(0).getId(),
@@ -284,7 +314,11 @@ class PersistenceE2ETest {
 
     @Test
     void mongoFindNearestByFieldVectorRanksByRealSimilarity() {
-        Article security = mongoRepository.save(newArticle("Zero-day disclosed in widely used TLS library",
+        // Unique per run, for the reason spelled out on the Neo4j variant of this test: these stores
+        // are not reset between runs, and two articles with the same title embed identically, making
+        // "nearest to the reference" a tie this assertion cannot decide.
+        Article security = mongoRepository.save(newArticle(
+                "Zero-day disclosed in widely used TLS library " + UUID.randomUUID(),
                 "Researchers disclosed a critical vulnerability prompting an emergency patch cycle."));
         mongoRepository.save(newArticle("Simple weeknight pasta recipes",
                 "Quick, easy pasta dishes you can make in under thirty minutes on a busy weeknight."));

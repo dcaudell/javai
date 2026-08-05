@@ -81,6 +81,22 @@ public final class MonolithicContainer {
     private static final int CONTAINER_OLLAMA_PORT = 11434;
     private static final int CONTAINER_MONGO_PORT = 27017;
 
+    // Must match docker/Dockerfile's JAVAI_EMBEDDING_MODEL/JAVAI_COMPLETION_MODEL build args -- these are
+    // the two models baked into the image, and the only two this container can serve without a pull.
+    private static final String EMBEDDING_MODEL = "qwen3-embedding:0.6b";
+    private static final String COMPLETION_MODEL = "qwen3:8b";
+
+    /** How long a model may take to load before warm-up gives up and lets the tests try for themselves. */
+    private static final Duration MODEL_WARM_UP_TIMEOUT = Duration.ofMinutes(10);
+
+    /** How long to wait for Ollama's HTTP server to start answering after its port is bound -- see
+     *  {@link #waitForOllamaServing} for why the two are not the same moment. */
+    private static final Duration OLLAMA_SERVING_TIMEOUT = Duration.ofMinutes(3);
+
+    /** Long enough to outlive a whole suite run, so no model is evicted between the test that loads it and
+     *  the test that needs it -- Ollama's own default is five minutes, which this suite exceeds easily. */
+    private static final String MODEL_KEEP_ALIVE = "2h";
+
     private static final Duration HEALTH_CHECK_TIMEOUT = Duration.ofMinutes(10);
     private static final Duration BUILD_TIMEOUT = Duration.ofMinutes(30);
     private static final Duration RUN_TIMEOUT = Duration.ofMinutes(1);
@@ -129,8 +145,93 @@ public final class MonolithicContainer {
         waitForPort(HOST_NEO4J_HTTP_PORT);
         waitForPort(HOST_NEO4J_BOLT_PORT);
         waitForPort(HOST_OLLAMA_PORT);
+        warmUpModels();
         ensureMongoRunning();
         ensured = true;
+    }
+
+    /**
+     * Loads both baked-in models into Ollama's memory, and pins them there, before any test runs.
+     *
+     * <p><b>An open port is not readiness here, for the same reason it wasn't for Mongo.</b> Ollama accepts
+     * connections immediately but loads a model into memory only when the first request for it arrives, and
+     * an 8B chat model takes far longer to load than any sensible client read timeout allows. So the first
+     * caller pays the load and times out, while every caller after it is fine -- which is exactly the shape
+     * of the failure this fixes: {@code TaggingE2ETest}'s real-Cortex classification failed with
+     * {@code SocketTimeoutException: Read timed out} on {@code POST /api/chat}, reproducibly, on a
+     * freshly-created container, while {@code CompletionE2ETest} against the very same endpoint passed in
+     * seconds.
+     *
+     * <p><b>{@code keep_alive} is the other half, and without it the warm-up only postpones the problem.</b>
+     * Ollama evicts an idle model after five minutes by default. The suite runs for well over that, and the
+     * gap between the last completion test and {@code TaggingE2ETest} is long enough for the chat model to be
+     * unloaded and have to load again mid-test. Pinning it for the run keeps the readiness this method
+     * establishes from expiring underneath the tests that depend on it.
+     *
+     * <p>Deliberately tolerant of failure: a warm-up that cannot reach Ollama is not itself a reason to fail
+     * the run, since the tests that actually need the model will report a far more specific error than this
+     * method could. It is an optimisation of *when* the load happens, not a new precondition.
+     */
+    private static void warmUpModels() {
+        waitForOllamaServing();
+        // Measured on a freshly-created container: the 8B chat model takes ~4m45s to load and answer its
+        // first request. Nothing sets an HTTP read timeout that long, which is the whole problem.
+        warmUp(EMBEDDING_MODEL, "/api/embed", "\"input\":\"warm-up\"");
+        warmUp(COMPLETION_MODEL, "/api/generate", "\"prompt\":\"warm-up\",\"stream\":false");
+    }
+
+    /**
+     * Polls until Ollama's HTTP server actually answers, which is later than its port being bound.
+     *
+     * <p>{@link #waitForPort} only proves something is listening on the socket. Ollama binds the port before
+     * its HTTP server is serving, so a request in that window is accepted and then reset --
+     * {@code curl exit 56}, receive error, with no response body to explain itself. That is not a slow model
+     * load and no amount of request timeout fixes it; the request has to not be sent yet.
+     *
+     * <p>{@code /api/tags} is the cheapest thing that proves the server is up: it lists what is installed and
+     * loads nothing.
+     */
+    private static void waitForOllamaServing() {
+        Instant deadline = Instant.now().plus(OLLAMA_SERVING_TIMEOUT);
+        while (Instant.now().isBefore(deadline)) {
+            try {
+                run(Duration.ofSeconds(30), "curl", "--silent", "--show-error", "--fail", "--max-time", "10",
+                        "http://localhost:" + HOST_OLLAMA_PORT + "/api/tags");
+                return;
+            } catch (RuntimeException notYet) {
+                sleep(Duration.ofSeconds(1));
+            }
+        }
+        System.err.println("[MonolithicContainer] Ollama's HTTP server did not begin serving within "
+                + OLLAMA_SERVING_TIMEOUT + ". Warm-up will be attempted anyway.");
+    }
+
+    /**
+     * One blocking request per model, which is what forces Ollama to load it, plus {@code keep_alive} to stop
+     * it being evicted again before the tests that need it run.
+     *
+     * <p><b>The endpoint differs by model kind and is not interchangeable</b>: an embedding model answers
+     * {@code /api/embed} and rejects {@code /api/generate} outright with
+     * {@code "qwen3-embedding:0.6b" does not support generate}. Sending both models to the same endpoint
+     * silently warms neither.
+     */
+    private static void warmUp(String model, String path, String payloadFields) {
+        // curl from the host rather than an HTTP client of our own: this class already shells out for every
+        // other piece of container orchestration, and adding a client dependency to reach one endpoint would
+        // be the only such dependency in this module's main sources.
+        String body = "{\"model\":\"" + model + "\"," + payloadFields
+                + ",\"keep_alive\":\"" + MODEL_KEEP_ALIVE + "\"}";
+        try {
+            run(MODEL_WARM_UP_TIMEOUT.plusMinutes(1), "curl", "--silent", "--show-error", "--fail",
+                    "--max-time", Long.toString(MODEL_WARM_UP_TIMEOUT.toSeconds()),
+                    "-H", "Content-Type: application/json",
+                    "-d", body,
+                    "http://localhost:" + HOST_OLLAMA_PORT + path);
+        } catch (RuntimeException e) {
+            System.err.println("[MonolithicContainer] Could not pre-load '" + model + "' via " + path + " ("
+                    + e.getMessage() + "). Continuing: the first test to use it will pay the load instead, "
+                    + "and may well time out doing so.");
+        }
     }
 
     /**

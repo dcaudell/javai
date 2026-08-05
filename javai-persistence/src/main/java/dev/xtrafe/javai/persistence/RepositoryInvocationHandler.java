@@ -33,7 +33,11 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     public Object invoke(Object proxy, Method method, Object[] args) {
         switch (method.getName()) {
             case "save":
-                return backend.save(entityType, args[0]);
+                // Two arguments means the SummaryPolicy overload (OMI-255); one means the original method,
+                // which is exactly that overload's RECOMPUTE_AFTER_COMMIT default.
+                return args.length == 2
+                        ? backend.save(entityType, args[0], (SummaryPolicy) args[1])
+                        : backend.save(entityType, args[0]);
             case "findById":
                 return backend.findById(entityType, (UUID) args[0]);
             case "findAll":

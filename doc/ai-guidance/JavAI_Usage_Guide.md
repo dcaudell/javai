@@ -126,11 +126,36 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@JavAIVectorizable` | class | Triggers the entire woven method table above. Never also write `implements JavAIVectorizable` by hand. |
 | `@Vectorize` | field | This field contributes to the declaring object's own `vector()`. Also gets a synthesized `<field>Vector()` accessor. |
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
-| `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. |
+| `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. **When persisted, this makes the container a write-coordination point** — see the note below. |
 | `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
+
+### ⚠️ What `@Summary` implies once the container is persisted
+
+A container's summary is stored as **one row per container**. So every write anywhere beneath a `@Summary`
+container changes that one row — whichever child was touched, and however unrelated two writers are to each
+other. Put `@Summary` on a hot container (an album everyone uploads into, a workspace everyone edits) and you
+have declared a point every write underneath it passes through.
+
+**JavAI handles the coordination for you** (OMI-255): on Postgres the summary is not written inside your
+transaction at all. Your write records that the container owes a recomputation — an insert that cannot
+collide with anyone — and the recomputation runs immediately after your transaction commits, from committed
+state, under a lock. Two concurrent writers both succeed, and the container reflects both.
+
+Three consequences worth knowing before you annotate:
+
+- **A summary-vector search inside your own still-open transaction sees the previous summary.** After the
+  commit it is current. Between `save` and `commit`, it is not.
+- **Ancestors are recomputed even if you never loaded them**, because containment is resolved from the
+  database. Adding to a `Shelf` updates the `Library` holding it without your code mentioning a library.
+- **You can defer it per write** with `save(entity, SummaryPolicy.QUEUE_ONLY)` when throughput matters more
+  than currency — then drain with `JavAIPI.drainPendingSummaries(config)`. The queue is durable, so this
+  delays the work; it never loses it. But nothing drains it on your behalf.
+
+Full contract, including what happens when a recomputation fails, is in `persistence-support-matrix.md`'s
+"Concurrency" section. On Neo4j/MongoDB summaries are still written inline.
 
 ### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
 

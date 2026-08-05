@@ -12,6 +12,169 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`javai-persistence`: concurrent writes beneath one `@Summary` container no longer refuse each other, and
+  the container now reflects all of them (OMI-255).** Two users adding assets to one album failed for each
+  other with `org.hibernate.exception.LockAcquisitionException`, from application code with no visible
+  connection to vectors. Three separate defects, found in this order:
+
+  1. **DDL ran on every vector write, inside the caller's transaction.** Each write issued
+     `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE … ADD COLUMN IF NOT EXISTS` + `CREATE INDEX IF NOT EXISTS`
+     before its `INSERT`. `CREATE INDEX` takes a `ShareLock` even when there is nothing to create, and that
+     conflicts with the `RowExclusiveLock` a concurrent transaction holds from its own insert into the same
+     table — so two savers **deadlocked on the DDL**, before reaching any of the contention the ticket was
+     filed about. Provisioning now happens once per table, on its own connection, committed independently.
+     Committing it separately is also what makes memoizing it safe: the previous code re-ran it every time
+     precisely because DDL rolls back with the caller's transaction, which had made an in-memory "already
+     created" flag unable to tell the truth.
+  2. **Unchanged vectors were rewritten anyway.** A save rewrote every vector row it touched even when the
+     value was byte-identical — and the object's own combined `$vector` is recombined arithmetically on each
+     save, so it always arrived with a fresh `computed_at`. At `REPEATABLE READ` a value-identical `UPDATE`
+     still creates a row version, and that version is what a concurrent writer collides with. This was the
+     row the reported error actually named: `javai_vectors__<model>` with `field_name = '$vector'`, which is
+     the container's *own* vector and does not depend on its `@Summary` children at all. Rows are now read
+     once per save and written only when their value genuinely changes.
+  3. **The summary row genuinely is shared, and is now written outside the caller's transaction.** A
+     container's summary is one row per owner and changes whenever any descendant does, so that contention is
+     real. It cannot be fixed with a lock inside the writer's transaction: at `REPEATABLE READ` the snapshot
+     is fixed by the first statement, long before the container is known, so a writer that waits for a lock
+     and then updates a row committed since is still refused. The mutation now appends to a durable
+     `javai_summary_pending` queue (inserts with distinct keys, which cannot collide), and the summary is
+     recomputed straight after the caller's transaction commits — in a short `READ COMMITTED` transaction,
+     under a Postgres advisory lock on the owner, **from the committed graph**. Recomputing from committed
+     state rather than folding the writer's own value is what makes the last drain *correct* rather than
+     merely last: it has seen both writers' children.
+
+  **The recomputation costs no embedding calls.** Getting there took two fixes, both found by counting
+  `embed()` calls rather than by reading code, and both worth naming because either alone leaves waste:
+
+  1. **Only `@Summary` containers are recomputed.** The queue also names leaves, since they are the starting
+     points for the walk upward — but a leaf's entity-grain row depends on nothing except itself and was
+     already written inline during the save. Recomputing it reloaded the entity and re-embedded any vector
+     that did not survive the trip. This was the part that **scaled with container size**.
+  2. **A lazy singular `@Summary` child is unproxied before its stored vectors are read.** A
+     `FetchType.LAZY` to-one reads back as an uninitialized proxy whose `@Id` is null, so hydration silently
+     did nothing while the object still answered vector calls — by recomputing them.
+
+  Guarded two ways: `AssociationGraphEmbeddingCostE2ETest` against a real model, and a new
+  `SummaryDrainEmbeddingCostTest` that runs the same accounting in seconds against a fake provider, split by
+  phase (`QUEUE_ONLY` = write only, `RECOMPUTE_AFTER_COMMIT` = write plus recomputation) and across all three
+  `EmbeddingConsistencyMode`s.
+
+  **Ancestors are found from the database, not from the object graph.** A pod that loads a `Shelf` through
+  its own repository holds no `Library`, so Vector Core's in-memory back-edge walk cannot reach it and the
+  library's summary silently kept whatever another pod last left. Containment is now resolved from the
+  declared `@Summary` fields of registered types plus the stored relationships — covering both
+  natively-mapped associations and `javai_collection_members` — and walked transitively.
+
+  Removing a child from a container recomputes it too, and `deleteById` resolves the containers that held an
+  entity *before* removing it, since afterwards there is nothing left to ask.
+
+- **`javai-persistence` (Neo4j): a vector search no longer runs against a half-built index.**
+  `CREATE VECTOR INDEX` returns as soon as the index *exists* — in state `POPULATING`. Neo4j populates it
+  asynchronously, and a query issued before it reaches `ONLINE` is answered from the partial index
+  **silently**: no error, just fewer or wrongly-ordered results. `ensureVectorIndex` now waits, using Neo4j's
+  own `db.awaitIndex`, which is the same readiness problem `RepositoryBackendSpringDataMongo` already solves
+  by polling `listSearchIndexes()` for `queryable: true`.
+
+  Only the creating caller pays the wait — one per index, per process — and a timeout is logged rather than
+  thrown, since a slow index on a large store is not a broken one.
+
+  ⚠️ **Defensive, and honestly labelled as such: no test demonstrates this.** It was written while chasing a
+  failing Neo4j ranking assertion that turned out to have an entirely different cause (see the test fix
+  below), and the wait did not stop that failure. The race it closes is real and documented — `ensureVectorIndex`
+  is called on the *query* path, immediately before searching, so a first-ever query on a fresh store creates
+  the index and queries it in the same breath — but it is kept on the strength of that reasoning rather than
+  a reproduction, which is a weaker footing than everything else in this entry.
+
+- **`e2e-client-test`: the Neo4j similarity-ranking test polls, like its MongoDB twin already did.** Neo4j's
+  vector index is updated **asynchronously**, so a just-saved node is briefly absent from it. The Neo4j test
+  queried once, immediately after saving — asking an index that did not yet contain the article whether the
+  article was in it, and getting back whichever *older* article was nearest. That reads as "an article is not
+  its own nearest neighbour" while being purely a timing problem.
+
+  The same file's MongoDB variant already used an `awaitNearest(...)` helper for exactly this, with a javadoc
+  explaining that `$vectorSearch` "updates near-real-time, not synchronously with the write". The Neo4j test
+  now uses it too. Pre-existing and intermittent; verified to fail identically on a build predating this
+  ticket.
+
+  Two earlier diagnoses of this failure were wrong and are recorded here so the next person does not repeat
+  them: it is not index *population* (the wait added for that did not stop it), and it is not duplicate
+  titles across runs (the titles were made unique per run, and it still failed). Those title changes are kept
+  anyway — an assertion that an article ranks nearest to itself is undecidable when an identically-titled
+  article exists, since identical text embeds identically — but they were hardening, not the cure.
+
+- **`e2e-client-test`: models are loaded and pinned before the suite runs.** Three separate reasons the
+  harness's readiness signal was wrong, each masking the next:
+
+  1. `waitForPort` proves only that Ollama's socket is bound. It binds before its HTTP server serves, so a
+     request in that window is accepted and reset (`curl exit 56`) — not a slow load, and no request timeout
+     fixes it. Readiness is now gated on `/api/tags` answering.
+  2. An embedding model rejects `/api/generate` outright (`"qwen3-embedding:0.6b" does not support
+     generate`), so the two models need different endpoints; sending both to one warms neither.
+  3. Cold-loading `qwen3:8b` takes **~4m45s**, measured. No sensible client read timeout survives that, so
+     whichever test hit the model first timed out while every later test passed —
+     `TaggingE2ETest.classifyAllAppliesCorrectRealWorldTopicTagsUsingTheRealCortex` failing while
+     `CompletionE2ETest` passed against the same endpoint in seconds.
+
+  `keep_alive` is set for the run as well, and matters as much as the warm-up: Ollama evicts an idle model
+  after five minutes, which is shorter than the gap between those two test classes, so warming alone would
+  only have moved the failure later.
+
+- **`javai-persistence`: `deleteById` no longer fails for an entity a container still holds.** Deleting an
+  entity that sat in another entity's natively-mapped `@OneToMany`/`@ManyToMany` left the join row behind and
+  the database refused the delete outright:
+
+  ```
+  ERROR: update or delete on table "test_book" violates foreign key constraint
+         "fkovgxnu4wc1n9jct9dc7he0gll" on table "test_shelf_test_book"
+  ```
+
+  JavAI already removed the equivalent rows for its *own* collection storage
+  (`javai_collection_members`), so whether `deleteById` worked depended on which of the two storage shapes
+  the container happened to declare — the same entity graph deleted cleanly or threw a constraint violation
+  based on a mapping choice made elsewhere. The entity is now detached from every container holding it, both
+  shapes, before the row is removed.
+
+  This is a **membership removal, never a cascade**: the container loses its reference and no other entity is
+  deleted. A *singular* reference (`@ManyToOne`/`@OneToOne`) pointing at the entity is deliberately left to
+  the foreign key to refuse — nulling out someone else's field is a change to their data, not a cleanup, and
+  a loud refusal is the honest answer there.
+
+### Added
+
+- **`javai-completion`: `CortexOllama.builder().readTimeout(Duration)`.** The connector had no way to say how
+  long a response is worth waiting for, and there is a real case for a long one: an 8B model on CPU working
+  through a long prompt — a tag-classification request listing every candidate tag, say — can spend minutes
+  generating before its first response byte, and the client's ordinary timeout severs that mid-generation
+  with `ResourceAccessException: Read timed out`. Nothing is wrong at either end; the caller simply refused
+  to wait for work it asked for. It presents as flakiness because it is load-dependent — the same
+  classification passed in 141s on one run and timed out on the next.
+
+  ⚠️ **Unset by default, and deliberately so.** A timeout exists to make a provider that has stopped
+  answering look like a failure rather than like slow work. A connector shipping a very long default would
+  decide, on every caller's behalf, that a hung endpoint should hold a thread for a quarter of an hour before
+  anyone finds out — a decision that belongs to the application, not the library. Existing behaviour is
+  therefore unchanged for everyone who does not ask.
+
+  `LocalCompletionDefaults.create(URI, Duration)` is the paired convenience for the case that does want it,
+  and `e2e-client-test`'s harness is the only thing in this repository that sets one.
+
+- **`javai-persistence`: `save(entity, SummaryPolicy)` and `JavAIPI.drainPendingSummaries(config)`
+  (OMI-255).** `save(entity)` is unchanged and settles its own summary work before returning, so no existing
+  call site needs to do anything. `SummaryPolicy.QUEUE_ONLY` records what is owed and returns, for
+  write-heavy paths where a container's summary being briefly behind is cheaper than recomputing it; the
+  queue is durable, so this delays the work rather than losing it, but nothing drains it on your behalf.
+  `reindex`/`reindexAll` now use it internally and drain once at the end instead of per entity.
+
+  An entity type in no `@Summary` relationship is entirely unaffected: nothing queued, no queue table
+  created, entity-grain row still written inline. `SummaryPolicy` is accepted and ignored on Neo4j/MongoDB,
+  which write summaries inline and are therefore already as current as it could ask for.
+
+  The full contract — including what is visible inside your own open transaction, and what happens when a
+  recomputation fails — is in `doc/ai-guidance/persistence-support-matrix.md`'s new "Concurrency" section.
+
 ## [0.1.7] - 2026-07-28
 
 ### Added
