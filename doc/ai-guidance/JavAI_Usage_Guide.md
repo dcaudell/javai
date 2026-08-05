@@ -763,6 +763,48 @@ savepoint manager, so Spring refuses it before JavAI is reached. **Neo4j and Mon
 every call is its own unit of work there, and `JavAIPI.inTransaction` throws rather than pretending, so
 multi-call flows against those backends must be designed to be safely retryable.
 
+**⚠️ Raising the isolation level on a JavAI-owned `SessionFactory` needs two settings, applied together.**
+This is worth knowing before you reach for `@Transactional(isolation = …)`, because the failure is loud,
+immediate, and looks unrelated to isolation: a bare `JpaTransactionManager` uses `DefaultJpaDialect`, which
+cannot prepare a JDBC connection and therefore **refuses every annotated call that asks for a non-default
+isolation level** rather than quietly degrading to the default. Both settings are required — either one
+alone still fails:
+
+```java
+@Bean PlatformTransactionManager transactionManager(SessionFactory factory) {
+    HibernateJpaDialect dialect = new HibernateJpaDialect();
+    dialect.setPrepareConnection(true);              // already Spring's default; see the note below
+    JpaTransactionManager manager = new JpaTransactionManager(factory);
+    manager.setJpaDialect(dialect);                  // (1) the dialect that can prepare a connection
+    return manager;
+}
+
+JavAIPersistenceConfig.builder()
+    .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+    // (2) the dialect prepares the connection once at transaction start and needs it held to the end;
+    //     Hibernate's default releases it after each statement, and Spring refuses the transaction
+    //     rather than run it at an isolation level it could not guarantee.
+    .hibernateProperty("hibernate.connection.handling_mode", "DELAYED_ACQUISITION_AND_HOLD")
+    .postgresUrl(...).postgresUsername(...).postgresPassword(...)
+    .build();
+```
+
+`setPrepareConnection(true)` is **not** a third requirement — it is already Spring's default, verified by
+measurement rather than inherited from the API docs. It is written out above because it is the other half of
+what Spring's own refusal message names (*"make sure that its 'prepareConnection' flag is on … and that the
+Hibernate connection release mode is set to ON_CLOSE"*), so it is worth being explicit if something in your
+configuration might turn it off.
+
+Note the second setting is fixed when the factory is built, so it must be on the `JavAIPersistenceConfig`
+before the first repository call. None of this applies when **Spring** owns the factory — a
+`LocalContainerEntityManagerFactoryBean` already configures a preparing dialect, which is why raised
+isolation works there with no extra wiring. All of the above is pinned by
+`JavAIOwnedSessionFactoryTransactionTest` rather than left as prose.
+
+This matters most as the alternative to `@Version` when you want a concurrency guarantee the caller cannot
+forget: isolation is enforced by the database on every transaction, where optimistic locking depends on each
+writer going through an entity that carries the annotation.
+
 **Postgres schema naming, in detail** — since **0.1.5**, the `SessionFactory` JavAI builds applies
 `CamelCaseToUnderscoresNamingStrategy`, so `emailVerified` maps to the column `email_verified` and an entity
 `OrderLine` to the table `order_line`, exactly as Spring Boot would. Two things follow:

@@ -14,6 +14,47 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-persistence`: `@Version` is usable, not merely honored (OMI-254).** Optimistic locking always
+  *detected* correctly -- two concurrent writers to one entity produced one winner and one
+  `OptimisticLockException` -- and was unusable anyway, because `save()` did not refresh the version on the
+  instance it returned. `merge()` performs the write on Hibernate's managed copy and increments *that*
+  copy's version, while `save()` deliberately hands back the caller's own instance (returning the managed
+  one would hand back an entity whose `@Transient` JavAI collection fields were empty). So the returned
+  object still carried the pre-write version, and saving it a second time collided with the row the first
+  save had just written -- **no concurrency involved: no second thread, no second transaction**. Adding the
+  annotation to an entity broke ordinary provisioning code that saves, mutates and saves again, and the
+  failure surfaced as what looked like a concurrency bug in unrelated code.
+
+  `save()` now carries the post-write version back onto the caller's instance, across the whole saved graph
+  rather than the root alone -- a cascaded child is written in the same flush and has its own version
+  bumped, so refreshing only the root would have left the identical defect one hop down. The invariant: *the
+  object `save()` hands back is safe to mutate and save again.* Detection is unchanged, since the version a
+  concurrent writer collides on is the one `merge()` read off the detached instance beforehand;
+  `OptimisticLockingTest` asserts both halves together, including a non-vectorized `@Version` entity, which
+  the vector-state machinery could never have carried by accident. Entities with no `@Version` anywhere are
+  unaffected and pay nothing: the graph walk is skipped entirely unless something registered with the
+  backend declares one. Postgres only -- Neo4j and MongoDB have no optimistic locking, and the support
+  matrix now says so instead of grouping `@Version` with the inert-but-harmless JPA annotations.
+
+- **`javai-persistence`: loading an entity no longer leaves its association members cold, so re-saving an
+  unchanged container embeds nothing (OMI-256).** Loading an entity and saving it back unchanged should
+  embed nothing -- every value involved is already stored. It embedded **one call per member of a natively
+  mapped association, every time**, because hydration served stored vectors into the *root* entity's cache
+  slots only. The members Hibernate materializes behind a `@OneToMany`/`@ManyToMany` arrived with empty
+  slots and the ensuing save recomputed each one for real. The cost scaled with how much the container held:
+  a gallery service loading an album of 50 assets and saving it back -- to reorder it, retitle it, change any
+  single field -- paid 50 embedding calls for content that had not changed and whose vectors were sitting in
+  the database. Embeddings are the expensive part of a write.
+
+  All four load paths (`findById`, `findAll`, derived finders, vector search) now hydrate the whole loaded
+  graph through one shared step, so a path cannot silently forget one -- which mattered, because forgetting
+  does not fail, it just costs a model call. The traversal is the one the geo-point hydration already made
+  on the same paths, so it initializes nothing that was not already being initialized: an untouched lazy
+  association is still skipped rather than loaded on JavAI's initiative, and the `AssociationGraphE2ETest`
+  invariants that pin that behavior are unchanged. This was the part OMI-187 left behind, not an OMI-255
+  regression -- verified against a worktree at the pre-OMI-255 commit rather than assumed. The test that
+  pinned the defect at "exactly one wasted call" now asserts zero.
+
 - **`javai-persistence`: concurrent writes beneath one `@Summary` container no longer refuse each other, and
   the container now reflects all of them (OMI-255).** Two users adding assets to one album failed for each
   other with `org.hibernate.exception.LockAcquisitionException`, from application code with no visible
@@ -174,6 +215,25 @@ version -- a given release usually changes only one or two of them.
 
   The full contract — including what is visible inside your own open transaction, and what happens when a
   recomputation fails — is in `doc/ai-guidance/persistence-support-matrix.md`'s new "Concurrency" section.
+
+### Documentation
+
+- **`doc/ai-guidance/JavAI_Usage_Guide.md`** now documents how to raise the transaction isolation level on a
+  **JavAI-owned `SessionFactory`**, which needs two settings applied together and fails loudly if either is
+  missing: `JpaTransactionManager.setJpaDialect(new HibernateJpaDialect())`, and
+  `.hibernateProperty("hibernate.connection.handling_mode", "DELAYED_ACQUISITION_AND_HOLD")` on the config.
+  A bare `JpaTransactionManager` uses `DefaultJpaDialect`, which cannot prepare a connection and therefore
+  refuses *every* `@Transactional(isolation = …)` call rather than degrading to the default — a failure that
+  looks nothing like its cause. Written up because it is the natural fallback when `@Version` is not the
+  right tool: isolation is enforced by the database on every transaction, where optimistic locking depends
+  on each writer going through an entity that carries the annotation. Pinned by
+  `JavAIOwnedSessionFactoryTransactionTest` rather than left as prose — which is also how a third setting
+  that had been believed necessary, `dialect.setPrepareConnection(true)`, was found to be Spring's own
+  default and documented as such rather than repeated as a requirement.
+- **`doc/ai-guidance/persistence-support-matrix.md`** splits `@Version` out of the grouped JPA-annotation row
+  into its own, with the Postgres/Neo4j/MongoDB positions stated separately. The grouped row's flat ✅ was
+  true of detection and misleading about usability, and a wrong ✅ costs more than an honest caveat: it is
+  discovered only after the annotation is in and unrelated tests have gone red.
 
 ## [0.1.7] - 2026-07-28
 

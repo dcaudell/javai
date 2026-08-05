@@ -2,12 +2,16 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import org.hibernate.Session;
 import org.hibernate.SessionFactory;
 import org.hibernate.service.UnknownUnwrapTypeException;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.orm.jpa.hibernate.HibernateTransactionManager;
 import org.springframework.orm.jpa.JpaTransactionManager;
+import org.springframework.orm.jpa.vendor.HibernateJpaDialect;
+import org.springframework.transaction.InvalidIsolationLevelException;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
@@ -52,6 +56,11 @@ class JavAIOwnedSessionFactoryTransactionTest {
     private static JavAIPersistenceConfig config;
     private static TestArticleRepository repository;
 
+    /** A second, independently-configured factory over the same database -- the isolation recipe needs a
+     *  Hibernate property, and a property is fixed at the moment the factory is built. */
+    private static JavAIPersistenceConfig isolationConfig;
+    private static TestArticleRepository isolationRepository;
+
     @BeforeAll
     static void configure() {
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
@@ -65,6 +74,15 @@ class JavAIOwnedSessionFactoryTransactionTest {
         // Registration before use -- building the factory freezes the entity set, and asking for the
         // factory is one of the things that builds it.
         repository = JavAIPI.repository(TestArticleRepository.class, config);
+
+        isolationConfig = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+                .postgresUrl(postgres.getJdbcUrl())
+                .postgresUsername(postgres.getUsername())
+                .postgresPassword(postgres.getPassword())
+                .hibernateProperty("hibernate.connection.handling_mode", "DELAYED_ACQUISITION_AND_HOLD")
+                .build();
+        isolationRepository = JavAIPI.repository(TestArticleRepository.class, isolationConfig);
     }
 
     @Test
@@ -133,6 +151,70 @@ class JavAIOwnedSessionFactoryTransactionTest {
         SessionFactory factory = JavAIPI.sessionFactory(config);
         assertThrows(UnknownUnwrapTypeException.class, () -> new HibernateTransactionManager(factory),
                 "documented limitation: use JpaTransactionManager with a JavAI-owned factory");
+    }
+
+    /**
+     * Raising isolation on a JavAI-owned factory fails on <em>every</em> annotated call unless the transaction
+     * manager is given a real dialect -- which is worth pinning, because the failure looks nothing like its
+     * cause. {@code JpaTransactionManager}'s default {@code DefaultJpaDialect} cannot prepare a JDBC
+     * connection, so rather than degrading to the default isolation it refuses outright, and it refuses at
+     * every call site that asks, not just the one that needed the stronger guarantee.
+     *
+     * <p>Documented in {@code JavAI_Usage_Guide.md}'s transactions section alongside the fix below.
+     */
+    @Test
+    void raisingIsolationIsRefusedByTheDefaultJpaDialect() {
+        TransactionTemplate template =
+                new TransactionTemplate(new JpaTransactionManager(JavAIPI.sessionFactory(config)));
+        template.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+
+        assertThrows(InvalidIsolationLevelException.class,
+                () -> template.execute(status -> repository.save(new TestArticle("never written", "body"))),
+                "the default JpaDialect refuses a raised isolation level rather than degrading to the default");
+    }
+
+    /**
+     * ...and what actually makes it work. <b>Two</b> settings are load-bearing, and they must be applied
+     * together -- either alone still fails:
+     *
+     * <ol>
+     *   <li>{@code JpaTransactionManager.setJpaDialect(new HibernateJpaDialect())} -- replaces the dialect
+     *       that refused above;</li>
+     *   <li>{@code .hibernateProperty("hibernate.connection.handling_mode", "DELAYED_ACQUISITION_AND_HOLD")}
+     *       -- the dialect prepares the connection once at transaction start and needs it held to the end.
+     *       Hibernate's default releases it after each statement, and Spring refuses the transaction outright
+     *       rather than running it at an isolation level it could not guarantee.</li>
+     * </ol>
+     *
+     * <p>The second is the JavAI-side one, and the one with no visible connection to the symptom -- which is
+     * why the recipe is documented as a set rather than as independent knobs.
+     *
+     * <p>{@code dialect.setPrepareConnection(true)} is kept below and is <em>not</em> a third requirement:
+     * measured, it is already Spring's default, and removing this line leaves the test passing. It is written
+     * out because it is the other half of what Spring's own refusal message names, so a reader who has turned
+     * it off elsewhere can see that it has to be on.
+     */
+    @Test
+    void raisingIsolationWorksWithAPreparingDialectAndAHeldConnection() {
+        SessionFactory factory = JavAIPI.sessionFactory(isolationConfig);
+
+        HibernateJpaDialect dialect = new HibernateJpaDialect();
+        dialect.setPrepareConnection(true);
+        JpaTransactionManager manager = new JpaTransactionManager(factory);
+        manager.setJpaDialect(dialect);
+
+        TransactionTemplate template = new TransactionTemplate(manager);
+        template.setIsolationLevel(TransactionDefinition.ISOLATION_SERIALIZABLE);
+
+        int isolation = template.execute(status -> {
+            isolationRepository.save(new TestArticle("written under serializable", "body"));
+            Session joined = SpringManagedSessions.current(factory);
+            assertNotNull(joined, "expected to find the Spring-managed session JavAI just wrote through");
+            return joined.doReturningWork(Connection::getTransactionIsolation);
+        });
+
+        assertEquals(Connection.TRANSACTION_SERIALIZABLE, isolation,
+                "the isolation the caller asked for must reach the connection JavAI writes through");
     }
 
     /** Postgres-only, and it says so rather than returning null or failing obscurely later. */
