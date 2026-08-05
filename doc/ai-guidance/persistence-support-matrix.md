@@ -72,7 +72,7 @@ hand-implemented.
 | **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | Same mechanisms; the to-many hop uses the collection's storage (Table 3). **Postgres:** a natively-mapped collection (plain JDK or interface-typed JavAI) resolves as a single **Criteria JOIN**; only a *concrete*-typed JavAI collection still uses id-set materialization (a query per hop). Mongo still uses id-set (references are `{type, id}` pointers); Neo4j composes `EXISTS {}` subqueries. |
 | `countBy…` / `existsBy…` | ✅ | ✅ | ✅ | Return `long`/`int` and `boolean` respectively. |
 | **Joining a caller's transaction** (Spring `@Transactional`, or `JavAIPI.inTransaction`) | ✅ | ❌ | ❌ | **Postgres, since 0.1.5 (OMI-146):** a repository call runs on the caller's session when one is active — a Spring `@Transactional` method or a `JavAIPI.inTransaction(config, body)` block — and opens its own session only when there is none. `@Transactional` needs Spring's transaction manager and JavAI to hold the *same* `SessionFactory` (matched by identity), which since **0.1.6 (OMI-160)** you can get either way round: let JavAI own the factory and ask for it with `JavAIPI.sessionFactory(config)` (**preferred** — keeps the mapping hooks that make an interface-typed `@OneToMany JavAIList<T>` a real JavAI collection; wire it to `JpaTransactionManager`, *not* `HibernateTransactionManager`, which can't unwrap a `DataSource` from it), or let Spring own it and hand it over with `Builder.sessionFactory(...)` (works with either manager, but loses those hooks). Vector rows commit/roll back with the caller. Neo4j/Mongo: every call is still its own unit of work, and `inTransaction` throws rather than pretending; design multi-call flows there to be idempotent. |
-| `deleteBy…` | ✅ | ✅ | ✅ | PG deletes per-id (cascades vectors + collection members) · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). |
+| `deleteBy…` / `deleteById` | ✅ | ✅ | ✅ | PG deletes per-id (cascades vectors + collection members) · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). **Postgres, since OMI-255:** an entity held in another entity's `@Summary` or ordinary to-many is **detached from those containers first**, so deleting it succeeds instead of tripping the join table's foreign key. Membership only — no other entity is deleted. A **singular** reference (`@ManyToOne`/`@OneToOne`) at the entity is still refused by the foreign key, deliberately: nulling someone else's field is a data change, not a cleanup. |
 | `OrderBy…` / dynamic `Sort` — **root scalar** | ✅ | ✅ | ✅ | |
 | `OrderBy…` / `Sort` — **nested singular path** | ✅ | ❌ | ❌ | Neo4j/Mongo sort only by a root scalar; a nested/to-many sort is rejected at creation. |
 | `Top`/`First` limiting | ✅ | ✅ | ✅ | |
@@ -196,6 +196,72 @@ invoking a method on any of them. Note that a late `JavAIPI.repository(...)` is 
 introduces nothing new — re-realizing one, or asking for a type another entity already pulled in, is a no-op.
 It fails only when the type is genuinely unknown, and the error then names *what built the factory*, because
 that call is the thing to move.
+
+---
+
+## Concurrency: what `@Summary` costs, and what JavAI does about it (OMI-255)
+
+**The short version:** a `@Summary` container's vector is derived state, so JavAI does not write it inside
+your transaction. Your mutation records that the container owes a recomputation; the recomputation happens
+straight after your transaction commits, against committed state, under a lock. Two people writing beneath
+one container no longer collide, and the container ends up reflecting **both** of them rather than whichever
+committed last.
+
+### Why this needed doing at all
+
+Annotating a container with `@Summary` means every write anywhere beneath it changes that container's
+**single** row — one per `(owner_type, owner_id)`. That is inherent to what a summary is, and it does not
+depend on the children having distinct primary keys or living in different tables. Before this was fixed,
+that row (and, worse, rows that had not changed at all) were written inside the caller's transaction, so at
+`REPEATABLE READ` two unrelated writers refused each other with `could not serialize access`, surfacing as
+`org.hibernate.exception.LockAcquisitionException` in code with no visible connection to vectors.
+
+### The contract you can rely on
+
+| | Guarantee |
+|---|---|
+| **Concurrent writes beneath one container** | Both succeed. They no longer share any row inside their own transactions. |
+| **The container's summary afterwards** | Reflects every committed write, not just the last one — it is recomputed *from the committed graph*, not folded from whatever the writer held. |
+| **When it is current** | By the time `save(...)` returns. Inside `JavAIPI.inTransaction` or a Spring `@Transactional` method, by the time that outer transaction commits. |
+| **Inside your own open transaction** | ⚠️ **Not yet current.** A summary-vector search issued between your `save` and your `commit` sees the container's *previous* summary. |
+| **Ancestors you never loaded** | Recomputed too. Containment is resolved from the database, so a pod that loaded only a `Shelf` still updates the `Library` above it. |
+| **If the recomputation fails** | Your write is committed and stays committed. The recomputation stays queued (`javai_summary_pending`) and is retried by the next save of that container, `JavAIPI.drainPendingSummaries(config)`, or a reindex. It is logged at `WARNING`, never silently dropped. |
+| **Entities with no `@Summary` anywhere** | Completely unaffected — nothing is queued, no queue table is created, and their entity-grain row is written inline exactly as before. |
+
+### The one thing to decide
+
+Nothing is required of you: `save(entity)` behaves as described above. The opt-out exists for write-heavy
+paths where a container's summary being a few seconds behind is cheaper than the recomputation:
+
+```java
+shelves.save(shelf, SummaryPolicy.QUEUE_ONLY);   // record what is owed, don't recompute now
+```
+
+Then drain it somewhere — a scheduled job, a quiet-period task, or the next ordinary `save`:
+
+```java
+JavAIPI.drainPendingSummaries(config);           // safe to run concurrently from several pods
+```
+
+⚠️ **`QUEUE_ONLY` with nothing ever draining leaves summaries stale indefinitely, and nothing will tell you
+so.** The work is durable, not automatic.
+
+### Postgres only, in this phase
+
+Neo4j and MongoDB recompute summaries inline and accept `SummaryPolicy` without acting on it — they are
+already as current as `RECOMPUTE_AFTER_COMMIT` would make them. They also do not join a caller's transaction
+at all (see Table 2), so the contention this addresses takes a different shape there and has not been
+characterised.
+
+### Two related things fixed alongside it
+
+- **DDL no longer runs on the write path.** Every vector write used to issue `CREATE TABLE IF NOT EXISTS` +
+  `CREATE INDEX IF NOT EXISTS` first, inside the caller's transaction. `CREATE INDEX` takes a lock that
+  conflicts with a concurrent transaction's inserts on the same table, so two savers could **deadlock** on
+  the DDL before reaching any of the contention above. Provisioning now happens once, on its own connection.
+- **Unchanged vectors are no longer rewritten.** A save used to rewrite every vector row it touched even when
+  the value was identical, and at `REPEATABLE READ` a value-identical `UPDATE` still creates a row version a
+  concurrent writer can collide with. Rows are now written only when their value actually changes.
 
 ---
 

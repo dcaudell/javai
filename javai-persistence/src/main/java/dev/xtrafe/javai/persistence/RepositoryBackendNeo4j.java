@@ -89,6 +89,12 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 final class RepositoryBackendNeo4j implements RepositoryBackend {
 
+    private static final System.Logger LOG = System.getLogger(RepositoryBackendNeo4j.class.getName());
+
+    /** How long {@code db.awaitIndex} may block waiting for a freshly-created vector index to finish
+     *  populating -- see {@link #awaitIndexOnline}. Paid once per index, by whichever caller creates it. */
+    private static final int INDEX_ONLINE_TIMEOUT_SECONDS = 120;
+
     private final JavAIPersistenceConfig config;
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Map<String, Class<?>> typesByLabel = new ConcurrentHashMap<>();
@@ -305,14 +311,52 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (!vectorIndexesEnsured.add(key)) {
             return;
         }
+        String indexName = vectorIndexName(label, property);
         try (Session session = driver().session()) {
             session.executeWrite(tx -> {
-                tx.run("CREATE VECTOR INDEX `" + vectorIndexName(label, property) + "` IF NOT EXISTS "
+                tx.run("CREATE VECTOR INDEX `" + indexName + "` IF NOT EXISTS "
                         + "FOR (n:`" + label + "`) ON n.`" + property + "` "
                         + "OPTIONS {indexConfig: {`vector.dimensions`: $dims, `vector.similarity_function`: 'cosine'}}",
                         Values.parameters("dims", dims));
                 return null;
             });
+            awaitIndexOnline(session, indexName);
+        }
+    }
+
+    /**
+     * Blocks until {@code indexName} is actually usable, rather than merely created.
+     *
+     * <p>A Neo4j index is populated <b>asynchronously</b>: {@code CREATE VECTOR INDEX} returns as soon as the
+     * index exists, in state {@code POPULATING}, and a query issued against it before it reaches
+     * {@code ONLINE} is answered from a partially-built index -- silently, with no error, just fewer or
+     * wrongly-ordered results. On a warm database nothing notices, because the index was built during some
+     * earlier run; on a fresh one it produces a nearest-neighbour search where a node is not its own nearest
+     * neighbour. That is exactly what {@code PersistenceE2ETest.neo4jFindNearestByFieldVectorRanksByRealSimilarity}
+     * hit on a newly-created container, and it reproduced on a build predating any of this ticket's changes.
+     *
+     * <p>This is the same readiness problem {@code RepositoryBackendSpringDataMongo} already solves by polling
+     * {@code listSearchIndexes()} for {@code queryable: true}, and it is solved the same way here -- with
+     * Neo4j's own {@code db.awaitIndex}, which exists for precisely this. Only the creating call pays the
+     * wait, since {@link #vectorIndexesEnsured} admits one caller per index.
+     *
+     * <p>A failure is swallowed deliberately. {@code db.awaitIndex} throws when the index does not come online
+     * inside its timeout, and on a very large store that is a slow index rather than a broken one; refusing
+     * the write in that case would be worse than proceeding, since the index will finish on its own and the
+     * only cost meanwhile is the imprecise ranking this method exists to avoid.
+     */
+    private static void awaitIndexOnline(Session session, String indexName) {
+        try {
+            session.executeWrite(tx -> {
+                tx.run("CALL db.awaitIndex($name, $timeout)",
+                        Values.parameters("name", indexName, "timeout", INDEX_ONLINE_TIMEOUT_SECONDS));
+                return null;
+            });
+        } catch (RuntimeException e) {
+            LOG.log(System.Logger.Level.WARNING, () -> "Vector index '" + indexName + "' did not come online "
+                    + "within " + INDEX_ONLINE_TIMEOUT_SECONDS + "s (" + e.getMessage() + "). Continuing: it "
+                    + "will finish populating on its own, but similarity searches against it may rank "
+                    + "imprecisely until it does.");
         }
     }
 

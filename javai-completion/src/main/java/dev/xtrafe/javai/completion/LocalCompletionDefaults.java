@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.completion;
 
 import java.net.URI;
+import java.time.Duration;
 
 /**
  * The one place this repo decides which local chat model {@link CortexOllama} defaults to for
@@ -43,8 +44,21 @@ public final class LocalCompletionDefaults {
     }
 
     /** Builds an {@link CortexOllama} against the given (already-running) Ollama endpoint, using
-     *  {@link #model()}. */
+     *  {@link #model()}, with the client's ordinary timeouts. */
     public static CortexOllama create(URI endpoint) {
         return CortexOllama.builder().endpoint(endpoint).model(model()).build();
+    }
+
+    /**
+     * As {@link #create(URI)}, but willing to wait {@code readTimeout} for a response.
+     *
+     * <p>For local inference specifically, where the wait is real work rather than a stall: a model of this
+     * size on CPU can spend minutes generating a long answer before its first response byte, and the default
+     * timeout severs it mid-generation. Because that looks like a hang, it is offered as an explicit,
+     * per-call choice rather than folded into {@link #create(URI)} -- a caller pointing this at a hosted
+     * endpoint should keep a timeout that actually reports a dead provider as dead.
+     */
+    public static CortexOllama create(URI endpoint, Duration readTimeout) {
+        return CortexOllama.builder().endpoint(endpoint).model(model()).readTimeout(readTimeout).build();
     }
 }

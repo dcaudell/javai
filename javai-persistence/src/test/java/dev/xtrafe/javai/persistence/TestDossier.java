@@ -1,0 +1,78 @@
+package dev.xtrafe.javai.persistence;
+
+import dev.xtrafe.javai.annotations.Vectorize;
+import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingVector;
+import jakarta.persistence.Entity;
+import jakarta.persistence.Id;
+
+import java.util.UUID;
+
+/** The target of {@link TestCabinet}'s lazy singular {@code @Summary} reference -- see that class. */
+@Entity
+final class TestDossier implements JavAIVectorizable {
+
+    @SuppressWarnings("unused") // reflectively accessed via JavAIRuntime.STATE_FIELD
+    private transient DirtyTrackingSupport $javai$state;
+
+    @Id
+    private UUID id;
+
+    @Vectorize
+    private String title;
+
+    TestDossier() {
+    }
+
+    TestDossier(String title) {
+        this.id = UUID.randomUUID();
+        this.title = title;
+    }
+
+    UUID getId() {
+        return id;
+    }
+
+    @Override
+    public EmbeddingVector vector() {
+        return JavAIRuntime.vector(this, "title");
+    }
+
+    @Override
+    public EmbeddingVector concatenatedTextVector() {
+        return JavAIRuntime.concatenatedTextVector(this, "title");
+    }
+
+    @Override
+    public EmbeddingVector summaryVector() {
+        return JavAIRuntime.summaryVector(this, "", "title");
+    }
+
+    @Override
+    public double similarityTo(JavAIVectorizable other) {
+        return JavAIRuntime.similarityToVectorizable(this, "title", other);
+    }
+
+    @Override
+    public double similarityTo(EmbeddingVector reference) {
+        return JavAIRuntime.similarityToReference(this, "title", reference);
+    }
+
+    @Override
+    public <T> JavAIList<T> query(EmbeddingVector reference, Class<T> type) {
+        return JavAIRuntime.query(this, reference, type, Integer.MAX_VALUE);
+    }
+
+    @Override
+    public <T> JavAIList<T> query(EmbeddingVector reference, Class<T> type, int maxDepth) {
+        return JavAIRuntime.query(this, reference, type, maxDepth);
+    }
+
+    @Override
+    public EmbeddingVector fieldVector(String fieldName) {
+        return JavAIRuntime.fieldVector(this, fieldName);
+    }
+}

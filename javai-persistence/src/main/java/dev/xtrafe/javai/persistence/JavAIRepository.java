@@ -32,6 +32,22 @@ public interface JavAIRepository<T> {
      *  and persisted alongside the entity itself, in the same transaction where the backend supports one. */
     T save(T entity);
 
+    /**
+     * {@link #save(Object)} with an explicit choice of when the {@code @Summary} containers above this
+     * entity are brought up to date (OMI-255).
+     *
+     * <p>{@code save(entity)} is exactly {@code save(entity, SummaryPolicy.RECOMPUTE_AFTER_COMMIT)} -- this
+     * overload exists only to offer the other option, and changes nothing else about the write. The entity
+     * and its own vectors are persisted identically either way.
+     *
+     * <p>Postgres is the only backend where the choice is meaningful in this phase; Neo4j and MongoDB
+     * recompute inline and accept the argument without acting on it, rather than refusing a call whose
+     * result would in fact be correct.
+     *
+     * @see SummaryPolicy
+     */
+    T save(T entity, SummaryPolicy summaryPolicy);
+
     Optional<T> findById(UUID id);
 
     List<T> findAll();

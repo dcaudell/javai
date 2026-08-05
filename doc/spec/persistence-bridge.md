@@ -221,6 +221,56 @@ own bookkeeping, the subgraph is genuinely frozen against mutation for the durat
 protected on the read side. See `javai-persistence/README.md`'s own "What's actually implemented" section
 for the tests proving this holds under all three modes.
 
+## `@Summary` is written after the transaction, not inside it (OMI-255)
+
+The accuracy rule above is about one writer: the database must never see a vector inconsistent with the
+field value committed alongside it. It says nothing about two writers, and for **derived** state the two
+questions have different answers.
+
+A container's `summaryVector()` is stored as one row per `(owner_type, owner_id)`, so every mutation
+anywhere beneath a `@Summary` container writes that same row. Writing it inside the caller's transaction
+therefore made two unrelated writers -- different children, different tables, different primary keys --
+collide on it: `could not serialize access due to concurrent update` at `REPEATABLE READ`, or a silent
+last-writer-wins at `READ COMMITTED` where the surviving summary reflects only one of the two mutations.
+
+**Neither isolation level can be made to give the right answer**, and this is worth stating precisely
+because it rules out the obvious fix. A lock taken inside the writer's transaction cannot help at
+`REPEATABLE READ`: the snapshot is fixed by the transaction's first statement, long before the container is
+known, so a writer that waits for the lock and then updates a row committed after that snapshot is still
+refused. Serialising the writers does not un-take their snapshots.
+
+So the Postgres backend does not write it there at all:
+
+1. **Inside the caller's transaction**, the mutation appends a row to `javai_summary_pending` naming the
+   container. Every enqueue is an insert with its own fresh primary key, so concurrent writers produce
+   distinct rows and cannot conflict at any isolation level. It commits and rolls back with the mutation.
+2. **After that transaction commits** -- immediately when JavAI owns it, from a commit callback when it
+   joined a Spring or `JavAIPI.inTransaction` one -- a short `READ COMMITTED` transaction takes a Postgres
+   advisory lock on `(owner_type, owner_id)`, recomputes the summary *from the committed graph*, writes the
+   one row, and deletes exactly the queue rows it claimed.
+
+Recomputing from committed state rather than folding the writer's in-memory value is what makes step 2
+correct rather than merely serialised: the drain that runs last has read both writers' children, so the
+surviving summary reflects both. `READ COMMITTED` is required here, not incidental -- at `REPEATABLE READ`
+two drains would refuse each other exactly as the writers used to.
+
+**Upward propagation is resolved from the database, not from the object graph.** Vector Core's in-memory
+back-edge walk is correct for a single process holding the whole graph, and insufficient the moment the
+deployment is multi-pod: a pod that loaded a `Shelf` through its own repository holds no `Library`, so there
+is no back-edge to walk and the library's summary silently keeps whatever some other pod last left. The
+drain instead asks which containers *currently* hold the entity, from the declared `@Summary` fields of
+registered types plus the stored relationships -- covering both natively-mapped associations (HQL) and this
+backend's own `javai_collection_members` (SQL) -- and walks up transitively.
+
+Two costs are accepted deliberately. A summary row is **stale within the caller's own transaction**, since
+the write happens after commit. And a drain that fails leaves the recomputation queued rather than
+performed -- durable, retried by the next save of that container or by `JavAIPI.drainPendingSummaries`, and
+logged, but not instantaneous. `SummaryPolicy.QUEUE_ONLY` makes the second case a deliberate choice for
+write-heavy paths.
+
+Entities outside `@Summary` containment entirely -- which is most of an application's entities -- keep the
+inline write and never touch the queue.
+
 ## Ordinary relational derived finders
 
 A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the
