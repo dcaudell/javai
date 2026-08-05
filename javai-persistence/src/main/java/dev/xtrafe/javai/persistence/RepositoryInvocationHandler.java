@@ -1,9 +1,9 @@
 package dev.xtrafe.javai.persistence;
 
-import dev.xtrafe.javai.vector.EmbeddingVector;
-
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -13,9 +13,9 @@ import java.util.concurrent.ConcurrentHashMap;
  * the base CRUD contract straight to {@link RepositoryBackend} -- including {@code reindexAll}, expressed
  * purely as a {@code findAll()} + {@code save(...)} loop over the existing backend methods, needing no
  * backend-specific support of its own; anything named {@code findNearestBy*} is parsed once (cached per
- * {@link Method}, since {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} already validated it at creation time) via
- * {@link DerivedQueryMethods} and dispatched to whichever backend method matches its
- * {@link DerivedQueryMethods.Kind}.
+ * {@link Method}, since {@link JavAIPI#repository(Class, JavAIPersistenceConfig)} already validated it at
+ * creation time) via {@link DerivedQueryMethods}, bound into a {@link NearestSpec}, and handed to the one
+ * {@link RepositoryBackend#findNearest} the builder idiom reaches too.
  */
 final class RepositoryInvocationHandler implements InvocationHandler {
 
@@ -51,6 +51,20 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "reindex":
                 backend.reindex(entityType);
                 return null;
+            // The builder idiom (OMI-230). Declared on JavAIRepository itself, so these names are matched
+            // here before the findNearestBy* convention below ever sees them -- and are deliberately not
+            // spelled findNearestBy*, so the two idioms cannot collide on a name in the first place.
+            case "nearest":
+                return newNearestQuery(DerivedQueryMethods.Kind.COMBINED, RepositoryBackend.COMBINED_VECTOR_FIELD);
+            case "nearestBy":
+                return newNearestQuery(
+                        DerivedQueryMethods.Kind.FIELD, DerivedQueryMethods.requireVectorizeField(
+                                entityType, (String) args[0]));
+            case "nearestBySummary":
+                return newNearestQuery(DerivedQueryMethods.Kind.SUMMARY, null);
+            case "nearestByConcatenatedText":
+                DerivedQueryMethods.requireConcatenationParticipant(entityType);
+                return newNearestQuery(DerivedQueryMethods.Kind.CONCATENATED_TEXT, null);
             case "toString":
                 return "JavAIRepository<" + entityType.getSimpleName() + ">";
             case "hashCode":
@@ -63,14 +77,18 @@ final class RepositoryInvocationHandler implements InvocationHandler {
         if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
             DerivedQueryMethods.ParsedQuery parsed =
                     parsedQueries.computeIfAbsent(method, m -> DerivedQueryMethods.parse(m, entityType));
-            EmbeddingVector reference = (EmbeddingVector) args[0];
-            int limit = (Integer) args[1];
-            return switch (parsed.kind()) {
-                case FIELD, COMBINED -> backend.findNearestByFieldVector(entityType, parsed.fieldName(), reference, limit);
-                case SUMMARY -> backend.findNearestBySummaryVector(entityType, reference, limit);
-                case CONCATENATED_TEXT ->
-                        backend.findNearestByConcatenatedTextVector(entityType, reference, limit);
-            };
+            List<Ranked<Object>> hits =
+                    backend.findNearest(entityType, DerivedQueryMethods.toSpec(parsed, args));
+            // Unwrapping here, not in the backend, is what lets one backend method serve both return shapes
+            // -- and the same reason the builder's results()/ranked() pair needs no second backend call.
+            if (parsed.ranked()) {
+                return hits;
+            }
+            List<Object> entities = new ArrayList<>(hits.size());
+            for (Ranked<Object> hit : hits) {
+                entities.add(hit.entity());
+            }
+            return entities;
         }
         // Ordinary Spring-Data-style derived finder (OMI-138) -- checked after findNearestBy* since the two
         // prefixes are disjoint (findNearestBy never startsWith findBy). Parsing was already validated at
@@ -81,5 +99,9 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             return query.execute(backend, entityType, args);
         }
         throw new UnsupportedOperationException("Unsupported repository method " + method);
+    }
+
+    private NearestQuery<Object> newNearestQuery(DerivedQueryMethods.Kind kind, String fieldName) {
+        return new NearestQuery<>(backend, entityType, kind, fieldName);
     }
 }

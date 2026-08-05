@@ -826,30 +826,73 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
+    /**
+     * Ranks by similarity, narrowed by an optional relational predicate that is applied <b>before</b> the
+     * limit (OMI-230).
+     *
+     * <p>That ordering is the entire point, and it is why this resolves the predicate to an id set first
+     * rather than filtering the ranked output. Ranking then filtering answers a different question -- "which
+     * of the nearest N happen to match" -- and gives back fewer than N whenever the predicate is selective,
+     * which is precisely the over-fetch-and-discard the caller was trying to escape. Resolving first means
+     * {@code LIMIT} sees only rows that already match, so N nearest matches means N.
+     *
+     * <p>The id set is resolved through the ordinary derived-finder Criteria machinery
+     * ({@link #buildWhere}), not a second predicate translator written for vectors: a predicate expressible
+     * in a {@code findBy…} finder is expressible here, with identical semantics, because it is literally the
+     * same code. The cost is materializing the matching ids -- bounded by how selective the predicate is,
+     * not by the store -- which is the trade this makes deliberately: one id array beats an unbounded number
+     * of round trips, and beats a join this backend would otherwise have to synthesize against a table name
+     * it only knows through Hibernate's mapping.
+     */
     @Override
-    public List<Object> findNearestByFieldVector(
-            Class<?> entityType, String fieldName, EmbeddingVector reference, int limit) {
-        String table = ensureFieldVectorTable(reference.modelId(), reference.dims());
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection ->
-                rankIds(connection, table, entityType, fieldName, reference, limit)));
-        return hydrate(entityType, rankedIds);
+    public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        EmbeddingVector reference = spec.reference();
+        boolean entityGrain = spec.kind() == DerivedQueryMethods.Kind.SUMMARY
+                || spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT;
+        String table = entityGrain
+                ? ensureSummaryVectorTable(reference.modelId(), reference.dims())
+                : ensureFieldVectorTable(reference.modelId(), reference.dims());
+        String vectorColumn = spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT
+                ? "concatenated_text_vector" : "vector";
+        String fieldName = entityGrain ? null : spec.fieldName();
+
+        List<UUID> allowedIds = null;
+        if (spec.isNarrowed()) {
+            allowedIds = matchingIds(entityType, spec.predicate());
+            if (allowedIds.isEmpty()) {
+                return List.of(); // nothing satisfies the predicate, so nothing can be near and satisfy it
+            }
+        }
+        List<UUID> allowed = allowedIds;
+        List<RankedId> ranked = inSession(session -> session.doReturningWork(connection -> rankIds(connection,
+                table, entityType, fieldName, reference, spec.limitIncludingOffset(), vectorColumn, allowed)));
+        if (spec.offset() > 0) {
+            ranked = ranked.size() <= spec.offset()
+                    ? List.of() : new ArrayList<>(ranked.subList(spec.offset(), ranked.size()));
+        }
+        return hydrateRanked(entityType, ranked);
     }
 
-    @Override
-    public List<Object> findNearestBySummaryVector(Class<?> entityType, EmbeddingVector reference, int limit) {
-        String table = ensureSummaryVectorTable(reference.modelId(), reference.dims());
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection ->
-                rankIds(connection, table, entityType, null, reference, limit)));
-        return hydrate(entityType, rankedIds);
-    }
-
-    @Override
-    public List<Object> findNearestByConcatenatedTextVector(Class<?> entityType, EmbeddingVector reference,
-            int limit) {
-        String table = ensureSummaryVectorTable(reference.modelId(), reference.dims());
-        List<UUID> rankedIds = inSession(session -> session.doReturningWork(connection ->
-                rankIds(connection, table, entityType, null, reference, limit, "concatenated_text_vector")));
-        return hydrate(entityType, rankedIds);
+    /**
+     * The ids satisfying {@code orGroups}, as an ordinary Criteria query over the entity's own table.
+     *
+     * <p>{@code distinct} unconditionally: a predicate reaching through a to-many association yields one row
+     * per matching member, and an id repeated in the array would rank the same entity several times.
+     */
+    private List<UUID> matchingIds(Class<?> entityType, List<List<DerivedFinderQuery.BoundPart>> orGroups) {
+        String idField = EntityReflection.idField(entityType).getName();
+        return inSession(session -> {
+            HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
+            JpaCriteriaQuery<UUID> cq = cb.createQuery(UUID.class);
+            JpaRoot<?> root = cq.from(entityType);
+            cq.select(root.get(idField));
+            cq.distinct(true);
+            Predicate where = buildWhere(session, cb, root, entityType, orGroups);
+            if (where != null) {
+                cq.where(where);
+            }
+            return session.createQuery(cq).list();
+        });
     }
 
     // ---- ordinary derived finders (OMI-138): JPA Criteria translation --------------------------
@@ -3038,52 +3081,71 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     /** Rank-then-hydrate's first half: ANN search entirely within one model's own vector table, bounded by
      *  LIMIT, before any of the entity's own table is touched. {@code fieldName} is null for the summary
      *  table, which has no per-field dimension. */
-    private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
-            EmbeddingVector reference, int limit) throws SQLException {
-        return rankIds(connection, table, entityType, fieldName, reference, limit, "vector");
+    /** One ranked hit as the vector table answers it, before the entity behind it is loaded. {@code distance}
+     *  is pgvector's own cosine distance; {@link Ranked} carries the similarity it converts to. */
+    private record RankedId(UUID id, double distance) {
     }
 
-    /** {@code vectorColumn} names which vector to rank by -- the entity-grain table holds two (OMI-191).
-     *  Rows where it is NULL are excluded, so a non-participating entity never surfaces as a match. */
-    private static List<UUID> rankIds(Connection connection, String table, Class<?> entityType, String fieldName,
-            EmbeddingVector reference, int limit, String vectorColumn) throws SQLException {
-        StringBuilder sql = new StringBuilder("SELECT owner_id FROM ").append(table)
+    /**
+     * {@code vectorColumn} names which vector to rank by -- the entity-grain table holds two (OMI-191).
+     * Rows where it is NULL are excluded, so a non-participating entity never surfaces as a match.
+     *
+     * <p>{@code allowedIds} is the narrowing predicate already resolved to the ids that satisfy it, or
+     * {@code null} for an unnarrowed search (OMI-230). Passed as a single {@code uuid[]} rather than an
+     * {@code IN} list built by string concatenation: one bound parameter regardless of how many ids there
+     * are, so the statement text stays constant and re-plannable however selective the predicate was.
+     */
+    private static List<RankedId> rankIds(Connection connection, String table, Class<?> entityType,
+            String fieldName, EmbeddingVector reference, int limit, String vectorColumn, List<UUID> allowedIds)
+            throws SQLException {
+        StringBuilder sql = new StringBuilder("SELECT owner_id, ").append(vectorColumn)
+                .append(" <=> ?::vector AS javai_distance FROM ").append(table)
                 .append(" WHERE owner_type = ?");
         if (fieldName != null) {
             sql.append(" AND field_name = ?");
         }
         sql.append(" AND ").append(vectorColumn).append(" IS NOT NULL");
-        sql.append(" ORDER BY ").append(vectorColumn).append(" <=> ?::vector LIMIT ?");
+        if (allowedIds != null) {
+            sql.append(" AND owner_id = ANY(?)");
+        }
+        sql.append(" ORDER BY javai_distance LIMIT ?");
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
             int index = 1;
+            statement.setString(index++, toVectorLiteral(reference.values()));
             statement.setString(index++, entityType.getName());
             if (fieldName != null) {
                 statement.setString(index++, fieldName);
             }
-            statement.setString(index++, toVectorLiteral(reference.values()));
+            if (allowedIds != null) {
+                statement.setArray(index++, connection.createArrayOf("uuid", allowedIds.toArray()));
+            }
             statement.setInt(index, limit);
             try (ResultSet resultSet = statement.executeQuery()) {
-                List<UUID> ids = new ArrayList<>();
+                List<RankedId> ranked = new ArrayList<>();
                 while (resultSet.next()) {
-                    ids.add((UUID) resultSet.getObject("owner_id"));
+                    ranked.add(new RankedId(
+                            (UUID) resultSet.getObject("owner_id"), resultSet.getDouble("javai_distance")));
                 }
-                return ids;
+                return ranked;
             }
         }
     }
 
     /** Second half: a targeted load of exactly the ranked ids, one {@code find} per id (bounded by
      *  {@code limit}, typically small) -- simpler and just as correct as a batch multi-load API for this
-     *  volume, and trivially preserves rank order without a separate re-sort step. */
-    private List<Object> hydrate(Class<?> entityType, List<UUID> rankedIds) {
+     *  volume, and trivially preserves rank order without a separate re-sort step. Each hit keeps the
+     *  distance it was ranked on, converted to the cosine similarity {@link Ranked} promises. */
+    private List<Ranked<Object>> hydrateRanked(Class<?> entityType, List<RankedId> ranked) {
         return inSession(session -> {
-            List<Object> results = new ArrayList<>(rankedIds.size());
+            List<Ranked<Object>> results = new ArrayList<>(ranked.size());
             Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
-            for (UUID id : rankedIds) {
-                Object entity = session.find(entityType, id);
+            for (RankedId hit : ranked) {
+                Object entity = session.find(entityType, hit.id());
                 if (entity != null) {
                     hydrateLoaded(session, entity, hydrated);
-                    results.add(entity);
+                    // pgvector's <=> is cosine distance; Ranked speaks the cosine similarity the rest of
+                    // JavAI does, so a hit's score means the same as VectorMath.cosineSimilarity would.
+                    results.add(new Ranked<>(entity, 1.0 - hit.distance()));
                 }
             }
             return results;
