@@ -12,6 +12,8 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-08-05
+
 ### Added
 
 - **`javai-persistence`: a vector search can be narrowed by a relational predicate, return each hit's
@@ -853,7 +855,8 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.7...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.8...HEAD
+[0.1.8]: https://github.com/dcaudell/javai/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dcaudell/javai/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dcaudell/javai/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/dcaudell/javai/compare/v0.1.4...v0.1.5
