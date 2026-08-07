@@ -60,6 +60,43 @@ public interface JavAIEmbeddingProvider {
     }
 
     /**
+     * The most inputs this provider will accept in one {@link #embedAll} request.
+     *
+     * <p>Distinct from {@link #maxInputTokens()}, which bounds one text against the model's context window
+     * and is applied <em>per member</em> of a batch. This bounds the batch itself, and the two are genuinely
+     * independent: a hundred individually-legal texts are still a request no provider agreed to accept.
+     *
+     * <p>Concrete, not hypothetical: Text Embeddings Inference defaults to <b>32</b>
+     * ({@code --max-client-batch-size}), below the 100 this library chunked at, so a default TEI deployment
+     * rejects a full batch outright. OpenAI documents 2048.
+     *
+     * <p>A {@code default} rather than an abstract method, for the reason given on {@link #modelId()}: this
+     * is a published SPI. A provider that doesn't override it gets
+     * {@link EmbeddingBatchLimits#DEFAULT_MAX_BATCH_SIZE}, which is the chunk size already in use -- so
+     * declaring nothing changes nothing. Non-positive means "no count limit".
+     */
+    default int maxBatchSize() {
+        return EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE;
+    }
+
+    /**
+     * The most tokens, in total across every input, this provider will accept in one {@link #embedAll}
+     * request.
+     *
+     * <p>The other half of {@link #maxBatchSize()}, and needed separately because the two fail in opposite
+     * directions: a batch of eight enormous documents breaks a token ceiling while satisfying any count
+     * ceiling, and a batch of two thousand one-word strings does the reverse. TEI defaults to 16,384
+     * ({@code --max-batch-tokens}); OpenAI documents 300,000 per embeddings request.
+     *
+     * <p>Like {@link #maxInputTokens()} this is a token count and JavAI has no tokenizer, so any enforcement
+     * built on it is approximate and errs small -- see {@link EmbeddingInputLimits}. Non-positive means "no
+     * size limit".
+     */
+    default int maxBatchTokens() {
+        return EmbeddingBatchLimits.DEFAULT_MAX_BATCH_TOKENS;
+    }
+
+    /**
      * Embeds several texts in one go, returning one vector per input, in order.
      *
      * <p>The reason this exists is latency, not call count. {@link #embed} is one text per HTTP round trip,
@@ -79,6 +116,14 @@ public interface JavAIEmbeddingProvider {
      * is individually well-formed, and the mistake only ever surfaces as inexplicably poor search results.
      * An implementation must order by whatever the API says the order is, and must refuse a response whose
      * row count doesn't match the request rather than returning a short or padded list.
+     *
+     * <p><b>This does not split an over-large list</b>, deliberately -- it sends exactly one request for
+     * exactly what it is given, so one call is one round trip, which is what makes the concurrency gate's
+     * one-permit-per-call accounting true and what lets a test count round trips at all. Respecting
+     * {@link #maxBatchSize()}/{@link #maxBatchTokens()} is the caller's job, and
+     * {@code JavAIRuntime.precomputeVectors} is the caller that does it (via
+     * {@link EmbeddingBatchLimits#split}). A caller handing this method ten thousand texts directly has
+     * chosen that request.
      *
      * @param texts the texts to embed, in order
      * @return one vector per input text, same order, same size

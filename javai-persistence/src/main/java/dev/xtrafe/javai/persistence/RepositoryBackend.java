@@ -1,7 +1,9 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -47,6 +49,55 @@ interface RepositoryBackend {
     }
 
     /**
+     * Saves several entities, embedding all their vectors up front in as few provider calls as possible
+     * (OMI-266) -- see {@link JavAIRepository#saveAll} for the consumer-facing contract.
+     *
+     * <p>The default is the whole feature for a backend with no transaction of its own: warm the union of
+     * every entity's subgraph, then save each by the ordinary path, which finds every vector already
+     * computed. The warm happens before the first write deliberately, so the provider round trips are not
+     * held inside whatever unit of work the saves open.
+     *
+     * <p>Only the Postgres backend overrides this, and only to add atomicity -- it wraps the same loop in one
+     * transaction. The batching itself is identical on all three.
+     */
+    default List<Object> saveAll(Class<?> entityType, List<Object> entities, SummaryPolicy summaryPolicy) {
+        JavAIRuntime.warmSubgraphsForPersistence(entities);
+        List<Object> saved = new ArrayList<>(entities.size());
+        for (Object entity : entities) {
+            saved.add(save(entityType, entity, summaryPolicy));
+        }
+        return saved;
+    }
+
+    /**
+     * Re-embeds and re-persists every entity of {@code entityType}, in batches -- the shared body behind
+     * {@link #reindex} and every backend's own {@link #reindexAll}.
+     *
+     * <p>Chunked rather than warmed in one pass: a re-index is the one operation guaranteed to touch every
+     * row in the store, so gathering the whole table's texts before issuing any request would trade a latency
+     * problem for a memory one. Each chunk is warmed and then saved.
+     *
+     * <p>Note it deliberately does <em>not</em> route through {@link #saveAll}: that would put a whole chunk
+     * in one transaction, and a maintenance pass over an entire table has no business widening the
+     * transaction boundary the per-entity saves already have.
+     */
+    default void reindexInChunks(Class<?> entityType, SummaryPolicy summaryPolicy) {
+        List<Object> all = findAll(entityType);
+        for (int start = 0; start < all.size(); start += REINDEX_CHUNK_SIZE) {
+            List<Object> chunk = all.subList(start, Math.min(start + REINDEX_CHUNK_SIZE, all.size()));
+            JavAIRuntime.warmSubgraphsForPersistence(chunk);
+            for (Object entity : chunk) {
+                save(entityType, entity, summaryPolicy);
+            }
+        }
+    }
+
+    /** How many entities a re-index warms at a time. Matches {@code JavAIRuntime.precomputeVectors}' own
+     *  default chunk size, which is what ultimately bounds the request; this bounds how much of the table is
+     *  held in flight around it. */
+    int REINDEX_CHUNK_SIZE = 100;
+
+    /**
      * Re-embeds and re-persists <em>every registered entity type</em> under the currently-configured model.
      * A datastore is re-indexed as a whole: an {@code Article}'s {@code Comment}s must be re-embedded too, or
      * the store is left straddling two models. Takes no argument precisely because no single type scopes it.
@@ -62,12 +113,13 @@ interface RepositoryBackend {
      * model they were last written under.
      *
      * <p>Backend-agnostic by construction -- {@code save()} always writes under whichever provider is
-     * currently configured -- so no backend needs to override this.
+     * currently configured -- so a backend overrides this only to change <em>when</em> the {@code @Summary}
+     * recomputation happens, never to change what is re-embedded. Postgres is the one that does, running the
+     * whole pass {@code QUEUE_ONLY} and draining once at the end (OMI-255). (This previously claimed no
+     * backend needed to override it, which had not been true since that ticket.)
      */
     default void reindex(Class<?> entityType) {
-        for (Object entity : findAll(entityType)) {
-            save(entityType, entity);
-        }
+        reindexInChunks(entityType, SummaryPolicy.RECOMPUTE_AFTER_COMMIT);
     }
 
     /**

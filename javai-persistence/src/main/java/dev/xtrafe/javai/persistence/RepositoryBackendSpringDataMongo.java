@@ -265,9 +265,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     @Override
     public void reindexAll() {
         for (Class<?> registered : registeredEntityTypes) {
-            for (Object entity : findAll(registered)) {
-                save(registered, entity);
-            }
+            reindexInChunks(registered, SummaryPolicy.RECOMPUTE_AFTER_COMMIT);
         }
     }
 

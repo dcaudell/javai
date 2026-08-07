@@ -2,6 +2,7 @@ package dev.xtrafe.javai.model;
 
 import dev.xtrafe.javai.annotations.SearchVisibility;
 import dev.xtrafe.javai.vector.DirtyTrackingSupport;
+import dev.xtrafe.javai.vector.EmbeddingBatchLimits;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
@@ -33,6 +34,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
 /**
@@ -667,49 +669,37 @@ public final class JavAIRuntime {
                 if (!slot.isDirty()) {
                     continue; // already accurate; nothing to compute
                 }
+                // Captured *before* the text is read, so a mutation racing this pass makes the commit below
+                // lose rather than land a vector computed from a value the field has already moved on from --
+                // exactly what the concatenated pass below does, and for the same reason.
+                long generation = slot.currentGeneration();
                 String text = fieldTextOf(object, fieldName);
                 if (text == null || text.isBlank()) {
                     continue; // no content: absent, and nothing to batch -- see embedText
                 }
                 pending.computeIfAbsent(text, key -> new ArrayList<>())
-                        .add(new FieldRef(object, fieldName));
+                        .add(new FieldRef(slot, generation));
             }
         }
         if (pending.isEmpty()) {
             return;
         }
 
-        List<String> texts = new ArrayList<>(pending.keySet());
-        JavAIEmbeddingProvider provider = embeddingProvider();
-        for (int start = 0; start < texts.size(); start += batchSize) {
-            List<String> chunk = texts.subList(start, Math.min(start + batchSize, texts.size()));
-            // One batched request costs one permit, not one per text (OMI-213). The gate bounds concurrent
-            // *calls into the provider* -- it exists so a burst degrades to "slower" rather than to
-            // unboundedly many concurrent HTTP calls -- and a batch is one call on one connection however
-            // many texts it carries. Charging it per text would instead make the gate throttle batching
-            // itself, penalising the very thing that reduces load on the endpoint: a 100-text batch against a
-            // gate of 8 would block outright, since no batch could ever acquire enough permits.
-            //
-            // Taking a permit at all is the point. Before this, precomputeVectors called the provider without
-            // touching the gate, so a bulk seed ran entirely outside the bound this class documents as
-            // applying to every provider call in every consistency mode.
-            List<EmbeddingVector> vectors;
-            acquireUninterruptibly(embeddingCallGate());
-            try {
-                vectors = provider.embedAll(chunk);
-            } finally {
-                embeddingCallGate().release();
+        embedInBatches(new ArrayList<>(pending.keySet()), batchSize, (text, vector) -> {
+            for (FieldRef ref : pending.get(text)) {
+                // commitSuccess, not hydrateFieldVector (OMI-266). Hydration is for a vector read back
+                // from the database, so it deliberately refuses any slot that has ever computed or has
+                // been mutated since construction -- the pristine-slot rule that stops a stored vector
+                // overwriting a real change. Applied here it silently discarded the result for every
+                // slot that had computed before: the batch embedded the text, threw the vector away, and
+                // the read that followed embedded the identical text a second time. Invisible while the
+                // only caller seeded fresh objects, and strictly worse than not batching for the ordinary
+                // load-mutate-save path. The generation captured above is what makes the plain commit
+                // safe: a mutation that landed since is a newer attempt, and commitSuccess rejects this
+                // one rather than overwriting it.
+                ref.slot().commitSuccess(ref.generation(), vector);
             }
-            if (vectors.size() != chunk.size()) {
-                throw new IllegalStateException("embedAll returned " + vectors.size() + " vectors for "
-                        + chunk.size() + " texts; a provider must answer one vector per input, in order");
-            }
-            for (int i = 0; i < chunk.size(); i++) {
-                for (FieldRef ref : pending.get(chunk.get(i))) {
-                    hydrateFieldVector(ref.owner(), ref.fieldName(), vectors.get(i));
-                }
-            }
-        }
+        });
 
         // The concatenated-text pass runs last, after every field vector is warm (OMI-191). Order matters:
         // assembling an object's text reads its descendants, and doing that while their own field vectors
@@ -756,36 +746,70 @@ public final class JavAIRuntime {
             return;
         }
 
-        List<String> texts = new ArrayList<>(pending.keySet());
+        embedInBatches(new ArrayList<>(pending.keySet()), batchSize, (text, vector) -> {
+            for (PendingConcatenation waiting : pending.get(text)) {
+                waiting.slot().commitSuccess(waiting.generation(), vector);
+            }
+        });
+    }
+
+    /**
+     * Embeds {@code texts} in as few provider calls as the provider will actually accept, handing each text
+     * its own vector as the batches come back.
+     *
+     * <p><b>Three ceilings, not one</b> (OMI-266). The caller's {@code batchSize} bounds how much work is
+     * gathered before anything is sent; the provider's {@link JavAIEmbeddingProvider#maxBatchSize()} and
+     * {@link JavAIEmbeddingProvider#maxBatchTokens()} bound what it is willing to receive. All three apply,
+     * and the smallest wins -- a caller asking for 100 against a default Text Embeddings Inference server
+     * gets batches of 32, because that is TEI's own {@code max_client_batch_size} and a 100-input request
+     * would simply be refused.
+     *
+     * <p>The size ceiling is the one that did not exist before, and it is separate from
+     * {@code EmbeddingInputLimits}' per-input truncation on purpose: that bounds each text against the
+     * model's context window and is explicitly <em>per member, never per batch</em>, so a hundred
+     * individually-legal texts still summed to a request no provider agreed to accept -- against a
+     * 32,768-token local model, roughly 9.4 MiB in one body.
+     *
+     * <p>One batched request costs <b>one</b> permit from {@link #embeddingCallGate()}, not one per text
+     * (OMI-213): the gate bounds concurrent <em>calls into the provider</em>, and a batch is one call on one
+     * connection however many texts it carries. Charging per text would make the gate throttle batching
+     * itself -- a 100-text batch against a gate of 8 could never acquire enough permits, so bulk seeding
+     * would deadlock rather than be bounded.
+     */
+    private static void embedInBatches(List<String> texts, int batchSize,
+            BiConsumer<String, EmbeddingVector> onVector) {
         JavAIEmbeddingProvider provider = embeddingProvider();
-        for (int start = 0; start < texts.size(); start += batchSize) {
-            List<String> chunk = texts.subList(start, Math.min(start + batchSize, texts.size()));
+        int providerCap = provider.maxBatchSize();
+        int countCap = providerCap > 0 ? Math.min(batchSize, providerCap) : batchSize;
+        int charCap = EmbeddingBatchLimits.characterBudget(provider.maxBatchTokens());
+        for (List<String> batch : EmbeddingBatchLimits.split(texts, countCap, charCap)) {
             List<EmbeddingVector> vectors;
-            acquireUninterruptibly(embeddingCallGate()); // one permit per batch -- see the field pass above
+            acquireUninterruptibly(embeddingCallGate());
             try {
-                vectors = provider.embedAll(chunk);
+                vectors = provider.embedAll(batch);
             } finally {
                 embeddingCallGate().release();
             }
-            if (vectors.size() != chunk.size()) {
+            if (vectors.size() != batch.size()) {
                 throw new IllegalStateException("embedAll returned " + vectors.size() + " vectors for "
-                        + chunk.size() + " texts; a provider must answer one vector per input, in order");
+                        + batch.size() + " texts; a provider must answer one vector per input, in order");
             }
-            for (int i = 0; i < chunk.size(); i++) {
-                for (PendingConcatenation waiting : pending.get(chunk.get(i))) {
-                    waiting.slot().commitSuccess(waiting.generation(), vectors.get(i));
-                }
+            for (int i = 0; i < batch.size(); i++) {
+                onVector.accept(batch.get(i), vectors.get(i));
             }
         }
     }
 
-    /** {@link #precomputeVectors(Collection, int)} with a batch size most provider APIs accept comfortably. */
+    /** {@link #precomputeVectors(Collection, int)} with a batch size most provider APIs accept comfortably --
+     *  and which the provider's own {@link JavAIEmbeddingProvider#maxBatchSize()} narrows further where it
+     *  declares a smaller one. */
     public static void precomputeVectors(Collection<?> objects) {
-        precomputeVectors(objects, 100);
+        precomputeVectors(objects, EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE);
     }
 
-    /** One object's one {@code @Vectorize} field, awaiting a batched embedding. */
-    private record FieldRef(Object owner, String fieldName) {
+    /** One {@code @Vectorize} field's cache slot, and the generation its text was read at, awaiting a
+     *  batched embedding. */
+    private record FieldRef(VectorCacheSlot slot, long generation) {
     }
 
     /** One object's concatenated-text slot, and the generation its text was assembled at. */
@@ -1146,6 +1170,13 @@ public final class JavAIRuntime {
         } else {
             walkGraph(self, 0, maxDepth, type, visited, matches);
         }
+        // Every candidate's vector, in as few provider calls as the provider supports, before the sort rather
+        // than inside it (OMI-266). The comparator below reads each match's vector(), so any candidate whose
+        // fields have not been embedded yet was previously discovered one at a time, deep inside a sort --
+        // the same one-round-trip-per-text shape as the persistence flows, in the one place where it is least
+        // visible. Warming first changes no ranking: it computes exactly the vectors the comparator is about
+        // to ask for, and skips every slot that is already accurate.
+        warmSubgraph(matches);
         matches.sort(Comparator.comparingDouble((T match) -> similarityOf(match, reference)).reversed());
         JavAIArrayList<T> result = new JavAIArrayList<>();
         result.addAll(matches);
@@ -1248,10 +1279,16 @@ public final class JavAIRuntime {
      * object's construction) -- a fixed, global, per-object order that holds regardless of which root or
      * traversal order a particular call started from, which is what makes this deadlock-free even when two
      * overlapping subgraphs are locked concurrently by separate persistence operations.
+     *
+     * <p>Once the subgraph is locked and before {@code action} runs, every vector it is about to read is
+     * computed in as few provider calls as the provider supports -- see {@link #warmSubgraph} (OMI-266).
+     * That changes no result: it only fills, up front and in batches, the same caches {@code action}'s own
+     * reads would otherwise fill one at a time.
      */
     public static void runWithSubgraphLockedForPersistence(Object root, Runnable action) {
+        Set<Object> subgraph = reachableVectorizables(root);
         List<DirtyTrackingSupport> states = new ArrayList<>();
-        for (Object node : reachableVectorizables(root)) {
+        for (Object node : subgraph) {
             states.add(stateOf(node));
         }
         states.sort(Comparator.comparingLong(DirtyTrackingSupport::sequenceNumber));
@@ -1265,6 +1302,7 @@ public final class JavAIRuntime {
             boolean alreadyForcing = FORCE_ACCURATE.get();
             FORCE_ACCURATE.set(true);
             try {
+                warmSubgraph(subgraph);
                 action.run();
             } finally {
                 FORCE_ACCURATE.set(alreadyForcing);
@@ -1273,6 +1311,64 @@ public final class JavAIRuntime {
             for (int i = 0; i < locked; i++) {
                 states.get(i).objectLock().unlock();
             }
+        }
+    }
+
+    /**
+     * {@link #warmSubgraph} across several roots at once -- everything reachable from any of {@code roots},
+     * embedded in as few provider calls as the provider supports (OMI-266).
+     *
+     * <p>What a per-save warm cannot do. Each {@code save()} warms its own subgraph, so saving a hundred
+     * entities in a loop still costs a hundred round trips however well each individual one batches; only a
+     * caller who can see the whole batch at once can collapse them, which is what
+     * {@code JavAIRepository.saveAll} exists to be. Texts are de-duplicated across the union, so a value
+     * shared between two of the roots is embedded once between them.
+     *
+     * <p>Deliberately callable <em>before</em> a transaction is opened rather than inside one: these are
+     * network round trips, and a bulk write has no reason to hold a database transaction open across them.
+     * It is still safe -- nothing is locked here, so a field mutated between this call and its {@code save()}
+     * simply leaves its slot dirty, and that save's own locked, accuracy-forced pass recomputes it.
+     */
+    public static void warmSubgraphsForPersistence(Collection<?> roots) {
+        Set<Object> union = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (Object root : roots) {
+            union.addAll(reachableVectorizables(root));
+        }
+        warmSubgraph(union);
+    }
+
+    /**
+     * Embeds everything a subsequent read is about to ask for, in as few provider calls as the provider
+     * supports, before it asks for any of it (OMI-266).
+     *
+     * <p><b>Why this is worth doing at the point of a flush.</b> A flush reads one field at a time, so lazy
+     * computation discovers one text at a time and every one of them is its own round trip: measured on the
+     * Postgres backend, saving a container with twelve members cost thirteen texts in thirteen sequential
+     * calls. Gathering first is the only way to hand a provider more than one, and
+     * {@link #runWithSubgraphLockedForPersistence} is the one place that already knows the whole set -- it
+     * computed it in order to lock it.
+     *
+     * <p><b>Round trips are not the only thing this shortens.</b> Called from there, these calls happen while
+     * every object in the subgraph is locked, and on the Postgres and Neo4j backends inside an open database
+     * transaction. So N sequential round trips hold the graph frozen against mutation, and hold a transaction
+     * open, for N times as long as one batched call does. That is contention, not merely latency.
+     *
+     * <p><b>A failure here is not a failure of the operation being warmed.</b> This only fills caches that
+     * the reads that follow would otherwise fill themselves, so if the provider is unreachable the right
+     * outcome is the one those reads would have produced -- which is not the same outcome for every
+     * configuration: {@link EmbeddingFailureMode#THROW} raises, {@link EmbeddingFailureMode#RETURN_NULL} does
+     * not. Rather than reimplement that decision here and risk disagreeing with it, the exception is dropped
+     * and the slots are left dirty for the ordinary path to resolve with whatever semantics are configured.
+     * The cost of a genuinely broken provider is therefore one wasted batched call before the real failure
+     * surfaces, and the observable behaviour of {@code save()} is unchanged under every failure mode.
+     */
+    private static void warmSubgraph(Collection<?> subgraph) {
+        try {
+            precomputeVectors(subgraph);
+        } catch (RuntimeException e) {
+            // Deliberately swallowed -- see this method's javadoc. Not a silent failure: every slot this
+            // failed to fill is still dirty, so the read that follows attempts it again and reports it (or
+            // not) exactly as the configured EmbeddingFailureMode says it should.
         }
     }
 

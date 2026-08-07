@@ -59,19 +59,30 @@ public final class EmbeddingLedger {
     private static final int MAX_REPORTED_CALLS = 60;
 
     /**
-     * One observed {@code embed()} call. {@code sequence} is 1-based and assigned in the order calls
+     * One observed embedding of one text. {@code sequence} is 1-based and assigned in the order calls
      * arrived at the provider, which under the async consistency modes is not the order the reads that
      * caused them were issued -- hence {@code threadName}, which is what makes a background recomputation
      * distinguishable from a blocking one after the fact.
+     *
+     * <p>{@code roundTrip} is which <em>provider invocation</em> carried this text: an {@code embed} call
+     * is a round trip of its own, while every text in one {@code embedAll} call shares one. Texts and round
+     * trips were the same number until batching existed, and OMI-266 is entirely about the difference --
+     * see {@link #roundTrips()}.
      */
-    public record Call(long sequence, String text, String threadName, String callSite) {
+    public record Call(long sequence, long roundTrip, String text, String threadName, String callSite) {
     }
 
     private final List<Call> calls = Collections.synchronizedList(new ArrayList<>());
     private final AtomicLong sequence = new AtomicLong();
+    private final AtomicLong roundTrips = new AtomicLong();
 
-    void record(String text, String threadName, String callSite) {
-        calls.add(new Call(sequence.incrementAndGet(), text, threadName, callSite));
+    /** Claims an id for one provider invocation, to be shared by every text that invocation carries. */
+    long nextRoundTrip() {
+        return roundTrips.incrementAndGet();
+    }
+
+    void record(long roundTrip, String text, String threadName, String callSite) {
+        calls.add(new Call(sequence.incrementAndGet(), roundTrip, text, threadName, callSite));
     }
 
     /** Every call so far, in arrival order. Snapshot -- safe to iterate while embedding continues. */
@@ -81,8 +92,39 @@ public final class EmbeddingLedger {
         }
     }
 
+    /** How many <b>texts</b> were embedded -- the OMI-187 measure, and what every existing assertion here
+     *  counts. Unaffected by batching: a batch of ten texts is ten. */
     public int totalCalls() {
         return calls.size();
+    }
+
+    /**
+     * How many <b>provider invocations</b> those texts arrived in -- the OMI-266 measure.
+     *
+     * <p>The distinction is the whole of that ticket. Waste (OMI-187) is texts embedded that needn't have
+     * been, and batching cannot reduce it. Latency is round trips, and batching is the only thing that
+     * reduces it: ten warranted texts cost ten sequential HTTP calls or one, and {@link #totalCalls()}
+     * reports ten either way.
+     *
+     * <p>Counted from ids assigned at the provider, not inferred from timing, so it is exact under the
+     * background consistency modes too.
+     */
+    public int roundTrips() {
+        Set<Long> distinct = new LinkedHashSet<>();
+        for (Call call : calls()) {
+            distinct.add(call.roundTrip());
+        }
+        return distinct.size();
+    }
+
+    /** Texts per round trip, in the order the round trips began -- what shows whether batching actually
+     *  grouped anything or merely renamed one-text calls. */
+    public Map<Long, Integer> batchSizes() {
+        Map<Long, Integer> sizes = new LinkedHashMap<>();
+        for (Call call : calls()) {
+            sizes.merge(call.roundTrip(), 1, Integer::sum);
+        }
+        return sizes;
     }
 
     /** How many times {@code text} was embedded. */
@@ -111,6 +153,7 @@ public final class EmbeddingLedger {
             calls.clear();
         }
         sequence.set(0);
+        roundTrips.set(0);
     }
 
     /**
@@ -256,12 +299,13 @@ public final class EmbeddingLedger {
     public String report() {
         List<Call> snapshot = calls();
         StringBuilder out = new StringBuilder();
-        out.append("Full call log (").append(snapshot.size()).append(" call(s), ")
-                .append(frequency().size()).append(" distinct text(s)):\n");
+        out.append("Full call log (").append(snapshot.size()).append(" text(s) in ").append(roundTrips())
+                .append(" round trip(s), ").append(frequency().size()).append(" distinct text(s)):\n");
         int shown = Math.min(snapshot.size(), MAX_REPORTED_CALLS);
         for (int i = 0; i < shown; i++) {
             Call call = snapshot.get(i);
-            out.append("  #").append(call.sequence()).append("  [").append(call.threadName()).append("]  ")
+            out.append("  #").append(call.sequence()).append("  trip ").append(call.roundTrip())
+                    .append("  [").append(call.threadName()).append("]  ")
                     .append(render(call.text())).append("  <-  ").append(call.callSite()).append('\n');
         }
         if (snapshot.size() > shown) {
