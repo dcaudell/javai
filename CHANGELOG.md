@@ -11,6 +11,138 @@ Each entry names the module it affects, because this repository releases all nin
 version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
+--
+## [0.1.9] - 2026-08-07
+
+### Added
+
+- **`javai-persistence`: `JavAIRepository.saveAll(Iterable<T>)` (OMI-266).** A repository could only be
+  handed one entity at a time, and a `save` can batch only within its own reachable subgraph — so saving a
+  hundred entities cost a hundred sequential round trips to the embedding provider however well each
+  individual save batched. `saveAll` embeds the whole batch first, then persists each entity by exactly the
+  same path it would have taken alone.
+
+  ```java
+  articles.saveAll(fleet);                              // one batched round trip, then the writes
+  articles.saveAll(fleet, SummaryPolicy.QUEUE_ONLY);    // same, deferring the @Summary recomputation
+  ```
+
+  **Atomicity is Postgres-only**, matching `JavAIPI.inTransaction`: there the batch is one transaction, all
+  or nothing. Neo4j and MongoDB write each entity independently and say so. They were deliberately not made
+  to refuse the call — refusing would deny them the batching, which is what the method primarily exists for,
+  for the sake of a guarantee it secondarily provides.
+
+  The embeddings are computed *before* the transaction opens, so on Postgres a bulk write no longer holds a
+  database transaction open across a sequence of network calls to an embedding provider.
+
+- **`javai-vector`: `JavAIEmbeddingProvider.maxBatchSize()`/`maxBatchTokens()`, and a batch that respects
+  them (OMI-266).** Nothing bounded how large a batched request could get. `EmbeddingInputLimits` bounds each
+  text against the model's context window and is deliberately explicit that it does so *per member, never per
+  batch* — which is right, and which left the sum completely unbounded. A hundred individually-legal texts
+  against `qwen3-embedding:0.6b`'s 32,768-token context is roughly **9.4 MiB in one HTTP body**.
+
+  That was theoretical while nothing in the library called `embedAll`. The batching work above made every
+  `save()`, `saveAll()` and re-index chunk go through it, so it stopped being theoretical.
+
+  Two ceilings, because they fail in opposite directions — eight enormous documents break a token ceiling
+  while satisfying any count ceiling, and two thousand one-word strings do the reverse:
+
+  | Provider | Count | Size | How |
+  |---|---|---|---|
+  | TEI | `max_client_batch_size` (**default 32**) | `max_batch_tokens` (default 16,384) | discovered from `/info`, now cached together with `max_input_length` in one fetch rather than one per limit |
+  | OpenAI | 2048 | 300,000 tokens | vendor-published; no endpoint reports them |
+  | Ollama, vLLM | library default | library default | neither publishes a batch limit |
+  | Replicate | — | — | doesn't batch at all |
+
+  **TEI's default of 32 is below the 100 this library chunked at**, so a default TEI deployment refused a full
+  batch outright. Nothing consulted the provider before this.
+
+  Both are `default` methods, so no third-party implementation breaks, and `EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE`
+  is the chunk size already in use — a provider that declares nothing behaves exactly as it did.
+  `EmbeddingBatchLimits.split` is the one place the rule lives. `embedAll` itself deliberately does *not*
+  split: it sends one request for exactly what it is given, which is what keeps one call equal to one round
+  trip and one permit. A single text larger than the whole batch budget is sent alone rather than dropped —
+  it is already bounded to the model's own context, so it is a request the provider has every reason to
+  accept, and skipping it forward would loop forever.
+
+### Changed
+
+- **`javai-model`, `javai-persistence`: persistence flows batch their embedding calls (OMI-266).** Nothing
+  in this library called `JavAIRuntime.precomputeVectors` or `JavAIEmbeddingProvider.embedAll`. Both had
+  existed since OMI-187/OMI-213, both were tested and documented, and both were reachable only by a caller
+  who read the spec and wired them up by hand. Every persistence flow discovered its texts one at a time,
+  deep inside a flush, and paid a round trip for each.
+
+  Measured on the Postgres backend with a round-trip-aware ledger, before → after:
+
+  | Flow | Texts | Round trips before | after |
+  |---|---|---|---|
+  | `save()` — one entity, two `@Vectorize` fields | 2 | 2 | **1** |
+  | `save()` — a container and twelve members | 13 | 13 | **1** |
+  | `saveAll()` — twelve entities | 24 | *(no such method)* | **1** |
+  | `reindex()` — whole table, new model | 98 | 98 | **1** |
+  | `inTransaction` — twelve `save` calls in a loop | 24 | 24 | 12 |
+
+  The number of texts embedded is unchanged in every row — this changes how many calls they arrive in, not
+  how much work is done, and OMI-187's exactly-once invariant still holds unmodified.
+
+  `JavAIRuntime.runWithSubgraphLockedForPersistence` is where the per-save half lives: it already computed
+  the whole reachable subgraph in order to lock it, so it now warms that same set before running the flush.
+  All three backends inherit it without changing a line, since all three already wrap `save()` in it.
+
+  **This is not only a latency change.** Those calls happen while every object in the subgraph is locked
+  against mutation, and on Postgres and Neo4j inside an open database transaction. Thirteen sequential round
+  trips held both for thirteen times as long as one batched call does.
+
+  The last row is deliberate and is documented rather than fixed: batching *across* a transaction whose body
+  is an opaque lambda would mean deferring every vector write to commit time, across three backends and
+  through OMI-255's summary queue. `saveAll` is the answer for that shape, and the row is pinned by a test so
+  the cost of deferring it stays visible.
+
+  **Covered end to end against a real model** by `EmbeddingBatchingE2ETest` (`e2e-client-test`), not only
+  against a fake provider: a fake can show that JavAI groups the texts, but not that the grouped request is
+  one a real embedding server accepts — which is a separate claim, and the one the batch ceilings exist for.
+  It covers `saveAll` on all three backends, every consistency mode, a bulk write provably larger than one
+  batch, a small declared ceiling honoured against the live server (the TEI-shaped case, unreachable on a
+  host where `LocalEmbeddingDefaults` picks Ollama), and that the returned vectors are real, correctly
+  dimensioned and distinct — a batch whose rows were misaligned would satisfy every count-based assertion and
+  be silently wrong forever.
+
+- **`javai-model`: `query()` no longer embeds from inside a sort comparator.** Its ranking step reads each
+  candidate's `vector()` as the comparator's key extractor, so the first pass over a cold graph discovered
+  and embedded each candidate's fields one at a time, in the one place it is least visible. The candidates
+  are warmed in one batched pass before the sort; the ranking is identical.
+
+### Fixed
+
+- **`javai-model`: `precomputeVectors` silently discarded the vectors it paid for, for any field that had
+  been embedded before (OMI-266).** It committed its batch results through `hydrateFieldVector`, which is
+  built for a vector read back from the *database* and therefore refuses any slot that has ever computed or
+  has been mutated since construction — the pristine-slot rule that stops a stored vector overwriting a real
+  change. Applied to a freshly-computed batch, that rule threw the result away and left the slot dirty, so
+  the read that followed embedded the identical text a second time.
+
+  Invisible while the only caller seeded fresh objects, which is the shape OMI-187 built it for. It became
+  load-bearing the moment a `save()` warmed an entity that had been loaded and mutated — the ordinary update
+  path — where it would have made batching *worse* than not batching: two embeddings of the same text rather
+  than one.
+
+  The field pass now captures the slot's generation before reading its text and commits with
+  `commitSuccess`, exactly as the concatenated-text pass beside it already did; the captured generation is
+  what makes the plain commit safe against a racing mutation, which is the job the pristine-slot check was
+  wrongly borrowed to do.
+
+  The existing test asserted the right text was embedded, which a discarded result passes perfectly. Reading
+  the slot afterwards and checking that costs nothing is the only thing that catches it, and that assertion
+  now exists alongside the old one.
+
+- **`javai-vector` test-jar: `RecordingEmbeddingProvider` un-batched every provider it wrapped.** It did not
+  override `embedAll`, so it inherited the looping `default` — wrapping Ollama, TEI, OpenAI or vLLM turned
+  their one request back into N sequential ones, and the ledger reported N texts in N calls whether or not
+  batching was happening. Every before/after measurement of batching taken through this instrument would have
+  been meaningless. It now records a batch as one round trip carrying several texts and passes it to the
+  delegate as a batch; `EmbeddingLedger` gained `roundTrips()`/`batchSizes()` alongside the existing
+  `totalCalls()`, whose meaning is unchanged so every OMI-187 assertion still reads as it did.
 
 ## [0.1.8] - 2026-08-05
 
@@ -855,7 +987,8 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.8...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.9...HEAD
+[0.1.9]: https://github.com/dcaudell/javai/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/dcaudell/javai/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dcaudell/javai/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/dcaudell/javai/compare/v0.1.5...v0.1.6

@@ -89,6 +89,31 @@ public final class EmbeddingProviderOpenAI implements JavAIEmbeddingProvider {
         return maxInputTokensOverride != null ? maxInputTokensOverride : EmbeddingModelLimits.lookup(model);
     }
 
+    /**
+     * OpenAI's documented ceiling of 2048 inputs per embeddings request (OMI-266).
+     *
+     * <p>A published constant rather than discovery, because there is nothing to ask: the embeddings API
+     * exposes no endpoint reporting its own request limits, which is the same reason
+     * {@link #maxInputTokens()} falls through to {@link EmbeddingModelLimits} here while TEI can answer
+     * exactly.
+     */
+    @Override
+    public int maxBatchSize() {
+        return DOCUMENTED_MAX_INPUTS_PER_REQUEST;
+    }
+
+    /** OpenAI's documented ceiling of 300,000 tokens summed across one embeddings request (OMI-266). */
+    @Override
+    public int maxBatchTokens() {
+        return DOCUMENTED_MAX_TOKENS_PER_REQUEST;
+    }
+
+    /** Vendor-published, not discovered -- see {@link #maxBatchSize()}. */
+    private static final int DOCUMENTED_MAX_INPUTS_PER_REQUEST = 2048;
+
+    /** Vendor-published, not discovered -- see {@link #maxBatchSize()}. */
+    private static final int DOCUMENTED_MAX_TOKENS_PER_REQUEST = 300_000;
+
     @Override
     public EmbeddingVector embed(String text) {
         // Same defensive substitution as EmbeddingProviderOllama -- see its javadoc for why

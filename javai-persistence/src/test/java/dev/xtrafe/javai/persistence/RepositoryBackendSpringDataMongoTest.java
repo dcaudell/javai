@@ -8,6 +8,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import dev.xtrafe.javai.vector.testsupport.RecordingEmbeddingProvider;
 import org.bson.Document;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -21,6 +22,7 @@ import org.testcontainers.utility.DockerImageName;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -107,6 +109,32 @@ class RepositoryBackendSpringDataMongoTest {
     void resetConsistencyMode() {
         JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    /**
+     * {@code saveAll} batches every entity's embeddings into one provider call here too (OMI-266) --
+     * measured on this backend rather than inherited from the Postgres numbers, for the reason given on
+     * {@code RepositoryBackendNeo4jTest}'s copy of this test. No atomicity is claimed: this backend writes
+     * each document independently.
+     */
+    @Test
+    void saveAllBatchesEveryEntityIntoOneProviderCall() {
+        RecordingEmbeddingProvider recording = new RecordingEmbeddingProvider(new FakeEmbeddingProvider());
+        JavAIRuntime.configureEmbeddingProvider(recording);
+        List<TestArticle> fleet = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            fleet.add(new TestArticle("mongo-bulk-title-" + UUID.randomUUID(),
+                    "mongo-bulk-body-" + UUID.randomUUID()));
+        }
+
+        recording.ledger().reset();
+        List<TestArticle> saved = repository.saveAll(fleet);
+
+        assertEquals(8, saved.size());
+        assertEquals(16, recording.ledger().totalCalls(),
+                "two @Vectorize fields each, embedded exactly once\n" + recording.ledger().report());
+        assertEquals(1, recording.ledger().roundTrips(),
+                "all sixteen texts should reach the provider in one call\n" + recording.ledger().report());
     }
 
     @Test

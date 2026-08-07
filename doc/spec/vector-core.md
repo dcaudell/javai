@@ -478,7 +478,7 @@ decisions than this fix. It is not a regression (Ollama and TEI already did this
 all), but it is the invisible-failure shape this project has twice rejected elsewhere, and it should be
 closed once a project-wide logging mechanism is chosen.
 
-## Batched embedding (OMI-187, OMI-213, not in the whitepaper)
+## Batched embedding (OMI-187, OMI-213, OMI-266, not in the whitepaper)
 
 `JavAIEmbeddingProvider.embedAll(List<String>)` embeds several texts in one request. Its `default` loops over
 `embed`, so every provider is correct without it and overriding it is a pure latency optimization with no
@@ -519,6 +519,56 @@ strings", which leaves it ambiguous between a native JSON array and a JSON-encod
 `cog` model expresses a list, given cog's scalar input types). Both the field name and the encoding would
 have been guesses. A wrong guess either errors loudly or silently embeds the string `["a","b"]` instead of
 `a` and `b` — the second being exactly the failure shape this work exists to prevent.
+
+**Who calls it (OMI-266).** For two releases, nothing did. `precomputeVectors` and `embedAll` were both real,
+both tested, both documented here — and reachable only by a caller who read this file and wired them up by
+hand, so every flow *inside* the library went on discovering one text at a time. That is now closed at three
+levels:
+
+| Level | Entry point | Batches across |
+|---|---|---|
+| One `save()` | `runWithSubgraphLockedForPersistence` warms before the flush runs | everything reachable from the saved root |
+| One bulk write | `JavAIRuntime.warmSubgraphsForPersistence(roots)`, behind `JavAIRepository.saveAll` | the union of every root's subgraph |
+| One `query()` | warms the candidate set before ranking | every match the graph walk found |
+
+The first is the important one, because it needs no caller cooperation at all: a plain `repo.save(article)`
+batches its whole subgraph without the caller knowing this section exists. The persistence-side numbers and
+the transaction-duration argument are in `doc/spec/persistence-bridge.md`'s own "Batching" section.
+
+A warm is always an optimization and never a semantic change: it fills exactly the slots the reads that
+follow would have filled, skips any slot already accurate, and — if the provider fails — is *dropped*, leaving
+the slots dirty for those reads to resolve under the configured `EmbeddingFailureMode`. Deciding the failure
+outcome in the warm instead would mean a second implementation of that policy, free to disagree with the
+first.
+
+**How large a batch may get (OMI-266).** Three ceilings apply, and the smallest wins: the caller's own
+`batchSize`, the provider's `maxBatchSize()` (inputs per request), and the provider's `maxBatchTokens()`
+(total tokens per request). The last two are new SPI `default` methods, so no implementation breaks and one
+that declares nothing keeps the chunk size already in use.
+
+Both provider ceilings are needed, because they fail in opposite directions: eight enormous documents break a
+token ceiling while satisfying any count ceiling, and two thousand one-word strings do the reverse. And
+neither is covered by the per-input limit above — that section is explicit that truncation is applied *per
+member, never per batch*, which is right, and which leaves the sum unbounded. A hundred individually-legal
+texts against `qwen3-embedding:0.6b`'s 32,768-token context is roughly **9.4 MiB in one HTTP body**. That was
+theoretical while nothing in the library called `embedAll`; it stopped being theoretical when every `save()`
+started to.
+
+| Provider | Count ceiling | Size ceiling | How |
+|---|---|---|---|
+| TEI | `max_client_batch_size` (**default 32**) | `max_batch_tokens` (default 16,384) | discovered from `/info`, cached with `max_input_length` in one fetch |
+| OpenAI | 2048 | 300,000 tokens | vendor-published; there is no endpoint to ask |
+| Ollama, vLLM | library default | library default | neither publishes a batch limit |
+| Replicate | — | — | doesn't batch at all |
+
+TEI's default of 32 is the concrete case: it is *below* the 100 this library chunked at, so a default TEI
+deployment refused a full batch outright.
+
+`embedAll` itself deliberately does **not** split — it sends exactly one request for exactly what it is given,
+which is what keeps one call equal to one round trip and one permit. Splitting is the caller's job, and
+`precomputeVectors` is the caller that does it. A single text larger than the whole batch budget is sent
+alone rather than dropped: it is already bounded to the model's context, so it is a request the provider has
+every reason to accept.
 
 **Gate accounting:** a batched call takes **one** permit from
 `JavAIRuntime.configureMaxConcurrentEmbeddingCalls`'s semaphore, not one per text. That gate bounds concurrent

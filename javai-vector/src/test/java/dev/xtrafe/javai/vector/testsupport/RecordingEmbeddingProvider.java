@@ -57,8 +57,30 @@ public final class RecordingEmbeddingProvider implements JavAIEmbeddingProvider 
 
     @Override
     public EmbeddingVector embed(String text) {
-        ledger.record(text, Thread.currentThread().getName(), captureCallSite());
+        ledger.record(ledger.nextRoundTrip(), text, Thread.currentThread().getName(), captureCallSite());
         return delegate.embed(text);
+    }
+
+    /**
+     * Records a batched call as <em>one</em> round trip carrying several texts, and passes it to the
+     * delegate <em>as a batch</em>.
+     *
+     * <p>Both halves matter, and the absence of this override was a real hole in the instrument (OMI-266).
+     * Without it this decorator inherited {@code embedAll}'s looping {@code default}, so wrapping a provider
+     * that genuinely batches -- Ollama, TEI, OpenAI, vLLM -- silently turned its one request back into N
+     * sequential ones. A measurement taken through this class could therefore never observe batching at all,
+     * whether or not JavAI was doing any: the ledger reported N texts in N round trips either way. Any
+     * before/after number for batching work is meaningless until this exists.
+     */
+    @Override
+    public java.util.List<EmbeddingVector> embedAll(java.util.List<String> texts) {
+        long roundTrip = ledger.nextRoundTrip();
+        String threadName = Thread.currentThread().getName();
+        String callSite = captureCallSite();
+        for (String text : texts) {
+            ledger.record(roundTrip, text, threadName, callSite);
+        }
+        return delegate.embedAll(texts);
     }
 
     /** The delegate's model -- a decorator that answered otherwise would silently disable any behaviour
