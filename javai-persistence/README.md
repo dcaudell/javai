@@ -13,7 +13,8 @@ alongside their ORM.
 | Element | Kind | Purpose |
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
-| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
+| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`saveAll`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
+| `saveAll(Iterable<T>)` | Bulk write | Saves a batch with **one** embedding round trip instead of one per entity (OMI-266); one transaction on Postgres, per-entity writes on Neo4j/Mongo -- see "Batching" below |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call. Optionally narrowed (`…VectorAnd<Predicate>`), ranked (`List<Ranked<T>>`) and paged (trailing `Pageable`/`Limit`) since OMI-230 |
 | `NearestQuery<T>` | Builder, from `nearest()`/`nearestBy(field)`/`nearestBySummary()` | The same vector search composed at runtime instead of declared as a method name -- `where(…)`, `offset`/`limit`, `results()`/`ranked()` |
 | `Ranked<T>` | Result record | A hit plus the cosine similarity it was ranked on, normalized to `[-1, 1]` on every backend |
@@ -500,10 +501,36 @@ avoids connection-unwrapping uncertainty through Hibernate's layer.
 
 `JavAIRepository`/`JavAIPI`/`JavAIPersistenceConfig` (`RepositoryBackendHibernatePostgres`/
 `RepositoryBackendNeo4j`/`RepositoryBackendSpringDataMongo` behind a `java.lang.reflect.Proxy`), all three
-backends' save/findById/findAll/deleteById/reindexAll plus the three `findNearestBy*` variants, described
-above. `reindexAll()` needed no backend-specific code at all -- it's dispatched in
-`RepositoryInvocationHandler` purely as a `findAll()` + `save(...)` loop over each backend's existing
-methods.
+backends' save/saveAll/findById/findAll/deleteById/reindexAll plus the three `findNearestBy*` variants,
+described above. `reindexAll()` needs almost no backend-specific code -- it's a `findAll()` + `save(...)`
+loop over each backend's existing methods, chunked and batch-warmed by one shared SPI default.
+
+**Batching: how many provider calls a write costs (OMI-266).** A flush reads one field at a time, so lazy
+computation used to discover one text at a time and pay a round trip for each. Measured here, before → after:
+
+| Flow | Texts | Round trips before | after |
+|---|---|---|---|
+| `save()` -- one entity, two `@Vectorize` fields | 2 | 2 | **1** |
+| `save()` -- a container and twelve members | 13 | 13 | **1** |
+| `saveAll()` -- twelve entities | 24 | *(no such method)* | **1** |
+| `reindex()` -- whole table under a new model | 98 | 98 | **1** |
+| `inTransaction` -- twelve `save` calls in a loop | 24 | 24 | 12 |
+
+The texts are unchanged in every row: this is how many calls they arrive in, not how much work is done, and
+OMI-187's exactly-once invariant is untouched. The per-save half needed **no code in this module at all** --
+`JavAIRuntime.runWithSubgraphLockedForPersistence`, which all three backends already wrap `save()` in, had
+already computed the whole reachable subgraph in order to lock it, and now warms it before the flush runs.
+Batching is measured on each backend rather than inherited from the Postgres numbers
+(`EmbeddingRoundTripCostTest`, plus a case in each of `RepositoryBackendNeo4jTest`/
+`RepositoryBackendSpringDataMongoTest`).
+
+Note those round trips happen while the subgraph is locked against mutation, and -- on Postgres and Neo4j --
+inside the open transaction, so this shortens lock and transaction hold time, not just wall-clock. `saveAll`
+computes its embeddings *before* the transaction opens, so a bulk write holds no transaction across them.
+
+The last row is deliberate: batching across an `inTransaction` body would mean deferring every vector write to
+commit time, across three backends and through OMI-255's summary queue. `saveAll` is the answer for that
+shape, and the row is pinned by a test so the cost of not doing it stays visible.
 
 **Transaction participation (OMI-146), Postgres.** A repository call joins a Spring `@Transactional` unit of
 work or a `JavAIPI.inTransaction(...)` body when one is active, and opens its own session only when there

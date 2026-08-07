@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.model;
 
+import dev.xtrafe.javai.vector.EmbeddingBatchLimits;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIEmbeddingProvider;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
@@ -47,11 +48,34 @@ class PrecomputeVectorsTest {
         return label + "-" + UNIQUE.incrementAndGet();
     }
 
-    /** Counts batches as well as texts, which a plain ledger cannot distinguish. */
+    /** Counts batches as well as texts, which a plain ledger cannot distinguish. Optionally declares its own
+     *  batch ceilings, so the caller-vs-provider negotiation can be exercised (OMI-266). */
     private static final class BatchCountingProvider implements JavAIEmbeddingProvider {
 
         private final FakeEmbeddingProvider delegate = new FakeEmbeddingProvider();
         private final List<Integer> batchSizes = Collections.synchronizedList(new ArrayList<>());
+        private final int maxBatchSize;
+        private final int maxBatchTokens;
+
+        /** Declares nothing, so the library's own defaults apply. */
+        BatchCountingProvider() {
+            this(EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE, EmbeddingBatchLimits.DEFAULT_MAX_BATCH_TOKENS);
+        }
+
+        BatchCountingProvider(int maxBatchSize, int maxBatchTokens) {
+            this.maxBatchSize = maxBatchSize;
+            this.maxBatchTokens = maxBatchTokens;
+        }
+
+        @Override
+        public int maxBatchSize() {
+            return maxBatchSize;
+        }
+
+        @Override
+        public int maxBatchTokens() {
+            return maxBatchTokens;
+        }
 
         @Override
         public EmbeddingVector embed(String text) {
@@ -111,6 +135,58 @@ class PrecomputeVectorsTest {
                 "250 texts at a batch size of 100 is three provider calls, not 250: " + counting.batchSizes);
         assertEquals(250, counting.batchSizes.stream().mapToInt(Integer::intValue).sum(),
                 "every text must still be embedded exactly once");
+    }
+
+    /**
+     * The caller asks for a batch size; the provider says what it will actually accept; the smaller wins
+     * (OMI-266).
+     *
+     * <p>Concretely why this matters: Text Embeddings Inference defaults to 32 inputs per request, below the
+     * 100 this library chunked at, so a default TEI deployment refused a full batch outright. Before this,
+     * nothing consulted the provider at all.
+     */
+    @Test
+    void aProvidersDeclaredCountCeilingNarrowsTheCallersBatchSize() {
+        BatchCountingProvider counting = new BatchCountingProvider(3, Integer.MAX_VALUE);
+        JavAIRuntime.configureEmbeddingProvider(counting);
+
+        List<TestNode> nodes = new ArrayList<>();
+        for (int i = 0; i < 10; i++) {
+            nodes.add(new TestNode(unique("capped")));
+        }
+
+        JavAIRuntime.precomputeVectors(nodes, 100);
+
+        assertEquals(List.of(3, 3, 3, 1), counting.batchSizes,
+                "the caller asked for 100 but the provider accepts 3: " + counting.batchSizes);
+    }
+
+    /**
+     * The ceiling per-input truncation structurally cannot enforce: the <em>sum</em>.
+     *
+     * <p>{@code EmbeddingInputLimits} bounds each text against the model's context window, deliberately per
+     * member so one over-long entry never shortens its neighbours -- which leaves a hundred individually
+     * legal texts summing to a request no provider agreed to accept. Against a 32,768-token local model that
+     * is roughly 9.4 MiB in one HTTP body.
+     */
+    @Test
+    void aProvidersDeclaredSizeCeilingSplitsABatchTheCountCeilingWouldAllow() {
+        // Two texts fit the token budget; the count ceiling is never reached.
+        BatchCountingProvider counting = new BatchCountingProvider(100, 100 / 3);
+        JavAIRuntime.configureEmbeddingProvider(counting);
+
+        List<TestNode> nodes = new ArrayList<>();
+        for (int i = 0; i < 6; i++) {
+            nodes.add(new TestNode("x".repeat(40) + i));
+        }
+
+        JavAIRuntime.precomputeVectors(nodes, 100);
+
+        assertEquals(6, counting.batchSizes.stream().mapToInt(Integer::intValue).sum(),
+                "every text must still be embedded exactly once");
+        assertTrue(counting.batchSizes.stream().allMatch(size -> size <= 2),
+                "a batch budget of ~33 characters cannot carry three 41-character texts: "
+                        + counting.batchSizes);
     }
 
     /**
@@ -246,5 +322,34 @@ class PrecomputeVectorsTest {
         JavAIRuntime.precomputeVectors(List.of(node));
 
         provider.ledger().assertEmbeddedExactlyOnce(mutated);
+    }
+
+    /**
+     * ...and the vector that precompute paid for is actually <em>kept</em>.
+     *
+     * <p>Split out from the test above deliberately, because that one cannot see this: it asserts on the
+     * ledger, so a precompute that embeds the right text and then discards the result passes it perfectly.
+     * The only way to catch that is to read the slot afterwards and check the read costs nothing.
+     *
+     * <p>The distinction is not hypothetical. Warming a slot that has computed before -- an entity loaded,
+     * mutated, and about to be saved, which is the ordinary update path -- goes through a different branch
+     * from warming a fresh one, and a discarded result there costs *two* embeddings of the same text rather
+     * than none: one thrown away by the batch, one paid again by the read that follows.
+     */
+    @Test
+    void aPrecomputeAfterMutationLeavesTheSlotWarm() {
+        TestNode node = new TestNode(unique("before"));
+        JavAIRuntime.precomputeVectors(List.of(node));
+
+        node.setText(unique("after"));
+        JavAIRuntime.precomputeVectors(List.of(node));
+        provider.reset();
+
+        node.vector();
+
+        assertEquals(0, provider.ledger().totalCalls(),
+                "precompute already embedded the mutated value, so reading it must cost nothing more -- "
+                        + "otherwise the batched call was wasted and the text is embedded twice\n\n"
+                        + provider.ledger().report());
     }
 }

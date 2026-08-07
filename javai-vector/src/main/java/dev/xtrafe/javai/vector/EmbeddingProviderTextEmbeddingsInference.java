@@ -29,8 +29,22 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
     private final String modelId;
     private final Integer maxInputTokensOverride;
 
-    /** Discovered once from /info, then reused. Zero means "asked, and the answer was unusable". */
-    private volatile Integer discoveredMaxInputTokens;
+    /** Discovered once from /info, then reused. A zero in any field means "asked, and that answer was
+     *  unusable" -- see {@link #info()}. */
+    private volatile Info discoveredInfo;
+
+    /**
+     * What TEI's {@code /info} says about its own limits. All three come back in one response, so they are
+     * fetched and cached together rather than costing a round trip each (OMI-266).
+     *
+     * @param maxInputLength     {@code max_input_length} -- one input's token ceiling
+     * @param maxClientBatchSize {@code max_client_batch_size} -- inputs per request, TEI default 32
+     * @param maxBatchTokens     {@code max_batch_tokens} -- total tokens per request, TEI default 16384
+     */
+    private record Info(int maxInputLength, int maxClientBatchSize, int maxBatchTokens) {
+
+        static final Info UNKNOWN = new Info(0, 0, 0);
+    }
 
     public EmbeddingProviderTextEmbeddingsInference(URI baseUri, String modelId) {
         this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build(), baseUri, modelId, null);
@@ -72,34 +86,75 @@ public final class EmbeddingProviderTextEmbeddingsInference implements JavAIEmbe
         if (maxInputTokensOverride != null) {
             return maxInputTokensOverride;
         }
-        Integer discovered = discoveredMaxInputTokens;
-        if (discovered == null) {
-            discovered = discoverMaxInputTokens();
-            discoveredMaxInputTokens = discovered;
-        }
+        int discovered = info().maxInputLength();
         return discovered > 0 ? discovered : EmbeddingModelLimits.lookup(modelId);
     }
 
-    private int discoverMaxInputTokens() {
+    /**
+     * TEI's own {@code max_client_batch_size} (OMI-266) -- the one bundled provider that can be asked.
+     *
+     * <p>Worth knowing this is not a formality: TEI's default is <b>32</b>, below the 100 this library
+     * chunked at before batch limits existed, so a default TEI deployment refused a full batch. Falling back
+     * to {@link EmbeddingBatchLimits#DEFAULT_MAX_BATCH_SIZE} when {@code /info} cannot be read keeps that
+     * case no worse than it was, rather than guessing TEI's default for a server that may have been
+     * configured away from it.
+     */
+    @Override
+    public int maxBatchSize() {
+        int discovered = info().maxClientBatchSize();
+        return discovered > 0 ? discovered : EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE;
+    }
+
+    /** TEI's own {@code max_batch_tokens} (OMI-266); TEI's default is 16,384. */
+    @Override
+    public int maxBatchTokens() {
+        int discovered = info().maxBatchTokens();
+        return discovered > 0 ? discovered : EmbeddingBatchLimits.DEFAULT_MAX_BATCH_TOKENS;
+    }
+
+    /**
+     * Asks TEI's {@code /info}, once, caching all three limits together.
+     *
+     * <p>TEI reports them directly, which makes it the one bundled provider whose limits are both
+     * discoverable and exact. A failed lookup falls through to each caller's own fallback rather than
+     * throwing: not knowing a limit precisely is a reason to be conservative, never a reason to refuse to
+     * embed.
+     */
+    private Info info() {
+        Info cached = discoveredInfo;
+        if (cached == null) {
+            cached = discoverInfo();
+            discoveredInfo = cached;
+        }
+        return cached;
+    }
+
+    private Info discoverInfo() {
         HttpRequest request = HttpRequest.newBuilder(infoEndpoint)
                 .timeout(Duration.ofSeconds(10))
                 .GET()
                 .build();
         try {
             HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-            return response.statusCode() == 200 ? parseMaxInputLength(response.body()) : 0;
+            return response.statusCode() == 200 ? parseInfo(response.body()) : Info.UNKNOWN;
         } catch (IOException | RuntimeException e) {
-            return 0;
+            return Info.UNKNOWN;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return 0;
+            return Info.UNKNOWN;
         }
     }
 
-    /** {@code "max_input_length": N} from TEI's /info, or 0 when absent or unparseable. */
-    static int parseMaxInputLength(String responseBody) {
+    /** The three limit fields from TEI's /info; any field absent or unparseable comes back as 0. */
+    private static Info parseInfo(String responseBody) {
+        return new Info(parseIntField(responseBody, "max_input_length"),
+                parseIntField(responseBody, "max_client_batch_size"),
+                parseIntField(responseBody, "max_batch_tokens"));
+    }
+
+    private static int parseIntField(String responseBody, String fieldName) {
         java.util.regex.Matcher matcher = java.util.regex.Pattern
-                .compile("\"max_input_length\"\\s*:\\s*(\\d+)")
+                .compile("\"" + fieldName + "\"\\s*:\\s*(\\d+)")
                 .matcher(responseBody);
         return matcher.find() ? Integer.parseInt(matcher.group(1)) : 0;
     }

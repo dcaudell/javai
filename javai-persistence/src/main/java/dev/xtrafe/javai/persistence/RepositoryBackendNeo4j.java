@@ -209,9 +209,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     @Override
     public void reindexAll() {
         for (Class<?> registered : typesByLabel.values()) {
-            for (Object entity : findAll(registered)) {
-                save(registered, entity);
-            }
+            reindexInChunks(registered, SummaryPolicy.RECOMPUTE_AFTER_COMMIT);
         }
     }
 

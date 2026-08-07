@@ -38,6 +38,10 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 return args.length == 2
                         ? backend.save(entityType, args[0], (SummaryPolicy) args[1])
                         : backend.save(entityType, args[0]);
+            case "saveAll":
+                return backend.saveAll(entityType, materialize((Iterable<?>) args[0]), args.length == 2
+                        ? (SummaryPolicy) args[1]
+                        : SummaryPolicy.RECOMPUTE_AFTER_COMMIT);
             case "findById":
                 return backend.findById(entityType, (UUID) args[0]);
             case "findAll":
@@ -99,6 +103,17 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             return query.execute(backend, entityType, args);
         }
         throw new UnsupportedOperationException("Unsupported repository method " + method);
+    }
+
+    /** {@code saveAll}'s parameter is an {@link Iterable}, which may be consumable only once -- and the
+     *  backend both warms it and then iterates it again to save. Materialized here so no backend has to
+     *  remember that, and so the one that does it wrong cannot silently save an empty batch. */
+    private static List<Object> materialize(Iterable<?> entities) {
+        List<Object> materialized = new ArrayList<>();
+        for (Object entity : entities) {
+            materialized.add(entity);
+        }
+        return materialized;
     }
 
     private NearestQuery<Object> newNearestQuery(DerivedQueryMethods.Kind kind, String fieldName) {

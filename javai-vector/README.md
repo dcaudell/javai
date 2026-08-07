@@ -57,6 +57,17 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
   `EmbeddingProviderAnthropic`/`EmbeddingProviderGroq` alongside `javai-completion`'s `CortexAnthropic`/
   `CortexGroq` — those two vendors have no native embeddings API to wrap.
 - All five providers retry a `429` via `RetrySupport`/`EndpointRateLimiter` — see "Rate limiting" below.
+- **Input and batch limits.** `EmbeddingInputLimits` bounds one text against the model's context window
+  (`maxInputTokens()`, OMI-216), applied uniformly on all five providers and deliberately **per member of a
+  batch** — one over-long entry must not shorten its neighbours or fail the request.
+  `EmbeddingBatchLimits` bounds the batch itself (`maxBatchSize()`/`maxBatchTokens()`, OMI-266), which is a
+  genuinely separate question: a hundred individually-legal texts against a 32,768-token model is roughly
+  9.4 MiB in one HTTP body, and per-member truncation cannot see that. TEI discovers both of its ceilings
+  from the same `/info` it already reads `max_input_length` from (its `max_client_batch_size` default of
+  **32** is below the 100 this library chunked at, so a default deployment refused a full batch); OpenAI's
+  are vendor-published constants (2048 inputs, 300,000 tokens); the rest fall back to library defaults.
+  Splitting is the *caller's* job — `embedAll` sends exactly one request for exactly what it is given, so one
+  call stays one round trip and one concurrency permit.
 
 ## Embedding concurrency: `VectorCacheSlot`
 

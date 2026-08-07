@@ -450,7 +450,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.8` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.9` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -458,42 +458,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.8</version>
+  <version>0.1.9</version>
 </dependency>
 ```
 
@@ -504,14 +504,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.8")
-    implementation("io.github.dcaudell:javai-model:0.1.8")
-    implementation("io.github.dcaudell:javai-substrate:0.1.8")
-    implementation("io.github.dcaudell:javai-supervision:0.1.8")
-    implementation("io.github.dcaudell:javai-collections:0.1.8")
-    implementation("io.github.dcaudell:javai-persistence:0.1.8")
-    implementation("io.github.dcaudell:javai-completion:0.1.8")
-    implementation("io.github.dcaudell:javai-tagging:0.1.8")
+    implementation("io.github.dcaudell:javai-vector:0.1.9")
+    implementation("io.github.dcaudell:javai-model:0.1.9")
+    implementation("io.github.dcaudell:javai-substrate:0.1.9")
+    implementation("io.github.dcaudell:javai-supervision:0.1.9")
+    implementation("io.github.dcaudell:javai-collections:0.1.9")
+    implementation("io.github.dcaudell:javai-persistence:0.1.9")
+    implementation("io.github.dcaudell:javai-completion:0.1.9")
+    implementation("io.github.dcaudell:javai-tagging:0.1.9")
 }
 ```
 
@@ -813,6 +813,22 @@ already in progress instead of always opening its own:
   One commit, or one rollback if the body throws. Nesting joins the outer body rather than starting a second
   transaction, and the scope is thread-bound.
 - **With neither**, each call is its own transaction, exactly as before 0.1.5.
+
+**⚠️ Saving many entities? Use `saveAll`, not a loop.** Every `save` embeds only what its own entity's
+subgraph needs, so `for (Article a : fleet) articles.save(a);` costs one round trip to the embedding provider
+*per entity* — the slowest part of a bulk write, and the one thing wrapping the loop in a transaction does
+not help with.
+
+```java
+articles.saveAll(fleet);                             // one batched round trip, then the writes
+articles.saveAll(fleet, SummaryPolicy.QUEUE_ONLY);   // same, deferring the @Summary recomputation
+```
+
+Measured: twelve two-field entities cost 24 provider round trips saved in a loop, **1** through `saveAll`.
+Each entity is persisted by exactly the same path either way; it simply finds its vectors already computed.
+On Postgres the batch is **one transaction** (all or nothing) and the embeddings happen *before* it opens.
+Neo4j and MongoDB batch the embeddings identically but write each entity independently, so a failure part-way
+leaves the earlier ones saved — the same limit `inTransaction` has on those backends.
 
 Two edges worth knowing: a write inside `readOnly = true` fails loudly (Postgres rejects the INSERT), and
 `PROPAGATION_NESTED` is unavailable under `JpaTransactionManager` — Spring's Hibernate JPA dialect has no

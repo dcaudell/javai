@@ -91,10 +91,21 @@ creep back into it, that's a regression -- replace it with the placeholder rathe
    shipped in the reactor for a full session before anyone noticed it was missing from both files' install
    instructions).
 
-4. **`CHANGELOG.md`, by hand** (see "Location 4" above): rename `## [Unreleased]` to `## [X.Y.Z] - YYYY-MM-DD`,
-   open a fresh empty `## [Unreleased]` above it, and fix the compare links at the bottom of the file. Read
-   the entries while you're there -- an empty or thin section on a release that clearly changed behavior means
-   the entry was never written, which is the failure this file actually guards against.
+4. **`CHANGELOG.md`, by hand** (see "Location 4" above). Four edits, all required -- the first is the one
+   that actually releases the notes, and the easiest to skip because nothing downstream breaks without it:
+
+   1. **Rename the existing `## [Unreleased]` heading to `## [X.Y.Z] - YYYY-MM-DD`.** Its accumulated
+      entries stay exactly where they are; this heading *is* the release notes for the version being cut.
+      Do not copy the entries anywhere -- renaming the heading in place is the whole operation.
+   2. **Add a fresh, empty `## [Unreleased]` above it**, for the next cycle's entries.
+   3. **Add a `[X.Y.Z]` compare link** at the bottom, above the previous version's:
+      `[X.Y.Z]: https://github.com/dcaudell/javai/compare/vW.W.W...vX.Y.Z` (where `W.W.W` is the version
+      before this one).
+   4. **Repoint the `[Unreleased]` compare link** at the bottom to the new tag:
+      `[Unreleased]: https://github.com/dcaudell/javai/compare/vX.Y.Z...HEAD`.
+
+   Read the entries while you're there -- an empty or thin section on a release that clearly changed behavior
+   means the entry was never written, which is the failure this file actually guards against.
 
 5. **Do not touch `doc/release-process.md`** -- its `vX.Y.Z` placeholders are intentionally generic (see
    "Location 5" above).
@@ -109,6 +120,25 @@ creep back into it, that's a regression -- replace it with the placeholder rathe
    "already done" note citing real past tags by their real version, `CHANGELOG.md`'s entries for past
    releases, which cite their own versions by design, or a changelog-style sentence describing what a past
    release did).
+
+   **The grep above cannot check step 4, and this is worth understanding rather than working around.** A
+   changelog that still says `## [Unreleased]` over the notes just released looks *identical* to a correct
+   one to any search for the old version number -- the old number legitimately appears throughout the file in
+   past entries either way. So the failure mode of step 4 is invisible to the only automated check here, and
+   it is a real one: the release ships with its notes filed under "Unreleased," and the next bump then
+   silently folds two releases' entries into one heading. Check it directly:
+
+   ```bash
+   # The new Unreleased must be empty -- i.e. immediately followed by the new version's heading.
+   grep -A4 "^## \[Unreleased\]" CHANGELOG.md
+
+   # Both the heading and its compare link must name the new version.
+   grep -c "^## \[X.Y.Z\] - " CHANGELOG.md    # expect 1
+   grep -c "^\[X.Y.Z\]: " CHANGELOG.md        # expect 1
+   ```
+
+   If the first command shows anything but blank lines before `## [X.Y.Z] - YYYY-MM-DD`, the rename in step
+   4.1 was skipped and those entries are about to be released as unreleased.
 
 7. **Rebuild to confirm the new version actually resolves:**
 

@@ -48,6 +48,38 @@ public interface JavAIRepository<T> {
      */
     T save(T entity, SummaryPolicy summaryPolicy);
 
+    /**
+     * Saves several entities, embedding every vector they need in as few provider calls as the provider
+     * supports (OMI-266).
+     *
+     * <p><b>Why this exists rather than a loop over {@link #save}.</b> A single {@code save} already batches
+     * within its own reachable subgraph, but it cannot see past it: saving a hundred entities one call at a
+     * time costs a hundred sequential round trips to the embedding provider, however well each one batches
+     * internally. Measured on the Postgres backend, twelve two-field entities cost 24 texts in 24 round trips
+     * saved individually, 24 texts in 1 round trip through this method. Nothing about what is written
+     * changes -- each entity is persisted by exactly the same path, and simply finds its vectors already
+     * computed.
+     *
+     * <p>The embeddings are computed <em>before</em> the write begins, so on Postgres they do not happen
+     * inside the transaction at all.
+     *
+     * <p><b>Atomicity is Postgres-only, matching {@link JavAIPI#inTransaction}.</b> There the whole batch is
+     * one transaction: either every entity is saved or none is. Neo4j and MongoDB write each entity
+     * independently, so a failure part-way leaves the earlier entities saved -- they get the batching, which
+     * is what this method is for, but no atomicity claim. This is stated rather than papered over, and it is
+     * the same asymmetry {@code inTransaction} already carries; the difference is that refusing outright
+     * would deny those backends the batching too, for a guarantee this method does not primarily exist to
+     * provide.
+     *
+     * @param entities the entities to save; may be any {@link Iterable}, consumed once
+     * @return the saved entities, in the order given -- each the same instance {@link #save} would return
+     */
+    List<T> saveAll(Iterable<T> entities);
+
+    /** {@link #saveAll(Iterable)} with an explicit {@link SummaryPolicy}, exactly as {@link #save(Object, SummaryPolicy)}
+     *  is to {@link #save(Object)}. */
+    List<T> saveAll(Iterable<T> entities, SummaryPolicy summaryPolicy);
+
     Optional<T> findById(UUID id);
 
     List<T> findAll();

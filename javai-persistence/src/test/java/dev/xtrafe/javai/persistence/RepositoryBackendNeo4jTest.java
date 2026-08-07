@@ -6,6 +6,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import dev.xtrafe.javai.vector.testsupport.RecordingEmbeddingProvider;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -20,6 +21,7 @@ import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -80,6 +82,35 @@ class RepositoryBackendNeo4jTest {
     void resetConsistencyMode() {
         JavAIRuntime.configureConsistencyMode(EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY);
         JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+    }
+
+    /**
+     * {@code saveAll} batches every entity's embeddings into one provider call here too (OMI-266).
+     *
+     * <p>Measured on this backend rather than inherited from the Postgres numbers. The batching lives in the
+     * shared SPI default, so it *ought* to be identical -- but this backend's {@code save} is a separate
+     * implementation with its own subgraph walk, and "ought to" is exactly the reasoning this repository has
+     * been burned by before. The one thing genuinely different here is that there is no transaction, so this
+     * asserts the batching and claims nothing about atomicity.
+     */
+    @Test
+    void saveAllBatchesEveryEntityIntoOneProviderCall() {
+        RecordingEmbeddingProvider recording = new RecordingEmbeddingProvider(new FakeEmbeddingProvider());
+        JavAIRuntime.configureEmbeddingProvider(recording);
+        List<TestArticle> fleet = new ArrayList<>();
+        for (int i = 0; i < 8; i++) {
+            fleet.add(new TestArticle("neo4j-bulk-title-" + UUID.randomUUID(),
+                    "neo4j-bulk-body-" + UUID.randomUUID()));
+        }
+
+        recording.ledger().reset();
+        List<TestArticle> saved = repository.saveAll(fleet);
+
+        assertEquals(8, saved.size());
+        assertEquals(16, recording.ledger().totalCalls(),
+                "two @Vectorize fields each, embedded exactly once\n" + recording.ledger().report());
+        assertEquals(1, recording.ledger().roundTrips(),
+                "all sixteen texts should reach the provider in one call\n" + recording.ledger().report());
     }
 
     @Test

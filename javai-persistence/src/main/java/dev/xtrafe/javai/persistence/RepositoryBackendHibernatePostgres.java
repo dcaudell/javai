@@ -671,6 +671,31 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     /**
+     * The batch as one transaction, with every embedding computed before it opens (OMI-266).
+     *
+     * <p>Overridden purely to add the atomicity {@link JavAIPI#inTransaction} provides -- either every entity
+     * in the batch is saved or none is, which is the guarantee a caller reaching for a bulk write on a
+     * relational store expects. The batching itself is the SPI default's and is identical on all three
+     * backends.
+     *
+     * <p>The warm is deliberately outside {@code inTransaction}: those are network round trips to an
+     * embedding provider, and holding a database transaction open across them is exactly the coupling this
+     * ticket set out to shorten. Anything mutated in between simply leaves its slot dirty for that entity's
+     * own locked, accuracy-forced save to recompute, so moving it out costs no correctness.
+     */
+    @Override
+    public List<Object> saveAll(Class<?> entityType, List<Object> entities, SummaryPolicy summaryPolicy) {
+        JavAIRuntime.warmSubgraphsForPersistence(entities);
+        return inTransaction(() -> {
+            List<Object> saved = new ArrayList<>(entities.size());
+            for (Object entity : entities) {
+                saved.add(save(entityType, entity, summaryPolicy));
+            }
+            return saved;
+        });
+    }
+
+    /**
      * Re-embeds <b>every registered entity type</b>, not just the repository's own -- re-indexing a datastore
      * against a new model has to cover the whole store, or it is left straddling two models (an
      * {@code Article} re-embedded while its {@code Comment}s are not). Then validates the result: every
@@ -693,10 +718,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // a transaction per entity for a value that is about to be superseded by the next entity's save
         // anyway -- a re-index rewrites the whole store, so every container is going to be recomputed
         // regardless of how many times it is asked for along the way. The queue collapses those requests.
+        // Chunked and batch-warmed (OMI-266). A re-index is the largest bulk embedding this library performs
+        // -- by construction every entity must be re-embedded and no stored vector is reusable -- so it is
+        // the flow with the most round trips to save and the least to lose: there is no waste to remove here,
+        // only sequential calls to collapse.
         for (Class<?> registered : registeredEntityTypes) {
-            for (Object entity : findAll(registered)) {
-                save(registered, entity, SummaryPolicy.QUEUE_ONLY);
-            }
+            reindexInChunks(registered, SummaryPolicy.QUEUE_ONLY);
         }
         drainPendingSummaries();
 
@@ -2052,11 +2079,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }));
     }
 
+    /** Overridden for the {@code QUEUE_ONLY}-then-drain half (OMI-255) -- the chunked, batch-warmed loop
+     *  itself is the SPI's, shared with {@code reindexAll} and with the other two backends (OMI-266). */
     @Override
     public void reindex(Class<?> entityType) {
-        for (Object entity : findAll(entityType)) {
-            save(entityType, entity, SummaryPolicy.QUEUE_ONLY);
-        }
+        reindexInChunks(entityType, SummaryPolicy.QUEUE_ONLY);
         drainPendingSummaries();
     }
 

@@ -236,6 +236,75 @@ class EmbeddingBatchingTest {
                 "the short input must be sent whole: " + captured.get());
     }
 
+    // ---- how big a batch a provider will admit to accepting (OMI-266) ----
+
+    /**
+     * TEI reports its own batch ceilings on the same {@code /info} it already reports {@code max_input_length}
+     * on, which makes it the one bundled provider that can be asked rather than assumed.
+     *
+     * <p>Not a formality: TEI's default {@code max_client_batch_size} is <b>32</b>, below the 100 this
+     * library chunked at, so a default TEI deployment refused a full batch outright.
+     */
+    @Test
+    void teiDiscoversItsOwnBatchCeilingsFromInfo() throws IOException {
+        startServer("/info", """
+                {"model_id":"test-model","max_input_length":512,
+                 "max_client_batch_size":32,"max_batch_tokens":16384}""");
+
+        var provider = new EmbeddingProviderTextEmbeddingsInference(baseUri(), "test-model");
+
+        assertEquals(32, provider.maxBatchSize());
+        assertEquals(16384, provider.maxBatchTokens());
+        assertEquals(512, provider.maxInputTokens(), "the pre-existing lookup must still work");
+    }
+
+    /** All three limits come from one response, so asking for them must not cost a round trip each. */
+    @Test
+    void teiFetchesInfoOnceForAllThreeLimits() throws IOException {
+        AtomicInteger requests = new AtomicInteger();
+        startCountingServer("/info", """
+                {"max_input_length":512,"max_client_batch_size":32,"max_batch_tokens":16384}""", requests);
+
+        var provider = new EmbeddingProviderTextEmbeddingsInference(baseUri(), "test-model");
+        provider.maxInputTokens();
+        provider.maxBatchSize();
+        provider.maxBatchTokens();
+        provider.maxBatchSize();
+
+        assertEquals(1, requests.get(), "/info must be fetched once and cached, not once per limit");
+    }
+
+    /** An unreachable or unparseable {@code /info} falls back rather than throwing -- not knowing a limit is
+     *  a reason to be conservative, never a reason to refuse to embed. */
+    @Test
+    void teiFallsBackWhenInfoCannotBeRead() throws IOException {
+        startServer("/nothing-here", "{}");
+
+        var provider = new EmbeddingProviderTextEmbeddingsInference(baseUri(), "test-model");
+
+        assertEquals(EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE, provider.maxBatchSize());
+        assertEquals(EmbeddingBatchLimits.DEFAULT_MAX_BATCH_TOKENS, provider.maxBatchTokens());
+    }
+
+    /** OpenAI publishes its limits but exposes no endpoint reporting them, so these are constants -- the same
+     *  reason its {@code maxInputTokens} falls through to the model table while TEI can answer exactly. */
+    @Test
+    void openAiReportsItsDocumentedBatchCeilings() {
+        var provider = new EmbeddingProviderOpenAI("http://localhost:1", "k", "text-embedding-3-small");
+
+        assertEquals(2048, provider.maxBatchSize());
+        assertEquals(300_000, provider.maxBatchTokens());
+    }
+
+    /** A provider that declares nothing keeps the behaviour it had before batch ceilings existed. */
+    @Test
+    void aProviderThatDeclaresNothingGetsTheExistingChunkSize() {
+        JavAIEmbeddingProvider silent = text -> EmbeddingVector.absent();
+
+        assertEquals(EmbeddingBatchLimits.DEFAULT_MAX_BATCH_SIZE, silent.maxBatchSize());
+        assertEquals(EmbeddingBatchLimits.DEFAULT_MAX_BATCH_TOKENS, silent.maxBatchTokens());
+    }
+
     // ---- helpers ----
 
     private void startServer(String path, String responseBody) throws IOException {

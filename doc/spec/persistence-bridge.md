@@ -271,6 +271,70 @@ write-heavy paths.
 Entities outside `@Summary` containment entirely -- which is most of an application's entities -- keep the
 inline write and never touch the queue.
 
+## Batching: how many provider calls a write costs (OMI-266)
+
+The accuracy rule above says a flush must never write a vector that disagrees with the field committed
+alongside it. It says nothing about how many times the flush talks to the embedding provider to get them, and
+the answer used to be *once per text*: a flush reads one field at a time, so lazy computation discovered one
+text at a time and each was its own round trip.
+
+Measured on the Postgres backend, before → after:
+
+| Flow | Texts | Round trips before | after |
+|---|---|---|---|
+| `save()` — one entity, two `@Vectorize` fields | 2 | 2 | **1** |
+| `save()` — a container and twelve members | 13 | 13 | **1** |
+| `saveAll()` — twelve entities | 24 | *(no such method)* | **1** |
+| `reindex()` — whole table under a new model | 98 | 98 | **1** |
+| `inTransaction` — twelve `save` calls in a loop | 24 | 24 | 12 |
+
+The texts are unchanged throughout — this is how many calls they arrive in, not how much work is done, and
+OMI-187's "each distinct value embedded exactly once" invariant is untouched.
+
+**Where the per-save half lives, and why nothing backend-specific changed.** All three backends already wrap
+every `save()` in `JavAIRuntime.runWithSubgraphLockedForPersistence`, which had already computed the entire
+reachable subgraph in order to lock it. It now warms that set — one batched pass — before running the flush.
+So one change in Vector Core covers Postgres, Neo4j and MongoDB, and no backend's own write path was touched.
+
+**This shortens more than latency.** Those round trips happen while every object in the subgraph is locked
+against mutation, and on Postgres and Neo4j *inside the open database transaction*. Thirteen sequential calls
+to an embedding provider hold the object graph frozen, and hold a transaction open, for thirteen times as long
+as one batched call. That is contention and serialization-failure surface, which is why this is worth doing
+inside `save()` rather than only offering a bulk API next to it.
+
+### `saveAll` — batching across entities
+
+A `save()` sees only its own subgraph, so a loop of saves stays one round trip per entity no matter how well
+each one batches internally. `JavAIRepository.saveAll(Iterable<T>)` is the seam that can see the whole batch:
+
+```java
+articles.saveAll(fleet);                             // one batched round trip, then the writes
+articles.saveAll(fleet, SummaryPolicy.QUEUE_ONLY);   // same, deferring the @Summary recomputation
+```
+
+**Atomicity is Postgres-only, exactly as with `JavAIPI.inTransaction`.** There the whole batch is one
+transaction. Neo4j and MongoDB write each entity independently, so a failure part-way leaves the earlier ones
+saved. They are deliberately *not* made to refuse the call the way `inTransaction` does: refusing would deny
+them the batching, which is the thing this method primarily exists to provide, for the sake of a guarantee it
+secondarily provides.
+
+On Postgres the embeddings are computed **before** the transaction opens. Nothing is locked at that moment, so
+a field mutated between the warm and its `save()` simply leaves its slot dirty and that save's own locked,
+accuracy-forced pass recomputes it — the guarantee at the top of this section is preserved, and a bulk write
+no longer holds a transaction open across a sequence of network calls.
+
+`reindexAll()`/`reindex()` run the same warm chunk by chunk (100 entities at a time) rather than in one pass:
+a re-index is the one operation guaranteed to touch every row, so gathering the whole table's texts before
+issuing any request would trade a latency problem for a memory one. It deliberately does not route through
+`saveAll`, because a maintenance pass over an entire table has no business widening the transaction boundary
+its per-entity saves already have.
+
+**One flow is deliberately left unbatched:** a caller looping `save()` inside `JavAIPI.inTransaction` still
+pays one round trip per entity. Batching across a transaction whose body is an opaque lambda would mean
+deferring every vector write to commit time — across three backends, and through the `javai_summary_pending`
+queue above. `saveAll` is the answer for that shape. The cost of not doing it is pinned by a test rather than
+left as a footnote.
+
 ## Ordinary relational derived finders
 
 A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the

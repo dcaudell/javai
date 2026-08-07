@@ -272,6 +272,18 @@ specification proposals only; do not implement until there's a demonstrated need
   `pom.xml`) reporting throughput and read-latency percentiles for all three modes side by side under a
   representative concurrent workload. `VectorizableString` has its own dedicated test suite
   (`VectorizableStringTest`).
+- **Batched embedding** — `precomputeVectors(Collection)` gathers every not-yet-computed `@Vectorize` text
+  across a collection, de-duplicates it, and issues chunked `embedAll` calls, then does the same for
+  concatenated text in a second pass (OMI-187/OMI-191). Since OMI-266 the library itself uses it, where before
+  only a caller who read the spec could: `runWithSubgraphLockedForPersistence` warms the whole subgraph before
+  a flush reads any of it, `warmSubgraphsForPersistence(roots)` does the same across a bulk write's union
+  (behind `JavAIRepository.saveAll`), and `query()` warms its candidates before ranking rather than embedding
+  them one at a time inside the sort comparator. A warm is never a semantic change: it fills exactly the slots
+  the following reads would fill, skips anything already accurate, and is dropped on provider failure so those
+  reads resolve it under the configured `EmbeddingFailureMode` rather than a second copy of that policy.
+  `PrecomputeVectorsTest`/`ConcatenatedTextBatchingTest` cover it, including that a warm after a mutation
+  actually leaves the slot warm — the case where committing through `hydrateFieldVector`'s pristine-slot rule
+  silently discarded the batch's result and made the text be embedded twice (fixed in OMI-266).
 - `Contextable`/`ContextableObject`/`PromptContext` — real and tested (`PromptContextTest`,
   `PromptContextListContractTest`, `ContextableCollectionsTest`, plus delegation tests in
   `JavAIArrayListTest`/`JavAILinkedHashSetTest`/`JavAILinkedHashMapTest`): stop-at-first-overflow budgeted
