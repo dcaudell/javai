@@ -611,6 +611,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // transaction, regardless of the ambient EmbeddingConsistencyMode.
         Object[] result = new Object[1];
         Set<Containment.OwnerRef> touched = new LinkedHashSet<>();
+        // Load-time hydration is suspended for this whole unit of work: merge() loads the row before it
+        // copies the caller's values on, so hydrating there would pair the old vector with the new value
+        // (see JavAIPostLoadVectorListener). This method does its own, below, where the caller's instance is
+        // still distinguishable from the merged copy.
+        boolean hydrationWasSuspended = JavAIPostLoadVectorListener.suspend();
+        try {
         JavAIRuntime.runWithSubgraphLockedForPersistence(entity, () -> result[0] = inTransactionalSession(session -> {
             JavAIFlushVectorListener.begin();
             try {
@@ -681,6 +687,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 JavAIFlushVectorListener.end();
             }
         }));
+        } finally {
+            // Restored before the drain below, deliberately: that runs after this transaction commits, loads
+            // the container and its children fresh, and wants them hydrated exactly as any other read does.
+            JavAIPostLoadVectorListener.restore(hydrationWasSuspended);
+        }
         if (policy == SummaryPolicy.RECOMPUTE_AFTER_COMMIT && !touched.isEmpty()) {
             recomputeAfterCommit(touched);
         }
@@ -817,9 +828,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             JpaRoot<T> root = query.from(entityType);
             query.select(root);
             List<T> results = session.createQuery(query).list();
-            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T result : results) {
-                hydrateLoaded(session, result, hydrated);
+                hydrateLoaded(session, result);
             }
             return (List<Object>) (List<?>) results;
         });
@@ -1057,9 +1067,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             List<T> results = typed.list();
             List<Object> out = new ArrayList<>(results.size());
-            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (T entity : results) {
-                hydrateLoaded(session, entity, hydrated);
+                hydrateLoaded(session, entity);
                 out.add(entity);
             }
             return out;
@@ -1446,8 +1455,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     /**
      * The singular related entities, collection elements, and map values reachable through {@code entity}'s
-     * own fields -- the graph {@link #syncGeoPoints}/{@link #hydrateGeoPoints}/
-     * {@link #hydrateAssociatedVectors} recurse over.
+     * own fields -- the graph {@link #syncGeoPoints}/{@link #hydrateGeoPoints} recurse over.
      *
      * <p><b>An uninitialized association is skipped, never resolved</b> (OMI-271). Without the
      * {@code Hibernate.isInitialized} guard this walk enforced laziness on singular associations only, by
@@ -2981,50 +2989,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * {@code findAll} routinely reach the same association target, and it only needs hydrating once -- the
      * second visit would be a redundant SELECT for a slot already filled.
      */
-    private void hydrateLoaded(Session session, Object entity, Set<Object> visited) {
+    private void hydrateLoaded(Session session, Object entity) {
         hydrateCollectionMembers(session, entity);
         hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-        hydrateAssociatedVectors(session, entity, visited);
-    }
-
-    /** A single-root load, where sharing a visited set across roots has nothing to share. */
-    private void hydrateLoaded(Session session, Object entity) {
-        hydrateLoaded(session, entity, Collections.newSetFromMap(new IdentityHashMap<>()));
-    }
-
-    /**
-     * Serves stored vectors into the loaded root <em>and every entity reachable from it</em> (OMI-256).
-     *
-     * <p>{@link #hydrateVectors} fills the root's cache slots only. The members Hibernate materializes behind
-     * a {@code @OneToMany}/{@code @ManyToMany} are ordinary loaded entities with stored vectors of their own,
-     * but nothing was serving them, so they arrived cold and the next save re-embedded every one of them --
-     * one model call per member, per re-save, for content that had not changed. Loading a container of fifty
-     * assets and saving it back to change its title cost fifty embeddings; it now costs none.
-     *
-     * <p><b>Traversal is {@link #reachableRelated}'s, not a new one</b>, and that is the load-bearing detail:
-     * {@link #hydrateGeoPoints} already walks exactly this graph on exactly these paths, so this initializes
-     * nothing that was not already going to be initialized a moment earlier. The invariant in
-     * {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} -- an untouched lazy association is
-     * skipped, never loaded on JavAI's initiative -- is therefore untouched by this, which
-     * {@code touchingAnUninitializedLazyAssociationOutsideASessionThrows} keeps honest. An uninitialized
-     * singular proxy is skipped explicitly here as well rather than relying on that, since reading through
-     * one would hydrate the proxy's own empty state rather than the entity's (see {@link #resolve}).
-     *
-     * <p>One SELECT per reachable entity, against an embedding call per reachable entity. That is the same
-     * trade {@link #hydrateSummaryChildren} makes on the recomputation path, for the same reason, and it is
-     * not close: a round trip to Postgres is orders of magnitude cheaper than a round trip to a model.
-     */
-    private void hydrateAssociatedVectors(Session session, Object entity, Set<Object> visited) {
-        if (entity == null || !visited.add(entity)) {
-            return;
-        }
-        hydrateVectors(session, entity);
-        for (Object related : reachableRelated(entity)) {
-            if (!Hibernate.isInitialized(related)) {
-                continue;
-            }
-            hydrateAssociatedVectors(session, Hibernate.unproxy(related), visited);
-        }
+        // No vector hydration here: JavAIPostLoadVectorListener served this entity -- and every other one
+        // Hibernate materialized, including the members session.find loaded just above -- as it was loaded.
+        // The shared `visited` set every caller used to thread through here went with the walk (OMI-271).
     }
 
     private static boolean tableExists(Connection connection, String table) throws SQLException {
@@ -3239,11 +3209,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private List<Ranked<Object>> hydrateRanked(Class<?> entityType, List<RankedId> ranked) {
         return inSession(session -> {
             List<Ranked<Object>> results = new ArrayList<>(ranked.size());
-            Set<Object> hydrated = Collections.newSetFromMap(new IdentityHashMap<>());
             for (RankedId hit : ranked) {
                 Object entity = session.find(entityType, hit.id());
                 if (entity != null) {
-                    hydrateLoaded(session, entity, hydrated);
+                    hydrateLoaded(session, entity);
                     // pgvector's <=> is cosine distance; Ranked speaks the cosine similarity the rest of
                     // JavAI does, so a hit's score means the same as VectorMath.cosineSimilarity would.
                     results.add(new Ranked<>(entity, 1.0 - hit.distance()));
@@ -3493,6 +3462,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                         ? nativeFactory(config.externalSessionFactory())
                         : buildSessionFactory();
                 registerFlushVectorListener(sessionFactory);
+                registerPostLoadVectorListener(sessionFactory);
                 initializeSchema(sessionFactory);
             }
             return sessionFactory;
@@ -3503,6 +3473,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  externally-supplied factory may be shared by several backends (or outlive this one) and must never be
      *  double-registered, nor kept alive by us. */
     private static final Set<SessionFactory> FLUSH_LISTENER_REGISTERED =
+            Collections.newSetFromMap(new WeakHashMap<>());
+
+    /** {@link #FLUSH_LISTENER_REGISTERED}'s counterpart for the post-load hydration listener, kept separate
+     *  so neither registration can mask the other's absence. */
+    private static final Set<SessionFactory> POST_LOAD_LISTENER_REGISTERED =
             Collections.newSetFromMap(new WeakHashMap<>());
 
     /** Attaches {@link JavAIFlushVectorListener} so vector writes can cover every entity Hibernate actually
@@ -3521,6 +3496,20 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         listeners.appendListeners(EventType.PRE_INSERT, listener);
         listeners.appendListeners(EventType.PRE_UPDATE, listener);
         listeners.appendListeners(EventType.POST_DELETE, listener);
+    }
+
+    /** Attaches {@link JavAIPostLoadVectorListener}, so an entity is served its stored vectors when Hibernate
+     *  materializes it rather than when some walk goes looking (OMI-271). Registered on the same factories
+     *  and under the same identity-keyed guard as the flush listener above. */
+    private void registerPostLoadVectorListener(SessionFactory factory) {
+        synchronized (POST_LOAD_LISTENER_REGISTERED) {
+            if (!POST_LOAD_LISTENER_REGISTERED.add(factory)) {
+                return;
+            }
+        }
+        EventListenerRegistry listeners = ((SessionFactoryImplementor) factory)
+                .getServiceRegistry().getService(EventListenerRegistry.class);
+        listeners.appendListeners(EventType.POST_LOAD, new JavAIPostLoadVectorListener(this::hydrateVectors));
     }
 
     /** Writes vectors for every {@code @JavAIVectorizable} Hibernate reported persisting in this flush.

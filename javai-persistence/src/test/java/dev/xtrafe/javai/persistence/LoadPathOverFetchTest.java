@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import dev.xtrafe.javai.vector.testsupport.RecordingEmbeddingProvider;
 import org.hibernate.Hibernate;
 import org.hibernate.stat.Statistics;
 import org.junit.jupiter.api.BeforeAll;
@@ -22,12 +23,16 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
  *
  * <h2>The defect these pin</h2>
  *
- * Every load path funnels through {@code hydrateLoaded}, whose two graph walks
- * ({@code hydrateGeoPoints}, {@code hydrateAssociatedVectors}) both traverse via {@code reachableRelated}.
- * That walk read every field and, on hitting a {@code Collection}, called {@code addAll} on it -- and
- * iterating an uninitialized {@code PersistentCollection} <em>is</em> initializing it. So reading one scalar
- * off one entity loaded its entire reachable collection graph, recursively, plus a side-table SELECT per
- * entity in it.
+ * Every load path funnels through {@code hydrateLoaded}, which walked the loaded root's whole reachable
+ * graph via {@code reachableRelated} -- reading every field and, on hitting a {@code Collection}, calling
+ * {@code addAll} on it. Iterating an uninitialized {@code PersistentCollection} <em>is</em> initializing it,
+ * so reading one scalar off one entity loaded its entire reachable collection graph, recursively, plus a
+ * side-table SELECT per entity in it.
+ *
+ * <p>The walk existed to serve those entities their stored vectors (OMI-256). {@link
+ * JavAIPostLoadVectorListener} now does that from Hibernate's own load event instead, which is both cheaper
+ * (one SELECT per entity actually loaded) and strictly more complete -- see
+ * {@link #aMemberInitializedByTheCallerIsStillServedItsStoredVectors}.
  *
  * <p>It went unnoticed because the same walk enforces laziness correctly on <em>singular</em> associations,
  * which {@code AssociationGraphE2ETest.touchingAnUninitializedLazyAssociationOutsideASessionThrows} pins --
@@ -138,6 +143,39 @@ class LoadPathOverFetchTest {
         });
 
         assertEquals(List.of("in-session-shelf"), shelfLabels);
+    }
+
+    /**
+     * The other half of removing the walk: an entity is still served its stored vectors, now at the moment
+     * Hibernate materializes it rather than because something went looking.
+     *
+     * <p>This is the case no load-time walk could ever have covered, and the reason
+     * {@link JavAIPostLoadVectorListener} exists rather than a smaller walk: the member is initialized by the
+     * <em>caller</em>, after any walk at {@code findById} time has finished. Served cold, it would be
+     * re-embedded on the next save -- one model call per member, for content that has not changed, which is
+     * exactly the waste OMI-256 removed and OMI-271 must not reintroduce.
+     */
+    @Test
+    void aMemberInitializedByTheCallerIsStillServedItsStoredVectors() {
+        TestLibrary library = new TestLibrary("post-load-hydration");
+        TestShelf shelf = new TestShelf("hydrated-shelf");
+        library.getShelves().add(shelf);
+        libraries.save(library);
+
+        RecordingEmbeddingProvider recorder = new RecordingEmbeddingProvider(new FakeEmbeddingProvider());
+        JavAIRuntime.configureEmbeddingProvider(recorder);
+        try {
+            TestLibrary loaded = JavAIPI.inTransaction(config, () -> {
+                TestLibrary reloaded = libraries.findById(library.getId()).orElseThrow();
+                Hibernate.initialize(reloaded.getShelves());
+                return reloaded;
+            });
+            libraries.save(loaded);
+        } finally {
+            JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
+        }
+
+        recorder.ledger().assertEmbeddedExactlyOnce();
     }
 
     /**

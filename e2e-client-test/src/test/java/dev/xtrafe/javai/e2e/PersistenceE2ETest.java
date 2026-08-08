@@ -4,10 +4,12 @@ import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.neo4j.driver.AuthTokens;
@@ -199,7 +201,15 @@ class PersistenceE2ETest {
         Article article = fullArticle("Full graph test (Postgres)");
         Article saved = postgresRepository.save(article);
 
-        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+        // Read inside a unit of work: `comments` is a lazy Hibernate-owned collection (OMI-142), and a
+        // repository hands back a detached entity, so it is only traversable while the loading session is
+        // open. It used to arrive initialized because the load path walked and loaded the whole reachable
+        // graph of everything anyone read -- the over-fetch OMI-271 removed.
+        Article reloaded = JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article loaded = postgresRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getComments());
+            return loaded;
+        });
         assertEquals("first take: Full graph test (Postgres)", reloaded.getFeaturedComment().getText());
         assertEquals(2, reloaded.getComments().size());
         assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("first listed comment")));
@@ -285,7 +295,11 @@ class PersistenceE2ETest {
         assertEquals(postgresManaged.getId(), neo4jManaged.getId(), "all three saves share the same identity");
         assertEquals(postgresManaged.getId(), mongoManaged.getId(), "all three saves share the same identity");
 
-        Article fromPostgres = postgresRepository.findById(article.getId()).orElseThrow();
+        Article fromPostgres = JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article loaded = postgresRepository.findById(article.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getComments());
+            return loaded;
+        });
         Article fromNeo4j = neo4jRepository.findById(article.getId()).orElseThrow();
         Article fromMongo = mongoRepository.findById(article.getId()).orElseThrow();
 

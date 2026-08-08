@@ -335,6 +335,54 @@ deferring every vector write to commit time — across three backends, and throu
 queue above. `saveAll` is the answer for that shape. The cost of not doing it is pinned by a test rather than
 left as a footnote.
 
+## A read loads what was read, not what is reachable from it (OMI-271)
+
+The section above is about not re-embedding what a load already knows. It says nothing about how much the
+load itself costs, and the answer used to be *everything reachable*: both post-load steps walked the loaded
+root's graph reflectively, and that walk called `addAll` on every collection-valued field. **Iterating an
+uninitialized `PersistentCollection` is initializing it**, so reading one scalar off one entity loaded its
+whole reachable collection graph, recursively, plus a side-table SELECT per entity in it.
+
+| Read | Entities loaded, before | After |
+|---|---|---|
+| a root with five children, one string asked for | 6 | **1** |
+| a three-level graph of sixteen, one string asked for | 16 | **1** |
+
+Laziness *was* enforced for **singular** associations, and this is worth stating because it is why the gap
+survived: an uninitialized proxy is a generated subclass, `@Entity` is not `@Inherited`, so the walk's
+`isAnnotationPresent` test rejected it — by accident rather than by design. A lazy `@OneToMany`/`@ManyToMany`
+had no such accident protecting it.
+
+**A repository therefore returns a genuinely detached entity now**, and traversing an association nobody
+touched raises `LazyInitializationException` like any other lazy dereference — the behaviour
+`doc/spec/vector-core.md`'s persistence rules and this project's own e2e tests already describe for singular
+associations. Read inside a unit of work when the graph is genuinely wanted, and pay for the hops taken:
+
+```java
+Library library = JavAIPI.inTransaction(config, () -> {
+    Library loaded = libraries.findById(id).orElseThrow();
+    Hibernate.initialize(loaded.getShelves());
+    return loaded;
+});
+```
+
+**Stored vectors are served from Hibernate's `POST_LOAD` event instead of from a walk.** That is what makes
+the removal free rather than a trade: the cost becomes one SELECT per entity *actually loaded*, and it covers
+a case no walk at load time could — a member the caller initializes afterwards, which arrives long after any
+walk has finished. `save()` suspends it for its own unit of work, since `merge()` loads the row *before*
+copying the caller's values onto it, and hydrating there would pair the old vector with the new value.
+
+Vector Core has the same hazard one layer up — its own walks must not touch a value whose resolution would
+perform I/O — and cannot recognise one without depending on an ORM. `JavAIRuntime.configureInitializationCheck`
+is the seam: the Hibernate backend installs `Hibernate::isInitialized`, and the default answers `true` for
+everything, which is right for a plain object graph with no persistence layer under it.
+
+**One eager mapping remains, deliberately.** A JavAI collection field carrying *no* association annotation is
+mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on — the field
+holds a real `JavAIArrayList` the constructor made, so declining to fill it would hand back a silently-empty
+collection rather than a lazy one. A JavAI collection that *does* carry `@OneToMany`/`@ManyToMany` is mapped
+natively (see OMI-142) and is lazy like any other.
+
 ## Ordinary relational derived finders
 
 A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the
