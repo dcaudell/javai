@@ -35,6 +35,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
 import java.util.function.BiConsumer;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 
 /**
@@ -77,6 +78,9 @@ public final class JavAIRuntime {
     private static volatile EmbeddingConsistencyMode consistencyMode = EmbeddingConsistencyMode.IMMEDIATE_CONSISTENCY;
     private static volatile EmbeddingFailureMode failureMode = EmbeddingFailureMode.THROW;
     private static volatile Semaphore embeddingCallGate = new Semaphore(DEFAULT_MAX_CONCURRENT_EMBEDDING_CALLS);
+    /** Everything is a real object until a persistence layer says otherwise -- see
+     *  {@link #configureInitializationCheck(Predicate)}. */
+    private static volatile Predicate<Object> initializationCheck = value -> true;
 
     /** Set for the duration of {@link #runWithSubgraphLockedForPersistence} on whichever thread is running
      *  it -- forces every {@code fieldVector}/{@code concatenatedTextVector} read on that thread to block for
@@ -130,6 +134,35 @@ public final class JavAIRuntime {
 
     static Semaphore embeddingCallGate() {
         return embeddingCallGate;
+    }
+
+    /**
+     * Lets a persistence layer tell Vector Core which values are unresolved placeholders it must not touch
+     * (OMI-271).
+     *
+     * <p>Every graph walk here reads fields reflectively and iterates whatever collections it finds. Against
+     * an ORM that is not a neutral act: iterating an uninitialized lazy collection <em>is</em> loading it,
+     * so a walk that means only to look ends up issuing SELECTs -- and, off a detached instance, throwing
+     * where it would otherwise have looked. Vector Core cannot recognise such a value itself without
+     * depending on an ORM, which it deliberately does not.
+     *
+     * <p>So the recogniser is supplied instead: {@code javai-persistence}'s Hibernate backend installs
+     * {@code Hibernate::isInitialized}. The default answers {@code true} for everything, which is exactly
+     * right for a plain object graph with no persistence layer under it -- nothing is a placeholder, so
+     * nothing is skipped.
+     *
+     * <p>Skipping is always safe, never a silent loss: an association nobody has resolved holds no mutation
+     * to lock, no vector to warm, and no id to assign. The same argument {@code versionedEntitiesById} and
+     * {@code writeVectorsForRelatedEntity} already make on the persistence side, one layer down.
+     */
+    public static void configureInitializationCheck(Predicate<Object> check) {
+        initializationCheck = Objects.requireNonNull(check, "initialization check");
+    }
+
+    /** Whether {@code value} is a real, resolved object rather than a placeholder -- see
+     *  {@link #configureInitializationCheck(Predicate)}. {@code null} counts as resolved: it is a value. */
+    public static boolean isResolved(Object value) {
+        return value == null || initializationCheck.test(value);
     }
 
     /**
@@ -1392,7 +1425,10 @@ public final class JavAIRuntime {
     }
 
     private static void collectReachableVectorizables(Object node, Set<Object> visited, Set<Object> result) {
-        if (node == null || !visited.add(node)) {
+        // An unresolved association is not part of the subgraph being flushed: nothing has mutated it, so
+        // there is nothing to lock, warm or write. Resolving one to find that out would be the load this
+        // walk has no business issuing -- and, off a detached instance, cannot issue at all (OMI-271).
+        if (node == null || !isResolved(node) || !visited.add(node)) {
             return;
         }
         if (node instanceof JavAIVectorizable) {

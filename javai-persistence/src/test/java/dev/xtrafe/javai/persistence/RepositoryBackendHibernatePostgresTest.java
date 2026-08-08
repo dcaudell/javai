@@ -5,6 +5,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -268,7 +269,13 @@ class RepositoryBackendHibernatePostgresTest {
         team.getMembers().add(new TestMember("grace"));
         TestTeam saved = teamRepository.save(team);
 
-        TestTeam reloaded = teamRepository.findById(saved.getId()).orElseThrow();
+        // Inside a unit of work: a repository returns a detached entity, so its lazy @OneToMany is only
+        // traversable while the session that loaded it is still open (OMI-271).
+        TestTeam reloaded = JavAIPI.inTransaction(config, () -> {
+            TestTeam loaded = teamRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getMembers());
+            return loaded;
+        });
         assertEquals(2, reloaded.getMembers().size(),
                 "a natively-mapped @OneToMany must round-trip exactly its own members, not doubled ones");
         assertEquals(List.of("ada", "grace"),
@@ -405,7 +412,11 @@ class RepositoryBackendHibernatePostgresTest {
         crew.getMembers().add(new TestMember("buzz"));
         TestCrew saved = crewRepository.save(crew);
 
-        TestCrew reloaded = crewRepository.findById(saved.getId()).orElseThrow();
+        TestCrew reloaded = JavAIPI.inTransaction(config, () -> {
+            TestCrew loaded = crewRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getMembers());
+            return loaded;
+        });
         JavAIList<TestMember> members = reloaded.getMembers();
 
         // Hibernate substituted JavAI's own persistent collection -- not a plain PersistentBag...

@@ -222,6 +222,15 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private static final String FIELD_VECTOR_TABLE_PREFIX = "javai_vectors__";
     private static final String SUMMARY_VECTOR_TABLE_PREFIX = "javai_summary_vectors__";
 
+    static {
+        // Teaches Vector Core to recognise a Hibernate proxy or an uninitialized lazy collection as a
+        // placeholder rather than an object, so its own graph walks look without loading (OMI-271). Done on
+        // class load rather than per configuration: it is a property of "Hibernate is what's underneath",
+        // which is true for every instance of this class and cannot differ between two of them. Harmless to
+        // the other two backends -- Hibernate.isInitialized answers true for anything it does not manage.
+        JavAIRuntime.configureInitializationCheck(Hibernate::isInitialized);
+    }
+
     /** How many queued owners one maintenance drain claims at a time. Bounded so a large backlog is worked
      *  through in several short transactions rather than one long one holding advisory locks throughout. */
     private static final int DRAIN_BATCH_SIZE = 256;
@@ -619,6 +628,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 Map<UUID, Object> originalsById = vectorizablesById(entity);
                 transferVectorState(entity, managed, originalsById);
                 transferToSummaryChildren(managed, originalsById);
+                // A @Summary child the caller never held arrives from the database with empty cache slots,
+                // and computing this container's summary vector below reads every one of them -- so without
+                // this it is re-embedded for real, once per child, per save (OMI-271). The load path used to
+                // mask this by hydrating the whole reachable graph on every read; it no longer does, so the
+                // cost is paid here, where it is one SELECT per summary child of one container, rather than
+                // there, where it was one per entity reachable from anything anyone read.
+                hydrateSummaryChildren(session, managed,
+                        Collections.newSetFromMap(new IdentityHashMap<>()), originalsById);
                 session.flush();
                 writeVectors(session, entityType, managed);
                 writeVectorsForRelatedEntities(session, managed, originalsById);
@@ -1427,8 +1444,26 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
-    /** The singular related entities, collection elements, and map values reachable through {@code entity}'s
-     *  own fields -- the graph {@link #syncGeoPoints}/{@link #hydrateGeoPoints} recurse over. */
+    /**
+     * The singular related entities, collection elements, and map values reachable through {@code entity}'s
+     * own fields -- the graph {@link #syncGeoPoints}/{@link #hydrateGeoPoints}/
+     * {@link #hydrateAssociatedVectors} recurse over.
+     *
+     * <p><b>An uninitialized association is skipped, never resolved</b> (OMI-271). Without the
+     * {@code Hibernate.isInitialized} guard this walk enforced laziness on singular associations only, by
+     * accident rather than by design: an uninitialized singular proxy is a generated subclass, and
+     * {@code @Entity} is not {@code @Inherited}, so the {@code isAnnotationPresent} test below happens to
+     * reject it. A lazy {@code @OneToMany}/{@code @ManyToMany} has no such accident protecting it --
+     * {@code addAll} iterates the {@code PersistentCollection}, and iterating one <em>is</em> initializing
+     * it. So every read of any entity loaded its whole reachable collection graph, recursively, and paid a
+     * side-table SELECT per entity in it, no matter what the caller had asked for.
+     *
+     * <p>That is the invariant {@code savingDoesNotForceUninitializedLazyAssociationsToLoad} states and
+     * {@code versionedEntitiesById} already keeps for its own walk, for the same reason and in the same
+     * words -- this walk simply never had it. Applying it here covers the read path
+     * ({@link #hydrateLoaded}) and the write path ({@link #syncGeoPoints}) at once: an association the
+     * caller never touched holds nothing this backend needs to read back or write out.
+     */
     private static List<Object> reachableRelated(Object entity) {
         List<Object> related = new ArrayList<>();
         for (Field field : EntityReflection.allFields(entity.getClass())) {
@@ -1438,6 +1473,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 value = field.get(entity);
             } catch (IllegalAccessException e) {
                 throw new IllegalStateException("Cannot read field " + field + " on " + entity.getClass(), e);
+            }
+            if (!Hibernate.isInitialized(value)) {
+                continue; // true for null and for anything Hibernate is not managing lazily
             }
             if (value instanceof Map<?, ?> map) {
                 related.addAll(map.values());
@@ -1951,6 +1989,24 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     private void hydrateSummaryChildren(Session session, Object entity, Set<Object> visited) {
+        hydrateSummaryChildren(session, entity, visited, Map.of());
+    }
+
+    /**
+     * @param originalsById the caller's own instances, by id, when this runs on the write path. A child the
+     *                      caller held cannot be hydrated directly: their mutation landed on their detached
+     *                      instance, so the merged copy carries the <em>new</em> field value on a
+     *                      <em>pristine</em> slot, and hydrating that serves the old vector and persists it
+     *                      (see {@link #hydrateVectors}'s own "load paths only" note). Hydrating the
+     *                      <em>original</em> instead is safe and does the same job:
+     *                      {@code JavAIRuntime.hydrateFieldVector} refuses any slot a setter has bumped, so
+     *                      a genuinely-changed field keeps its dirty slot and is embedded for real, while an
+     *                      untouched one is served its stored vector and then carried across by the same
+     *                      transfer {@code save()} already performs. Empty on the read path, where every
+     *                      instance is freshly loaded and there is no laundering to see through.
+     */
+    private void hydrateSummaryChildren(
+            Session session, Object entity, Set<Object> visited, Map<UUID, Object> originalsById) {
         if (entity == null || !visited.add(entity)) {
             return;
         }
@@ -1958,8 +2014,15 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             Object value = EntityReflection.readField(entity, fieldName);
             for (Object child : expandToEntities(value)) {
                 Object resolved = Hibernate.unproxy(child);
-                hydrateVectors(session, resolved);
-                hydrateSummaryChildren(session, resolved, visited);
+                UUID id = resolved == null ? null : idOrNull(resolved);
+                Object original = id == null ? null : originalsById.get(id);
+                if (original != null && original != resolved) {
+                    hydrateVectors(session, original);
+                    JavAIRuntime.transferComputedVectors(original, resolved);
+                } else {
+                    hydrateVectors(session, resolved);
+                }
+                hydrateSummaryChildren(session, resolved, visited, originalsById);
             }
         }
     }
@@ -2175,7 +2238,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  included. Must run before {@code session.merge(...)}, not after: Hibernate needs the id in place to
      *  cascade-insert a related entity at all. */
     private static void ensureIdsAssigned(Object entity, Map<Object, Boolean> visited) {
-        if (entity == null || visited.put(entity, Boolean.TRUE) != null) {
+        // An uninitialized association was loaded from the database, so it has an id already -- and
+        // resolving it to confirm that would be exactly the load this walk must not cause (OMI-271).
+        if (entity == null || !Hibernate.isInitialized(entity) || visited.put(entity, Boolean.TRUE) != null) {
             return;
         }
         if (entity.getClass().isAnnotationPresent(Entity.class) && EntityReflection.readId(entity) == null) {
@@ -2188,6 +2253,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 value = field.get(entity);
             } catch (IllegalAccessException e) {
                 throw new IllegalStateException("Cannot read field " + field + " on " + entity.getClass(), e);
+            }
+            if (!Hibernate.isInitialized(value)) {
+                continue; // an unresolved collection holds only stored entities, which already have ids
             }
             if (value instanceof Map<?, ?> map) {
                 for (Object element : map.values()) {
@@ -2223,6 +2291,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             if (isJavAICollectionField(field)) {
                 continue; // syncCollectionMembers writes these members' vectors as it persists them
+            }
+            if (!Hibernate.isInitialized(value)) {
+                // This save did not touch these members, so their stored vectors are still the right ones.
+                // Iterating to find that out would load them cold and re-embed every one (OMI-271) -- the
+                // exact per-member waste OMI-256 removed from the load path, reintroduced on the write path.
+                continue;
             }
             if (value instanceof Map<?, ?> map) {
                 writeVectorsForCollectionMembers(session, map.values(), originalsById);
