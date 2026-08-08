@@ -4,6 +4,7 @@ import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
 import dev.xtrafe.javai.vector.testsupport.RecordingEmbeddingProvider;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -246,7 +247,13 @@ class SummaryDrainEmbeddingCostTest {
         shelf.getBooks().add(new TestBook("untouched-book"));
         shelves.save(shelf);
 
-        TestShelf reloaded = shelves.findById(shelf.getId()).orElseThrow();
+        // Initialized inside the unit of work that loaded it -- see OMI-271. Hydration serves the member its
+        // stored vector here exactly as it does the root, which is what the last assertion below checks.
+        TestShelf reloaded = JavAIPI.inTransaction(config, () -> {
+            TestShelf loaded = shelves.findById(shelf.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getBooks());
+            return loaded;
+        });
         provider.ledger().reset();
         reloaded.setLabel("changing-shelf, wholly different subject matter");
         reloaded.getBooks().add(new TestBook("added-book"));

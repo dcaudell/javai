@@ -309,3 +309,36 @@ This is deliberate, not an oversight: silently treating an unloadable child as c
 make `summaryVector()` depend on session state, so the identical object graph would summarize differently
 depending on how it happened to be loaded. **Fix:** fetch that association eagerly, or read the summary while
 the entity is still managed. Saving is unaffected — only reading a summary off a detached instance.
+
+### A repository returns a genuinely detached entity (changed in 0.1.10, OMI-271)
+
+Up to and including 0.1.9, an entity from `findById`/`findAll`/a derived finder/a vector search came back
+with its **whole reachable collection graph already loaded** — a read of one entity loaded everything
+reachable from it, recursively, and paid a side-table SELECT per entity in it. That was a defect, not a
+feature: the post-load walk that served stored vectors iterated every collection field, and iterating an
+uninitialized Hibernate collection is initializing it.
+
+Since 0.1.10 nothing is loaded that the caller did not ask for, which means **traversing an untouched lazy
+association on a returned entity now throws `LazyInitializationException`** — ordinary JPA, and the same rule
+the `@Summary` section above already described for singular associations. Code that relied on the graph
+arriving pre-loaded will break, visibly and at the point of traversal.
+
+**Fix:** read inside a unit of work and initialize the hops you actually want, so the cost is yours to choose:
+
+```java
+Identity identity = JavAIPI.inTransaction(config, () -> {
+    Identity loaded = identities.findById(id).orElseThrow();
+    Hibernate.initialize(loaded.getGallery());
+    return loaded;
+});
+```
+
+A Spring `@Transactional` method works the same way (see OMI-146's Spring-managed sessions). For a GraphQL or
+REST surface, the durable answer is to resolve each hop from its own repository call driven by the selection
+set, rather than loading a graph and projecting it.
+
+**One mapping is still eager, deliberately:** a JavAI collection field carrying *no* association annotation
+(`private final JavAIArrayList<X> …`) is stored out-of-band in `javai_collection_members` and has no
+Hibernate laziness to lean on, so it is still filled on load. Declare the field by the interface with
+`@OneToMany`/`@ManyToMany` (see "Which JavAI collection shape should I use on Postgres?" above) to get a
+lazy one.

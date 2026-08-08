@@ -11,6 +11,61 @@ Each entry names the module it affects, because this repository releases all nin
 version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
+
+### Fixed
+
+- **`javai-persistence`: a read no longer loads the whole reachable object graph (OMI-271).**
+  `reachableRelated` -- the walk both post-load steps traversed -- called `addAll` on every collection-valued
+  field, and iterating an uninitialized Hibernate `PersistentCollection` *is* initializing it. So every
+  `findById`/`findAll`/derived finder/vector search loaded the root's entire reachable collection graph,
+  recursively, and paid a side-table SELECT per entity in it, whatever the caller had asked for.
+
+  Measured with Hibernate's own load counters against a real pgvector container: reading one string off a
+  root with five children loaded **6** entities, now **1**; off a three-level graph of sixteen, loaded
+  **16**, now **1**.
+
+  Laziness was already enforced on *singular* associations -- but by accident, not design: an uninitialized
+  proxy is a generated subclass, `@Entity` is not `@Inherited`, so the walk's `isAnnotationPresent` test
+  happened to reject it. A lazy `@OneToMany`/`@ManyToMany` had no such accident protecting it.
+
+  ⚠️ **This changes what a consumer gets back.** A repository now returns a genuinely detached entity, so
+  traversing an association the caller never touched raises `LazyInitializationException` -- ordinary JPA,
+  and what `AssociationGraphE2ETest` already asserted for singular associations. Read inside
+  `JavAIPI.inTransaction` (or a Spring `@Transactional` unit of work) when the graph is genuinely wanted:
+
+  ```java
+  Library library = JavAIPI.inTransaction(config, () -> {
+      Library loaded = libraries.findById(id).orElseThrow();
+      Hibernate.initialize(loaded.getShelves());   // pay for the hop you actually want
+      return loaded;
+  });
+  ```
+
+  Fixing the walk exposed the same defect in four more graph walks that had only ever worked *because* the
+  read path pre-initialized everything for them -- `JavAIRuntime.collectReachableVectorizables`,
+  `ensureIdsAssigned`, `writeVectorsForRelatedEntities`, and the `@Summary` child handling -- so `save()` of
+  a detached entity threw from inside JavAI once the crutch was gone. All four now skip what they cannot see
+  without loading it.
+
+  A JavAI collection field carrying **no** association annotation is still hydrated eagerly, deliberately: it
+  is mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on, so
+  declining to fill it would hand back a silently-empty collection rather than a lazy one.
+
+### Added
+
+- **`javai-persistence`: stored vectors are served from Hibernate's load event (OMI-271).** The walk removed
+  above existed to serve loaded entities their stored vectors, so that re-saving unchanged content does not
+  re-embed it (OMI-256). `JavAIPostLoadVectorListener` does that from `POST_LOAD` instead -- one SELECT per
+  entity *actually loaded*, and strictly more complete than any walk could be: a member the caller
+  initializes later, after any load-time walk has finished, is served as it arrives. `save()` suspends it for
+  its own unit of work, because `merge()` loads the row before copying the caller's values onto it and
+  hydrating there would pair the old vector with the new value.
+
+- **`javai-model`: `JavAIRuntime.configureInitializationCheck(Predicate<Object>)` (OMI-271).** Vector Core's
+  graph walks must not touch a value whose resolution would perform I/O, and cannot recognise one without
+  depending on an ORM -- which it deliberately does not. The Hibernate backend installs
+  `Hibernate::isInitialized`; the default answers `true` for everything, which is exactly right for a plain
+  object graph with no persistence layer under it.
 --
 ## [0.1.9] - 2026-08-07
 
