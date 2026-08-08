@@ -95,6 +95,10 @@ public final class JavAIEnvironment {
     private static final AssocSelfNodeRepository POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
     private static final AssocBiParentRepository POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
 
+    /** Exposed so a test can compose several repository calls into one unit of work -- which a test that
+     *  traverses a lazy association must, since a repository returns a detached entity (OMI-271). */
+    private static final JavAIPersistenceConfig POSTGRES_CONFIG;
+
     private static final Cortex CORTEX;
 
     private static final JavAITagRepository POSTGRES_TAGGING;
@@ -116,6 +120,7 @@ public final class JavAIEnvironment {
                 .postgresUsername(MonolithicContainer.POSTGRES_USERNAME)
                 .postgresPassword(MonolithicContainer.POSTGRES_PASSWORD)
                 .build();
+        POSTGRES_CONFIG = postgresConfig;
         POSTGRES_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, postgresConfig);
         POSTGRES_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, postgresConfig);
         POSTGRES_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, postgresConfig);
@@ -194,6 +199,11 @@ public final class JavAIEnvironment {
 
     public static ArticleRepository postgresArticleRepository() {
         return POSTGRES_ARTICLE_REPOSITORY;
+    }
+
+    /** The Postgres configuration, for {@link JavAIPI#inTransaction} -- see {@link #POSTGRES_CONFIG}. */
+    public static JavAIPersistenceConfig postgresConfig() {
+        return POSTGRES_CONFIG;
     }
 
     public static ArticleRepository neo4jArticleRepository() {
