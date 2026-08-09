@@ -299,6 +299,49 @@ The getter that "helps" is what breaks it. **Fix:** rename the getter (`identity
 `resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
 JavAI reads fields.
 
+### Inheritance: a subclass must be registered, the root is not enough
+
+JavAI discovers related types by walking an entity's **fields**, and a subclass is not reachable that way —
+nor discoverable by reflection at all without scanning. So registering a repository for an inheritance root
+does **not** bring its subclasses in, and saving one fails with Hibernate's `Unknown entity type`, which does
+not point at the fix. Name them with `entityPackages(...)` for a whole package, or `entityType(Subclass.class)`
+one at a time. `JOINED` hierarchies otherwise behave normally: a subclass round-trips as itself and a
+polymorphic `findAll` over the root sees it.
+
+### `@MapsId`, `@ElementCollection`, `@Basic(fetch = LAZY)`
+
+- **`@MapsId` ✅** — the derived id wins over JavAI's own assignment, which is the outcome you want and not
+  the obvious one: JavAI assigns a random `UUID` to any null `@Id` before Hibernate sees the graph, and if
+  that had won, the child would be written under an id unrelated to its parent and the shared primary key
+  would be silently broken.
+- **`@ElementCollection` ✅** — round-trips, and is lazy like any other collection.
+- **⚠️ `@Basic(fetch = LAZY)` degrades to eager.** A lazy basic has no proxy to stand in for it; Hibernate
+  defers it only by rewriting field access, which needs bytecode enhancement that a JavAI-built
+  `SessionFactory` does not apply. The value is correct, just fetched sooner than asked — safe, unlike a
+  missing value. For a genuinely large column, split it into its own entity behind a lazy `@OneToOne`.
+
+### `save()` returns the managed instance, not the one you passed (changed in 0.1.11, OMI-275)
+
+`repo.save(x)` returns Hibernate's **managed** instance, exactly as Spring Data JPA's `save` does. Up to
+0.1.10 it returned `x` itself, which was never managed.
+
+Two consequences, and the second is the one that bites:
+
+1. **Inside a transaction, mutating the result is dirty-checked.** Before, it silently was not.
+2. ⚠️ **The returned graph is a different object graph from the one you passed in.** Ordinary `merge`
+   semantics: `save(x) != x`, and mutating `x` afterwards does not affect what you got back. **After a save,
+   keep using what `save` returned, or keep using your own instance — do not mix them.**
+
+### An uninitialized proxy answers its `@Id` for free, *if* the getter is public
+
+A lazy singular association comes back as an uninitialized proxy whose `@Id` you can read without a database
+round trip — which is what lets you wire associations by identity on a detached entity.
+
+⚠️ **This requires a `public` identifier getter.** Hibernate serves the id by overriding that getter, and it
+cannot override a package-private one: the call falls through to the uninitialized instance and triggers a
+load, so on a detached entity what looks like a free read raises `LazyInitializationException`. Nothing warns
+you; the fix is one keyword.
+
 ### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
 
 `summaryVector()` has to read each `@Summary` child's own summary. If that child is a still-uninitialized

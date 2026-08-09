@@ -688,12 +688,26 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // so a recomputation is never queued for a mutation that never happened (OMI-255).
                 touched.addAll(participatingOwners(entity, managed));
                 enqueueSummaries(session, touched);
-                // Returns the original `entity`, not `managed`: the same reason as above -- `managed`'s
-                // @Transient collection fields are left empty by merge(), so returning it would hand the
-                // caller back an Article whose in-memory `comments` looks wrong immediately after save().
-                // `entity` already carries every assigned id (ensureIdsAssigned mutates it in place) and is
-                // what RepositoryBackendNeo4j.save() returns too, so both backends behave consistently.
-                return entity;
+                // The @Transient Point fields, which merge() does not copy because this backend maps them
+                // itself. They have just been written to javai_geo_points from `entity`; putting them on
+                // `managed` too is what makes it safe to return (OMI-275).
+                copyBackendManagedFields(entity, managed, Collections.newSetFromMap(new IdentityHashMap<>()));
+                // Returns the MANAGED instance, as Spring Data JPA's save() does (OMI-275, Topic 1).
+                //
+                // It used to return the caller's own `entity`, because merge() left @Transient JavAI
+                // collection fields empty on the managed copy and returning it would have handed back an
+                // object whose collections looked wrong immediately after a save. OMI-277 removed that
+                // reason: a JavAI collection is a native Hibernate association now, so merge() carries it
+                // across, and only Point fields are still @Transient -- copied explicitly just above.
+                //
+                // What this fixes is not merely a difference from Spring Data. Returning an unmanaged root
+                // while the session was open was the ONE way a caller could be handed a graph that is
+                // attached in one place and detached in another: mutate the root and the change is silently
+                // discarded, mutate a child reached through it and the change is silently persisted, with
+                // nothing about either object saying which is which. See
+                // AttachmentConformanceTest.aSavedRootHoldingAPreviouslyLoadedChildIsAMixedGraph, which
+                // measured exactly that before this line changed.
+                return managed;
             } finally {
                 JavAIFlushVectorListener.end();
             }
@@ -1454,8 +1468,44 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * ({@link #hydrateLoaded}) and the write path ({@link #syncGeoPoints}) at once: an association the
      * caller never touched holds nothing this backend needs to read back or write out.
      */
+    /**
+     * Copies the fields this backend maps itself -- {@code Point}s -- from the caller's instance onto the
+     * managed copy, over the same graph {@link #syncGeoPoints} just wrote to the database.
+     *
+     * <p>Needed because those fields are {@code <transient>} to Hibernate, so {@code merge()} does not carry
+     * them: without this, {@code save()} would return an entity whose {@code Point} reads {@code null}
+     * immediately after being set, which is the class of "looks wrong right after a save" problem that kept
+     * this method returning the caller's own instance for so long (OMI-275).
+     */
+    private static void copyBackendManagedFields(Object from, Object to, Set<Object> visited) {
+        if (from == null || to == null || from == to || !visited.add(from)) {
+            return;
+        }
+        if (!from.getClass().isInstance(to)) {
+            return; // a proxy or subclass mismatch: nothing sensible to copy field-for-field
+        }
+        for (Field field : EntityReflection.allFields(from.getClass())) {
+            if (!Point.class.isAssignableFrom(field.getType())) {
+                continue;
+            }
+            field.setAccessible(true);
+            try {
+                field.set(to, field.get(from));
+            } catch (IllegalAccessException e) {
+                throw new IllegalStateException("Cannot copy backend-managed field " + field, e);
+            }
+        }
+    }
+
     private static List<Object> reachableRelated(Object entity) {
         List<Object> related = new ArrayList<>();
+        // A JDK value is a leaf. Reflecting into one is not merely pointless, it throws: an
+        // @ElementCollection of Strings puts this walk on String.value and the module system refuses to open
+        // java.lang for it (OMI-275). The guard belongs here rather than at each call site, because every
+        // caller iterates whatever this returns and would need it independently.
+        if (entity.getClass().getName().startsWith("java.")) {
+            return related;
+        }
         for (Field field : EntityReflection.allFields(entity.getClass())) {
             field.setAccessible(true);
             Object value;
@@ -2231,6 +2281,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // An uninitialized association was loaded from the database, so it has an id already -- and
         // resolving it to confirm that would be exactly the load this walk must not cause (OMI-271).
         if (entity == null || !Hibernate.isInitialized(entity) || visited.put(entity, Boolean.TRUE) != null) {
+            return;
+        }
+        // A JDK value is a leaf, never a node with an @Id somewhere inside it -- and reflecting into one is
+        // not merely pointless, it throws: an @ElementCollection of Strings put this walk on
+        // String.value, and the module system refuses to open java.lang for that (OMI-275). Checked here
+        // rather than at each recursion site so no future caller has to remember it.
+        if (entity.getClass().getName().startsWith("java.")) {
             return;
         }
         if (entity.getClass().isAnnotationPresent(Entity.class) && EntityReflection.readId(entity) == null) {
