@@ -12,6 +12,37 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Added
+
+- **Conformance coverage for the fetch/attachment cells that were named but never measured (OMI-279).** The
+  bidirectional `@OneToOne`/`@OneToMany` pairs, `@OneToOne(optional = false)`, `@Any` under `LAZY`, and the
+  `EAGER` variants of both collection mappings. No production code changed — every cell is either conformant
+  or a documented Hibernate behaviour JavAI inherits — but three of them are now written down rather than
+  assumed:
+
+  - ⚠️ **A lazy to-one whose target class is `final` is silently eager.** Hibernate proxies by subclassing,
+    and a `final` class cannot be subclassed. Nothing reports it, `Hibernate.isInitialized` returns `true` on
+    a field declared `LAZY`, and the value is correct — only early. `final` is a keyword people put on
+    entities by habit, so this is the one most likely to be met in the wild.
+  - ⚠️ **The inverse side of a `@OneToOne` (`mappedBy`) ignores `LAZY`.** No foreign key on that side, so
+    Hibernate must look to know whether the other row exists.
+  - **`optional = false` on the *owning* side does *not* force an eager fetch** — the opposite of the widely
+    repeated rule, which holds only for the inverse side. The FK column is itself proof the row exists.
+
+  The middle finding is why the first was found at all: every fixture in the new test was `final`, so *both*
+  to-ones came back eager and finality was very nearly documented as optionality. `TestSeal` and
+  `TestWaxSeal` are now identical targets of identical mappings differing only in the keyword.
+
+- **A `JavAIMap` keyed by something other than `String` is supported on Postgres, and now measured (OMI-279).**
+  OMI-277 deleted the validator that refused one, because it deleted the `varchar` key column that was the
+  reason for it — which left the cell *un-refused but never exercised*, and "we stopped rejecting it" is not
+  the claim a reader hears. `NonStringMapKeyConformanceTest` answers the harm the old rule named rather than
+  settling for a round trip: `Integer`, `UUID` and enum keys come back **as their own types**, out of
+  `integer`/`uuid`/`varchar` columns, with `PersistentJavAIMap` still substituted in and the association
+  lazy. A key stringified on write and parsed on read would pass a naive round-trip assertion and fail both
+  of those. `String` remains the portable choice, but only because Neo4j and MongoDB still refuse the rest —
+  for the reason Postgres no longer has.
+
 ### Changed
 
 - **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
@@ -83,6 +114,19 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **Docs: `doc/ai-guidance/persistence-support-matrix.md` described the storage this release deleted.** The
+  consumer-facing support matrix still had JavAI collections living in a side table, `@Transient` being
+  auto-added for them, a to-many finder hop costing a query per hop, `String`-keyed maps as a rule on all
+  three backends, and — worst of the set, because someone would have followed it — a *Rules of thumb* line
+  reading "*Many* related entities → a **JavAI collection**, never `@OneToMany`", which 0.1.10 inverts. Also
+  corrected: the `save()`-returns-managed note was dated to 0.1.11, a version that does not exist.
+
+  The same OMI-277 vestiges are gone from `RepositoryBackendHibernatePostgres`'s own javadoc, which claimed
+  "both shapes are fully supported and can coexist" two paragraphs after explaining that one of them was
+  withdrawn, and from the `IllegalArgumentException` thrown at an unmapped collection field, which advised
+  reaching for a concrete JavAI collection — the shape that is now refused, so following the message led
+  straight into a second failure.
+
 - **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**
   A 0.1.10 regression, and a silent one: nothing threw and nothing logged, so an entity simply appeared to
   have no location. `Point` fields live out-of-band in `javai_geo_points` and were read by a recursive walk
@@ -139,9 +183,11 @@ version -- a given release usually changes only one or two of them.
   a detached entity threw from inside JavAI once the crutch was gone. All four now skip what they cannot see
   without loading it.
 
-  A JavAI collection field carrying **no** association annotation is still hydrated eagerly, deliberately: it
-  is mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on, so
-  declining to fill it would hand back a silently-empty collection rather than a lazy one.
+  This left one deliberate exception — a JavAI collection field carrying **no** association annotation stayed
+  eagerly hydrated, since it was mapped out-of-band and had no Hibernate laziness to lean on, and declining to
+  fill it would have handed back a silently-empty collection rather than a lazy one. **OMI-277, later in this
+  same release, removed that mapping and with it the exception.** As shipped, no collection shape ignores its
+  declared `FetchType`.
 
 ### Added
 

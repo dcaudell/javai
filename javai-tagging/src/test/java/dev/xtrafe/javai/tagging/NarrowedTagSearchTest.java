@@ -185,10 +185,10 @@ class NarrowedTagSearchTest {
     }
 
     /**
-     * Narrowing through a <b>to-many</b> path, which takes a different route inside the backend than every
-     * other case here: {@code TagSet.tags} is declared by the concrete {@code JavAIArrayList} type, so it
-     * lives in {@code javai_collection_members} and a predicate reaching through it resolves as an id set
-     * rather than a Criteria join. The vector path has to work over that too.
+     * Narrowing through a <b>to-many</b> path -- {@code TagSet.tags} -- which reaches its leaf by a
+     * collection join rather than the singular join every other case here uses. The vector path has to work
+     * over that too. (Before OMI-277 this route differed more sharply still: the field was concrete-typed,
+     * so the predicate resolved as an id set instead of a join.)
      */
     @Test
     @DisplayName("a vector search narrows through a to-many collection path")
