@@ -6,7 +6,6 @@ import jakarta.persistence.EntityManagerFactory;
 import org.hibernate.SessionFactory;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.annotation.AnnotationConfigApplicationContext;
 import org.springframework.context.annotation.Bean;
@@ -16,23 +15,15 @@ import org.springframework.orm.jpa.JpaTransactionManager;
 import org.springframework.orm.jpa.persistenceunit.PersistenceManagedTypes;
 import org.springframework.orm.jpa.LocalContainerEntityManagerFactoryBean;
 import org.springframework.orm.jpa.vendor.HibernateJpaVendorAdapter;
-import org.springframework.transaction.IllegalTransactionStateException;
-import org.springframework.transaction.NestedTransactionNotSupportedException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.EnableTransactionManagement;
 import org.springframework.transaction.annotation.Isolation;
-import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.testcontainers.containers.PostgreSQLContainer;
-import org.testcontainers.junit.jupiter.Container;
-import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
 
 import javax.sql.DataSource;
 import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.util.Properties;
 import java.util.UUID;
 
@@ -64,16 +55,31 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * works at the edges, and each case here pins one attribute's real, measured behavior -- including the two
  * ({@code NOT_SUPPORTED}, {@code NEVER}) where the correct behavior is for JavAI to NOT join.
  */
-@Testcontainers
-class SpringTransactionalIntegrationTest {
-
-    @Container
-    static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
-            DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres"));
+class SpringTransactionalIntegrationTest extends SpringTransactionalConformance {
 
     private static AnnotationConfigApplicationContext context;
     private static OuterService outer;
     private static ClassLevelService classLevel;
+
+    @Override
+    OuterService outer() {
+        return outer;
+    }
+
+    @Override
+    ClassLevelService classLevel() {
+        return classLevel;
+    }
+
+    @Override
+    JavAIPersistenceConfig config() {
+        return context.getBean(JavAIPersistenceConfig.class);
+    }
+
+    @Override
+    SpringTxRecordRepository repository() {
+        return context.getBean(SpringTxRecordRepository.class);
+    }
 
     @BeforeAll
     static void startSpring() {
@@ -88,218 +94,6 @@ class SpringTransactionalIntegrationTest {
         if (context != null) {
             context.close();
         }
-    }
-
-    @BeforeEach
-    void resetProvider() {
-        JavAIRuntime.configureEmbeddingProvider(new FakeEmbeddingProvider());
-    }
-
-    // ---- the core claim ------------------------------------------------------------------------
-
-    /** The ticket's motivating scenario: several repository calls in one {@code @Transactional} method, one
-     *  of which fails. Under per-call transactions the earlier writes stayed committed. */
-    @Test
-    void writesInOneTransactionalMethodRollBackTogether() {
-        String label = label();
-
-        assertThrows(IllegalStateException.class, () -> outer.twoWritesThenFail(label));
-
-        assertEquals(0, committed(label), "an earlier write must not survive a later failure in the same method");
-    }
-
-    @Test
-    void writesInOneTransactionalMethodCommitTogether() {
-        String label = label();
-
-        outer.twoWrites(label);
-
-        assertEquals(2, committed(label));
-    }
-
-    /** Class-level {@code @Transactional} must behave exactly like the method-level form -- the annotation is
-     *  resolved by Spring before JavAI sees anything, but the whole point is that JavAI needs to know nothing
-     *  about where it was declared. */
-    @Test
-    void classLevelTransactionalBehavesTheSameAsMethodLevel() {
-        String label = label();
-
-        assertThrows(IllegalStateException.class, () -> classLevel.twoWritesThenFail(label));
-
-        assertEquals(0, committed(label), "class-level @Transactional must roll back the same way");
-    }
-
-    /** Read-your-own-writes across two separate repository calls in one transaction: only possible if the
-     *  second call joined the first one's session rather than opening its own. */
-    @Test
-    void aLaterCallSeesAnEarlierCallsUncommittedWrite() {
-        String label = label();
-
-        assertTrue(outer.writeThenReadBack(label), "the second repository call must see the first one's write");
-    }
-
-    // ---- propagation --------------------------------------------------------------------------
-
-    @Test
-    void propagationRequiresNewCommitsIndependentlyOfTheOuterRollback() {
-        String outerLabel = label();
-        String innerLabel = label();
-
-        assertThrows(IllegalStateException.class, () -> outer.writeThenRequiresNewThenFail(outerLabel, innerLabel));
-
-        assertEquals(0, committed(outerLabel), "the outer transaction rolled back");
-        assertEquals(1, committed(innerLabel),
-                "REQUIRES_NEW is a genuinely separate transaction, so its write must survive");
-    }
-
-    @Test
-    void propagationMandatoryFailsOutsideATransactionAndWorksInside() {
-        assertThrows(IllegalTransactionStateException.class, () -> outer.inner().mandatoryWrite(label()));
-
-        String label = label();
-        outer.callMandatoryWithinTransaction(label);
-        assertEquals(1, committed(label));
-    }
-
-    @Test
-    void propagationSupportsRunsWithoutATransactionWhenThereIsNone() {
-        String label = label();
-
-        outer.inner().supportsWrite(label);
-
-        assertEquals(1, committed(label),
-                "with no transaction to join, the call falls back to committing on its own");
-    }
-
-    /** NOT_SUPPORTED suspends the caller's transaction, so JavAI must NOT join it -- proven by the write
-     *  surviving the outer rollback. Joining a suspended transaction would be a real defect. */
-    @Test
-    void propagationNotSupportedDoesNotJoinTheSuspendedTransaction() {
-        String outerLabel = label();
-        String innerLabel = label();
-
-        assertThrows(IllegalStateException.class, () -> outer.writeThenNotSupportedThenFail(outerLabel, innerLabel));
-
-        assertEquals(0, committed(outerLabel));
-        assertEquals(1, committed(innerLabel),
-                "work done under NOT_SUPPORTED is outside the caller's transaction and must survive its rollback");
-    }
-
-    @Test
-    void propagationNeverRejectsBeingCalledInsideATransaction() {
-        assertThrows(IllegalTransactionStateException.class, () -> outer.callNeverWithinTransaction(label()));
-    }
-
-    /**
-     * {@code PROPAGATION_NESTED} is refused under {@code JpaTransactionManager} -- measured, and <em>not</em>
-     * a JavAI limitation: Spring's Hibernate JPA dialect exposes no {@code SavepointManager}, so the
-     * transaction manager rejects the nested call before any repository code runs. Pinned here so the
-     * limitation is attributed correctly if someone hits it; the sibling test below shows the same
-     * propagation working under the other transaction manager.
-     */
-    @Test
-    void propagationNestedIsUnsupportedUnderJpaTransactionManager() {
-        NestedTransactionNotSupportedException thrown = assertThrows(NestedTransactionNotSupportedException.class,
-                () -> outer.writeThenNestedFailureIsCaught(label(), label()));
-
-        assertTrue(thrown.getMessage().contains("savepoints"),
-                "the refusal must come from Spring's savepoint support, not from JavAI; got: "
-                        + thrown.getMessage());
-    }
-
-    /** The same nested call under {@code HibernateTransactionManager}, which does support savepoints: the
-     *  savepoint rolls back without losing the outer transaction's own JavAI write. */
-    @Test
-    void propagationNestedRollsBackToTheSavepointUnderHibernateTransactionManager() {
-        try (AnnotationConfigApplicationContext hibernateContext =
-                new AnnotationConfigApplicationContext(HibernateConfig.class)) {
-            OuterService service = hibernateContext.getBean(OuterService.class);
-            String outerLabel = label();
-            String innerLabel = label();
-
-            service.writeThenNestedFailureIsCaught(outerLabel, innerLabel);
-
-            assertEquals(1, committed(outerLabel), "the outer write survives a rolled-back savepoint");
-            assertEquals(0, committed(innerLabel), "the nested write is undone by its savepoint rollback");
-        }
-    }
-
-    // ---- isolation, readOnly, timeout ----------------------------------------------------------
-
-    @Test
-    void isolationIsAppliedToTheConnectionJavAIWritesThrough() {
-        String label = label();
-
-        int isolation = outer.writeUnderSerializableAndReportIsolation(label);
-
-        assertEquals(Connection.TRANSACTION_SERIALIZABLE, isolation,
-                "JavAI must be writing through the very connection Spring configured, isolation included");
-        assertEquals(1, committed(label));
-    }
-
-    @Test
-    void readOnlyTransactionsStillServeReads() {
-        String label = label();
-        outer.twoWrites(label);
-
-        assertEquals(2, outer.countUnderReadOnly(label), "a read-only transaction must still read");
-    }
-
-    /**
-     * A write attempted inside {@code readOnly = true} fails loudly rather than being silently dropped:
-     * Spring marks the JDBC connection read-only, and Postgres itself rejects the INSERT. Measured, not
-     * assumed -- the plausible-sounding alternative (Hibernate's read-only {@code FlushMode.MANUAL} quietly
-     * discarding the insert) is what this test was originally written to assert, and it is wrong. The loud
-     * failure is the better outcome, and it comes from the caller's own transaction settings reaching JavAI's
-     * writes, which is the whole point.
-     */
-    @Test
-    void writesInsideAReadOnlyTransactionFailLoudly() {
-        String label = label();
-
-        assertThrows(RuntimeException.class, () -> outer.writeUnderReadOnly(label),
-                "Postgres rejects an INSERT in a read-only transaction");
-
-        assertEquals(0, committed(label), "and nothing is written");
-    }
-
-    @Test
-    void aTransactionPastItsTimeoutFailsRatherThanCommitting() {
-        String label = label();
-
-        assertThrows(RuntimeException.class, () -> outer.writeSleepThenWriteWithTimeout(label));
-
-        assertEquals(0, committed(label), "nothing from a timed-out transaction may commit");
-    }
-
-    // ---- rollback rules -----------------------------------------------------------------------
-
-    /** Spring's default: a checked exception does not trigger rollback, so the write commits. */
-    @Test
-    void aCheckedExceptionCommitsByDefault() {
-        String label = label();
-
-        assertThrows(TestCheckedException.class, () -> outer.writeThenThrowChecked(label));
-
-        assertEquals(1, committed(label), "a checked exception does not roll back unless asked to");
-    }
-
-    @Test
-    void rollbackForMakesACheckedExceptionRollBack() {
-        String label = label();
-
-        assertThrows(TestCheckedException.class, () -> outer.writeThenThrowCheckedWithRollbackFor(label));
-
-        assertEquals(0, committed(label), "rollbackFor must extend rollback to the checked exception");
-    }
-
-    @Test
-    void noRollbackForKeepsAWriteDespiteARuntimeException() {
-        String label = label();
-
-        assertThrows(IllegalStateException.class, () -> outer.writeThenThrowWithNoRollbackFor(label));
-
-        assertEquals(1, committed(label), "noRollbackFor must suppress the default runtime-exception rollback");
     }
 
     // ---- the other transaction manager ---------------------------------------------------------
@@ -323,6 +117,25 @@ class SpringTransactionalIntegrationTest {
         }
     }
 
+    // ---- topology-specific: needs a DataSource bean, which only exists when Spring owns the factory ----
+
+    /** The same nested call under {@code HibernateTransactionManager}, which does support savepoints: the
+     *  savepoint rolls back without losing the outer transaction's own JavAI write. */
+    @Test
+    void propagationNestedRollsBackToTheSavepointUnderHibernateTransactionManager() {
+        try (AnnotationConfigApplicationContext hibernateContext =
+                new AnnotationConfigApplicationContext(HibernateConfig.class)) {
+            OuterService service = hibernateContext.getBean(OuterService.class);
+            String outerLabel = label();
+            String innerLabel = label();
+
+            service.writeThenNestedFailureIsCaught(outerLabel, innerLabel);
+
+            assertEquals(1, committed(outerLabel), "the outer write survives a rolled-back savepoint");
+            assertEquals(0, committed(innerLabel), "the nested write is undone by its savepoint rollback");
+        }
+    }
+
     // ---- wiring -------------------------------------------------------------------------------
 
     /** JPA wiring, as a Spring Boot application would have it: LCEMFB + JpaTransactionManager. */
@@ -333,9 +146,9 @@ class SpringTransactionalIntegrationTest {
         @Bean
         DataSource dataSource() {
             DriverManagerDataSource dataSource = new DriverManagerDataSource();
-            dataSource.setUrl(postgres.getJdbcUrl());
-            dataSource.setUsername(postgres.getUsername());
-            dataSource.setPassword(postgres.getPassword());
+            dataSource.setUrl(POSTGRES.getJdbcUrl());
+            dataSource.setUsername(POSTGRES.getUsername());
+            dataSource.setPassword(POSTGRES.getPassword());
             return dataSource;
         }
 
@@ -381,11 +194,12 @@ class SpringTransactionalIntegrationTest {
 
         @Bean
         OuterService outerService(SpringTxRecordRepository repository, InnerService inner,
-                EntityManagerFactory entityManagerFactory) {
+                EntityManagerFactory entityManagerFactory, JavAIPersistenceConfig config) {
             // The NATIVE factory, not the proxy unwrap(SessionFactory.class) yields: that is the identity
             // the backend normalizes to, and the one a Spring-managed session reports as its own.
             return new OuterService(repository, inner,
-                    entityManagerFactory.unwrap(org.hibernate.engine.spi.SessionFactoryImplementor.class));
+                    entityManagerFactory.unwrap(org.hibernate.engine.spi.SessionFactoryImplementor.class),
+                    config);
         }
 
         @Bean
@@ -422,39 +236,10 @@ class SpringTransactionalIntegrationTest {
     private static JavAIPersistenceConfig sharedFactoryConfig(SessionFactory sessionFactory) {
         return JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.POSTGRES)
-                .postgresUrl(postgres.getJdbcUrl())
-                .postgresUsername(postgres.getUsername())
-                .postgresPassword(postgres.getPassword())
+                .postgresUrl(POSTGRES.getJdbcUrl())
+                .postgresUsername(POSTGRES.getUsername())
+                .postgresPassword(POSTGRES.getPassword())
                 .sessionFactory(sessionFactory)
                 .build();
-    }
-
-    private static String label() {
-        return "spring-" + UUID.randomUUID();
-    }
-
-    /** Committed rows only: a separate connection, so nothing in-flight can be mistaken for committed. */
-    private static int committed(String label) {
-        try (Connection connection = DriverManager.getConnection(
-                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
-                PreparedStatement statement = connection.prepareStatement(
-                        "SELECT count(*) FROM test_tx_record WHERE label = ?")) {
-            statement.setString(1, label);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                resultSet.next();
-                return resultSet.getInt(1);
-            }
-        } catch (Exception e) {
-            throw new IllegalStateException("could not count committed rows for " + label, e);
-        }
-    }
-
-    interface SpringTxRecordRepository extends JavAIRepository<TestTxRecord> {
-    }
-
-    static class TestCheckedException extends Exception {
-        TestCheckedException(String message) {
-            super(message);
-        }
     }
 }
