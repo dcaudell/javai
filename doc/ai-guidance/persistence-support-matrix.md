@@ -299,6 +299,28 @@ The getter that "helps" is what breaks it. **Fix:** rename the getter (`identity
 `resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
 JavAI reads fields.
 
+### `save()` returns the managed instance, not the one you passed (changed in 0.1.11, OMI-275)
+
+`repo.save(x)` returns Hibernate's **managed** instance, exactly as Spring Data JPA's `save` does. Up to
+0.1.10 it returned `x` itself, which was never managed.
+
+Two consequences, and the second is the one that bites:
+
+1. **Inside a transaction, mutating the result is dirty-checked.** Before, it silently was not.
+2. ⚠️ **The returned graph is a different object graph from the one you passed in.** Ordinary `merge`
+   semantics: `save(x) != x`, and mutating `x` afterwards does not affect what you got back. **After a save,
+   keep using what `save` returned, or keep using your own instance — do not mix them.**
+
+### An uninitialized proxy answers its `@Id` for free, *if* the getter is public
+
+A lazy singular association comes back as an uninitialized proxy whose `@Id` you can read without a database
+round trip — which is what lets you wire associations by identity on a detached entity.
+
+⚠️ **This requires a `public` identifier getter.** Hibernate serves the id by overriding that getter, and it
+cannot override a package-private one: the call falls through to the uninitialized instance and triggers a
+load, so on a detached entity what looks like a free read raises `LazyInitializationException`. Nothing warns
+you; the fix is one keyword.
+
 ### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
 
 `summaryVector()` has to read each `@Summary` child's own summary. If that child is a still-uninitialized

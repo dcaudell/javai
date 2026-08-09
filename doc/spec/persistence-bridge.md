@@ -335,6 +335,39 @@ deferring every vector write to commit time — across three backends, and throu
 queue above. `saveAll` is the answer for that shape. The cost of not doing it is pinned by a test rather than
 left as a footnote.
 
+## Attachment: one graph, one state (OMI-275)
+
+A repository call returns a graph that is uniformly attached or uniformly detached, never mixed. Outside a
+unit of work everything is detached; inside one, the root and every node reached through it are managed --
+through a lazy hop, an eager one, `@OneToOne`, `@ManyToOne`, `@OneToMany`, `@ManyToMany`, `@Any`, and a
+self-reference alike.
+
+**A mixed graph is the outcome worth designing against**, which is why it is stated as a property rather than
+left to fall out. Nothing about an object tells a caller which kind of node they hold, so in a mixed graph the
+same traversal works or throws depending on where they landed, and mutations are silently persisted in one
+place and silently discarded in another. No rule a caller could learn covers it.
+
+There was exactly one route to one: `save()` used to return the caller's own instance, which is never
+managed, while Hibernate tracked a merged copy. Give that unmanaged root a child the caller had loaded in the
+same unit of work and the result was an unmanaged root holding a managed child.
+
+**So `save()` returns the managed instance now, as Spring Data JPA's does.** It could not before: `merge()`
+leaves `<transient>` fields empty on the managed copy, and JavAI collections used to be transient. OMI-277
+made them native associations that `merge()` carries across, leaving only `Point` fields, which `save` copies
+across explicitly.
+
+Two consequences to know:
+
+- **Inside a transaction, mutating what `save` returned is dirty-checked.** Before, it was not.
+- **The returned graph is a different object graph from the one passed in** -- ordinary `merge` semantics.
+  After a save, use what `save` returned *or* your own instance, but do not mix them and expect the same
+  objects.
+
+**An uninitialized proxy answers its `@Id` without a round trip only if the identifier getter is `public`.**
+Hibernate serves it by overriding that getter and cannot override a package-private one, so the call falls
+through to the uninitialized instance and triggers a load -- which on a detached entity turns a free read into
+`LazyInitializationException`. Nothing warns about it.
+
 ## A read loads what was read, not what is reachable from it (OMI-271)
 
 The section above is about not re-embedding what a load already knows. It says nothing about how much the

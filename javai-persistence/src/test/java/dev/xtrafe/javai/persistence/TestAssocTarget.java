@@ -36,7 +36,10 @@ class TestAssocTarget implements JavAIVectorizable {
         this.label = label;
     }
 
-    UUID getId() {
+    /** Public deliberately: Hibernate can only serve a proxy's identifier without initializing it when it
+     *  can override the identifier getter, which it cannot do for a package-private method. See
+     *  {@code AttachmentConformanceTest.aLazyManyToOneIsAnUninitializedProxyThatStillAnswersItsId}. */
+    public UUID getId() {
         return id;
     }
 

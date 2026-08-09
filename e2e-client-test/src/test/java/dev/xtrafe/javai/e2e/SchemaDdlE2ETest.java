@@ -80,18 +80,27 @@ class SchemaDdlE2ETest {
         assertTrue(keys.contains("comments_id -> comment"), "join table must FK to the target; got " + keys);
     }
 
-    /** ...and the side table still exists for the concrete-typed shape, holding its own membership rows. */
+    /**
+     * The membership side table is no longer claimed by any mapping (OMI-277).
+     *
+     * <p>It used to hold the concrete-typed shape's rows -- {@code relatedComments} lived here while
+     * {@code comments} was native, and this test pinned exactly that split. OMI-277 refused the concrete
+     * shape, so both collections are native associations now and nothing writes here.
+     *
+     * <p>The table is still created, deliberately: the machinery is left in place, unreachable rather than
+     * deleted, so the decision can be reversed if real use argues for it. Its shape is still asserted for
+     * the same reason -- a reversal should find it as it was.
+     */
     @Test
-    void concreteTypedJavAICollectionStillUsesTheSideTable() throws Exception {
+    void theMembershipSideTableIsNoLongerClaimedByAnyMapping() throws Exception {
         assertTrue(tables().contains("javai_collection_members"));
         assertEquals(
                 Set.of("owner_type", "owner_id", "field_name", "member_type", "member_id", "member_key", "ordinal"),
                 columns("javai_collection_members"),
-                "the membership side table's shape is part of the contract");
+                "the membership side table's shape is part of the contract, reversible or not");
 
-        // relatedComments (concrete) is in the side table; comments (native) must NOT be.
-        assertTrue(sideTableHasField("relatedComments"),
-                "the concrete-typed collection must round-trip through javai_collection_members");
+        assertFalse(sideTableHasField("relatedComments"),
+                "the map is a native @OneToMany + @MapKeyColumn now, not a side-table collection");
         assertFalse(sideTableHasField("comments"),
                 "the natively-mapped collection must NOT be claimed by the side table -- that double-claim was "
                         + "the silent duplication bug OMI-142 fixed");

@@ -14,6 +14,24 @@ version -- a given release usually changes only one or two of them.
 
 ### Changed
 
+- **⚠️ `javai-persistence`: `save()` returns the managed instance, as Spring Data JPA's does (OMI-275).**
+  It used to return the caller's own instance, which was never managed. That was deliberate — `merge()` left
+  `@Transient` JavAI collection fields empty on the managed copy — and OMI-277 removed the reason by making
+  JavAI collections native associations `merge()` carries across. Only `Point` fields are still transient,
+  and `save` now copies those onto the managed copy explicitly.
+
+  **What it fixes is not only a difference from Spring Data.** Returning an unmanaged root while the session
+  was open was the *one* way a caller could be handed a graph attached in one place and detached in another:
+  mutate the root and the change was silently discarded, mutate a child reached through it and the change was
+  silently persisted, with nothing about either object saying which was which. Measured, then fixed —
+  `AttachmentConformanceTest`.
+
+  ⚠️ **The returned graph is a different object graph from the one passed in.** That is ordinary `merge`
+  semantics, and it is the part most likely to surprise: after a save, keep using what `save` returned *or*
+  keep using your own instance, but do not mix them and expect the same objects. Mutating an entity you still
+  hold no longer affects what `save` handed back.
+
+
 - **⚠️ `javai-persistence`/`javai-tagging`: a JavAI collection field must be declared by its interface
   (OMI-277).** `private final JavAIArrayList<X> xs = new JavAIArrayList<>();` is **refused at registration**
   now, with a message naming the interface to use instead. The supported shape is the one already
