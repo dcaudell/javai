@@ -332,6 +332,40 @@ Two consequences, and the second is the one that bites:
    semantics: `save(x) != x`, and mutating `x` afterwards does not affect what you got back. **After a save,
    keep using what `save` returned, or keep using your own instance — do not mix them.**
 
+### ⚠️ A lazy to-one whose target class is `final` is silently eager (OMI-279)
+
+Hibernate makes a lazy to-one by handing you a **proxy — a generated subclass of the target entity**. A
+`final` class cannot be subclassed, so there is no proxy to hand over and the association is fetched with its
+owner instead.
+
+```java
+@Entity final class Seal { … }                    // ← the whole cause
+
+@OneToOne(fetch = FetchType.LAZY)
+private Seal seal;                                 // asks for lazy, gets eager
+```
+
+**Nothing tells you.** Not the mapping, not the annotation, not the log. The value is correct — merely
+fetched sooner than you asked — so this is a cost, never a wrong answer. But it is a cost that scales with
+the graph, and `final` is a keyword people put on entities by habit.
+
+The same applies to the entity a lazy `@ManyToOne`, `@OneToOne` or `@Any` points at, and to
+`Hibernate.isInitialized`, which will report `true` on a field you declared `LAZY`. If a to-one you expected
+to be lazy is not, **check the target class for `final` before looking anywhere else** — measured in
+`RemainingFetchCellsConformanceTest`, where `TestSeal` and `TestWaxSeal` are identical targets of identical
+mappings and differ only in that keyword.
+
+### `@OneToOne`: the two sides do not behave alike (OMI-279)
+
+| Side | `fetch = LAZY` | Why |
+|---|---|---|
+| **Owning** (holds the FK), optional **or** `optional = false` | ✅ honoured | The FK column is itself proof of whether the row exists, so a proxy promises nothing it cannot keep |
+| **Inverse** (`mappedBy`) | ❌ **fetched eagerly** | There is no FK on this side. Hibernate has to look to know whether the other row exists at all, so it looks |
+
+⚠️ **`optional = false` does *not* force an eager fetch on the owning side**, which is worth stating because
+the opposite is widely repeated. That folklore is true of the inverse side and false here; measured, not
+assumed. As with the `final` rule above, the inverse-side fetch is early rather than wrong.
+
 ### An uninitialized proxy answers its `@Id` for free, *if* the getter is public
 
 A lazy singular association comes back as an uninitialized proxy whose `@Id` you can read without a database

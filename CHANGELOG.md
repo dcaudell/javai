@@ -12,6 +12,27 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Added
+
+- **Conformance coverage for the fetch/attachment cells that were named but never measured (OMI-279).** The
+  bidirectional `@OneToOne`/`@OneToMany` pairs, `@OneToOne(optional = false)`, `@Any` under `LAZY`, and the
+  `EAGER` variants of both collection mappings. No production code changed — every cell is either conformant
+  or a documented Hibernate behaviour JavAI inherits — but three of them are now written down rather than
+  assumed:
+
+  - ⚠️ **A lazy to-one whose target class is `final` is silently eager.** Hibernate proxies by subclassing,
+    and a `final` class cannot be subclassed. Nothing reports it, `Hibernate.isInitialized` returns `true` on
+    a field declared `LAZY`, and the value is correct — only early. `final` is a keyword people put on
+    entities by habit, so this is the one most likely to be met in the wild.
+  - ⚠️ **The inverse side of a `@OneToOne` (`mappedBy`) ignores `LAZY`.** No foreign key on that side, so
+    Hibernate must look to know whether the other row exists.
+  - **`optional = false` on the *owning* side does *not* force an eager fetch** — the opposite of the widely
+    repeated rule, which holds only for the inverse side. The FK column is itself proof the row exists.
+
+  The middle finding is why the first was found at all: every fixture in the new test was `final`, so *both*
+  to-ones came back eager and finality was very nearly documented as optionality. `TestSeal` and
+  `TestWaxSeal` are now identical targets of identical mappings differing only in the keyword.
+
 ### Changed
 
 - **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
