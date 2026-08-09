@@ -131,25 +131,23 @@ import java.util.concurrent.ConcurrentHashMap;
  * saved through one its members were silently never written. It could not be made lazy where it stood
  * either, since the field holds a final instance of a final class. Both the mapping and its table are gone.
  *
- * <p>Both shapes are fully supported and can coexist in the same entity, field by field. The one
- * combination that cannot work -- a concrete-typed field carrying {@code @OneToMany}/{@code @ManyToMany} --
- * is rejected eagerly by {@link #validateCollectionFieldMapping} with a message naming the interface-typed
- * fix. Note this is a Postgres-only distinction: the Neo4j and MongoDB backends classify collections purely
- * by declared type and have no equivalent of a native JPA association.
+ * <p>So there is exactly <b>one</b> JavAI collection mapping on this backend, and
+ * {@link #validateCollectionFieldMapping} rejects the concrete-typed field eagerly, with a message naming the
+ * interface-typed fix. Note this is a Postgres-only distinction: the Neo4j and MongoDB backends classify
+ * collections purely by declared type, have no equivalent of a native JPA association, and accept either
+ * shape -- so the field that works on all three is the interface-typed one.
  *
- * <p><b>No manual {@code @Transient} required.</b> {@link #registerEntityType} reflectively detects, for
- * every registered entity type, which fields are shaped like a JavAI collection (a {@code Collection}/
- * {@code Map} that also implements {@link JavAIDirtyTracking} -- true of {@code JavAIArrayList}/
- * {@code JavAILinkedHashSet}/{@code JavAILinkedHashMap} today, and of any future JavAI collection type
- * following the same pattern, with no code change needed here) and, at {@link #buildSessionFactory}
- * time, generates an in-memory JPA {@code orm.xml}-equivalent mapping document that marks exactly those
- * fields {@code <transient>} -- fed to Hibernate via {@link MetadataSources#addInputStream}, alongside the
- * ordinary {@code @Entity}-driven annotation scanning. This is a real, spec-defined JPA override mechanism
- * (XML mappings logically override annotations for whatever they explicitly mention, leaving everything
- * else annotation-driven), not a hack -- the developer's source needs no {@code @Transient} on these
- * fields at all; detection is 100%-confidence from the field's declared type alone, since a
- * {@code JavAIDirtyTracking}-implementing collection can never be validly Hibernate-mapped natively
- * regardless of context.
+ * <p><b>No manual {@code @Transient} required</b> on a field this backend maps itself. At
+ * {@link #buildSessionFactory} time it generates an in-memory JPA {@code orm.xml}-equivalent mapping document
+ * marking exactly those fields {@code <transient>} -- fed to Hibernate via
+ * {@link MetadataSources#addInputStream}, alongside the ordinary {@code @Entity}-driven annotation scanning.
+ * This is a real, spec-defined JPA override mechanism (XML mappings logically override annotations for
+ * whatever they explicitly mention, leaving everything else annotation-driven), not a hack, and detection is
+ * 100%-confidence from the field's declared type alone -- see {@link #isBackendManagedField}.
+ *
+ * <p>Today that means <b>{@code Point} fields only</b>, which live in {@code javai_geo_points}. It used to
+ * mean JavAI collection fields as well, when they had storage of their own; since OMI-277 they are ordinary
+ * Hibernate associations, and hiding them from Hibernate is the last thing wanted.
  *
  * <p><b>Transactions: joins the caller's, or opens its own (OMI-146).</b> Every operation resolves its
  * session through {@link #ambientSession()} rather than calling {@code openSession()} directly. When the
@@ -184,11 +182,13 @@ import java.util.concurrent.ConcurrentHashMap;
  * separately realize {@code CommentRepository}/{@code AttachmentRepository} first just to get those types
  * into Hibernate's boot metadata -- reachability through {@code Article}'s own fields is enough.
  *
- * <p><b>Known limitation: {@code Map} fields must be keyed by {@code String} in this phase.</b> The
- * membership table's key column is a plain {@code varchar}; a {@code JavAILinkedHashMap<K, V>} field is
- * only supported when {@code K} is {@code String}. {@link #registerEntityType} validates this eagerly, at
- * registration time, and throws a clear {@code IllegalArgumentException} for any other key type rather than
- * silently storing a stringified key that could never correctly round-trip back to its original type.
+ * <p><b>Map keys are Hibernate's business, not this backend's (OMI-277).</b> This class used to refuse any
+ * {@code Map} field not keyed by {@code String}, because the membership table's key column was a plain
+ * {@code varchar} and a stringified key could never round-trip back to its original type. The table is gone
+ * and a map is an ordinary JPA association now, keyed however {@code @MapKeyColumn}/{@code @MapKeyEnumerated}
+ * and friends say -- so the validator went with the storage it protected. {@code RepositoryBackendNeo4j} and
+ * {@code RepositoryBackendSpringDataMongo} still enforce the rule, for exactly the reason it originally
+ * existed: their key genuinely is a string property on a relationship or in a reference array.
  *
  * <p><b>How the native mapping is attached.</b> Shape 1 above is delivered by Hibernate's
  * {@code org.hibernate.usertype.UserCollectionType} SPI, which lets a custom {@code PersistentCollection}
@@ -493,9 +493,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                         + entityType.getName() + "." + field.getName() + " -- a plain JDK collection needs a JPA "
                         + "mapping annotation (@OneToMany/@ManyToMany for entities, @ManyToAny for a polymorphic "
                         + "collection, @ElementCollection for "
-                        + "basic/embeddable values), or @Transient to exclude it. Use a JavAI collection type "
-                        + "(JavAIArrayList/JavAILinkedHashSet/JavAILinkedHashMap) if you want JavAI's own "
-                        + "vector-aware collection storage instead.");
+                        + "basic/embeddable values), or @Transient to exclude it. For a vector-aware, "
+                        + "dirty-tracking collection, declare the field by a JavAI INTERFACE "
+                        + "(JavAIList/JavAISet/JavAIMap), non-final, and annotate it exactly the same way -- "
+                        + "it stays an ordinary JPA association, and JavAI's own collection instance is "
+                        + "preserved across Hibernate's substitution.");
             }
         }
     }
@@ -522,8 +524,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     /** Deletes the vector/geo rows of members Hibernate is about to cascade-delete along with {@code entity}.
-     *  The JavAI-collection equivalent lives in {@link #cascadeDeleteCollectionMembers}, which is driven off
-     *  membership rows -- rows a natively-mapped association doesn't have. */
+     *  Without this their side-table rows would outlive the rows they describe. (There used to be a second
+     *  path here for members held in a membership table of this backend's own; it went with the table in
+     *  OMI-277, and a natively-mapped association is now the only shape there is.) */
     private void deleteVectorsForCascadedCollectionMembers(Session session, Object entity) {
         for (Field field : EntityReflection.allFields(entity.getClass())) {
             if (isJavAICollectionField(field) || !cascadesRemove(field)) {
@@ -1343,9 +1346,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     // ---- geo Point fields: out-of-band storage in javai_geo_points ----------------------------
 
     /** Upserts (or clears) the {@code Point} fields of every reachable {@code @Entity} into
-     *  {@code javai_geo_points}. Point fields are {@code @Transient} (see {@link #isBackendManagedField}),
-     *  so -- exactly like JavAI collection fields -- their value lives only on the caller's original object,
-     *  which is why {@link #save} passes {@code entity}, not the merged instance. */
+     *  {@code javai_geo_points}. Point fields are {@code @Transient} (see {@link #isBackendManagedField}), so
+     *  {@code merge()} does not carry them onto the managed copy and their value lives only on the caller's
+     *  original object -- which is why {@link #save} passes {@code entity} here, not the merged instance, and
+     *  copies them across explicitly afterwards. They are the last field kind this is true of. */
     private void syncGeoPoints(Session session, Object entity, Map<Object, Boolean> visited) {
         if (entity == null || visited.put(entity, Boolean.TRUE) != null) {
             return;
@@ -1864,9 +1868,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * session holding an element that no longer exists.
      *
      * <p>This is a <b>membership</b> removal, never a cascade: the container loses its reference, and every
-     * other entity is untouched. That is the same thing {@code cascadeDeleteCollectionMembers} has always
-     * done for this backend's own membership rows -- the natively-mapped half was simply missing, which is
-     * why deleting an entity worked or failed depending on how its container declared the field.
+     * other entity is untouched. It was added (OMI-255) because only the membership-table half of this
+     * existed, so deleting an entity worked or failed depending on how its container happened to declare the
+     * field -- a distinction no caller deleting something should have had to know about. That other half is
+     * gone with its table (OMI-277); this is the whole of it now.
      */
     private void detachFromContainers(Session session, Class<?> entityType, UUID id) {
         List<Containment.Edge> edges = containment().collectionEdgesHolding(entityType);

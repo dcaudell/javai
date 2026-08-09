@@ -157,13 +157,11 @@ Three consequences worth knowing before you annotate:
 Full contract, including what happens when a recomputation fails, is in `persistence-support-matrix.md`'s
 "Concurrency" section. On Neo4j/MongoDB summaries are still written inline.
 
-### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
+### Collection fields on a persisted `@Entity` — declare them by the interface
 
 When a class is both `@JavAIVectorizable` and a JPA `@Entity` persisted through `JavAIRepository` on
-**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides how it is
-stored. Both shapes are fully supported, and one entity can carry both.
-
-**1. Interface-typed + an ordinary JPA association → a native Hibernate association.** The recommended shape:
+**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides whether it
+can be mapped at all. **Since 0.1.10 there is one shape:**
 
 ```java
 @OneToMany(cascade = CascadeType.ALL)
@@ -177,25 +175,29 @@ field is a `PersistentJavAIList`/`PersistentJavAISet`/`PersistentJavAIMap`, i.e.
 collection, so vectors and dirty-tracking survive the load. You write **nothing** JavAI-specific to get
 this — no `@CollectionType`; the backend attaches it at mapping time. Two requirements, both mechanical:
 declare the field by the JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), and don't make it `final`,
-since Hibernate assigns the field its own instance.
+since Hibernate assigns the field its own instance. A `Map` also wants `@MapKeyColumn`.
 
-**2. Concrete-typed with no association annotation → JavAI's own side-table storage.**
+**⚠️ Breaking change in 0.1.10 (OMI-277): the concrete-typed field is now refused.**
 
 ```java
 private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 ```
 
-Stored in `javai_collection_members`, a shared side table the persistence backend owns, and hydrated
-reflectively back into the instance your own constructor created — so `final` is fine here. No join table and
-no FK integrity; `Map` keys must be `String` in this phase.
+That used to be a second supported shape, stored in a side table the backend owned. It is rejected at
+repository-registration time now, with an `IllegalArgumentException` naming the interface to use — and the
+table is gone. It was withdrawn rather than repaired because it was **silently root-only in both
+directions**: reached through an association the collection came back empty, and saved through one its
+members were never written. It could not be made lazy where it stood either, since the field holds a `final`
+instance of a `final` class and Hibernate manages a collection by substituting its own.
 
-**The one combination that fails fast:** a *concrete*-typed field carrying `@OneToMany`/`@ManyToMany` is
-rejected with an `IllegalArgumentException` at repository-registration time, naming the interface-typed fix.
-It can't be honored — you'd silently get JavAI's own "owner owns its members" cascade instead of the JPA
-semantics you asked for, which is actively unsafe for `@ManyToMany`.
+**Migrating:** change the declared type to the interface, drop `final`, and add the JPA annotation you would
+have written for a plain collection. The initializer stays exactly as it is. Any *caller* that declared its
+receiver as the concrete type (`JavAIArrayList<Comment> cs = article.getComments();`) needs the same one-word
+change.
 
 **Backend caveat:** native associations are **Postgres-only**. Neo4j and MongoDB classify collection fields by
-declared type and store both shapes their own way, so an interface-typed field buys you nothing there. Check
+declared type, accept either declaration, and store both their own way — so the interface-typed field buys
+you nothing there, but it is what makes one entity portable across all three. Check
 [`persistence-support-matrix.md`](persistence-support-matrix.md) — it has the per-backend tables for JPA
 annotations, derived-finder capabilities, and collection types — before relying on any of this.
 
@@ -731,7 +733,8 @@ public class Chapter {
     private Chapter continuation;
 
     @Summary(concatenate = true)           // 3. aggregate these members' text into mine
-    private final JavAIArrayList<Footnote> footnotes = new JavAIArrayList<>();
+    @OneToMany(cascade = CascadeType.ALL)  //    (interface-typed + annotated: see "Collection fields" above)
+    private JavAIList<Footnote> footnotes = new JavAIArrayList<>();
 }
 ```
 
@@ -923,6 +926,7 @@ import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
+import dev.xtrafe.javai.model.JavAIMap;
 import jakarta.persistence.*;
 import java.util.UUID;
 
@@ -941,15 +945,18 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
     @PromptContext
     private String body;
 
-    // Shape 1: interface-typed + @OneToMany -> a native Hibernate association (Postgres).
-    // Non-final, because Hibernate substitutes its own PersistentJavAIList into the field.
+    // Interface-typed + @OneToMany -> a native Hibernate association. Non-final, because Hibernate
+    // substitutes its own PersistentJavAIList into the field.
     @OneToMany(cascade = CascadeType.ALL)
     @Summary
     private JavAIList<Comment> comments = new JavAIArrayList<>();
 
-    // Shape 2: concrete-typed, unannotated -> JavAI's own javai_collection_members side table.
-    // final is fine here: this instance is hydrated into, never replaced.
-    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+    // A second to-many of the SAME element type, so it needs its own join table named explicitly --
+    // Hibernate would otherwise derive `article_comment` for both. A map also wants @MapKeyColumn.
+    @OneToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    @JoinTable(name = "article_related_comment")
+    @MapKeyColumn(name = "related_key")
+    private JavAIMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     public void setTitle(String title) { this.title = title; }   // re-vectorizes lazily on next vector() read
     public void setBody(String body) { this.body = body; }
@@ -957,10 +964,10 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
 }
 ```
 
-Both collection shapes appear here deliberately — see "Collection fields on a persisted `@Entity`" above.
-Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments` can just as well be a plain
-`final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()` don't depend on persistence
-at all.
+Both collection fields are interface-typed, because since 0.1.10 that is the only shape Postgres maps — see
+"Collection fields on a persisted `@Entity`" above. Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments`
+can just as well be a plain `final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()`
+don't depend on persistence at all, and the concrete type is only a problem when Hibernate has to map it.
 
 Using it — every call below is a woven method, not something declared in `Article.java`
 (imports for `EmbeddingVector`/`JavAIList`/`Cortex`/`CompletionRequest`/`CompletionResult`/`PromptContext`/

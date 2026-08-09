@@ -26,12 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <em>behavior</em> (a save round-trips, a finder matches); this one asserts the <em>shape of the database</em>,
  * which is what a DBA, a reporting tool, or a hand-written SQL query would see.
  *
- * <p>The load-bearing claim is that {@link Article} carries <b>both</b> collection mappings simultaneously:
- * {@code comments} is an interface-typed JavAI collection with a plain {@code @OneToMany}, so Hibernate owns
- * it as a genuine association with its own join table and foreign keys; {@code relatedComments} is a
- * concrete-typed JavAI collection, so it round-trips through JavAI's own {@code javai_collection_members}
- * side table. Neither leaks a column onto the owning entity's table. If a future change quietly collapsed
- * one path into the other, these assertions fail rather than the behavior silently drifting.
+ * <p>The load-bearing claim is that {@link Article}'s two collection fields are <b>real Hibernate
+ * associations</b> -- each with its own join table and foreign keys, neither leaking a column onto the
+ * owning entity's table, and each in a table of its own rather than sharing the one Hibernate would name by
+ * default for two to-manys of the same element type. It also pins the <em>absence</em> of
+ * {@code javai_collection_members}: the mapping that used it was refused in OMI-277 and its DDL went with
+ * it, so a database built from scratch must not have one.
  */
 class SchemaDdlE2ETest {
 
@@ -193,15 +193,4 @@ class SchemaDdlE2ETest {
         return found;
     }
 
-    private static boolean sideTableHasField(String fieldName) throws Exception {
-        try (Connection connection = connection();
-                PreparedStatement statement = connection.prepareStatement(
-                        "SELECT count(*) FROM javai_collection_members WHERE field_name = ?")) {
-            statement.setString(1, fieldName);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                resultSet.next();
-                return resultSet.getInt(1) > 0;
-            }
-        }
-    }
 }

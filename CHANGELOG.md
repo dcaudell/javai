@@ -104,6 +104,19 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **Docs: `doc/ai-guidance/persistence-support-matrix.md` described the storage this release deleted.** The
+  consumer-facing support matrix still had JavAI collections living in a side table, `@Transient` being
+  auto-added for them, a to-many finder hop costing a query per hop, `String`-keyed maps as a rule on all
+  three backends, and — worst of the set, because someone would have followed it — a *Rules of thumb* line
+  reading "*Many* related entities → a **JavAI collection**, never `@OneToMany`", which 0.1.10 inverts. Also
+  corrected: the `save()`-returns-managed note was dated to 0.1.11, a version that does not exist.
+
+  The same OMI-277 vestiges are gone from `RepositoryBackendHibernatePostgres`'s own javadoc, which claimed
+  "both shapes are fully supported and can coexist" two paragraphs after explaining that one of them was
+  withdrawn, and from the `IllegalArgumentException` thrown at an unmapped collection field, which advised
+  reaching for a concrete JavAI collection — the shape that is now refused, so following the message led
+  straight into a second failure.
+
 - **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**
   A 0.1.10 regression, and a silent one: nothing threw and nothing logged, so an entity simply appeared to
   have no location. `Point` fields live out-of-band in `javai_geo_points` and were read by a recursive walk
@@ -160,9 +173,11 @@ version -- a given release usually changes only one or two of them.
   a detached entity threw from inside JavAI once the crutch was gone. All four now skip what they cannot see
   without loading it.
 
-  A JavAI collection field carrying **no** association annotation is still hydrated eagerly, deliberately: it
-  is mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on, so
-  declining to fill it would hand back a silently-empty collection rather than a lazy one.
+  This left one deliberate exception — a JavAI collection field carrying **no** association annotation stayed
+  eagerly hydrated, since it was mapped out-of-band and had no Hibernate laziness to lean on, and declining to
+  fill it would have handed back a silently-empty collection rather than a lazy one. **OMI-277, later in this
+  same release, removed that mapping and with it the exception.** As shipped, no collection shape ignores its
+  declared `FetchType`.
 
 ### Added
 

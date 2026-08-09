@@ -259,8 +259,9 @@ back-edge walk is correct for a single process holding the whole graph, and insu
 deployment is multi-pod: a pod that loaded a `Shelf` through its own repository holds no `Library`, so there
 is no back-edge to walk and the library's summary silently keeps whatever some other pod last left. The
 drain instead asks which containers *currently* hold the entity, from the declared `@Summary` fields of
-registered types plus the stored relationships -- covering both natively-mapped associations (HQL) and this
-backend's own `javai_collection_members` (SQL) -- and walks up transitively.
+registered types plus the stored relationships -- resolved by HQL over the mapped association, singular or
+to-many -- and walks up transitively. (It used to cover a second storage shape by SQL as well; that shape and
+its table went in OMI-277, and this lookup lost the half that served it.)
 
 Two costs are accepted deliberately. A summary row is **stale within the caller's own transaction**, since
 the write happens after commit. And a drain that fails leaves the recomputation queued rather than
@@ -482,15 +483,16 @@ query language (Postgres → JPA Criteria, Neo4j → Cypher, MongoDB → a drive
 paths** are supported through *both* singular associations *and* to-many/collection relationships
 (`findByReviewsReviewer` — an entity by a field of its collection members). Each backend uses the mechanism
 that fits its storage: Neo4j composes a self-contained `EXISTS { MATCH (n)-[:REL]->(x) WHERE … }` subquery
-(correct through any cardinality and under `And`/`Or`); Postgres and MongoDB, whose related entities live
-out-of-band (Postgres `javai_collection_members`; Mongo `{type, id}` reference pointers, not embedded),
-resolve the matching related ids first and then match owners referencing them, expressed as `root.id IN (…)`.
-Pure single-or-nested-*singular* scalar predicates stay a native Criteria join on Postgres. **Collection
-emptiness** (`findByReviewsIsEmpty`) rides the same side tables/relationships. *Sort* is still limited to a
-singular scalar path (a to-many sort is ambiguous). The id-set resolution materializes intermediate id sets
-and issues a query per hop — fine for the Phase-0 goal of proving the design space; a single-statement
-rewrite (a mapped membership entity for Criteria subqueries; `$lookup` for Mongo) is a natural later
-optimization.
+(correct through any cardinality and under `And`/`Or`); MongoDB, whose related entities live out-of-band as
+`{type, id}` reference pointers rather than embedded, resolves the matching related ids first and then matches
+owners referencing them, expressed as `root.id IN (…)`. **Postgres is a native Criteria join throughout** —
+singular or to-many, since OMI-277 left it one collection shape and that shape is a mapped association. The
+id-set-per-hop path it used to need for the other shape is gone with it; the one Postgres predicate still
+resolved that way is **geo**, whose `javai_geo_points` is not a table Hibernate can join. **Collection
+emptiness** (`findByReviewsIsEmpty`) rides the same mechanisms. *Sort* is still limited to a singular scalar
+path (a to-many sort is ambiguous). Where id-set resolution survives it materializes an id set and issues a
+query per hop — fine for the Phase-0 goal of proving the design space; `$lookup` is the natural later
+optimization for Mongo.
 
 **Geo (`Near`/`Within`).** A `Point` field (Spring Data's `org.springframework.data.geo.Point`) round-trips
 per backend — a Neo4j native `point`, a MongoDB GeoJSON `Point`, and (Postgres) two columns in a
