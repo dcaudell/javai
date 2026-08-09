@@ -13,6 +13,7 @@ import org.testcontainers.utility.DockerImageName;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -49,23 +50,52 @@ class JpaFetchSemanticsConformanceTest {
     }
 
     /**
-     * The same field, the same row, two access paths.
+     * The shape that used to be silently root-only is refused outright (OMI-277).
      *
-     * <p>{@code TestVenue.reviews} is a JavAI collection with no association annotation, so it is stored
-     * out-of-band in {@code javai_collection_members} rather than mapped by Hibernate. {@code hydrateLoaded}
-     * fills it for the entity a repository call returns -- and only for that entity, since it does not
-     * recurse. Reached through an association instead, nothing fills it, and it is indistinguishable from a
-     * venue that genuinely has no reviews.
+     * <p>A concrete-typed JavAI collection field was stored out-of-band in {@code javai_collection_members},
+     * and that storage was only ever read and written for the entity a repository call returned: reached
+     * through an association it came back empty, and saved through one its members were never written.
+     * Neither failure announced itself, which is what made "still supported" the wrong answer.
+     *
+     * <p>Refusing it at registration is the whole fix. It cannot be made lazy where it stands -- the field
+     * holds a {@code final} concrete instance the entity's own constructor created, and Hibernate manages a
+     * collection by substituting its own, which a final class forbids. The message has to say that, because
+     * the fix is a one-line change to the declaration and nothing about the failure suggests it.
      */
     @Test
-    void aSideTableCollectionIsPopulatedAsARootAndEmptyThroughAnAssociation() {
-        TestVenue venue = new TestVenue("conformance-venue", null,
+    void aConcreteTypedJavAICollectionFieldIsRefusedAtRegistration() {
+        // Its own configuration, so the refusal is the mapping validation rather than the
+        // already-built-the-factory refusal this class's shared config would hit by now.
+        JavAIPersistenceConfig freshConfig = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.POSTGRES)
+                .postgresUrl(postgres.getJdbcUrl())
+                .postgresUsername(postgres.getUsername())
+                .postgresPassword(postgres.getPassword())
+                .build();
+
+        IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
+                () -> JavAIPI.repository(TestConcreteJavAICollectionRepository.class, freshConfig));
+
+        assertTrue(refused.getMessage().contains("JavAIList"),
+                "the message must name the interface to declare instead; got: " + refused.getMessage());
+        assertTrue(refused.getMessage().contains("members"),
+                "...and the offending field; got: " + refused.getMessage());
+    }
+
+    /**
+     * And the supported shape behaves like any other association through the same access path the refused
+     * one got wrong -- which is the point of refusing it rather than repairing it.
+     */
+    @Test
+    void aJavAICollectionIsReadableThroughAnAssociationLikeAnyOtherAssociation() {
+        TestVenue venue = new TestVenue("through-association-venue", null,
                 List.of(new TestReview("a", 5), new TestReview("b", 4), new TestReview("c", 3)));
-        TestVenueGroup group = new TestVenueGroup("conformance-group");
+        TestVenueGroup group = new TestVenueGroup("through-association-group");
         group.getVenues().add(venue);
         groups.save(group);
 
-        int asRoot = venues.findById(venue.getId()).orElseThrow().getReviews().size();
+        int asRoot = JavAIPI.inTransaction(config, () ->
+                venues.findById(venue.getId()).orElseThrow().getReviews().size());
 
         int throughAssociation = JavAIPI.inTransaction(config, () -> {
             TestVenueGroup loaded = groups.findById(group.getId()).orElseThrow();
@@ -73,7 +103,7 @@ class JpaFetchSemanticsConformanceTest {
             return loaded.getVenues().get(0).getReviews().size();
         });
 
-        assertEquals(3, asRoot, "as the root of a repository call the side table is read");
+        assertEquals(3, asRoot);
         assertEquals(asRoot, throughAssociation,
                 "the same field on the same row must not depend on how its owner was reached");
     }
@@ -121,36 +151,20 @@ class JpaFetchSemanticsConformanceTest {
     }
 
     /**
-     * Separates the two halves of the collection defect, which otherwise hide inside one another: the test
-     * above cannot tell "the rows were never written" from "the rows are never read".
-     *
-     * <p>Saving as a root first guarantees the rows exist; reading as a root afterwards confirms they are
-     * still there. Only the read <em>through an association</em> comes back empty. Measured:
-     * {@code afterRootSave=2, rootReadAfterGroupSave=2, throughAssociation=0}.
+     * The write side of the same question, which used to lose members entirely when an owner was saved
+     * through an association rather than as a root.
      */
     @Test
-    void theSideTableReadIsRootOnlyEvenWhenTheRowsCertainlyExist() {
-        // Saved as ROOT first, so the side-table rows definitely exist.
-        TestVenue venue = new TestVenue("isolation-venue", null,
+    void aJavAICollectionIsWrittenWhenItsOwnerIsSavedThroughAnAssociation() {
+        TestVenue venue = new TestVenue("written-through-venue", null,
                 List.of(new TestReview("x", 5), new TestReview("y", 4)));
-        venues.save(venue);
-        int afterRootSave = venues.findById(venue.getId()).orElseThrow().getReviews().size();
-
-        // Now referenced by a group and saved again through it.
-        TestVenueGroup group = new TestVenueGroup("isolation-group");
+        TestVenueGroup group = new TestVenueGroup("written-through-group");
         group.getVenues().add(venue);
         groups.save(group);
 
-        int rootReadAfterGroupSave = venues.findById(venue.getId()).orElseThrow().getReviews().size();
-        int throughAssociation = JavAIPI.inTransaction(config, () -> {
-            TestVenueGroup loaded = groups.findById(group.getId()).orElseThrow();
-            Hibernate.initialize(loaded.getVenues());
-            return loaded.getVenues().get(0).getReviews().size();
-        });
+        int reviews = JavAIPI.inTransaction(config, () ->
+                venues.findById(venue.getId()).orElseThrow().getReviews().size());
 
-        assertEquals(2, afterRootSave, "a root save writes the side table");
-        assertEquals(2, rootReadAfterGroupSave, "and the rows are still there afterwards");
-        assertEquals(2, throughAssociation,
-                "so an empty result through an association is a read defect, not a missing write");
+        assertEquals(2, reviews, "members saved through an association must actually be written");
     }
 }
