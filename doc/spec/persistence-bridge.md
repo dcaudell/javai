@@ -335,6 +335,39 @@ deferring every vector write to commit time — across three backends, and throu
 queue above. `saveAll` is the answer for that shape. The cost of not doing it is pinned by a test rather than
 left as a footnote.
 
+## Attachment: one graph, one state (OMI-275)
+
+A repository call returns a graph that is uniformly attached or uniformly detached, never mixed. Outside a
+unit of work everything is detached; inside one, the root and every node reached through it are managed --
+through a lazy hop, an eager one, `@OneToOne`, `@ManyToOne`, `@OneToMany`, `@ManyToMany`, `@Any`, and a
+self-reference alike.
+
+**A mixed graph is the outcome worth designing against**, which is why it is stated as a property rather than
+left to fall out. Nothing about an object tells a caller which kind of node they hold, so in a mixed graph the
+same traversal works or throws depending on where they landed, and mutations are silently persisted in one
+place and silently discarded in another. No rule a caller could learn covers it.
+
+There was exactly one route to one: `save()` used to return the caller's own instance, which is never
+managed, while Hibernate tracked a merged copy. Give that unmanaged root a child the caller had loaded in the
+same unit of work and the result was an unmanaged root holding a managed child.
+
+**So `save()` returns the managed instance now, as Spring Data JPA's does.** It could not before: `merge()`
+leaves `<transient>` fields empty on the managed copy, and JavAI collections used to be transient. OMI-277
+made them native associations that `merge()` carries across, leaving only `Point` fields, which `save` copies
+across explicitly.
+
+Two consequences to know:
+
+- **Inside a transaction, mutating what `save` returned is dirty-checked.** Before, it was not.
+- **The returned graph is a different object graph from the one passed in** -- ordinary `merge` semantics.
+  After a save, use what `save` returned *or* your own instance, but do not mix them and expect the same
+  objects.
+
+**An uninitialized proxy answers its `@Id` without a round trip only if the identifier getter is `public`.**
+Hibernate serves it by overriding that getter and cannot override a package-private one, so the call falls
+through to the uninitialized instance and triggers a load -- which on a detached entity turns a free read into
+`LazyInitializationException`. Nothing warns about it.
+
 ## A read loads what was read, not what is reachable from it (OMI-271)
 
 The section above is about not re-embedding what a load already knows. It says nothing about how much the
@@ -366,6 +399,15 @@ Library library = JavAIPI.inTransaction(config, () -> {
 });
 ```
 
+**Every piece of out-of-band state is served from Hibernate's `POST_LOAD` event, in one read (OMI-276).**
+Three things live outside an entity's own table -- each `@Vectorize` field's vector, the entity-grain
+concatenated text vector, and any `Point` field -- and they were originally fetched by different mechanisms
+at different times. Geo kept its own recursive walk, which is what made it the one that broke: the walk ran
+before a caller could initialize anything, so a `Point` on an entity reached through an association was
+silently never read. All three now come from one `UNION` per entity, over the tables that apply to it and
+exist, with existence memoised. One statement per entity, and the count does not scale with how many
+`@Vectorize` or `Point` fields that entity has.
+
 **Stored vectors are served from Hibernate's `POST_LOAD` event instead of from a walk.** That is what makes
 the removal free rather than a trade: the cost becomes one SELECT per entity *actually loaded*, and it covers
 a case no walk at load time could — a member the caller initializes afterwards, which arrives long after any
@@ -377,11 +419,33 @@ perform I/O — and cannot recognise one without depending on an ORM. `JavAIRunt
 is the seam: the Hibernate backend installs `Hibernate::isInitialized`, and the default answers `true` for
 everything, which is right for a plain object graph with no persistence layer under it.
 
-**One eager mapping remains, deliberately.** A JavAI collection field carrying *no* association annotation is
-mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on — the field
-holds a real `JavAIArrayList` the constructor made, so declining to fill it would hand back a silently-empty
-collection rather than a lazy one. A JavAI collection that *does* carry `@OneToMany`/`@ManyToMany` is mapped
-natively (see OMI-142) and is lazy like any other.
+**There is now exactly one JavAI collection mapping (OMI-277).** A JavAI collection field must be declared by
+the *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with the ordinary JPA annotation; Hibernate
+then substitutes `PersistentJavAIList`/`Set`/`Map`, and the field is an ordinary lazy association with vectors
+and dirty-tracking intact (see OMI-142 for how that substitution works).
+
+A *concrete*-typed field (`private final JavAIArrayList<X>`) is refused at registration. It used to be a
+second, out-of-band mapping through `javai_collection_members`, and it was withdrawn rather than repaired
+because that storage was only ever read and written for the entity a repository call **returned**: reached
+through an association the collection came back silently empty, and saved through one its members were
+silently never written. Neither failure announced itself.
+
+It could not be made lazy where it stood, and the reason is worth recording because it is the whole argument.
+The field holds a `final` instance of a `final` class that the entity's own constructor created; Hibernate
+manages a collection by substituting its own instance, which a final class forbids. Laziness would therefore
+have had to live *inside* `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap`, as a pending load
+triggered from every read — and `ArrayList`'s read surface has no single funnel, so a missed override returns
+an empty collection, which is precisely the defect being fixed. Doing it properly would have required an
+interface-typed, non-final field: exactly what the native mapping already requires, at which point the second
+mapping has no reason to exist.
+
+The membership table and every path that touched it have been **removed**: an unclaimed table created in
+every database on every boot, plus code nothing could reach, is vestigial rather than reversible. Nothing
+drops an existing one — a database that has it keeps it, empty, until somebody drops it by hand.
+
+One live path was rebuilt rather than deleted. A geo predicate nested through a to-many hop used the
+membership table to map member ids back to owner ids; it resolves through an HQL join over the association
+now, which is what that hop always was once the collection became native.
 
 ## Ordinary relational derived finders
 

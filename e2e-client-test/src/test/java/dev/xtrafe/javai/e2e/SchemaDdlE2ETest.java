@@ -80,21 +80,19 @@ class SchemaDdlE2ETest {
         assertTrue(keys.contains("comments_id -> comment"), "join table must FK to the target; got " + keys);
     }
 
-    /** ...and the side table still exists for the concrete-typed shape, holding its own membership rows. */
+    /**
+     * The membership side table is not created at all any more (OMI-277).
+     *
+     * <p>It used to hold the concrete-typed shape's rows while the natively-mapped one used a real join
+     * table, and this test pinned that split. The concrete shape was refused, which left the table
+     * unclaimed -- and an unclaimed table created in every database on every boot is vestigial, so its DDL
+     * went too. Asserted rather than assumed, because "nothing writes to it" and "it does not exist" are
+     * different promises and only the second one survives a rebuild from scratch.
+     */
     @Test
-    void concreteTypedJavAICollectionStillUsesTheSideTable() throws Exception {
-        assertTrue(tables().contains("javai_collection_members"));
-        assertEquals(
-                Set.of("owner_type", "owner_id", "field_name", "member_type", "member_id", "member_key", "ordinal"),
-                columns("javai_collection_members"),
-                "the membership side table's shape is part of the contract");
-
-        // relatedComments (concrete) is in the side table; comments (native) must NOT be.
-        assertTrue(sideTableHasField("relatedComments"),
-                "the concrete-typed collection must round-trip through javai_collection_members");
-        assertFalse(sideTableHasField("comments"),
-                "the natively-mapped collection must NOT be claimed by the side table -- that double-claim was "
-                        + "the silent duplication bug OMI-142 fixed");
+    void theMembershipSideTableIsNoLongerCreated() throws Exception {
+        assertFalse(tables().contains("javai_collection_members"),
+                "no supported mapping uses it, so nothing should be creating it either");
     }
 
     /** Neither collection shape may leak a column onto the owning entity's own table. */

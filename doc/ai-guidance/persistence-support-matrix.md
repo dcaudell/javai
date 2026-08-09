@@ -36,7 +36,7 @@ Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupporte
 | `@GeneratedValue` | ❌ | ❌ | ❌ | Identity is always an app-assigned `UUID`. Don't use it. |
 | `@MappedSuperclass` | ✅ | ⚠️ | ⚠️ | Postgres needs it for an inherited field to be mapped. Neo4j/Mongo walk the full class hierarchy regardless, so inherited fields round-trip either way. |
 | `@OneToOne` / `@ManyToOne` | ✅ | ⚠️ | ⚠️ | Postgres maps a **singular** association through Hibernate (use `cascade = CascadeType.ALL` so it saves with the owner). Neo4j/Mongo infer a singular relationship/reference from the field's declared type (a `JavAIVectorizable`-typed field) — the annotation is inert. |
-| `@OneToMany` / `@ManyToMany` | ✅ on a plain JDK collection **and** on an interface-typed JavAI collection<br>❌ on a *concrete*-typed JavAI collection | ⚠️ | ⚠️ | **Postgres:** a normal Hibernate association — FK/join table, cascade, `orphanRemoval`, `mappedBy`, lazy loading — whether the field is a plain JDK collection **or** declared by a JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`). In both cases `@JavAIVectorizable` members get their vectors persisted automatically; for the JavAI-interface case the instance Hibernate substitutes is still a real JavAI collection (vectors + dirty-tracking intact), with **no `@CollectionType` or other JavAI-specific annotation required**. A *concrete*-typed field (`JavAIArrayList<X>`) is rejected at registration, because Hibernate must be able to substitute its own instance — declare it by the interface and make it non-final. Neo4j/Mongo: inert, to-many works by declared type. |
+| `@OneToMany` / `@ManyToMany` | ✅ on a plain JDK collection **and** on an interface-typed JavAI collection (`JavAIList`/`JavAISet`/`JavAIMap`, non-final)<br>❌ on a *concrete*-typed JavAI collection, annotated or not (OMI-277) | ⚠️ | ⚠️ | **Postgres:** a normal Hibernate association — FK/join table, cascade, `orphanRemoval`, `mappedBy`, lazy loading — whether the field is a plain JDK collection **or** declared by a JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`). In both cases `@JavAIVectorizable` members get their vectors persisted automatically; for the JavAI-interface case the instance Hibernate substitutes is still a real JavAI collection (vectors + dirty-tracking intact), with **no `@CollectionType` or other JavAI-specific annotation required**. A *concrete*-typed field (`JavAIArrayList<X>`) is rejected at registration, because Hibernate must be able to substitute its own instance — declare it by the interface and make it non-final. Neo4j/Mongo: inert, to-many works by declared type. |
 | `@Transient` | ✅ | ⚠️ | ⚠️ | Postgres honors it (and auto-adds it for JavAI-collection and `Point` fields). Neo4j/Mongo don't skip `@Transient` fields — a simple-typed one would still be persisted. |
 | `@Column`, `@Table`, `@Basic`, `@Enumerated`, `@Temporal`, `@Lob` | ✅ | ⚠️ | ⚠️ | Postgres: honored by Hibernate as usual. Neo4j/Mongo: ignored — scalar conversion is fixed (`enum`→`name()`, `Instant`/`UUID`→string, etc.), column/table names don't apply. |
 | `@Version` | ✅ | ⚠️ | ⚠️ | **Postgres:** optimistic locking works, and works through a detached-entity repository. Concurrent writers to one entity produce one winner and one `OptimisticLockException`; and **since 0.1.8 (OMI-254) the instance `save()` returns carries the version the write assigned**, so the object you get back is safe to mutate and save again — the ordinary load-mutate-save-mutate-save shape, on the root and on cascaded members alike. Up to and including 0.1.7 it did not: detection was correct but `save()` handed back the *pre-write* version, so a second save of the same instance threw with no concurrency involved at all, which made the annotation effectively unusable. On ≤0.1.7, re-read between writes. **Neo4j/Mongo:** inert, and inert in a way worth stating plainly — the field is persisted as an ordinary scalar and never checked or incremented, so it looks like protection and provides none. Use `@Transactional(isolation = …)`, not `@Version`, on those backends. |
@@ -298,6 +298,49 @@ IllegalStateException: Expected field identityId on class ...Profile or one of i
 The getter that "helps" is what breaks it. **Fix:** rename the getter (`identityIdOrNull()`,
 `resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
 JavAI reads fields.
+
+### Inheritance: a subclass must be registered, the root is not enough
+
+JavAI discovers related types by walking an entity's **fields**, and a subclass is not reachable that way —
+nor discoverable by reflection at all without scanning. So registering a repository for an inheritance root
+does **not** bring its subclasses in, and saving one fails with Hibernate's `Unknown entity type`, which does
+not point at the fix. Name them with `entityPackages(...)` for a whole package, or `entityType(Subclass.class)`
+one at a time. `JOINED` hierarchies otherwise behave normally: a subclass round-trips as itself and a
+polymorphic `findAll` over the root sees it.
+
+### `@MapsId`, `@ElementCollection`, `@Basic(fetch = LAZY)`
+
+- **`@MapsId` ✅** — the derived id wins over JavAI's own assignment, which is the outcome you want and not
+  the obvious one: JavAI assigns a random `UUID` to any null `@Id` before Hibernate sees the graph, and if
+  that had won, the child would be written under an id unrelated to its parent and the shared primary key
+  would be silently broken.
+- **`@ElementCollection` ✅** — round-trips, and is lazy like any other collection.
+- **⚠️ `@Basic(fetch = LAZY)` degrades to eager.** A lazy basic has no proxy to stand in for it; Hibernate
+  defers it only by rewriting field access, which needs bytecode enhancement that a JavAI-built
+  `SessionFactory` does not apply. The value is correct, just fetched sooner than asked — safe, unlike a
+  missing value. For a genuinely large column, split it into its own entity behind a lazy `@OneToOne`.
+
+### `save()` returns the managed instance, not the one you passed (changed in 0.1.11, OMI-275)
+
+`repo.save(x)` returns Hibernate's **managed** instance, exactly as Spring Data JPA's `save` does. Up to
+0.1.10 it returned `x` itself, which was never managed.
+
+Two consequences, and the second is the one that bites:
+
+1. **Inside a transaction, mutating the result is dirty-checked.** Before, it silently was not.
+2. ⚠️ **The returned graph is a different object graph from the one you passed in.** Ordinary `merge`
+   semantics: `save(x) != x`, and mutating `x` afterwards does not affect what you got back. **After a save,
+   keep using what `save` returned, or keep using your own instance — do not mix them.**
+
+### An uninitialized proxy answers its `@Id` for free, *if* the getter is public
+
+A lazy singular association comes back as an uninitialized proxy whose `@Id` you can read without a database
+round trip — which is what lets you wire associations by identity on a detached entity.
+
+⚠️ **This requires a `public` identifier getter.** Hibernate serves the id by overriding that getter, and it
+cannot override a package-private one: the call falls through to the uninitialized instance and triggers a
+load, so on a detached entity what looks like a free read raises `LazyInitializationException`. Nothing warns
+you; the fix is one keyword.
 
 ### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
 

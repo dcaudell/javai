@@ -10,9 +10,9 @@ import org.springframework.transaction.annotation.Transactional;
  */
 class InnerService {
 
-    private final SpringTransactionalIntegrationTest.SpringTxRecordRepository repository;
+    private final SpringTxRecordRepository repository;
 
-    InnerService(SpringTransactionalIntegrationTest.SpringTxRecordRepository repository) {
+    InnerService(SpringTxRecordRepository repository) {
         this.repository = repository;
     }
 

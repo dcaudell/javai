@@ -439,26 +439,22 @@ class RepositoryBackendHibernatePostgresTest {
         }
     }
 
-    /** Hibernate owns the association, so it must be a real join table -- not this backend's
-     *  {@code javai_collection_members} side table. */
+    /**
+     * Hibernate owns the association, so it must be a real join table.
+     *
+     * <p>This used to also assert the row was absent from {@code javai_collection_members}, the side table a
+     * concrete-typed JavAI collection went to. That mapping was withdrawn in OMI-277 and its table is no
+     * longer created at all, so the check became a query against a relation that does not exist -- which is
+     * a stronger guarantee than the one it replaced, just not one a SELECT can express.
+     */
     @Test
-    void nativelyMappedJavAICollectionUsesHibernatesJoinTableNotTheSideTable() throws Exception {
+    void nativelyMappedJavAICollectionUsesHibernatesJoinTable() throws Exception {
         TestCrew crew = new TestCrew("phase2-storage");
         crew.getMembers().add(new TestMember("sally"));
         TestCrew saved = crewRepository.save(crew);
 
         try (Connection connection = DriverManager.getConnection(
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "SELECT count(*) FROM javai_collection_members WHERE owner_type = ? AND owner_id = ?")) {
-                statement.setString(1, TestCrew.class.getName());
-                statement.setObject(2, saved.getId());
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    resultSet.next();
-                    assertEquals(0, resultSet.getInt(1),
-                            "a natively-mapped JavAI collection must not be claimed by the side table");
-                }
-            }
             // Hibernate's own join table for the association exists and holds the row. Named
             // test_crew_test_member, not testcrew_testmember, since OMI-145 made
             // CamelCaseToUnderscoresNamingStrategy the default -- the join table's name is derived from the

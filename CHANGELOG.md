@@ -12,6 +12,98 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Changed
+
+- **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
+  graph walks reflected into every collection element, so a `List<String>` put them on `String.value` and the
+  module system refused to open `java.lang` — `InaccessibleObjectException` on an ordinary JPA mapping the
+  registration validator explicitly accepts. JDK values are leaves now, guarded in the shared walk rather
+  than at each call site.
+
+- **⚠️ `javai-persistence`: `save()` returns the managed instance, as Spring Data JPA's does (OMI-275).**
+  It used to return the caller's own instance, which was never managed. That was deliberate — `merge()` left
+  `@Transient` JavAI collection fields empty on the managed copy — and OMI-277 removed the reason by making
+  JavAI collections native associations `merge()` carries across. Only `Point` fields are still transient,
+  and `save` now copies those onto the managed copy explicitly.
+
+  **What it fixes is not only a difference from Spring Data.** Returning an unmanaged root while the session
+  was open was the *one* way a caller could be handed a graph attached in one place and detached in another:
+  mutate the root and the change was silently discarded, mutate a child reached through it and the change was
+  silently persisted, with nothing about either object saying which was which. Measured, then fixed —
+  `AttachmentConformanceTest`.
+
+  ⚠️ **The returned graph is a different object graph from the one passed in.** That is ordinary `merge`
+  semantics, and it is the part most likely to surprise: after a save, keep using what `save` returned *or*
+  keep using your own instance, but do not mix them and expect the same objects. Mutating an entity you still
+  hold no longer affects what `save` handed back.
+
+
+- **⚠️ `javai-persistence`/`javai-tagging`: a JavAI collection field must be declared by its interface
+  (OMI-277).** `private final JavAIArrayList<X> xs = new JavAIArrayList<>();` is **refused at registration**
+  now, with a message naming the interface to use instead. The supported shape is the one already
+  recommended:
+
+  ```java
+  @OneToMany(cascade = CascadeType.ALL)
+  private JavAIList<Photo> photos = new JavAIArrayList<>();   // interface-typed, non-final, annotated
+  ```
+
+  The concrete form was a second storage mechanism (`javai_collection_members`) and it was **silently
+  root-only in both directions**: reached through an association the collection came back empty, and saved
+  through one its members were never written. It was withdrawn rather than repaired because it cannot be made
+  lazy where it stands — the field holds a `final` instance of a `final` class, and Hibernate manages a
+  collection by substituting its own. See OMI-277 for the options weighed, including the one that was chosen
+  and then withdrawn on contact with the types.
+
+  **This is a breaking API change to `javai-tagging`'s shipped `TagSet`**: `getTags()` returns
+  `JavAIList<Tag>` rather than `JavAIArrayList<Tag>`. A caller that declared the receiver as the concrete
+  type needs a one-word change; every other use is unaffected.
+
+  ⚠️ **Two to-many fields of the same element type now need explicit `@JoinTable(name = …)`.** Hibernate
+  derives the default join-table name from owner + element type, so a list and a map of the same type on one
+  entity silently claim the same table. Ordinary JPA, newly reachable because the map used to avoid the
+  native path entirely.
+
+### Removed
+
+- **`javai-persistence`: the `javai_collection_members` side table and all its machinery (OMI-277).** The
+  mapping that used it was refused in the same release; the table was left in place, unreachable, so the
+  decision could be walked back. Kept that way it would have been an empty table created in every database on
+  every boot, plus read/write/delete/derived-finder/containment code nothing could reach — vestigial by any
+  reading. Gone: the `CREATE TABLE`, the membership read and write paths, the cascade-delete and
+  detach-from-container halves, the map-key validator that only ever fired for the refused shape, and
+  `Containment`'s `JAVAI_COLLECTION` edge kind.
+
+  **Nothing drops an existing table.** A database that already has one keeps it, empty and unread, until
+  somebody drops it by hand; a database built from scratch never gets one.
+
+  One live path had to be rebuilt rather than deleted: a **geo predicate nested through a to-many hop** used
+  the membership table to map member ids back to owner ids. It resolves through an HQL join over the
+  association now, which is what the hop always was once the collection was native.
+
+### Fixed
+
+- **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**
+  A 0.1.10 regression, and a silent one: nothing threw and nothing logged, so an entity simply appeared to
+  have no location. `Point` fields live out-of-band in `javai_geo_points` and were read by a recursive walk
+  of the loaded graph. OMI-271 correctly stopped that walk at uninitialized associations, and the walk runs
+  before the caller can initialize anything -- so a `Point` on any entity the caller initialized afterwards
+  was never read. On 0.1.9 the walk force-initialized the whole graph and always got there; the over-fetch
+  was carrying it.
+
+  `Point` fields now come from the same `POST_LOAD` event that already serves vectors -- once per entity
+  Hibernate actually loads, whenever it loads it -- which is the one place that can also cover an entity
+  initialized later. The recursive geo walk is gone, and with it the last graph walk on the load path.
+
+- **`javai-persistence`: an entity's out-of-band state is read in one statement (OMI-276).** Restoring the
+  `Point` could have meant a third query per entity on top of the two the post-load listener already issued
+  for vectors, plus a JDBC metadata call per table per entity, plus **one query per `Point` field**. Instead
+  the three reads are one: a single `UNION` over the tables that apply to that entity and actually exist,
+  with existence memoised so the metadata round trip is paid once per table rather than once per entity.
+  Measured, per OMI-275's standing criterion: an entity with two `Point` fields costs **one** geo read, and
+  a load costs **one** field-vector read per entity.
+
+
 ### Fixed
 
 - **`javai-persistence`: a read no longer loads the whole reachable object graph (OMI-271).**
