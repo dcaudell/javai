@@ -64,6 +64,23 @@ version -- a given release usually changes only one or two of them.
   entity silently claim the same table. Ordinary JPA, newly reachable because the map used to avoid the
   native path entirely.
 
+### Removed
+
+- **`javai-persistence`: the `javai_collection_members` side table and all its machinery (OMI-277).** The
+  mapping that used it was refused in the same release; the table was left in place, unreachable, so the
+  decision could be walked back. Kept that way it would have been an empty table created in every database on
+  every boot, plus read/write/delete/derived-finder/containment code nothing could reach — vestigial by any
+  reading. Gone: the `CREATE TABLE`, the membership read and write paths, the cascade-delete and
+  detach-from-container halves, the map-key validator that only ever fired for the refused shape, and
+  `Containment`'s `JAVAI_COLLECTION` edge kind.
+
+  **Nothing drops an existing table.** A database that already has one keeps it, empty and unread, until
+  somebody drops it by hand; a database built from scratch never gets one.
+
+  One live path had to be rebuilt rather than deleted: a **geo predicate nested through a to-many hop** used
+  the membership table to map member ids back to owner ids. It resolves through an HQL join over the
+  association now, which is what the hop always was once the collection was native.
+
 ### Fixed
 
 - **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**

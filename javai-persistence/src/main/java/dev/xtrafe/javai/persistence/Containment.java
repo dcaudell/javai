@@ -43,12 +43,11 @@ import java.util.UUID;
  *
  * <h2>Both storage shapes are covered</h2>
  *
- * A {@code @Summary} collection is stored one of two ways on this backend, and the reverse lookup differs:
- * a <b>natively mapped</b> association (a plain JDK collection, or an interface-typed JavAI collection with
- * {@code @OneToMany}/{@code @ManyToMany}) lives in Hibernate's own join table and is reached with HQL, while
- * a <b>concrete-typed</b> JavAI collection lives in this backend's {@code javai_collection_members} and is
- * reached with SQL against that table. A singular {@code @Summary} reference is HQL either way. Missing
- * either shape would make the fix silently partial for entities that happen to use it.
+ * A {@code @Summary} collection is a natively mapped association -- a plain JDK collection, or an
+ * interface-typed JavAI collection with {@code @OneToMany}/{@code @ManyToMany} -- living in Hibernate's own
+ * join table and reached with HQL. A singular {@code @Summary} reference is HQL too. There used to be a
+ * second shape, a concrete-typed JavAI collection with its own membership table, reached with SQL; it was
+ * withdrawn in OMI-277 and its half of this lookup went with it.
  */
 final class Containment {
 
@@ -67,9 +66,7 @@ final class Containment {
         /** Hibernate owns the association -- reachable by HQL through the mapped field. */
         NATIVE_COLLECTION,
         /** A singular reference ({@code @OneToOne}/{@code @ManyToOne}). */
-        NATIVE_SINGULAR,
-        /** This backend owns the membership rows, in {@code javai_collection_members}. */
-        JAVAI_COLLECTION
+        NATIVE_SINGULAR
     }
 
     private final List<Edge> edges;
@@ -92,8 +89,9 @@ final class Containment {
                 if (Map.class.isAssignableFrom(declared) || Collection.class.isAssignableFrom(declared)) {
                     Class<?> element = elementType(field, Map.class.isAssignableFrom(declared) ? 1 : 0);
                     if (element != null && element.isAnnotationPresent(Entity.class)) {
-                        edges.add(new Edge(parentType, field.getName(), element,
-                                isNativelyMapped(field) ? Kind.NATIVE_COLLECTION : Kind.JAVAI_COLLECTION,
+                        // Always native: a collection of entities that is not a mapped association is
+                        // refused at registration (OMI-277), so there is no second shape left to detect.
+                        edges.add(new Edge(parentType, field.getName(), element, Kind.NATIVE_COLLECTION,
                                 summary));
                     }
                 } else if (summary && declared.isAnnotationPresent(Entity.class)) {
@@ -162,7 +160,6 @@ final class Containment {
                 case NATIVE_SINGULAR -> collectHql(session, owners, edge,
                         "select p." + parentId + " from " + edge.parentType().getName() + " p"
                                 + " where p." + edge.fieldName() + "." + childIdField + " = :childId", childId);
-                case JAVAI_COLLECTION -> collectMembershipRows(session, owners, edge, childType, childId);
             }
         }
         return owners;
@@ -183,7 +180,6 @@ final class Containment {
             case NATIVE_SINGULAR -> collectHql(session, owners, edge,
                     "select p." + parentId + " from " + edge.parentType().getName() + " p"
                             + " where p." + edge.fieldName() + "." + childIdField + " = :childId", childId);
-            case JAVAI_COLLECTION -> collectMembershipRows(session, owners, edge, childType, childId);
         }
         return owners;
     }
@@ -194,39 +190,7 @@ final class Containment {
         }
     }
 
-    /** The {@code javai_collection_members} half. Filtered by {@code field_name} as well as member, so a
-     *  container holding the same entity in both a {@code @Summary} field and an ordinary one is credited
-     *  only for the {@code @Summary} one. */
-    private static void collectMembershipRows(
-            Session session, Set<OwnerRef> owners, Edge edge, Class<?> childType, UUID childId) {
-        session.doWork(connection -> {
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "SELECT owner_id FROM javai_collection_members WHERE owner_type = ? AND field_name = ?"
-                            + " AND member_type = ? AND member_id = ?")) {
-                statement.setString(1, edge.parentType().getName());
-                statement.setString(2, edge.fieldName());
-                statement.setString(3, childType.getName());
-                statement.setObject(4, childId);
-                try (ResultSet rows = statement.executeQuery()) {
-                    while (rows.next()) {
-                        owners.add(new OwnerRef(edge.parentType(), (UUID) rows.getObject(1)));
-                    }
-                }
-            }
-        });
-    }
 
-    /**
-     * A {@code @Summary} collection field is Hibernate's to map when it carries an association annotation;
-     * otherwise this backend stores its membership itself. Mirrors the rule
-     * {@code RepositoryBackendHibernatePostgres.isJavAICollectionField} enforces at registration, read from
-     * the same annotations rather than re-derived from the field's type.
-     */
-    private static boolean isNativelyMapped(Field field) {
-        return field.isAnnotationPresent(jakarta.persistence.OneToMany.class)
-                || field.isAnnotationPresent(jakarta.persistence.ManyToMany.class)
-                || field.isAnnotationPresent(jakarta.persistence.ElementCollection.class);
-    }
 
     private static Class<?> elementType(Field field, int index) {
         if (field.getGenericType() instanceof ParameterizedType parameterized) {

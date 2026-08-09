@@ -439,8 +439,13 @@ an empty collection, which is precisely the defect being fixed. Doing it properl
 interface-typed, non-final field: exactly what the native mapping already requires, at which point the second
 mapping has no reason to exist.
 
-The `javai_collection_members` machinery is left in place, unreachable rather than deleted, so the decision
-can be reversed if real use argues for it.
+The membership table and every path that touched it have been **removed**: an unclaimed table created in
+every database on every boot, plus code nothing could reach, is vestigial rather than reversible. Nothing
+drops an existing one — a database that has it keeps it, empty, until somebody drops it by hand.
+
+One live path was rebuilt rather than deleted. A geo predicate nested through a to-many hop used the
+membership table to map member ids back to owner ids; it resolves through an HQL join over the association
+now, which is what that hop always was once the collection became native.
 
 ## Ordinary relational derived finders
 

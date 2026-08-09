@@ -81,29 +81,18 @@ class SchemaDdlE2ETest {
     }
 
     /**
-     * The membership side table is no longer claimed by any mapping (OMI-277).
+     * The membership side table is not created at all any more (OMI-277).
      *
-     * <p>It used to hold the concrete-typed shape's rows -- {@code relatedComments} lived here while
-     * {@code comments} was native, and this test pinned exactly that split. OMI-277 refused the concrete
-     * shape, so both collections are native associations now and nothing writes here.
-     *
-     * <p>The table is still created, deliberately: the machinery is left in place, unreachable rather than
-     * deleted, so the decision can be reversed if real use argues for it. Its shape is still asserted for
-     * the same reason -- a reversal should find it as it was.
+     * <p>It used to hold the concrete-typed shape's rows while the natively-mapped one used a real join
+     * table, and this test pinned that split. The concrete shape was refused, which left the table
+     * unclaimed -- and an unclaimed table created in every database on every boot is vestigial, so its DDL
+     * went too. Asserted rather than assumed, because "nothing writes to it" and "it does not exist" are
+     * different promises and only the second one survives a rebuild from scratch.
      */
     @Test
-    void theMembershipSideTableIsNoLongerClaimedByAnyMapping() throws Exception {
-        assertTrue(tables().contains("javai_collection_members"));
-        assertEquals(
-                Set.of("owner_type", "owner_id", "field_name", "member_type", "member_id", "member_key", "ordinal"),
-                columns("javai_collection_members"),
-                "the membership side table's shape is part of the contract, reversible or not");
-
-        assertFalse(sideTableHasField("relatedComments"),
-                "the map is a native @OneToMany + @MapKeyColumn now, not a side-table collection");
-        assertFalse(sideTableHasField("comments"),
-                "the natively-mapped collection must NOT be claimed by the side table -- that double-claim was "
-                        + "the silent duplication bug OMI-142 fixed");
+    void theMembershipSideTableIsNoLongerCreated() throws Exception {
+        assertFalse(tables().contains("javai_collection_members"),
+                "no supported mapping uses it, so nothing should be creating it either");
     }
 
     /** Neither collection shape may leak a column onto the owning entity's own table. */
