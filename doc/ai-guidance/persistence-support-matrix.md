@@ -299,6 +299,27 @@ The getter that "helps" is what breaks it. **Fix:** rename the getter (`identity
 `resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
 JavAI reads fields.
 
+### Inheritance: a subclass must be registered, the root is not enough
+
+JavAI discovers related types by walking an entity's **fields**, and a subclass is not reachable that way —
+nor discoverable by reflection at all without scanning. So registering a repository for an inheritance root
+does **not** bring its subclasses in, and saving one fails with Hibernate's `Unknown entity type`, which does
+not point at the fix. Name them with `entityPackages(...)` for a whole package, or `entityType(Subclass.class)`
+one at a time. `JOINED` hierarchies otherwise behave normally: a subclass round-trips as itself and a
+polymorphic `findAll` over the root sees it.
+
+### `@MapsId`, `@ElementCollection`, `@Basic(fetch = LAZY)`
+
+- **`@MapsId` ✅** — the derived id wins over JavAI's own assignment, which is the outcome you want and not
+  the obvious one: JavAI assigns a random `UUID` to any null `@Id` before Hibernate sees the graph, and if
+  that had won, the child would be written under an id unrelated to its parent and the shared primary key
+  would be silently broken.
+- **`@ElementCollection` ✅** — round-trips, and is lazy like any other collection.
+- **⚠️ `@Basic(fetch = LAZY)` degrades to eager.** A lazy basic has no proxy to stand in for it; Hibernate
+  defers it only by rewriting field access, which needs bytecode enhancement that a JavAI-built
+  `SessionFactory` does not apply. The value is correct, just fetched sooner than asked — safe, unlike a
+  missing value. For a genuinely large column, split it into its own entity behind a lazy `@OneToOne`.
+
 ### `save()` returns the managed instance, not the one you passed (changed in 0.1.11, OMI-275)
 
 `repo.save(x)` returns Hibernate's **managed** instance, exactly as Spring Data JPA's `save` does. Up to

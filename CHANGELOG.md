@@ -14,6 +14,12 @@ version -- a given release usually changes only one or two of them.
 
 ### Changed
 
+- **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
+  graph walks reflected into every collection element, so a `List<String>` put them on `String.value` and the
+  module system refused to open `java.lang` — `InaccessibleObjectException` on an ordinary JPA mapping the
+  registration validator explicitly accepts. JDK values are leaves now, guarded in the shared walk rather
+  than at each call site.
+
 - **⚠️ `javai-persistence`: `save()` returns the managed instance, as Spring Data JPA's does (OMI-275).**
   It used to return the caller's own instance, which was never managed. That was deliberate — `merge()` left
   `@Transient` JavAI collection fields empty on the managed copy — and OMI-277 removed the reason by making

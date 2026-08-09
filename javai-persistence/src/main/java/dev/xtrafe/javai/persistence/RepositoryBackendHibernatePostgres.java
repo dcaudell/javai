@@ -1499,6 +1499,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private static List<Object> reachableRelated(Object entity) {
         List<Object> related = new ArrayList<>();
+        // A JDK value is a leaf. Reflecting into one is not merely pointless, it throws: an
+        // @ElementCollection of Strings puts this walk on String.value and the module system refuses to open
+        // java.lang for it (OMI-275). The guard belongs here rather than at each call site, because every
+        // caller iterates whatever this returns and would need it independently.
+        if (entity.getClass().getName().startsWith("java.")) {
+            return related;
+        }
         for (Field field : EntityReflection.allFields(entity.getClass())) {
             field.setAccessible(true);
             Object value;
@@ -2274,6 +2281,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // An uninitialized association was loaded from the database, so it has an id already -- and
         // resolving it to confirm that would be exactly the load this walk must not cause (OMI-271).
         if (entity == null || !Hibernate.isInitialized(entity) || visited.put(entity, Boolean.TRUE) != null) {
+            return;
+        }
+        // A JDK value is a leaf, never a node with an @Id somewhere inside it -- and reflecting into one is
+        // not merely pointless, it throws: an @ElementCollection of Strings put this walk on
+        // String.value, and the module system refuses to open java.lang for that (OMI-275). Checked here
+        // rather than at each recursion site so no future caller has to remember it.
+        if (entity.getClass().getName().startsWith("java.")) {
             return;
         }
         if (entity.getClass().isAnnotationPresent(Entity.class) && EntityReflection.readId(entity) == null) {
