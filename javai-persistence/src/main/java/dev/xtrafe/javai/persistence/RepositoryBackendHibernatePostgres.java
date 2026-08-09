@@ -1424,38 +1424,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
-    /** Populates the {@code Point} fields of an already-loaded entity (and its reachable related entities)
-     *  from {@code javai_geo_points}, mirroring {@link #hydrateCollectionMembers}. */
-    private void hydrateGeoPoints(Session session, Object entity, Map<Object, Boolean> visited) {
-        if (entity == null || visited.put(entity, Boolean.TRUE) != null) {
-            return;
-        }
-        if (entity.getClass().isAnnotationPresent(Entity.class)) {
-            UUID id = EntityReflection.readId(entity);
-            String ownerType = entity.getClass().getName();
-            for (Field field : EntityReflection.allFields(entity.getClass())) {
-                if (Point.class.isAssignableFrom(field.getType())) {
-                    Point point = session.doReturningWork(
-                            connection -> readGeoPoint(connection, ownerType, id, field.getName()));
-                    if (point != null) {
-                        field.setAccessible(true);
-                        try {
-                            field.set(entity, point);
-                        } catch (IllegalAccessException e) {
-                            throw new IllegalStateException("Cannot write Point field " + field, e);
-                        }
-                    }
-                }
-            }
-        }
-        for (Object related : reachableRelated(entity)) {
-            hydrateGeoPoints(session, related, visited);
-        }
-    }
-
     /**
      * The singular related entities, collection elements, and map values reachable through {@code entity}'s
-     * own fields -- the graph {@link #syncGeoPoints}/{@link #hydrateGeoPoints} recurse over.
+     * own fields -- the graph {@link #syncGeoPoints} recurses over.
      *
      * <p><b>An uninitialized association is skipped, never resolved</b> (OMI-271). Without the
      * {@code Hibernate.isInitialized} guard this walk enforced laziness on singular associations only, by
@@ -2853,86 +2824,109 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     /**
-     * Serves every {@code @Vectorize} field's already-stored vector back into the loaded instance's cache
-     * slots, so reading it costs nothing rather than a fresh round trip to the embedding model (OMI-187).
+     * Serves an entity every piece of state this backend stores <em>outside</em> its own table, in one read.
      *
-     * <p>Why this is needed at all: JavAI's vector caches live on a woven <em>instance</em> field, so they
-     * are keyed to object identity and cannot survive a load -- Hibernate hands back a different object for
-     * the same logical entity every time. Without this, an entity loaded from a row that already contains
-     * its vectors re-embeds every one of them. That was two thirds of OMI-187's measured waste, and unlike
-     * the empty-collection half it is not avoidable by computing less: the value is genuinely needed, we
-     * simply already had it.
+     * <p>Three things live out-of-band: each {@code @Vectorize} field's vector, the entity-grain concatenated
+     * text vector, and any {@code Point} field. They used to be fetched by three different mechanisms at
+     * three different times -- two queries here plus a JDBC metadata call each, and a separate recursive walk
+     * for geo. That walk is what OMI-276 broke: it ran before the caller could initialize anything, so a
+     * {@code Point} on an entity reached through an association was silently never read.
      *
-     * <p>Validity is decided by model identity, which is also why {@code JavAIEmbeddingProvider.modelId()}
-     * exists: vectors are stored per model, so a row is reusable exactly when its table is the one the
-     * currently-configured provider would write to. A provider that cannot name its model (the SPI default)
-     * makes this a no-op and everything recomputes exactly as it did before -- correct, just not free.
+     * <p>Fetching them together fixes that and costs less than the two queries did, which is the point --
+     * OMI-275's standing criterion is that a correctness fix must not be bought with round trips. One
+     * statement per entity, over only the tables that apply to this entity and actually exist, with existence
+     * memoised in {@link #confirmedTables} so the metadata call is paid once per table rather than once per
+     * entity.
      *
-     * <p><b>Load paths only. Deliberately not called from {@code writeVectors}</b>, even though that is
-     * where the remaining OMI-187 waste lives (a child save re-embedding its owner's unchanged field).
-     * {@code JavAIRuntime.hydrateFieldVector} refuses any slot whose generation a setter has bumped, and
-     * that guard cannot see through {@code merge()}: the caller mutates their own detached instance, so
-     * the bump lands there, while Hibernate's merged copy carries the <em>new</em> field value on a
-     * <em>pristine</em> slot. Hydrating that copy served the old vector and persisted it, which
-     * {@code savedVectorIsAlwaysAccurateUnderImmediateConsistency} catches.
-     *
-     * <p>This is not the "someone mutated a field behind JavAI's back" case, which JavAI legitimately
-     * declines to defend against -- it is an ordinary, correctly-reported mutation that merge launders into
-     * an instance with no record of it. Closing it safely needs the stored vector to carry a hash of the
-     * text it was computed from, so reuse becomes a check ("does this vector match the current value?")
-     * rather than an inference from cache state.
+     * @param includeGeo whether to restore {@code Point} fields as well. False on the write path, which
+     *                   reads vectors onto the caller's <em>own</em> instance ({@code hydrateSummaryChildren})
+     *                   and must not overwrite a {@code Point} that caller just set; the values there flow
+     *                   the other way, through {@code syncGeoPoints}.
      */
-    private void hydrateVectors(Session session, Object entity) {
-        if (!(entity instanceof JavAIVectorizable)) {
-            return;
-        }
-        String modelId = JavAIRuntime.currentModelId();
-        if (modelId == null) {
+    private void hydrateOutOfBand(Session session, Object entity, boolean includeGeo) {
+        if (entity == null || !entity.getClass().isAnnotationPresent(Entity.class)) {
             return;
         }
         Class<?> entityType = entity.getClass();
-        UUID ownerId = EntityReflection.readId(entity);
+        UUID ownerId = idOrNull(entity);
         if (ownerId == null) {
             return;
         }
-        String ownerType = entityType.getName();
-        // Before the @Vectorize short-circuit below, deliberately: an entity can participate in
-        // concatenation while having no @Vectorize fields of its own (a container that only absorbs its
-        // children -- see @Summary.concatenate's field-level opt-in), and that entity still has a stored
-        // text vector worth restoring.
-        hydrateConcatenatedTextVector(session, entity, modelId, ownerType, ownerId);
-
-        Set<String> fieldNames = EntityReflection.vectorizeFieldNames(entityType);
-        if (fieldNames.isEmpty()) {
-            return;
+        boolean vectorizable = entity instanceof JavAIVectorizable;
+        String modelId = vectorizable ? JavAIRuntime.currentModelId() : null;
+        Set<String> fieldNames = vectorizable ? EntityReflection.vectorizeFieldNames(entityType) : Set.of();
+        // A model the provider cannot name has no table to read, but that says nothing about geo -- which is
+        // model-independent, and is why this is three separate decisions rather than one early return.
+        boolean wantsFieldVectors = modelId != null && !fieldNames.isEmpty();
+        boolean wantsConcatenated = modelId != null && JavAIRuntime.participatesInConcatenation(entityType);
+        List<Field> pointFields = includeGeo ? pointFieldsOf(entityType) : List.of();
+        if (!wantsFieldVectors && !wantsConcatenated && pointFields.isEmpty()) {
+            return; // the common case for a plain entity: no statement at all
         }
-        String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+
+        String ownerType = entityType.getName();
+        String fieldTable = modelId == null ? null : FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        String summaryTable = modelId == null ? null : SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+
         session.doWork(connection -> {
-            if (!tableExists(connection, table)) {
-                // Nothing has been written for this model yet -- a first run, or a model switch. Recompute.
-                return;
+            List<String> branches = new ArrayList<>();
+            if (wantsFieldVectors && tableExistsCached(connection, fieldTable)) {
+                branches.add("SELECT 'v'::text, field_name::text, model_id::text, dims::int,"
+                        + " computed_at::timestamptz, vector::text, NULL::float8, NULL::float8"
+                        + " FROM " + fieldTable + " WHERE owner_type = ? AND owner_id = ?");
             }
-            String sql = "SELECT field_name, model_id, dims, computed_at, vector::text FROM " + table
-                    + " WHERE owner_type = ? AND owner_id = ?";
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setString(1, ownerType);
-                statement.setObject(2, ownerId);
+            if (wantsConcatenated && tableExistsCached(connection, summaryTable)) {
+                branches.add("SELECT 'c'::text, NULL::text, model_id::text, dims::int,"
+                        + " concatenated_text_computed_at::timestamptz, concatenated_text_vector::text,"
+                        + " NULL::float8, NULL::float8"
+                        + " FROM " + summaryTable + " WHERE owner_type = ? AND owner_id = ?");
+            }
+            if (!pointFields.isEmpty() && tableExistsCached(connection, "javai_geo_points")) {
+                branches.add("SELECT 'g'::text, field_name::text, NULL::text, NULL::int,"
+                        + " NULL::timestamptz, NULL::text, longitude::float8, latitude::float8"
+                        + " FROM javai_geo_points WHERE owner_type = ? AND owner_id = ?");
+            }
+            if (branches.isEmpty()) {
+                return; // nothing written for this model yet, or no geo table: recompute rather than read
+            }
+            // Read positionally, never by label: a UNION takes its column names from whichever branch
+            // happens to be first, and which branch that is depends on this entity's own shape.
+            try (PreparedStatement statement = connection.prepareStatement(String.join(" UNION ALL ", branches))) {
+                int parameter = 1;
+                for (int i = 0; i < branches.size(); i++) {
+                    statement.setString(parameter++, ownerType);
+                    statement.setObject(parameter++, ownerId);
+                }
                 try (ResultSet rows = statement.executeQuery()) {
                     while (rows.next()) {
-                        String fieldName = rows.getString("field_name");
-                        if (!fieldNames.contains(fieldName)) {
-                            // COMBINED_VECTOR_FIELD and any field no longer annotated: stored, but not a
-                            // slot anything reads. vector()/summaryVector() recombine from field slots.
-                            continue;
+                        switch (rows.getString(1)) {
+                            case "v" -> hydrateOneFieldVector(entity, fieldNames, rows);
+                            case "c" -> hydrateOneConcatenatedTextVector(entity, rows);
+                            case "g" -> hydrateOnePoint(entity, pointFields, rows);
+                            default -> throw new IllegalStateException("unknown out-of-band row kind");
                         }
-                        float[] values = parseVectorLiteral(rows.getString(5));
-                        JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
-                                values, rows.getString("model_id"), rows.getInt("dims"),
-                                rows.getTimestamp("computed_at").toInstant()));
                     }
                 }
             }
         });
+    }
+
+    /** Vectors only, for the write path -- see {@link #hydrateOutOfBand}'s {@code includeGeo} parameter. */
+    private void hydrateVectors(Session session, Object entity) {
+        hydrateOutOfBand(session, entity, false);
+    }
+
+    private static void hydrateOneFieldVector(Object entity, Set<String> fieldNames, ResultSet rows)
+            throws SQLException {
+        String fieldName = rows.getString(2);
+        if (!fieldNames.contains(fieldName)) {
+            // COMBINED_VECTOR_FIELD and any field no longer annotated: stored, but not a slot anything
+            // reads. vector()/summaryVector() recombine from field slots.
+            return;
+        }
+        float[] values = parseVectorLiteral(rows.getString(6));
+        JavAIRuntime.hydrateFieldVector(entity, fieldName, new EmbeddingVector(
+                values, rows.getString(3), rows.getInt(4), rows.getTimestamp(5).toInstant()));
     }
 
     /**
@@ -2940,39 +2934,49 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *
      * <p>Matters more than hydrating a field vector. A loaded entity's {@code summaryVector()} is arithmetic
      * over field vectors hydration already restored, so recomputing costs nothing; the concatenated text
-     * vector is a real embedding, so skipping this would mean a live model call on every load of every
-     * participating entity.
+     * vector is a real embedding, so not restoring it would mean a live model call on every load.
      */
-    private void hydrateConcatenatedTextVector(Session session, Object entity, String modelId, String ownerType,
-            UUID ownerId) {
-        if (!JavAIRuntime.participatesInConcatenation(entity.getClass())) {
-            return;
+    private static void hydrateOneConcatenatedTextVector(Object entity, ResultSet rows) throws SQLException {
+        String literal = rows.getString(6);
+        Timestamp computedAt = rows.getTimestamp(5);
+        if (literal == null || computedAt == null) {
+            return; // stored without concatenation, or the opt-in was switched off
         }
-        String table = SUMMARY_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
-        session.doWork(connection -> {
-            if (!tableExists(connection, table)) {
+        float[] values = parseVectorLiteral(literal);
+        JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
+                values, rows.getString(3), values.length, computedAt.toInstant()));
+    }
+
+    private static void hydrateOnePoint(Object entity, List<Field> pointFields, ResultSet rows)
+            throws SQLException {
+        String fieldName = rows.getString(2);
+        Point point = new Point(rows.getDouble(7), rows.getDouble(8));
+        for (Field field : pointFields) {
+            if (field.getName().equals(fieldName)) {
+                try {
+                    field.set(entity, point);
+                } catch (IllegalAccessException e) {
+                    throw new IllegalStateException("Cannot write Point field " + field, e);
+                }
                 return;
             }
-            String sql = "SELECT model_id, dims, concatenated_text_computed_at,"
-                    + " concatenated_text_vector::text FROM " + table
-                    + " WHERE owner_type = ? AND owner_id = ?";
-            try (PreparedStatement statement = connection.prepareStatement(sql)) {
-                statement.setString(1, ownerType);
-                statement.setObject(2, ownerId);
-                try (ResultSet rows = statement.executeQuery()) {
-                    if (!rows.next()) {
-                        return;
-                    }
-                    String literal = rows.getString(4);
-                    Timestamp computedAt = rows.getTimestamp("concatenated_text_computed_at");
-                    if (literal == null || computedAt == null) {
-                        return; // stored without concatenation, or the opt-in was switched off
-                    }
-                    float[] values = parseVectorLiteral(literal);
-                    JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
-                            values, rows.getString("model_id"), values.length, computedAt.toInstant()));
+        }
+    }
+
+    /** {@code Point}-typed fields per entity class, resolved once: this runs for every entity Hibernate
+     *  loads, so the reflection behind it must not. */
+    private static final Map<Class<?>, List<Field>> POINT_FIELDS = new ConcurrentHashMap<>();
+
+    private static List<Field> pointFieldsOf(Class<?> entityType) {
+        return POINT_FIELDS.computeIfAbsent(entityType, type -> {
+            List<Field> fields = new ArrayList<>();
+            for (Field field : EntityReflection.allFields(type)) {
+                if (Point.class.isAssignableFrom(field.getType())) {
+                    field.setAccessible(true);
+                    fields.add(field);
                 }
             }
+            return List.copyOf(fields);
         });
     }
 
@@ -2991,10 +2995,22 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      */
     private void hydrateLoaded(Session session, Object entity) {
         hydrateCollectionMembers(session, entity);
-        hydrateGeoPoints(session, entity, new IdentityHashMap<>());
-        // No vector hydration here: JavAIPostLoadVectorListener served this entity -- and every other one
-        // Hibernate materialized, including the members session.find loaded just above -- as it was loaded.
-        // The shared `visited` set every caller used to thread through here went with the walk (OMI-271).
+        // Nothing else: JavAIPostLoadVectorListener served this entity its vectors AND its Point fields --
+        // and every other entity Hibernate materialized, whenever it did so, including ones the caller
+        // initializes later. That is what the geo walk could not do, and why it is gone (OMI-276). Only the
+        // side-table collection hydration is left here, still root-only, still wrong (OMI-277).
+    }
+
+    /** {@link #tableExists} with the confirmation memoised -- see {@link #confirmedTables}. */
+    private boolean tableExistsCached(Connection connection, String table) throws SQLException {
+        if (confirmedTables.contains(table)) {
+            return true;
+        }
+        if (!tableExists(connection, table)) {
+            return false;
+        }
+        confirmedTables.add(table);
+        return true;
     }
 
     private static boolean tableExists(Connection connection, String table) throws SQLException {
@@ -3480,6 +3496,15 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private static final Set<SessionFactory> POST_LOAD_LISTENER_REGISTERED =
             Collections.newSetFromMap(new WeakHashMap<>());
 
+    /**
+     * Tables this backend has confirmed exist. Positives only, deliberately: a table cannot stop existing,
+     * so a hit is permanently safe -- while a miss must stay a miss, since the very next write may create it
+     * (a first run, or a switch to a model whose vector table has never been written). Without this the
+     * per-entity read below pays a JDBC metadata round trip per table per entity, which is a cost nobody
+     * measured because it never appeared in {@code pg_stat_user_tables} (OMI-276).
+     */
+    private final Set<String> confirmedTables = ConcurrentHashMap.newKeySet();
+
     /** Attaches {@link JavAIFlushVectorListener} so vector writes can cover every entity Hibernate actually
      *  persists -- including ones reached only by cascading, at any depth. Works on a factory this backend
      *  built and, equally, on one the application supplied (proven in {@code PhaseZeroSpikeTest}'s Gate 2);
@@ -3509,7 +3534,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
         EventListenerRegistry listeners = ((SessionFactoryImplementor) factory)
                 .getServiceRegistry().getService(EventListenerRegistry.class);
-        listeners.appendListeners(EventType.POST_LOAD, new JavAIPostLoadVectorListener(this::hydrateVectors));
+        listeners.appendListeners(EventType.POST_LOAD,
+                new JavAIPostLoadVectorListener((session, entity) -> hydrateOutOfBand(session, entity, true)));
     }
 
     /** Writes vectors for every {@code @JavAIVectorizable} Hibernate reported persisting in this flush.

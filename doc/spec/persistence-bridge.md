@@ -366,6 +366,15 @@ Library library = JavAIPI.inTransaction(config, () -> {
 });
 ```
 
+**Every piece of out-of-band state is served from Hibernate's `POST_LOAD` event, in one read (OMI-276).**
+Three things live outside an entity's own table -- each `@Vectorize` field's vector, the entity-grain
+concatenated text vector, and any `Point` field -- and they were originally fetched by different mechanisms
+at different times. Geo kept its own recursive walk, which is what made it the one that broke: the walk ran
+before a caller could initialize anything, so a `Point` on an entity reached through an association was
+silently never read. All three now come from one `UNION` per entity, over the tables that apply to it and
+exist, with existence memoised. One statement per entity, and the count does not scale with how many
+`@Vectorize` or `Point` fields that entity has.
+
 **Stored vectors are served from Hibernate's `POST_LOAD` event instead of from a walk.** That is what makes
 the removal free rather than a trade: the cost becomes one SELECT per entity *actually loaded*, and it covers
 a case no walk at load time could — a member the caller initializes afterwards, which arrives long after any
