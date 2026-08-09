@@ -12,6 +12,34 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Changed
+
+- **⚠️ `javai-persistence`/`javai-tagging`: a JavAI collection field must be declared by its interface
+  (OMI-277).** `private final JavAIArrayList<X> xs = new JavAIArrayList<>();` is **refused at registration**
+  now, with a message naming the interface to use instead. The supported shape is the one already
+  recommended:
+
+  ```java
+  @OneToMany(cascade = CascadeType.ALL)
+  private JavAIList<Photo> photos = new JavAIArrayList<>();   // interface-typed, non-final, annotated
+  ```
+
+  The concrete form was a second storage mechanism (`javai_collection_members`) and it was **silently
+  root-only in both directions**: reached through an association the collection came back empty, and saved
+  through one its members were never written. It was withdrawn rather than repaired because it cannot be made
+  lazy where it stands — the field holds a `final` instance of a `final` class, and Hibernate manages a
+  collection by substituting its own. See OMI-277 for the options weighed, including the one that was chosen
+  and then withdrawn on contact with the types.
+
+  **This is a breaking API change to `javai-tagging`'s shipped `TagSet`**: `getTags()` returns
+  `JavAIList<Tag>` rather than `JavAIArrayList<Tag>`. A caller that declared the receiver as the concrete
+  type needs a one-word change; every other use is unaffected.
+
+  ⚠️ **Two to-many fields of the same element type now need explicit `@JoinTable(name = …)`.** Hibernate
+  derives the default join-table name from owner + element type, so a list and a map of the same type on one
+  entity silently claim the same table. Ordinary JPA, newly reachable because the map used to avoid the
+  native path entirely.
+
 ### Fixed
 
 - **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**

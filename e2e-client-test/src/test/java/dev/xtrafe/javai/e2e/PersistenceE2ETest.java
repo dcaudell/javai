@@ -222,8 +222,12 @@ class PersistenceE2ETest {
 
     /**
      * {@code relatedComments} (a {@code JavAILinkedHashMap<String, Comment>}, not {@code @Summary} -- see
-     * {@code Article}'s own javadoc) round-trips through the same {@code javai_collection_members} table as
-     * {@code comments}, this time with {@code member_key} populated.
+     * {@code Article}'s own javadoc) round-trips as a native Hibernate map, keyed by {@code @MapKeyColumn}.
+     *
+     * <p>It used to go through {@code javai_collection_members} with {@code member_key} populated. OMI-277
+     * refused that mapping, so this is now an ordinary lazy association and has to be read inside a unit of
+     * work like any other -- which is the whole point of the change: one collection mechanism, one set of
+     * rules.
      */
     @Test
     void postgresJavAILinkedHashMapFieldRoundTrips() {
@@ -232,11 +236,14 @@ class PersistenceE2ETest {
         article.getRelatedComments().put("second", new Comment("frank", "second related comment"));
 
         Article saved = postgresRepository.save(article);
-        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
 
-        assertEquals(2, reloaded.getRelatedComments().size());
-        assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
-        assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+        JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+            assertEquals(2, reloaded.getRelatedComments().size());
+            assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
+            assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+            return null;
+        });
     }
 
     /**

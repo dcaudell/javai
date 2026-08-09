@@ -179,30 +179,25 @@ class LoadPathOverFetchTest {
     }
 
     /**
-     * The residual, asserted so it is a known quantity rather than a surprise: a JavAI collection field
-     * carrying <em>no</em> association annotation is mapped out-of-band through
-     * {@code javai_collection_members} and hydrated eagerly by {@code hydrateCollectionMembers}, because it
-     * has no Hibernate laziness to lean on -- {@code JavAIArrayList} is a plain field value the constructor
-     * already created, so declining to fill it would hand the caller a silently-empty collection rather than
-     * a lazy one.
+     * What used to be this class's "known residual" is gone (OMI-277).
      *
-     * <p>Contrast {@link TestLibrary#getShelves()}, a JavAI collection that <em>does</em> carry
-     * {@code @OneToMany}: Hibernate maps that natively and substitutes a {@link PersistentJavAIList}, so it
-     * is genuinely lazy (see the test above). Making the out-of-band form lazy too means a lazy-initializing
-     * JavAI collection, which is a feature rather than this fix.
+     * <p>A JavAI collection field carrying no association annotation was mapped out-of-band and hydrated
+     * eagerly for the root of a repository call -- the one mapping OMI-271 could not make lazy, because the
+     * field held a final concrete instance with no Hibernate collection behind it. That shape is refused at
+     * registration now, so every JavAI collection is a native association and every one of them is lazy.
      */
     @Test
-    void aSideTableJavAICollectionIsStillHydratedEagerly() {
-        TestVenue venue = new TestVenue("over-fetch-javai-collection", null, List.of(
-                new TestReview("a", 5), new TestReview("b", 4), new TestReview("c", 3),
-                new TestReview("d", 2), new TestReview("e", 1)));
-        UUID id = venues.save(venue).getId();
+    void everyJavAICollectionIsNowLazyIncludingTheOnesThatUsedToBeEager() {
+        TestVenue venue = new TestVenue("no-longer-eager", null, List.of(
+                new TestReview("a", 5), new TestReview("b", 4)));
+        venues.save(venue);
 
-        statistics.clear();
-        TestVenue loaded = venues.findById(id).orElseThrow();
+        TestVenue detached = venues.findById(venue.getId()).orElseThrow();
+        assertFalse(Hibernate.isInitialized(detached.getReviews()),
+                "a JavAI collection is lazy like any other association now");
 
-        assertEquals(5, loaded.getReviews().size());
-        assertEquals(6, statistics.getEntityLoadCount(),
-                "the owner plus its five members -- the known cost of an out-of-band collection mapping");
+        int inSession = JavAIPI.inTransaction(config, () ->
+                venues.findById(venue.getId()).orElseThrow().getReviews().size());
+        assertEquals(2, inSession, "...and initializes normally inside a unit of work");
     }
 }

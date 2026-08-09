@@ -435,6 +435,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  not a heuristic: such a field can never be validly Hibernate-mapped natively (see this class's own
      *  javadoc), so auto-excluding it is always correct, never a loss of an alternative that could have
      *  worked. */
+    /** The interface a consumer should declare instead of {@code type}, for the refusal message above. */
+    private static String javAIInterfaceFor(Class<?> type) {
+        if (Map.class.isAssignableFrom(type)) {
+            return "JavAIMap";
+        }
+        return Set.class.isAssignableFrom(type) ? "JavAISet" : "JavAIList";
+    }
+
     private static boolean isJavAICollectionField(Field field) {
         Class<?> type = field.getType();
         boolean collectionShaped = Collection.class.isAssignableFrom(type) || Map.class.isAssignableFrom(type);
@@ -473,17 +481,20 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     || field.isAnnotationPresent(ManyToMany.class)
                     || field.isAnnotationPresent(org.hibernate.annotations.ManyToAny.class);
             if (isJavAICollectionField(field)) {
-                if (association) {
-                    throw new IllegalArgumentException("Cannot honor @OneToMany/@ManyToMany on "
-                            + entityType.getName() + "." + field.getName() + ": the field is declared as the "
-                            + "CONCRETE type " + field.getType().getSimpleName() + ", which Hibernate can never "
-                            + "manage (it substitutes its own collection instance into the field). Declare it by "
-                            + "the JavAI INTERFACE instead -- e.g. 'private JavAIList<X> " + field.getName()
-                            + " = new JavAIArrayList<>();' (non-final) -- and the association becomes a native "
-                            + "Hibernate one, with vectors and dirty-tracking preserved. Leave the field concrete "
-                            + "and drop the annotation to keep JavAI's own side-table collection storage.");
-                }
-                continue; // plain JavAI collection field: mapped by this backend's own side table
+                throw new IllegalArgumentException("Cannot map " + entityType.getName() + "."
+                        + field.getName() + ": the field is declared as the CONCRETE type "
+                        + field.getType().getSimpleName() + ", which Hibernate can never manage -- it "
+                        + "substitutes its own collection instance into the field, and a final class cannot "
+                        + "be substituted. Declare it by the JavAI INTERFACE instead -- 'private "
+                        + javAIInterfaceFor(type) + "<X> " + field.getName() + " = new "
+                        + field.getType().getSimpleName() + "<>();', non-final, with the ordinary JPA "
+                        + "annotation (@OneToMany/@ManyToMany, plus @MapKeyColumn for a map) -- and the "
+                        + "association becomes a native Hibernate one, with vectors and dirty-tracking "
+                        + "preserved. This shape used to be accepted and stored out-of-band in "
+                        + "javai_collection_members; it is refused as of OMI-277, because that storage was "
+                        + "only ever read and written for the entity a repository call returned. Reached "
+                        + "through an association it came back silently empty, and saved through one its "
+                        + "members were silently never written.");
             }
             if (!association && !field.isAnnotationPresent(ElementCollection.class)
                     && !field.isAnnotationPresent(Transient.class)) {

@@ -386,11 +386,28 @@ perform I/O — and cannot recognise one without depending on an ORM. `JavAIRunt
 is the seam: the Hibernate backend installs `Hibernate::isInitialized`, and the default answers `true` for
 everything, which is right for a plain object graph with no persistence layer under it.
 
-**One eager mapping remains, deliberately.** A JavAI collection field carrying *no* association annotation is
-mapped out-of-band through `javai_collection_members` and has no Hibernate laziness to lean on — the field
-holds a real `JavAIArrayList` the constructor made, so declining to fill it would hand back a silently-empty
-collection rather than a lazy one. A JavAI collection that *does* carry `@OneToMany`/`@ManyToMany` is mapped
-natively (see OMI-142) and is lazy like any other.
+**There is now exactly one JavAI collection mapping (OMI-277).** A JavAI collection field must be declared by
+the *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with the ordinary JPA annotation; Hibernate
+then substitutes `PersistentJavAIList`/`Set`/`Map`, and the field is an ordinary lazy association with vectors
+and dirty-tracking intact (see OMI-142 for how that substitution works).
+
+A *concrete*-typed field (`private final JavAIArrayList<X>`) is refused at registration. It used to be a
+second, out-of-band mapping through `javai_collection_members`, and it was withdrawn rather than repaired
+because that storage was only ever read and written for the entity a repository call **returned**: reached
+through an association the collection came back silently empty, and saved through one its members were
+silently never written. Neither failure announced itself.
+
+It could not be made lazy where it stood, and the reason is worth recording because it is the whole argument.
+The field holds a `final` instance of a `final` class that the entity's own constructor created; Hibernate
+manages a collection by substituting its own instance, which a final class forbids. Laziness would therefore
+have had to live *inside* `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap`, as a pending load
+triggered from every read — and `ArrayList`'s read surface has no single funnel, so a missed override returns
+an empty collection, which is precisely the defect being fixed. Doing it properly would have required an
+interface-typed, non-final field: exactly what the native mapping already requires, at which point the second
+mapping has no reason to exist.
+
+The `javai_collection_members` machinery is left in place, unreachable rather than deleted, so the decision
+can be reversed if real use argues for it.
 
 ## Ordinary relational derived finders
 

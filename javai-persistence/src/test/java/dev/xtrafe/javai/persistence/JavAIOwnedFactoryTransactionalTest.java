@@ -176,7 +176,9 @@ class JavAIOwnedFactoryTransactionalTest extends SpringTransactionalConformance 
                 "...nor a queued recomputation for a mutation that never happened");
     }
 
-    /** The other two side tables, on the fixture that has them. */
+    /** The remaining side table, on the fixture that has one. {@code javai_collection_members} is not
+     *  asserted here any more: since OMI-277 no supported mapping writes to it -- a JavAI collection is a
+     *  native Hibernate association, so its rows roll back as part of its own join table. */
     @Test
     void aRollbackTakesTheGeoPointAndCollectionMemberRowsWithIt() {
         TestVenue venue = new TestVenue("rollback-venue-" + UUID.randomUUID(),
@@ -189,7 +191,6 @@ class JavAIOwnedFactoryTransactionalTest extends SpringTransactionalConformance 
         }));
 
         assertEquals(0, rowsFor("javai_geo_points", venue.getId()), "no orphaned geo point");
-        assertEquals(0, rowsFor("javai_collection_members", venue.getId()), "no orphaned collection members");
     }
 
     /** ...and the committing counterpart, so the two above cannot pass by never writing anything at all. */
@@ -202,7 +203,6 @@ class JavAIOwnedFactoryTransactionalTest extends SpringTransactionalConformance 
         transactions.executeWithoutResult(status -> venues.save(venue));
 
         assertEquals(1, rowsFor("javai_geo_points", venue.getId()));
-        assertEquals(1, rowsFor("javai_collection_members", venue.getId()));
     }
 
     // ---- cost: OMI-275's standing acceptance criterion ------------------------------------------

@@ -9,10 +9,13 @@ import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIMap;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.JoinTable;
+import jakarta.persistence.MapKeyColumn;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 
@@ -105,7 +108,12 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
     // Not @Summary -- purely exercises JavAILinkedHashMap persistence (String-keyed, per
     // RepositoryBackendHibernatePostgres's own documented Phase 0 limitation) alongside comments'
     // JavAIArrayList, without changing what already-passing tests assert about summaryVector().
-    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+    // Its own join table, explicitly: `comments` above is also a to-many of Comment, and Hibernate derives
+    // the default join-table name from owner + element type, so both would claim `article_comment`.
+    @OneToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    @JoinTable(name = "article_related_comment")
+    @MapKeyColumn(name = "related_key")
+    private JavAIMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     @OneToOne(cascade = CascadeType.ALL)
     @SearchVisibility(PRIVATE)
@@ -154,7 +162,7 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
         return comments;
     }
 
-    public JavAILinkedHashMap<String, Comment> getRelatedComments() {
+    public JavAIMap<String, Comment> getRelatedComments() {
         return relatedComments;
     }
 
