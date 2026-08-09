@@ -26,10 +26,12 @@ below:
 repository-creation time**, never on first call.
 
 **Not an invariant any more:** the `String`-keyed-`Map` rule. **Neo4j and MongoDB** still refuse any
-`Map`-typed field keyed by anything else, at registration, JavAI-typed or plain. **Postgres does not** — the
-validator went with the storage it protected (OMI-277), and a map is now mapped by Hibernate the way JPA
-specifies (`@MapKeyColumn`, `@MapKeyEnumerated`, …). ⚠️ *Not refusing is not the same as measured:* nothing
-in the suite exercises a non-`String` key on Postgres, so treat `String` as the portable choice.
+`Map`-typed field keyed by anything else, at registration, JavAI-typed or plain. **On Postgres a non-`String`
+key is supported** — the validator went with the storage it protected (OMI-277), and a map is now mapped by
+Hibernate the way JPA specifies (`@MapKeyColumn`, `@MapKeyEnumerated`, …). Measured, not merely un-refused:
+`Integer`, `UUID` and enum keys round-trip **as their own types**, in `integer`/`uuid`/`varchar` columns
+(`NonStringMapKeyConformanceTest`). `String` is still the **portable** choice, but only because of the other
+two backends.
 
 Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupported / rejected · **N/A** not applicable.
 
@@ -110,7 +112,7 @@ is the interface-typed one.
 
 | Collection type | Persist: Postgres | Persist: Neo4j | Persist: MongoDB | Nested-traversal finder | `IsEmpty`/`IsNotEmpty` finder |
 |---|:--:|:--:|:--:|:--:|:--:|
-| **interface-typed** `JavAIList`/`JavAISet`/`JavAIMap` + `@OneToMany`/`@ManyToMany` | ✅ **native Hibernate association** (own join table/FK), JavAI collection instance preserved | ✅ relationship | ✅ reference array | ✅ P·N·M | ✅ P·N·M |
+| **interface-typed** `JavAIList`/`JavAISet`/`JavAIMap` + `@OneToMany`/`@ManyToMany` | ✅ **native Hibernate association** (own join table/FK), JavAI collection instance preserved; a `JavAIMap` takes **any key JPA can map**, not just `String` | ✅ relationship (`String` key only) | ✅ reference array (`String` key only) | ✅ P·N·M | ✅ P·N·M |
 | *plain* `List`/`Set`/`Map` (not a JavAI type) | ✅ native Hibernate association — **requires** `@OneToMany`/`@ManyToMany`/`@ManyToAny`/`@ElementCollection` | ✅ relationship (annotation inert) | ✅ reference array (annotation inert) | ✅ P·N·M | ✅ P·N·M |
 | *concrete-typed* `JavAIArrayList<E>` | ❌ **refused at registration** (OMI-277) — declare it `JavAIList<E>` | ✅ relationship (ordered) | ✅ `{type,id}` reference array | ✅ N·M | ✅ N·M |
 | *concrete-typed* `JavAILinkedHashSet<E>` | ❌ **refused at registration** — declare it `JavAISet<E>` | ✅ relationship | ✅ reference array | ✅ N·M | ✅ N·M |
@@ -126,7 +128,8 @@ private JavAIList<Comment> comments = new JavAIArrayList<>();   // interface-typ
 ```
 
 You get real JPA semantics *and* a real JavAI collection — vectors and dirty-tracking survive, with **no
-`@CollectionType` or other JavAI-specific annotation**. A **map** additionally needs `@MapKeyColumn`.
+`@CollectionType` or other JavAI-specific annotation**. A **map** additionally needs `@MapKeyColumn`, and may
+be keyed by anything JPA can map — add `@MapKeyEnumerated` for an enum key, as you would on a plain `Map`.
 
 Declaring it by the **concrete** class (`private final JavAIArrayList<Comment> …`) is **refused at
 registration** as of 0.1.10, with a message naming the interface to use. It used to be a second storage
@@ -163,8 +166,8 @@ Notes:
 - **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Any`, `@Embedded`, and nested/to-many
   *sort*) if the same entity must run on more than one backend. Two more since 0.1.10, both pointing *away*
   from Postgres: declare a JavAI collection by its **interface** (the concrete type still works on
-  Neo4j/Mongo, but Postgres refuses it), and key any `Map` by **`String`** (only Postgres accepts anything
-  else, and only untested). Note that `KnowledgeGraph` and `@Any` pull in
+  Neo4j/Mongo, but Postgres refuses it), and key any `Map` by **`String`** (Postgres takes any key JPA can
+  map, but it is the only one that does). Note that `KnowledgeGraph` and `@Any` pull in
   opposite directions — one is Neo4j-only, the other Postgres-only — so an entity declaring both cannot be
   persisted on any single backend at all.
 

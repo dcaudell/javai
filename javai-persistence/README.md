@@ -339,8 +339,11 @@ last thing wanted.
 **Map keys are Hibernate's business on Postgres.** A `Map` field not keyed by `String` used to be refused
 here, because the membership table's key column was a plain `varchar` and a stringified key could never
 round-trip back to its original type. With that table gone a map is an ordinary JPA association, keyed
-however `@MapKeyColumn`/`@MapKeyEnumerated` say, and the validator went with the storage it protected. Neo4j
-and MongoDB still enforce the rule -- see below, where the reason still holds.
+however `@MapKeyColumn`/`@MapKeyEnumerated` say, and the validator went with the storage it protected.
+`NonStringMapKeyConformanceTest` (OMI-279) pins the result against the harm the old rule named: `Integer`,
+`UUID` and enum keys come back as their own types, from `integer`/`uuid`/`varchar` columns, with
+`PersistentJavAIMap` still substituted in. Neo4j and MongoDB still enforce the rule -- see below, where the
+reason still holds.
 
 **Neo4j doesn't need any of this ceremony removal** -- its own reflective relationship mapping has no
 `PersistentBag`-equivalent substitution problem to begin with, so there was never an `@Transient`/proxy

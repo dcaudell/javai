@@ -186,9 +186,12 @@ import java.util.concurrent.ConcurrentHashMap;
  * {@code Map} field not keyed by {@code String}, because the membership table's key column was a plain
  * {@code varchar} and a stringified key could never round-trip back to its original type. The table is gone
  * and a map is an ordinary JPA association now, keyed however {@code @MapKeyColumn}/{@code @MapKeyEnumerated}
- * and friends say -- so the validator went with the storage it protected. {@code RepositoryBackendNeo4j} and
- * {@code RepositoryBackendSpringDataMongo} still enforce the rule, for exactly the reason it originally
- * existed: their key genuinely is a string property on a relationship or in a reference array.
+ * and friends say -- so the validator went with the storage it protected. Measured against the harm the rule
+ * named, rather than left as an absence of refusal: {@code NonStringMapKeyConformanceTest} (OMI-279) pins
+ * {@code Integer}/{@code UUID}/enum keys round-tripping as their own types, out of columns of their own
+ * types. {@code RepositoryBackendNeo4j} and {@code RepositoryBackendSpringDataMongo} still enforce the rule,
+ * for exactly the reason it originally existed: their key genuinely is a string property on a relationship
+ * or in a reference array.
  *
  * <p><b>How the native mapping is attached.</b> Shape 1 above is delivered by Hibernate's
  * {@code org.hibernate.usertype.UserCollectionType} SPI, which lets a custom {@code PersistentCollection}

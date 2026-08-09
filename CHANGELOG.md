@@ -33,6 +33,16 @@ version -- a given release usually changes only one or two of them.
   to-ones came back eager and finality was very nearly documented as optionality. `TestSeal` and
   `TestWaxSeal` are now identical targets of identical mappings differing only in the keyword.
 
+- **A `JavAIMap` keyed by something other than `String` is supported on Postgres, and now measured (OMI-279).**
+  OMI-277 deleted the validator that refused one, because it deleted the `varchar` key column that was the
+  reason for it — which left the cell *un-refused but never exercised*, and "we stopped rejecting it" is not
+  the claim a reader hears. `NonStringMapKeyConformanceTest` answers the harm the old rule named rather than
+  settling for a round trip: `Integer`, `UUID` and enum keys come back **as their own types**, out of
+  `integer`/`uuid`/`varchar` columns, with `PersistentJavAIMap` still substituted in and the association
+  lazy. A key stringified on write and parsed on read would pass a naive round-trip assertion and fail both
+  of those. `String` remains the portable choice, but only because Neo4j and MongoDB still refuse the rest —
+  for the reason Postgres no longer has.
+
 ### Changed
 
 - **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
