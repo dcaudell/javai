@@ -79,9 +79,10 @@
          to be a property indirection rather than a literal value directly in that plugin's excludedGroups
          element. "performance" is hand-run profiling harnesses (see EmbeddingConsistencyBenchmark);
          "requires-model" is real-container tests needing an actual LLM/embedding model running (see
-         CortexOllamaRealContainerTest); both excluded by default so plain `mvn test` (what every GitHub
-         Actions CI workflow in .github/workflows runs) never pays for either. -->
-    <javai.excludedTestGroups>performance, requires-model</javai.excludedTestGroups>
+         CortexOllamaRealContainerTest); "cost" is round-trip accounting (see OutOfBandReadCostTest); all
+         three excluded by default so plain `mvn test` (what every GitHub Actions CI workflow in
+         .github/workflows runs) never pays for any of them. -->
+    <javai.excludedTestGroups>performance, requires-model, cost</javai.excludedTestGroups>
 
     <junit.version>6.1.2</junit.version>
     <!--
@@ -402,11 +403,23 @@
               their assertions are loose by nature (comparative timings, not exact values). "requires-model"-
               tagged tests (see CortexOllamaRealContainerTest) need an actual LLM/embedding model running in
               a real container; a real compute/bandwidth cost, not something any CI workflow in
-              .github/workflows should pay on every PR. Both excluded from the default `mvn test`/
-              `mvn install` run repo-wide; run either explicitly with, e.g.,
+              .github/workflows should pay on every PR.
+
+              "cost"-tagged tests (see OutOfBandReadCostTest in javai-persistence) count round trips rather
+              than assert behaviour, per OMI-275's standing criterion that a fix must not be bought with
+              queries. Deliberately its own tag rather than "performance": its assertions are exact, not
+              comparative timings. What makes it slow is neither the work nor loose measurement but the
+              waiting. Postgres flushes a backend's statistics on its own schedule, and
+              pg_stat_force_next_flush() reaches only the sampling connection's own, so the counters have to
+              be allowed to settle before and after each measurement. Roughly 45 seconds for three
+              assertions, which is worth paying when the read path changes and worth nothing on every other
+              PR. All three excluded from the default `mvn test`/`mvn install` run repo-wide; run any of them
+              explicitly with, e.g.,
               `mvn -pl javai-model test -Djavai.excludedTestGroups=` (drops both) or
-              `mvn -pl javai-completion test -Djavai.excludedTestGroups=performance` (drops just
-              requires-model, keeps performance excluded).
+              `mvn -pl javai-completion test -Djavai.excludedTestGroups=performance` (drops the other two,
+              keeps performance excluded), or
+              `mvn -pl javai-persistence test -Djavai.excludedTestGroups=performance,requires-model`
+              (runs the cost accounting alone).
 
               Deliberately an indirection through the javai.excludedTestGroups property (rather than the
               literal string directly here): surefire only auto-binds its own -DexcludedGroups command-line

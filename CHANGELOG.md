@@ -14,6 +14,29 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**
+  A 0.1.10 regression, and a silent one: nothing threw and nothing logged, so an entity simply appeared to
+  have no location. `Point` fields live out-of-band in `javai_geo_points` and were read by a recursive walk
+  of the loaded graph. OMI-271 correctly stopped that walk at uninitialized associations, and the walk runs
+  before the caller can initialize anything -- so a `Point` on any entity the caller initialized afterwards
+  was never read. On 0.1.9 the walk force-initialized the whole graph and always got there; the over-fetch
+  was carrying it.
+
+  `Point` fields now come from the same `POST_LOAD` event that already serves vectors -- once per entity
+  Hibernate actually loads, whenever it loads it -- which is the one place that can also cover an entity
+  initialized later. The recursive geo walk is gone, and with it the last graph walk on the load path.
+
+- **`javai-persistence`: an entity's out-of-band state is read in one statement (OMI-276).** Restoring the
+  `Point` could have meant a third query per entity on top of the two the post-load listener already issued
+  for vectors, plus a JDBC metadata call per table per entity, plus **one query per `Point` field**. Instead
+  the three reads are one: a single `UNION` over the tables that apply to that entity and actually exist,
+  with existence memoised so the metadata round trip is paid once per table rather than once per entity.
+  Measured, per OMI-275's standing criterion: an entity with two `Point` fields costs **one** geo read, and
+  a load costs **one** field-vector read per entity.
+
+
+### Fixed
+
 - **`javai-persistence`: a read no longer loads the whole reachable object graph (OMI-271).**
   `reachableRelated` -- the walk both post-load steps traversed -- called `addAll` on every collection-valued
   field, and iterating an uninitialized Hibernate `PersistentCollection` *is* initializing it. So every
