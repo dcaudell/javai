@@ -359,6 +359,29 @@ class ExternalVectorPersistenceTest {
         assertTrue(thrown.getMessage().contains("caption"), thrown.getMessage());
     }
 
+    @Test
+    void reindexPreservesAnExternalVectorAndNeverTriesToComputeOne() {
+        TestImageAsset asset = new TestImageAsset("a reindexed photo", "sha256:reindex");
+        EmbeddingVector supplied = TestImageAsset.imageVector(0.77f);
+        JavAIRuntime.supplyVector(asset, "pixels", supplied, "sha256:reindex");
+        assets.save(asset);
+        ledger.reset();
+
+        assets.reindex();
+        ledger.awaitQuiescence();
+
+        // A re-index exists to re-embed under the currently configured model. An external vector is not in
+        // that model and could not be re-embedded by this process even if it were -- so it must be carried
+        // across untouched rather than recomputed or dropped. Nothing it stores may reach the provider.
+        for (EmbeddingLedger.Call call : ledger.calls()) {
+            assertFalse(call.text().startsWith("sha256:"),
+                    "reindex must not hand a content key to the embedding provider: " + call.text());
+        }
+        assertArrayEquals(supplied.values(),
+                assets.findById(asset.getId()).orElseThrow().externalVector("pixels").values(),
+                "a re-index must not lose a vector it cannot recompute");
+    }
+
     // ---- direct SQL, so the assertions are about what is actually stored ------------------------------
 
     private static String imageTable() {

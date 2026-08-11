@@ -170,6 +170,12 @@ database and, since OMI-187, read straight back into a loaded object's cache slo
 no longer stale merely for that object's lifetime — it is stored, served on every subsequent load, and
 outlives the process that produced it. The rule is the same rule; persistence just makes breaking it durable.
 
+**An `@ExternalVector` is outside this rule entirely** (OMI-290), and is the one kind of vector that is. Its
+validity is re-derived on every read by comparing a short content key against the field that holds it, rather
+than tracked through an intercepted write — affordable precisely because the key stands in for content JavAI
+never reads. A key written by reflection, by a framework, or by any other route that bypasses a woven setter
+is therefore caught exactly like one written through it. See `doc/spec/vector-core.md`'s own section.
+
 Two things that are explicitly *not* violations, because JavAI handles them itself:
 - **`merge()` handing back a different instance.** Hibernate copies mapped field values onto a managed copy
   but not the woven `$javai$state` the caches live in. `javai-persistence` carries the vectors across
