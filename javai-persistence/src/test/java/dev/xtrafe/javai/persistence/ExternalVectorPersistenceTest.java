@@ -8,7 +8,12 @@ import dev.xtrafe.javai.vector.testsupport.RecordingEmbeddingProvider;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
+import org.testcontainers.containers.GenericContainer;
+import org.testcontainers.containers.Neo4jContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.containers.wait.strategy.Wait;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.utility.DockerImageName;
@@ -17,6 +22,8 @@ import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.time.Duration;
+import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,11 +42,26 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @Testcontainers
 class ExternalVectorPersistenceTest {
 
+    private static final String NEO4J_PASSWORD = "external-vector-password";
+
     @Container
     static final PostgreSQLContainer<?> postgres = new PostgreSQLContainer<>(
             DockerImageName.parse("pgvector/pgvector:pg16").asCompatibleSubstituteFor("postgres"));
 
+    @Container
+    static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:5.26-community"))
+            .withAdminPassword(NEO4J_PASSWORD);
+
+    @Container
+    static final GenericContainer<?> mongo =
+            new GenericContainer<>(DockerImageName.parse("mongodb/mongodb-atlas-local:8.2"))
+                    .withExposedPorts(27017)
+                    .waitingFor(Wait.forHealthcheck())
+                    .withStartupTimeout(Duration.ofMinutes(3));
+
     private static TestImageAssetRepository assets;
+    private static TestImageAssetRepository neo4jAssets;
+    private static TestImageAssetRepository mongoAssets;
     private static RecordingEmbeddingProvider provider;
     private static EmbeddingLedger ledger;
 
@@ -55,6 +77,85 @@ class ExternalVectorPersistenceTest {
                 .postgresUsername(postgres.getUsername())
                 .postgresPassword(postgres.getPassword())
                 .build());
+        neo4jAssets = JavAIPI.repository(TestImageAssetRepository.class, JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
+                .build());
+        mongoAssets = JavAIPI.repository(TestImageAssetRepository.class, JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.MONGODB)
+                .mongoUri("mongodb://" + mongo.getHost() + ":" + mongo.getMappedPort(27017) + "/?directConnection=true")
+                .mongoDatabase("externalvectors")
+                .build());
+    }
+
+    /** Every backend stores these independently, and "this one does it right" is exactly the claim that
+     *  quietly stops being true -- the same reasoning {@code AbsentVectorRemovalTest} states for its own
+     *  three-backend coverage. */
+    static Stream<org.junit.jupiter.params.provider.Arguments> everyBackend() {
+        return Stream.of(
+                org.junit.jupiter.params.provider.Arguments.of("postgres", assets),
+                org.junit.jupiter.params.provider.Arguments.of("neo4j", neo4jAssets),
+                org.junit.jupiter.params.provider.Arguments.of("mongodb", mongoAssets));
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void everyBackendRoundTripsTheVectorWithItsContentKey(String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("a photo on " + backend, "sha256:" + backend);
+        EmbeddingVector supplied = TestImageAsset.imageVector(0.25f);
+        assertTrue(JavAIRuntime.supplyVector(asset, "pixels", supplied, "sha256:" + backend));
+        repository.save(asset);
+
+        TestImageAsset loaded = repository.findById(asset.getId()).orElseThrow();
+        EmbeddingVector served = loaded.externalVector("pixels");
+
+        assertFalse(served.isAbsent(), backend + " must hydrate the content key alongside the vector");
+        assertArrayEquals(supplied.values(), served.values());
+        assertEquals(TestImageAsset.IMAGE_MODEL, served.modelId());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void everyBackendStopsServingAVectorWhoseContentChanged(String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("a re-uploaded photo on " + backend, "sha256:first-" + backend);
+        JavAIRuntime.supplyVector(asset, "pixels", TestImageAsset.imageVector(0.25f), "sha256:first-" + backend);
+        repository.save(asset);
+        assertFalse(repository.findById(asset.getId()).orElseThrow().externalVector("pixels").isAbsent());
+
+        asset.setContentHash("sha256:second-" + backend);
+        repository.save(asset);
+
+        TestImageAsset loaded = repository.findById(asset.getId()).orElseThrow();
+        assertTrue(loaded.externalVector("pixels").isAbsent(),
+                backend + " must not go on serving a vector for content the asset no longer references");
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void everyBackendSavesAnAssetWhoseVectorHasNotArrived(String backend, TestImageAssetRepository repository) {
+        // The ordinary state between upload and the pipeline catching up: an unremarkable save.
+        TestImageAsset asset = new TestImageAsset("still queued on " + backend, "sha256:pending-" + backend);
+        repository.save(asset);
+
+        assertTrue(repository.findById(asset.getId()).orElseThrow().externalVector("pixels").isAbsent());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void everyBackendReplacesRatherThanAccumulatesOnResupply(String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("reprocessed on " + backend, "sha256:before-" + backend);
+        JavAIRuntime.supplyVector(asset, "pixels", TestImageAsset.imageVector(0.25f), "sha256:before-" + backend);
+        repository.save(asset);
+
+        asset.setContentHash("sha256:after-" + backend);
+        EmbeddingVector reprocessed = TestImageAsset.imageVector(0.9f);
+        assertTrue(JavAIRuntime.supplyVector(asset, "pixels", reprocessed, "sha256:after-" + backend));
+        repository.save(asset);
+
+        TestImageAsset loaded = repository.findById(asset.getId()).orElseThrow();
+        assertArrayEquals(reprocessed.values(), loaded.externalVector("pixels").values());
     }
 
     @BeforeEach

@@ -850,6 +850,29 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 properties.put(qualify("concatenatedText", concatenated.modelId()),
                         vectorizable.concatenatedText());
             }
+
+            // @ExternalVector properties (OMI-290). Same per-entity shape as summaryVector above, with two
+            // differences: the qualifier is the *declared* model rather than the configured one -- these
+            // vectors have nothing to do with whichever text provider is running -- and the content key the
+            // vector was computed for travels alongside it. Without that key a hydrated vector is held and
+            // never served, since every read compares it against the entity's current content.
+            for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+                String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+                EmbeddingVector external = vectorizable.externalVector(vectorName);
+                if (external.isAbsent()) {
+                    // Nothing supplied yet, or superseded. Removing rather than leaving it is the same rule
+                    // an absent @Vectorize field follows, and matters more: the stored vector confidently
+                    // describes content this node no longer references.
+                    clearVectorProperty(properties, vectorName + "Vector", declaredModel);
+                    properties.put(qualify(vectorName + "Vector", declaredModel) + "ComputedFor", null);
+                    continue;
+                }
+                String qualifiedExternal = qualify(vectorName + "Vector", external.modelId());
+                properties.put(qualifiedExternal, external.values());
+                properties.put(qualifiedExternal + "ComputedAt", external.computedAt().toString());
+                properties.put(qualifiedExternal + "ComputedFor",
+                        JavAIRuntime.externalVectorKey(entity, vectorName));
+            }
         }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
@@ -1050,6 +1073,10 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (!(entity instanceof JavAIVectorizable)) {
             return;
         }
+        // Read before the currentModelId() guard below, deliberately: an @ExternalVector's model is declared
+        // on the type, so it is readable whether or not a text provider is configured or can name itself
+        // (OMI-290).
+        hydrateExternalVectors(entityType, entity, node);
         String modelId = JavAIRuntime.currentModelId();
         if (modelId == null) {
             return;
@@ -1086,6 +1113,39 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                     : Instant.now();
             JavAIRuntime.hydrateConcatenatedTextVector(entity,
                     new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+    }
+
+    /**
+     * Restores each {@code @ExternalVector} from its declared model's node properties, together with the
+     * content key it was written for (OMI-290).
+     *
+     * <p>The key is what makes the restored vector answerable at all: {@code externalVector()} compares it
+     * against the entity's current content on every read, so hydrating the vector alone would leave the
+     * entity holding something it can never serve -- indistinguishable, from outside, from a vector that had
+     * been superseded, and from a pipeline that had never run.
+     */
+    private void hydrateExternalVectors(Class<?> entityType, Object entity, Node node) {
+        for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+            String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            if (!node.containsKey(qualified) || node.get(qualified).isNull()) {
+                continue;
+            }
+            List<Object> raw = node.get(qualified).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualified + "ComputedAt")
+                    ? Instant.parse(node.get(qualified + "ComputedAt").asString())
+                    : Instant.now();
+            String computedFor = node.containsKey(qualified + "ComputedFor")
+                    && !node.get(qualified + "ComputedFor").isNull()
+                    ? node.get(qualified + "ComputedFor").asString()
+                    : null;
+            JavAIRuntime.hydrateExternalVector(entity, vectorName,
+                    new EmbeddingVector(values, declaredModel, values.length, computedAt), computedFor);
         }
     }
 

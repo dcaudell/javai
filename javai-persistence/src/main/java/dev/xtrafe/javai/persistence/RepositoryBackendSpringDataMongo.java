@@ -940,6 +940,29 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                     updates.put(qualifiedText, text);
                 }
             }
+
+            // @ExternalVector fields (OMI-290). Per-document, like summaryVector above, with two
+            // differences: the qualifier is the *declared* model rather than the configured one -- these
+            // have nothing to do with whichever text provider is running -- and the content key the vector
+            // was computed for is stored beside it. Without that key a hydrated vector is held and never
+            // served, since every read compares it against the document's current content.
+            for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+                String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+                EmbeddingVector external = vectorizable.externalVector(vectorName);
+                if (external.isAbsent()) {
+                    // Nothing supplied yet, or superseded. $unset rather than left behind: the stored vector
+                    // confidently describes content this document no longer references, and a stale entry in
+                    // a $vectorSearch index goes on matching forever.
+                    clearVectorField(removals, vectorName + "Vector", declaredModel);
+                    removals.add(qualify(vectorName + "Vector", declaredModel) + "ComputedFor");
+                    continue;
+                }
+                String qualifiedExternal = qualify(vectorName + "Vector", external.modelId());
+                updates.put(qualifiedExternal, toDoubleList(external.values()));
+                updates.put(qualifiedExternal + "ComputedAt", external.computedAt().toString());
+                updates.put(qualifiedExternal + "ComputedFor",
+                        JavAIRuntime.externalVectorKey(entity, vectorName));
+            }
         }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
@@ -1051,11 +1074,41 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         removals.add(qualified + "ComputedAt");
     }
 
+    /**
+     * Restores each {@code @ExternalVector} from its declared model's document fields, together with the
+     * content key it was written for (OMI-290).
+     *
+     * <p>The key is what makes the restored vector answerable: {@code externalVector()} compares it against
+     * the entity's current content on every read, so a vector hydrated without one is held and never served
+     * -- which from outside looks exactly like a pipeline that never ran.
+     */
+    private void hydrateExternalVectors(Class<?> entityType, Object entity, Document doc) {
+        for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+            String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            if (!(doc.get(qualified) instanceof List<?> stored)) {
+                continue;
+            }
+            float[] values = new float[stored.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) stored.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualified + "ComputedAt");
+            JavAIRuntime.hydrateExternalVector(entity, vectorName,
+                    new EmbeddingVector(values, declaredModel, values.length,
+                            computedAt == null ? Instant.now() : Instant.parse(computedAt)),
+                    doc.getString(qualified + "ComputedFor"));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void hydrateVectors(Class<?> entityType, Object entity, Document doc) {
         if (!(entity instanceof JavAIVectorizable)) {
             return;
         }
+        // Read before the currentModelId() guard: an @ExternalVector's model is declared on the type, so it
+        // is readable whether or not a text provider is configured or can name itself (OMI-290).
+        hydrateExternalVectors(entityType, entity, doc);
         String modelId = JavAIRuntime.currentModelId();
         if (modelId == null) {
             return;

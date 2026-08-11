@@ -1849,11 +1849,26 @@ public final class JavAIRuntime {
         }
     }
 
-    /** Every field declared anywhere in {@code type}'s class hierarchy, not just on {@code type} itself. */
+    /**
+     * Every <b>instance</b> field declared anywhere in {@code type}'s class hierarchy, not just on
+     * {@code type} itself.
+     *
+     * <p>⚠️ {@code static} fields are excluded (OMI-290). Every caller here treats a field as a property of
+     * one object: {@link #walkGraph} follows it as a graph edge, {@link #registerAllFieldDependencies} wires
+     * a back-edge through it, {@link #collectReachableVectorizables} locks what it reaches for a flush. Class
+     * state is none of those things -- a static holding a shared cache or a constant would put objects
+     * nobody referenced into a {@code query()} result and into a persistence flush's lock set. The sibling
+     * defect in {@code javai-persistence}'s own {@code EntityReflection.allFields} was the visible half of
+     * this, failing outright on load; this half would merely have been quietly wrong.
+     */
     private static List<Field> allFields(Class<?> type) {
         List<Field> fields = new ArrayList<>();
         for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
-            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+            for (Field field : current.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+                    fields.add(field);
+                }
+            }
         }
         return fields;
     }

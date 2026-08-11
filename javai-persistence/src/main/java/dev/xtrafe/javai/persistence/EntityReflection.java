@@ -107,11 +107,25 @@ final class EntityReflection {
         throw new IllegalStateException("Expected field " + fieldName + " on " + type + " or one of its superclasses");
     }
 
+    /**
+     * Every instance field declared anywhere in {@code type}'s hierarchy.
+     *
+     * <p>⚠️ <b>{@code static} fields are excluded, and that is a correctness requirement rather than tidiness</b>
+     * (found by OMI-290). A static is class state, so it has no per-instance value to store and no per-instance
+     * slot to restore into -- but both reflective backends map a field by walking this list, so a constant as
+     * ordinary as {@code static final String MODEL = "..."} on an entity was written as a document/node
+     * property on save and then <em>written back</em> on load, which fails outright:
+     * {@code Cannot write field static final java.lang.String ...}. The Postgres backend never saw it because
+     * Hibernate does its own mapping and ignores statics; nothing else in this repository declared one on an
+     * entity, so the whole class of failure sat one ordinary constant away the entire time.
+     */
     static List<Field> allFields(Class<?> type) {
         List<Field> fields = new ArrayList<>();
         for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
             for (Field field : current.getDeclaredFields()) {
-                if (!field.isSynthetic() && !field.getName().startsWith("$javai$")) {
+                if (!field.isSynthetic()
+                        && !java.lang.reflect.Modifier.isStatic(field.getModifiers())
+                        && !field.getName().startsWith("$javai$")) {
                     fields.add(field);
                 }
             }
