@@ -12,6 +12,7 @@ import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.persistence.JavAIRepository;
+import dev.xtrafe.javai.persistence.PersistentEntities;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.VectorMath;
 
@@ -189,9 +190,64 @@ public final class JavAITagRepository {
         for (Tag candidate : candidates) {
             candidatesBySlug.put(candidate.getSlug(), candidate);
         }
+
+        List<ClassificationResult.AppliedTag> results = new ArrayList<>();
+        for (ParsedTag parsedTag : parsed) {
+            Tag matched = candidatesBySlug.get(parsedTag.slug());
+            if (matched == null) {
+                // The model returned a slug outside tagSet's own candidates -- discarded here rather than
+                // passed on, because a hallucination is expected noise from a model and applyClassification
+                // treats an off-set tag as a caller bug. See that method's own javadoc.
+                continue;
+            }
+            results.add(new ClassificationResult.AppliedTag(matched, parsedTag.affinity(), parsedTag.reasoning()));
+        }
+        return applyClassification(instance, tagSet, results);
+    }
+
+    /**
+     * Applies an <b>already-computed</b> classification -- the reconciliation half of {@link #classify},
+     * reachable without a {@link Cortex}.
+     *
+     * <p>Exists because a classifier need not be an LLM. An image tagger (RAM++, OMI-289) returns
+     * {@code (slug, confidence)} from its own model, out of process, and everything worth having about
+     * {@code classify} is on this side of the model call: the diff against this instance's existing
+     * {@code source = "auto"} associations <em>for this TagSet specifically</em> -- a returned tag is added
+     * or has its affinity updated, one no longer returned is removed, and {@code source = "manual"} taggings
+     * are never read or touched, including for tags in this very set. Duplicating that reconciliation for a
+     * second kind of classifier would be a second implementation free to disagree with the first.
+     *
+     * <p><b>One recomputation of the tag-summary vector per call, not one per tag.</b> That is the whole
+     * cost difference against looping {@link #addTag}: {@link #recomputeTagSummaryVector} resolves every
+     * association through {@code findById}, so N sequential {@code addTag} calls cost ~N²/2 id lookups.
+     * A classifier returning twenty tags does one recomputation here and twenty there.
+     *
+     * <p><b>⚠️ Every tag must belong to {@code tagSet}</b>, and an off-set tag throws rather than being
+     * discarded -- deliberately the opposite of how {@link #classify} treats a hallucinated slug. The
+     * asymmetry is about who is wrong: a model inventing a slug is expected noise, whereas a caller passing
+     * a tag from another set is a bug with a silent, durable consequence. The diff's removal scan is scoped
+     * to this set's own tags, so such a tag would be applied as {@code auto} and then never be retractable
+     * by any later classification run -- a permanent automatic tag no classifier can take back.
+     *
+     * @param instance the object being classified
+     * @param tagSet   the taxonomy this run is scoped to; the diff never reaches outside it
+     * @param results  what the classifier decided -- affinity and reasoning both optional
+     * @throws IllegalArgumentException if any result's tag belongs to a different {@link TagSet}
+     */
+    public ClassificationResult applyClassification(Object instance, TagSet tagSet,
+            List<ClassificationResult.AppliedTag> results) {
         Set<UUID> candidateIds = new HashSet<>();
-        for (Tag candidate : candidates) {
+        for (Tag candidate : tagSet.getTags()) {
             candidateIds.add(candidate.getId());
+        }
+        for (ClassificationResult.AppliedTag result : results) {
+            requireSlug(result.tag());
+            if (!candidateIds.contains(result.tag().getId())) {
+                throw new IllegalArgumentException("Tag '" + result.tag().getSlug() + "' does not belong to TagSet '"
+                        + tagSet.getSlug() + "', so applying it would create an automatic tagging that no later"
+                        + " classification of this set could ever remove. Classify against the TagSet the tag"
+                        + " actually belongs to, or add the tag to this set first.");
+            }
         }
 
         TaggableRef ref = refOf(instance);
@@ -204,14 +260,14 @@ public final class JavAITagRepository {
 
         List<ClassificationResult.AppliedTag> applied = new ArrayList<>();
         Set<UUID> returnedIds = new HashSet<>();
-        for (ParsedTag parsedTag : parsed) {
-            Tag matched = candidatesBySlug.get(parsedTag.slug());
-            if (matched == null) {
-                continue; // the model returned a slug outside tagSet's own candidates -- discarded, not an error
+        for (ClassificationResult.AppliedTag result : results) {
+            if (!returnedIds.add(result.tag().getId())) {
+                // The same tag twice in one classification: addTag is idempotent per (ref, tagId) so this
+                // would merely overwrite, but reporting it twice would misrepresent one association as two.
+                continue;
             }
-            returnedIds.add(matched.getId());
-            backend.addTag(ref, matched.getId(), parsedTag.affinity(), Tagging.SOURCE_AUTO);
-            applied.add(new ClassificationResult.AppliedTag(matched, parsedTag.affinity(), parsedTag.reasoning()));
+            backend.addTag(ref, result.tag().getId(), result.affinity(), Tagging.SOURCE_AUTO);
+            applied.add(result);
         }
         for (UUID previousId : previousAutoIdsInThisSet) {
             if (!returnedIds.contains(previousId)) {
@@ -316,8 +372,24 @@ public final class JavAITagRepository {
         return cortex;
     }
 
+    /**
+     * The {@link TaggableRef} for {@code instance}, resolving a persistence proxy to the real entity first.
+     *
+     * <p>⚠️ <b>Both halves of a ref are wrong for an unresolved proxy</b>, and both fail silently. A
+     * Hibernate proxy is a generated subclass, so {@code getClass().getName()} answers
+     * {@code Target$HibernateProxy$xyz} and the association is filed under an owner type nothing can ever
+     * look up again; and the proxy holds no state of its own, so field reflection reads a {@code null}
+     * {@code @Id} from it whether or not it has been initialized. Neither shows up at the call site -- the
+     * write succeeds and every later {@code hasTag}/{@code tagsOf}/{@code taggedWith} simply answers "no".
+     *
+     * <p>This is not hypothetical for a domain that tags entities reached through associations: an
+     * {@code @Any(fetch = LAZY)} or lazy {@code @ManyToOne} hands back exactly such a proxy, so
+     * {@code addTag(parent.getChild(), tag)} was the shape that hit it. {@link PersistentEntities#resolve}
+     * unwraps it; {@link TaggingReflection#idOf} catches anything that still arrives without an id.
+     */
     private static TaggableRef refOf(Object instance) {
-        return new TaggableRef(instance.getClass().getName(), TaggingReflection.idOf(instance));
+        Object resolved = PersistentEntities.resolve(instance);
+        return new TaggableRef(resolved.getClass().getName(), TaggingReflection.idOf(resolved));
     }
 
     private static TaggingBackend backendFor(JavAIPersistenceConfig config) {

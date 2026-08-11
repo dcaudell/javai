@@ -47,6 +47,55 @@ public final class CollectionVectorSupport {
         return state.cachedVector();
     }
 
+    /**
+     * A collection's centroid restricted to one embedding model -- the mean of each member's own
+     * {@code vector(modelId)} (OMI-290).
+     *
+     * <p>Uncached, unlike {@link #vector}: that one is gated by {@code CentroidDirty}, a single flag with a
+     * single reader, and adding a second reader per model is exactly the shape OMI-187 established does not
+     * work -- whichever reader clears the flag starves the others. Recombining already-computed member
+     * vectors is cheap enough that the flag is not worth generalising for it.
+     */
+    public static EmbeddingVector vector(DirtyTrackingSupport state, Collection<?> elements, String modelId) {
+        List<EmbeddingVector> vectors = new ArrayList<>(elements.size());
+        for (Object element : elements) {
+            if (element instanceof JavAIVectorizable vectorizable) {
+                vectors.add(vectorizable.vector(modelId));
+            }
+        }
+        // VectorMath skips absent members, so a collection where only some members carry this model
+        // averages over exactly those -- and one where none do is itself absent.
+        return VectorMath.centroid(vectors);
+    }
+
+    /**
+     * A collection's decay-weighted summary restricted to one embedding model (OMI-290) -- the same formula
+     * as {@link #summaryVector(DirtyTrackingSupport, Collection)} over the same members, admitting only
+     * vectors that model produced.
+     *
+     * <p>This is what makes a container of images summarizable by what its images <em>look</em> like, in a
+     * model no text field on any of them was ever embedded under.
+     */
+    public static EmbeddingVector summaryVector(DirtyTrackingSupport state, Collection<?> elements,
+            String modelId) {
+        if (!JavAIRuntime.enterSummaryComputation(elements)) {
+            return vector(state, elements, modelId); // cycle: treat as a leaf, as the unqualified form does
+        }
+        try {
+            List<VectorMath.WeightedVector> terms = new ArrayList<>();
+            terms.add(new VectorMath.WeightedVector(vector(state, elements, modelId), 1.0));
+            for (Object element : elements) {
+                if (element instanceof JavAIVectorizable child) {
+                    terms.add(new VectorMath.WeightedVector(
+                            child.summaryVector(modelId), JavAIRuntime.DEFAULT_SUMMARY_DECAY));
+                }
+            }
+            return VectorMath.normalize(VectorMath.weightedSum(terms));
+        } finally {
+            JavAIRuntime.exitSummaryComputation(elements);
+        }
+    }
+
     public static EmbeddingVector summaryVector(DirtyTrackingSupport state, Collection<?> elements) {
         if (state.cachedSummaryVector() == null || state.isSummaryDirty()) {
             if (!JavAIRuntime.enterSummaryComputation(elements)) {

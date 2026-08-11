@@ -1,6 +1,8 @@
 package dev.xtrafe.javai.substrate;
 
+import dev.xtrafe.javai.substrate.fixtures.CollidingExternalVectorWidget;
 import dev.xtrafe.javai.substrate.fixtures.CyclicWidget;
+import dev.xtrafe.javai.substrate.fixtures.ExternalVectorWidget;
 import dev.xtrafe.javai.substrate.fixtures.GraphChild;
 import dev.xtrafe.javai.substrate.fixtures.GraphContainer;
 import dev.xtrafe.javai.substrate.fixtures.InheritedVectorizeBase;
@@ -10,9 +12,12 @@ import dev.xtrafe.javai.substrate.fixtures.VectorizeIgnoreWidget;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.agent.ByteBuddyAgent;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.agent.builder.ResettableClassFileTransformer;
+import net.bytebuddy.description.type.TypeDescription;
+import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.dynamic.loading.ByteArrayClassLoader;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -226,6 +231,67 @@ class VectorizationWeavingTest {
         EmbeddingVector second = (EmbeddingVector) vector.invoke(leaf);
         assertFalse(java.util.Arrays.equals(first.values(), second.values()),
                 "changing the inherited field's value must change vector()");
+    }
+
+    // ---- @ExternalVector (OMI-290) ------------------------------------------------------------------
+
+    @Test
+    void anAccessorIsSynthesizedForEachDeclaredExternalVector() throws Exception {
+        ClassLoader loader = loadFixtures(ExternalVectorWidget.class);
+        Class<?> widgetClass = loader.loadClass(ExternalVectorWidget.class.getName());
+        Object widget = widgetClass.getDeclaredConstructor().newInstance();
+        widgetClass.getMethod("setContentKey", String.class).invoke(widget, "sha256:aaa");
+
+        // Both shapes of the repeatable annotation are exercised by one fixture: the weaver reads a single
+        // declaration off the type directly and two or more out of the generated container.
+        EmbeddingVector pixels = (EmbeddingVector) widgetClass.getMethod("pixelsVector").invoke(widget);
+        EmbeddingVector audio = (EmbeddingVector) widgetClass.getMethod("audioVector").invoke(widget);
+        assertTrue(pixels.isAbsent(), "nothing has been supplied yet");
+        assertTrue(audio.isAbsent());
+
+        EmbeddingVector supplied = new EmbeddingVector(new float[16], "fake-image-model/pp1", 16,
+                java.time.Instant.now());
+        assertTrue(JavAIRuntime.supplyVector(widget, "pixels", supplied, "sha256:aaa"));
+
+        EmbeddingVector served = (EmbeddingVector) widgetClass.getMethod("pixelsVector").invoke(widget);
+        assertFalse(served.isAbsent());
+        assertEquals("fake-image-model/pp1", served.modelId());
+        // Its sibling is untouched -- two external vectors over the same key field stay independent.
+        assertTrue(((EmbeddingVector) widgetClass.getMethod("audioVector").invoke(widget)).isAbsent());
+    }
+
+    @Test
+    void anExternalVectorDoesNotContributeToTheComputedVector() throws Exception {
+        ClassLoader loader = loadFixtures(ExternalVectorWidget.class);
+        Class<?> widgetClass = loader.loadClass(ExternalVectorWidget.class.getName());
+        Object widget = widgetClass.getDeclaredConstructor().newInstance();
+        widgetClass.getMethod("setContentKey", String.class).invoke(widget, "sha256:aaa");
+        widgetClass.getMethod("setCaption", String.class).invoke(widget, "a caption");
+        JavAIRuntime.supplyVector(widget, "pixels",
+                new EmbeddingVector(new float[16], "fake-image-model/pp1", 16, java.time.Instant.now()),
+                "sha256:aaa");
+
+        // The 16-dimensional supplied vector must stay out of the 8-dimensional text centroid. Folding it in
+        // is not a subtle wrongness but an outright failure -- VectorMath refuses to combine differing
+        // dimensionality -- so this is the assertion that the two models coexist at all.
+        EmbeddingVector combined = (EmbeddingVector) widgetClass.getMethod("vector").invoke(widget);
+        assertEquals(FakeEmbeddingProvider.DIMS, combined.dims());
+    }
+
+    @Test
+    void anExternalVectorNamedAfterAVectorizeFieldIsRefusedAtWeaveTime() {
+        // Driven through weave() directly rather than by loading the fixture: AgentBuilder's default
+        // listener swallows a transform-time exception, leaving an unwoven class instead of surfacing the
+        // cause -- the exact failure mode that made the reserved-name check necessary in the first place.
+        // This is also the path the build-time Maven plugin takes, where the throw is genuinely fatal.
+        TypeDescription colliding = TypeDescription.ForLoadedType.of(CollidingExternalVectorWidget.class);
+        DynamicType.Builder<?> builder = new ByteBuddy().redefine(CollidingExternalVectorWidget.class);
+
+        IllegalStateException thrown = assertThrows(IllegalStateException.class,
+                () -> JavAIWeaver.weave(builder, colliding));
+
+        assertTrue(thrown.getMessage().contains("caption"), thrown.getMessage());
+        assertTrue(thrown.getMessage().contains("@Vectorize"), thrown.getMessage());
     }
 
     private static ClassLoader loadFixtures(Class<?>... fixtureClasses) throws IOException {

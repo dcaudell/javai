@@ -61,7 +61,44 @@ public interface JavAIVectorizable {
         return null;
     }
 
+    /**
+     * {@link #vector()} restricted to one embedding model -- the centroid of every vector this object
+     * carries that {@code modelId} produced, {@code @Vectorize} field and {@code @ExternalVector} alike
+     * (OMI-290).
+     *
+     * <p>Exists because two models' vectors cannot be combined -- {@code VectorMath} refuses, and rightly:
+     * their cosine similarity is not a weaker answer but no answer. Once an object carries an image
+     * embedding beside a text one, "this object's vector" is two questions, and {@link #vector()} keeps
+     * answering the text one.
+     *
+     * <p>Returns {@link EmbeddingVector#absent()} when this object carries nothing from that model, which
+     * is the ordinary case for most models and costs nothing to ask.
+     *
+     * <p>A {@code default} returning absent, so a hand-written implementation keeps compiling; the weaver
+     * overrides it on every woven class, and the JavAI collections override it to aggregate their members'.
+     */
+    default EmbeddingVector vector(String modelId) {
+        return EmbeddingVector.absent();
+    }
+
     EmbeddingVector summaryVector();
+
+    /**
+     * {@link #summaryVector()} restricted to one embedding model -- this object's own {@code modelId}
+     * aggregate at full weight plus each {@code @Summary} child's {@code modelId} summary at the decay
+     * factor (OMI-290).
+     *
+     * <p>The decay-weighted formula is unchanged; only which vectors are admitted to it is. That is what
+     * lets one container carry two coherent summaries -- what its subtree looks like, and what its subtree
+     * reads like -- instead of one that cannot be computed.
+     *
+     * <p>Deliberately uncached, unlike {@link #summaryVector()}: it is arithmetic over vectors that are
+     * themselves already cached, so caching per model would buy little and cost a slot, an invalidation
+     * rule and a dirty flag per model.
+     */
+    default EmbeddingVector summaryVector(String modelId) {
+        return EmbeddingVector.absent();
+    }
 
     double similarityTo(JavAIVectorizable other);
 
@@ -77,6 +114,27 @@ public interface JavAIVectorizable {
     /** Same, with an explicit traversal depth limit. */
     <T> JavAIList<T> query(EmbeddingVector reference, Class<T> type, int maxDepth);
 
-    /** Dynamic counterpart to the per-field {@code fieldNameVector()}-style accessors. */
+    /** Dynamic counterpart to the per-field {@code fieldNameVector()}-style accessors. Also serves an
+     *  {@code @ExternalVector} by name, so reflective and generic tooling needs no separate entry point. */
     EmbeddingVector fieldVector(String fieldName);
+
+    /**
+     * An {@code @ExternalVector}'s current value -- a vector supplied from outside this process rather than
+     * computed here (OMI-290).
+     *
+     * <p>Returns {@link EmbeddingVector#absent()} until one has been supplied, and again if the content it
+     * was computed for has since changed. <b>It never computes, never blocks and never calls a provider</b>,
+     * under any {@code EmbeddingConsistencyMode} and including inside a persistence flush -- the whole point
+     * being that nothing in this process is able to produce it.
+     *
+     * <p>A {@code default} that throws for an undeclared name, so a hand-written implementation of this
+     * interface keeps compiling; the weaver overrides it on every woven class, and a class declaring no
+     * {@code @ExternalVector} has nothing this could legitimately be called with.
+     *
+     * @throws IllegalArgumentException if this class declares no {@code @ExternalVector} of that name
+     */
+    default EmbeddingVector externalVector(String vectorName) {
+        throw new IllegalArgumentException(
+                getClass().getName() + " declares no @ExternalVector named '" + vectorName + "'");
+    }
 }
