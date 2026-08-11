@@ -1,5 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.vector.EmbeddingVector;
+
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -119,6 +121,45 @@ public interface JavAIRepository<T> {
      * {@code reindexAll()}'s completeness validation.
      */
     void reindex();
+
+    // ---- externally-supplied vectors (OMI-290) -----------------------------------------------------
+
+    /**
+     * Stores a vector this process could not have computed against one entity, without saving it.
+     *
+     * <p>The entry point for a pipeline: a consumer holding an id, a vector, and the content key the model
+     * actually embedded. It reads the entity to check that key still applies and then writes one vector --
+     * no merge, no summary recomputation, no walk of the reachable graph.
+     *
+     * <pre>{@code
+     * images.supplyVector(event.assetId(), "pixels",
+     *         new EmbeddingVector(event.values(), MODEL_ID, event.dims(), event.computedAt()),
+     *         event.contentHash());
+     * }</pre>
+     *
+     * <p><b>{@code computedFor} is what makes this safe under at-least-once delivery.</b> If the entity has
+     * moved on to different content since the model ran, the vector is discarded and this returns
+     * {@code false} -- a normal outcome of a slow producer racing an edit, not a failure. Redelivery of the
+     * same event simply stores the same vector again.
+     *
+     * @param computedFor the {@code @ExternalVector} {@code keyField} value the producer actually embedded
+     * @return whether the vector was stored
+     * @throws IllegalArgumentException if no such entity exists, if the type declares no
+     *                                  {@code @ExternalVector} of that name, or if the vector's own
+     *                                  {@code modelId()} disagrees with the declared model
+     */
+    boolean supplyVector(UUID id, String vectorName, EmbeddingVector vector, String computedFor);
+
+    /**
+     * Entities whose {@code vectorName} has not been supplied for the content they currently reference --
+     * the backlog a producer works through.
+     *
+     * <p>Covers both causes at once, because they mean the same thing to a producer: never supplied, and
+     * supplied for content since replaced. Intended for backfills and for re-driving after a dead-letter
+     * drain, both of which sweep the whole type; a per-item "is this one done yet" belongs in whatever
+     * status the application already keeps, not here.
+     */
+    List<T> findPendingVector(String vectorName, int limit);
 
     // ---- vector search as a builder (OMI-230) ------------------------------------------------------
     //

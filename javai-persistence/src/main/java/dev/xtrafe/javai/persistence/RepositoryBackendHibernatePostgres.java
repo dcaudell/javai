@@ -2736,6 +2736,34 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         });
     }
 
+    /**
+     * Writes one {@code @ExternalVector}'s row and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290).
+     *
+     * <p>Deliberately not a {@code save()}: a queue consumer storing a vector has not touched the entity,
+     * so merging it, recomputing its summary and walking its graph would all be work for a change that did
+     * not happen.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        String ownerType = entityType.getName();
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        String table = vector.isAbsent() ? null : ensureFieldVectorTable(vector.modelId(), vector.dims());
+        String computedFor = vector.isAbsent() ? null : JavAIRuntime.externalVectorKey(entity, vectorName);
+        inSession(session -> {
+            session.doWork(connection -> {
+                if (vector.isAbsent()) {
+                    deleteFieldVectorRow(connection, declaredModel, ownerType, id, vectorName);
+                } else {
+                    upsertVector(connection, table, ownerType, id, vectorName, vector, computedFor);
+                }
+            });
+            return null;
+        });
+    }
+
     /** Vectors only, for the write path -- see {@link #hydrateOutOfBand}'s {@code includeGeo} parameter. */
     private void hydrateVectors(Session session, Object entity) {
         hydrateOutOfBand(session, entity, false);

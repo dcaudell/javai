@@ -1117,6 +1117,33 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     /**
+     * Writes one {@code @ExternalVector}'s node properties and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290). Not a {@code save()}: the consumer storing a vector has not touched
+     * the entity itself.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        String label = label(entityType);
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        Map<String, Object> properties = new HashMap<>();
+        if (vector.isAbsent()) {
+            clearVectorProperty(properties, vectorName + "Vector", declaredModel);
+            properties.put(qualify(vectorName + "Vector", declaredModel) + "ComputedFor", null);
+        } else {
+            String qualified = qualify(vectorName + "Vector", vector.modelId());
+            properties.put(qualified, vector.values());
+            properties.put(qualified + "ComputedAt", vector.computedAt().toString());
+            properties.put(qualified + "ComputedFor", JavAIRuntime.externalVectorKey(entity, vectorName));
+        }
+        try (Session session = driver().session()) {
+            session.executeWrite(tx -> tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
+                    Values.parameters("id", id.toString(), "props", properties)).consume());
+        }
+    }
+
+    /**
      * Restores each {@code @ExternalVector} from its declared model's node properties, together with the
      * content key it was written for (OMI-290).
      *

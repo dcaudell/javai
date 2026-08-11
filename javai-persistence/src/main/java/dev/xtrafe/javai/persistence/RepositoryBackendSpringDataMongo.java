@@ -1075,6 +1075,32 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     }
 
     /**
+     * Writes one {@code @ExternalVector}'s document fields and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290). Not a {@code save()}: the consumer storing a vector has not touched
+     * the entity itself.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        List<Bson> ops = new ArrayList<>();
+        if (vector.isAbsent()) {
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            ops.add(Updates.unset(qualified));
+            ops.add(Updates.unset(qualified + "ComputedAt"));
+            ops.add(Updates.unset(qualified + "ComputedFor"));
+        } else {
+            String qualified = qualify(vectorName + "Vector", vector.modelId());
+            ops.add(Updates.set(qualified, toDoubleList(vector.values())));
+            ops.add(Updates.set(qualified + "ComputedAt", vector.computedAt().toString()));
+            ops.add(Updates.set(qualified + "ComputedFor",
+                    JavAIRuntime.externalVectorKey(entity, vectorName)));
+        }
+        collectionFor(entityType).updateOne(Filters.eq("_id", id.toString()), Updates.combine(ops));
+    }
+
+    /**
      * Restores each {@code @ExternalVector} from its declared model's document fields, together with the
      * content key it was written for (OMI-290).
      *

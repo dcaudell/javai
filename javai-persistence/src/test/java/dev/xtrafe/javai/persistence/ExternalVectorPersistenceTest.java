@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -266,6 +267,96 @@ class ExternalVectorPersistenceTest {
         assertArrayEquals(reprocessed.values(), loaded.externalVector("pixels").values());
         assertEquals("sha256:after", readComputedFor(asset));
         assertEquals(1, countRows(imageTable(), asset), "replaced, not accumulated");
+    }
+
+    // ---- the repository-level pipeline entry point ---------------------------------------------------
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void supplyVectorStoresAgainstAnEntityTheCallerNeverLoaded(String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("consumed on " + backend, "sha256:consumer-" + backend);
+        repository.save(asset);
+
+        // Exactly what a queue consumer holds: an id, a vector, and the key the model actually embedded.
+        assertTrue(repository.supplyVector(asset.getId(), "pixels",
+                TestImageAsset.imageVector(0.33f), "sha256:consumer-" + backend));
+
+        TestImageAsset loaded = repository.findById(asset.getId()).orElseThrow();
+        assertFalse(loaded.externalVector("pixels").isAbsent());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void supplyVectorDiscardsAResultForContentTheEntityHasMovedOnFrom(
+            String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("re-uploaded on " + backend, "sha256:now-" + backend);
+        repository.save(asset);
+
+        // The producer embedded the previous bytes; the asset has since been replaced. At-least-once
+        // delivery makes this ordinary rather than exceptional, so it is a false return, not a throw.
+        assertFalse(repository.supplyVector(asset.getId(), "pixels",
+                TestImageAsset.imageVector(0.44f), "sha256:stale-" + backend));
+
+        assertTrue(repository.findById(asset.getId()).orElseThrow().externalVector("pixels").isAbsent());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void supplyVectorIsIdempotentUnderRedelivery(String backend, TestImageAssetRepository repository) {
+        TestImageAsset asset = new TestImageAsset("redelivered on " + backend, "sha256:redeliver-" + backend);
+        repository.save(asset);
+        EmbeddingVector supplied = TestImageAsset.imageVector(0.55f);
+
+        assertTrue(repository.supplyVector(asset.getId(), "pixels", supplied, "sha256:redeliver-" + backend));
+        assertTrue(repository.supplyVector(asset.getId(), "pixels", supplied, "sha256:redeliver-" + backend));
+
+        assertArrayEquals(supplied.values(),
+                repository.findById(asset.getId()).orElseThrow().externalVector("pixels").values());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @MethodSource("everyBackend")
+    void pendingListsWhatTheProducerStillOwes(String backend, TestImageAssetRepository repository) {
+        TestImageAsset owed = new TestImageAsset("owed on " + backend, "sha256:owed-" + backend);
+        repository.save(owed);
+
+        assertTrue(repository.findPendingVector("pixels", 500).stream()
+                        .anyMatch(each -> each.getId().equals(owed.getId())),
+                backend + " must report an asset whose vector has never been supplied");
+
+        repository.supplyVector(owed.getId(), "pixels", TestImageAsset.imageVector(0.66f),
+                "sha256:owed-" + backend);
+
+        assertFalse(repository.findPendingVector("pixels", 500).stream()
+                        .anyMatch(each -> each.getId().equals(owed.getId())),
+                backend + " must stop reporting it once the vector is stored");
+    }
+
+    @Test
+    void aStoredExternalVectorIsSearchableByTheOrdinaryConvention() {
+        TestImageAsset near = new TestImageAsset("the target", "sha256:search-near");
+        TestImageAsset far = new TestImageAsset("something else", "sha256:search-far");
+        EmbeddingVector nearVector = TestImageAsset.imageVector(0.11f);
+        JavAIRuntime.supplyVector(near, "pixels", nearVector, "sha256:search-near");
+        JavAIRuntime.supplyVector(far, "pixels", TestImageAsset.imageVector(0.88f), "sha256:search-far");
+        assets.save(near);
+        assets.save(far);
+
+        // The whole point of storing it: findNearestBy<Name>Vector, with the name being an @ExternalVector
+        // rather than a @Vectorize field. Nothing about the query machinery had to learn a new concept --
+        // the reference vector's own model already selects which storage answers.
+        var hits = assets.nearestBy("pixels").to(nearVector).limit(1).results();
+
+        assertEquals(1, hits.size());
+        assertEquals(near.getId(), hits.get(0).getId());
+    }
+
+    @Test
+    void anUndeclaredVectorNameIsRefusedRatherThanSearchingNothing() {
+        IllegalArgumentException thrown = assertThrows(IllegalArgumentException.class,
+                () -> assets.nearestBy("nope"));
+        assertTrue(thrown.getMessage().contains("pixels"), thrown.getMessage());
+        assertTrue(thrown.getMessage().contains("caption"), thrown.getMessage());
     }
 
     // ---- direct SQL, so the assertions are about what is actually stored ------------------------------
