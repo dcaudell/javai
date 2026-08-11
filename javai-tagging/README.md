@@ -252,3 +252,27 @@ plugin configuration and the two required `<dependencies>` overrides (`byte-budd
   composition, not a required dependency in either direction, left for when a concrete use case needs it.
 - No dual-write/transactional multi-backend tagging -- same "two independent bindings, no cross-store
   transaction" posture `javai-persistence` itself documents for its own multi-store pattern.
+
+## Classification without an LLM (OMI-290)
+
+`JavAITagRepository.applyClassification(instance, tagSet, results)` is the reconciliation half of
+`classify()`, reachable without a `Cortex` — so an image tagger, a rules engine, or anything else returning
+`(tag, confidence)` drives the identical diff against `source = "auto"`. `classify()` is now "ask `Cortex`,
+then call this", so the two cannot disagree.
+
+- **An off-set tag throws**, where `classify` silently discards a hallucinated slug. The asymmetry is about
+  who is wrong: a model inventing a slug is expected noise; a caller passing a tag from another `TagSet`
+  creates an automatic tagging that no later classification of either set could ever retract.
+- **One tag-summary recomputation per call**, not one per tag — that path resolves every association through
+  `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups.
+
+⚠️ **`refOf` now resolves a persistence proxy first.** Both halves of a `TaggableRef` are wrong for one:
+`getClass().getName()` answers `Target$HibernateProxy$xyz`, and a proxy holds no state of its own, so field
+reflection reads a `null` `@Id` whether or not it has been initialized. `addTag(parent.getChild(), tag)` was
+the shape that hit it — the write succeeded and every later lookup answered "no". Resolving forces the load,
+so a *detached* proxy now raises `LazyInitializationException`, which is the correct outcome: you cannot tag
+what you cannot identify.
+
+`@Taggable` is also `@Inherited` now, so a `@MappedSuperclass` can declare the intent once for a hierarchy.
+Note that nothing reads the annotation at runtime — only `implements Taggable` and a `@Id UUID` field matter
+— so a hierarchy whose common supertype is an *interface* can simply have that interface extend the marker.

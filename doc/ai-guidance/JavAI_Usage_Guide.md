@@ -103,6 +103,10 @@ have to live together upstream of everything else. Don't be surprised to find `P
 | `<T> JavAIList<T> query(EmbeddingVector reference, Class<T> type, int maxDepth)` | `JavAIVectorizable` | Yes | Same, with an explicit traversal-depth limit. |
 | `EmbeddingVector fieldVector(String fieldName)` | `JavAIVectorizable` | Yes | Dynamic (string-keyed) counterpart to the per-field accessors below. |
 | `<field>Vector()` — e.g. `titleVector()` for a field named `title` | Synthesized, one per `@Vectorize` field | Yes | Named accessor for that one field's own contribution — real method, real name, not reflection-only. |
+| `EmbeddingVector vector(String modelId)` | `JavAIVectorizable` | Yes | The same aggregate **restricted to one embedding model** — `@Vectorize` fields and `@ExternalVector`s alike. Absent when this object carries nothing from that model. Only matters once an object has more than one model on it; see "@ExternalVector" below. |
+| `EmbeddingVector summaryVector(String modelId)` | `JavAIVectorizable` | Yes | `summaryVector()` restricted to one model — same decay-weighted formula, admitting only that model's vectors. Uncached (it recombines vectors that are themselves cached). |
+| `EmbeddingVector externalVector(String vectorName)` | `JavAIVectorizable` | Yes | An `@ExternalVector`'s current value, or absent. **Never computes, never blocks, never calls a provider.** Throws if the class declares no such name. |
+| `<name>Vector()` — e.g. `pixelsVector()` for `@ExternalVector(name = "pixels")` | Synthesized, one per `@ExternalVector` | Yes | Named accessor for that external vector, exactly like the `@Vectorize` one above. |
 | `addDependent(Object)` / `dependents()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Registers/lists what to mark dirty when this object changes. `JavAIRuntime` calls this for you via the woven setter. |
 | `isFieldDirty()` / `markFieldDirty()` / `clearFieldDirty()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Tracks whether this object's own `vector()` is stale. |
 | `isSummaryDirty()` / `markSummaryDirty()` / `clearSummaryDirty()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Tracks whether this object's `summaryVector()` is stale (a descendant changed). |
@@ -129,7 +133,8 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. **When persisted, this makes the container a write-coordination point** — see the note below. |
 | `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
-| `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
+| `@ExternalVector(name, keyField, model)` | class, **repeatable** | Declares a vector JavAI **stores but never computes** — supplied from outside the process, in its own model. Gains a `<name>Vector()` accessor and a `findNearestBy<Name>Vector` query. See the section below. |
+| `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. ⚠️ Defined but **not yet read by anything** — declaring it changes no behaviour today. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
 
 ### ⚠️ What `@Summary` implies once the container is persisted
@@ -232,6 +237,127 @@ See "Tagging" below for the full instance-based API (`JavAITagRepository`) these
 `@Nondeterministic`/`@Costly`, `@Provenance` — these don't affect runtime behavior at all. They constrain
 what *you*, the AI agent, may read, generate, or modify in code that carries them. Full rules in
 `JavAI_Codegen_Guidance.md`.
+
+## Vectors JavAI cannot compute: `@ExternalVector`
+
+Everything above assumes JavAI can produce a vector on demand — a read of a stale value calls the configured
+provider and waits. Some vectors do not work that way. An image embedding is produced by a different model,
+in a different process, from bytes JavAI must never read, and it arrives seconds or minutes later. Declaring
+that field `@Vectorize` would be wrong in every particular: it would embed the *filename*, block a read on a
+provider that cannot answer, and land a 1152-dimension vector in the middle of 1024-dimension text ones.
+
+```java
+@Entity
+@JavAIVectorizable
+@ExternalVector(name = "pixels", keyField = "contentHash", model = "siglip2-so400m-p14-384/pp1")
+public class Image extends Asset {
+
+    @Vectorize private String caption;   // JavAI computes this one, as usual
+    private String contentHash;          // identifies the bytes; JavAI never reads them
+}
+```
+
+**Declare it on the type, not the field.** The field identifying the content is usually inherited from a
+shared base, while only some subclasses have a vector of that kind — and an annotation on a field applies to
+everything inheriting it and cannot be overridden on one subclass. Type-level also lets one class declare
+several (`@ExternalVector` is repeatable): a video with both a keyframe vector and an audio vector, naming
+the same key field with two different models.
+
+### Reading one
+
+```java
+EmbeddingVector pixels = image.pixelsVector();   // or image.externalVector("pixels")
+if (pixels.isAbsent()) {
+    // Either nothing has been supplied yet, or the bytes changed since it was.
+}
+```
+
+| | |
+|---|---|
+| Before anything is supplied | `EmbeddingVector.absent()` |
+| After `contentHash` changes | `absent()` again — the stored vector describes *different content* |
+| Provider calls | **none, ever** |
+| Blocking | **none, ever** — under every `EmbeddingConsistencyMode`, and inside a save |
+
+⚠️ **Do not reach for `EVENTUAL_CONSISTENCY` to get this.** That mode still blocks a vector's *first* read
+(there is no prior value to serve) and still yields to the accuracy a save forces — so both would end up
+waiting on a provider that cannot produce this vector, and asking the *text* provider for it. The
+consistency-mode setting simply does not apply to external vectors; you need no configuration at all.
+
+### Supplying one
+
+From whatever consumes your pipeline's output — it needs only an id, a vector, and the key the model
+actually embedded:
+
+```java
+images.supplyVector(event.assetId(), "pixels",
+        new EmbeddingVector(event.values(), "siglip2-so400m-p14-384/pp1", event.dims(), event.computedAt()),
+        event.contentHash());
+```
+
+**`computedFor` is what makes this safe under at-least-once delivery**, and it is not optional ceremony. If
+the asset has moved on to different content since the model ran, the vector is discarded and `supplyVector`
+returns `false` — a normal outcome of a slow producer racing an edit, not a failure to handle. Redelivering
+the same event simply stores the same vector again.
+
+If you already hold the object rather than just its id, `JavAIRuntime.supplyVector(image, "pixels", vector,
+hash)` does the same thing in memory; save as usual afterwards.
+
+**Fold every dimension of the model's identity into `model`** — name, weights version, preprocessing version
+(`siglip2-so400m-p14-384/pp1`). Storage is partitioned by that string, so changing it makes the new vectors a
+separate, additively-migratable set rather than an in-place overwrite. This is the difference between a model
+upgrade you can run and one you cannot.
+
+### Finding what is still owed
+
+```java
+List<Image> backlog = images.findPendingVector("pixels", 500);
+```
+
+Covers both causes at once, because they mean the same thing to a producer: never supplied, and supplied for
+content since replaced. Intended for backfills and for re-driving after a dead-letter drain. ⚠️ It is a scan
+of the type — right for those two jobs, wrong for polling per upload. For "is *this* upload processed yet",
+keep your own status row.
+
+### Searching one
+
+Nothing new to learn — the ordinary convention, with the external vector's name:
+
+```java
+public interface ImageRepository extends JavAIRepository<Image> {
+    List<Image> findNearestByPixelsVector(EmbeddingVector reference, int limit);
+}
+
+images.nearestBy("pixels").to(siglipQuery).limit(20).ranked();   // or the builder
+```
+
+⚠️ **The reference vector must come from the same model.** A query embedding produced by your text provider
+cannot search an image index — not less well, but not at all. Embedding a text query into image space needs
+that model's own text tower, which is your pipeline's job to expose, not JavAI's.
+
+### Two models on one object
+
+Once an object carries both, "this object's vector" is two questions, and each aggregate names which:
+
+```java
+image.vector();                                    // the text model, exactly as before
+image.vector("siglip2-so400m-p14-384/pp1");        // the image one
+album.summaryVector("siglip2-so400m-p14-384/pp1"); // what this album *looks* like
+album.summaryVector();                             // what it reads like
+```
+
+They are separate on purpose. Two models' vectors cannot be combined — their cosine similarity is not a
+weaker answer but no answer — and JavAI refuses rather than producing a meaningless number. Combining two
+models' *rankings* (reciprocal rank fusion and friends) is a real technique, but the weighting is specific to
+your domain, so it is your code, not the library's.
+
+### The one rule it is exempt from
+
+Elsewhere in JavAI, a `@Vectorize` field mutated by anything other than its woven setter goes silently stale
+forever. An `@ExternalVector` has no such exposure: its validity is re-derived on every read by comparing the
+key field's current value, so a `contentHash` written by reflection, by a framework, or by any other route is
+caught exactly like one written through a setter. That is affordable here precisely because the key is a
+short identifier standing in for content JavAI never touches.
 
 ## Tagging: `JavAITagRepository`, an instance, not a woven mechanism
 
@@ -368,12 +494,22 @@ association on top of it.
 | `boolean hasTag(Object instance, Tag tag)` | Structural presence check. |
 | `ClassificationResult classify(Object instance, TagSet tagSet)` | One LLM call via the constructor-supplied `Cortex`: marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones), shows the model only `tagSet`'s candidate **slugs**, and diffs the result against `instance`'s existing `source = "auto"` taggings *for this `TagSet` specifically* — adds/updates/removes as needed, never touching `source = "manual"` taggings even for tags in the same set. Client-invoked only; never triggered automatically by a `TagSet` edit. |
 | `List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet)` | Convenience batch form — still one LLM call per instance internally, not a fan-out you hand-loop yourself. |
+| `ClassificationResult applyClassification(Object instance, TagSet tagSet, List<AppliedTag> results)` | The same reconciliation as `classify`, for a classifier that **is not an LLM** — an image tagger, a rules engine, anything returning `(tag, confidence)` of its own. Needs no `Cortex`. ⚠️ A tag from another `TagSet` throws here, where `classify` silently discards a hallucinated slug: a model inventing a slug is expected noise, but a caller passing the wrong set creates an automatic tagging no later run could ever retract. |
 | `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. |
 
 `ClassificationResult` is `record ClassificationResult(TaggableRef instance, TagSet tagSet, List<AppliedTag>
 appliedTags)`, where `AppliedTag` is `record AppliedTag(Tag tag, Double affinity, String reasoning)` —
 `affinity`/`reasoning` are nullable, since a classifier is free to say "this applies" without a strength
 score or explanation.
+
+⚠️ **Prefer `applyClassification` to a loop of `addTag`** when a classifier hands you several tags at once.
+The tag-summary index is recomputed once per call there and once per tag in a loop, and each recomputation
+resolves every association the instance already has — so twenty tags applied one at a time cost on the order
+of two hundred id lookups instead of twenty.
+
+⚠️ **Tag an instance you loaded, not one you reached through a lazy association.** JavAI resolves a
+persistence proxy before recording a tag, so both work — but resolving forces the load, which on a detached
+graph raises `LazyInitializationException`. If you hold an id, load it and tag that.
 
 **Homogeneous vs. heterogeneous `taggedWith`** — the same method either way; the shape of `candidateTypes`
 is what decides which you get, continuing the `breach`/`recipe`/`reply` example above:

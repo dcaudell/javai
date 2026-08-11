@@ -233,7 +233,12 @@ against all three persistence backends, LLM-based classification via `JavAITagRe
 weaving to `javai-substrate` as a prerequisite (see that module's own README). `JavAITagRepository` is an
 instance wrapper, not a static facade — see "Coding standard: static/global scope is the exception" below,
 which this module (alongside `javai-persistence`'s own `JavAIPI.repository(Class, JavAIPersistenceConfig)`)
-is the reference example for. Don't assume anything beyond what's in a given module's actual source and
+is the reference example for. As of OMI-290 Vector Core also carries **externally-supplied
+vectors** (`@ExternalVector`: a vector JavAI stores, versions, serves and searches but never computes,
+supplied from outside the process in its own embedding model) and **model-scoped aggregates**
+(`vector(modelId)`/`summaryVector(modelId)`, since two models' vectors cannot be combined), both realized
+across all three persistence backends; and `javai-tagging` carries `applyClassification`, the reconciliation
+half of `classify()` reachable without an LLM. Don't assume anything beyond what's in a given module's actual source and
 tests reflects working code; check that module's README before relying on a claim from this file,
 `doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
 module's real implementation state at a given moment.

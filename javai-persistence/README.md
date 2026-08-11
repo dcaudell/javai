@@ -673,3 +673,26 @@ the e2e suite, including the full object graph (singular references, the `JavAIA
 `JavAILinkedHashMap` collection fields above, real embeddings) and realistic-volume/semantic-similarity
 checks. The MongoDB backend is proven at the unit level (`RepositoryBackendSpringDataMongoTest`, a real
 container) but not yet wired into the monolithic e2e container/`JavAIEnvironment` alongside the other two.
+
+## Externally-supplied vectors (OMI-290)
+
+An `@ExternalVector` is stored at the ordinary per-field grain, partitioned by the model the type *declares*
+rather than the one configured. Postgres adds a `computed_for` column to `javai_vectors__<model>` (with an
+idempotent `ADD COLUMN IF NOT EXISTS` migration); Neo4j and MongoDB add `…ComputedFor` beside their existing
+`…ComputedAt`. All three write, hydrate, remove-on-content-change, and search.
+
+New on `JavAIRepository`:
+
+- `supplyVector(id, vectorName, vector, computedFor)` — the pipeline entry point. Reads the entity (the key
+  comparison has nothing to compare against otherwise) and writes exactly one vector: no merge, no summary
+  recomputation, no graph walk. Returns `false`, rather than throwing, when the entity has moved on to
+  different content.
+- `findPendingVector(vectorName, limit)` — the backlog. A scan, deliberately; see
+  `doc/spec/persistence-bridge.md` for why that is the right shape for the jobs it exists for.
+
+`findNearestBy<Name>Vector` accepts an external vector's name with no backend change — every backend already
+resolves which storage answers from `reference.modelId()`.
+
+⚠️ **A `static` field on an entity used to break both reflective backends** (`Cannot write field static final
+…`), because `EntityReflection.allFields` did not exclude them and Neo4j/MongoDB map an entity by walking
+that list. Fixed. Postgres never saw it, since Hibernate does its own mapping.

@@ -100,6 +100,23 @@ hand-implemented.
 
 ---
 
+## Table 2b — Externally-supplied vectors (`@ExternalVector`, OMI-290)
+
+| Capability | Postgres | Neo4j | MongoDB | Notes |
+|---|---|---|---|---|
+| Store / hydrate an `@ExternalVector` | ✅ | ✅ | ✅ | Per-field grain, partitioned by the **declared** model, not the configured one |
+| Content key round-trips (`computed_for`) | ✅ | ✅ | ✅ | Postgres column; `…ComputedFor` property/field on the other two. Without it a hydrated vector is held and never served |
+| Row/property removed when the content changes | ✅ | ✅ | ✅ | Same rule as an absent `@Vectorize` field — a stale entry keeps matching searches |
+| `supplyVector(id, name, vector, computedFor)` | ✅ | ✅ | ✅ | Reads the entity, writes one vector. No merge, no summary recomputation |
+| `findPendingVector(name, limit)` | ✅ | ✅ | ✅ | A scan, deliberately — for backfills and dead-letter re-drives, not per-item polling |
+| `findNearestBy<Name>Vector` / `nearestBy("<name>")` | ✅ | ✅ | ✅ | Same convention as a `@Vectorize` field; the reference vector's own model selects the storage |
+| Narrowing a search of one (`…AndKindIs`) | ✅ | ❌ | ✅ | Inherits Table 2's rule exactly — Neo4j cannot narrow *any* vector search, for its own structural reason |
+| Reads never call a provider or block | ✅ | ✅ | ✅ | Including inside a save's forced-accuracy pass, under every `EmbeddingConsistencyMode` |
+| `reindex` preserves it | ✅ | ✅ | ✅ | Neither recomputed nor dropped — there is no provider that could produce it |
+
+⚠️ **Searching an external vector needs a reference from the same model.** A query embedding from your text
+provider cannot search an image index — not less well, but not at all. Producing one is your pipeline's job.
+
 ## Table 3 — JavAI collection field types
 
 How each **JavAI collection type**, declared as an `@Entity` field, persists and what derived-finder queries
@@ -367,6 +384,16 @@ first field's collection.
 Ordinary JPA, and the fix is the ordinary one — name the table explicitly, `@JoinTable(name = "…")`, on at
 least one of them. It is worth stating here because it is **newly reachable in 0.1.10**: a JavAI-typed map
 used to avoid the native path entirely, so it could not collide with anything.
+
+### ⚠️ A `static` field on an entity used to break Neo4j and MongoDB (fixed in 0.1.10, OMI-290)
+
+Both reflective backends map an entity by walking its declared fields, and that walk did not exclude
+statics — so a constant as ordinary as `static final String MODEL = "…"` was written as a node/document
+property on save and then written *back* on load, failing with `Cannot write field static final
+java.lang.String …`. Postgres never saw it, because Hibernate does its own mapping and ignores statics.
+
+Fixed, and recorded here because the shape is worth recognising: a defect that only one of three backends
+can express will look like a backend bug when it is really a shared-helper one.
 
 ### `@MapsId`, `@ElementCollection`, `@Basic(fetch = LAZY)`
 
