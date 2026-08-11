@@ -19,11 +19,23 @@ final class TaggingReflection {
     static UUID idOf(Object instance) {
         Field idField = idField(instance.getClass());
         idField.setAccessible(true);
+        UUID id;
         try {
-            return (UUID) idField.get(instance);
+            id = (UUID) idField.get(instance);
         } catch (IllegalAccessException e) {
             throw new IllegalStateException("Cannot read @Id field on " + instance.getClass(), e);
         }
+        if (id == null) {
+            // Every taggable instance is identified by this value, and a null one cannot be stored, queried
+            // or removed -- so it fails here, naming the two situations that actually produce it, rather
+            // than surfacing as a NOT NULL violation from whichever backend happens to write first.
+            throw new IllegalArgumentException("Cannot tag " + instance.getClass().getName()
+                    + ": its @Id is null. Either the instance was never persisted (JavAI assigns ids in the"
+                    + " constructor, so this usually means a hand-written no-arg constructor left it unset),"
+                    + " or it is an unresolved persistence proxy, whose @Id field is never populated"
+                    + " regardless of initialization state.");
+        }
+        return id;
     }
 
     private static Field idField(Class<?> type) {

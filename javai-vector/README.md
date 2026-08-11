@@ -157,3 +157,15 @@ gets started":
 
 `e2e-client-test`'s `ArticleGraphEmbeddingE2ETest` is built entirely on top of this — it has no
 platform-specific logic of its own, just asks `LocalEmbeddingDefaults` what to do.
+
+## `DirtyTrackingSupport`: external vector keys (OMI-290)
+
+One addition: a per-name map of the content key each `@ExternalVector` was supplied for. Its whole job is
+answering "does the stored vector still describe this object's current content?".
+
+Deliberately **not** folded into `VectorCacheSlot`. That class is the general lock-free primitive behind
+every vector cache in the system; this is a fact about one kind of vector. And the two answer staleness by
+genuinely different means: a slot tracks it by generation, because a `@Vectorize` field's content *is* the
+field and re-deriving validity would mean re-reading and re-hashing it on every access. An external vector's
+key is a short identifier standing in for content JavAI never touches, so plain comparison is affordable —
+which is also why it needs no woven setter to notice a change.

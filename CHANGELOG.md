@@ -14,6 +14,75 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **A vector JavAI never computes: `@ExternalVector` (OMI-290).** An image embedding is produced by a model
+  in its own container behind a queue, from bytes JavAI must not read, arriving minutes later in a different
+  model and dimensionality from every text vector on the same object. Nothing about that fits `@Vectorize`,
+  whose whole shape is "a read of a stale value computes it now" — so this is a separate declaration, made on
+  the type and repeatable, that JavAI stores, versions, serves and searches without ever producing.
+
+  ⚠️ **"Externally-supplied vectors are eventually consistent" is the obvious wrong answer**, and stating why
+  is the clearest way to say what the guarantee actually is. `EVENTUAL_CONSISTENCY` still blocks a slot's
+  *first* read — there being no prior value to serve — and still yields to
+  `runWithSubgraphLockedForPersistence`'s forced-accuracy override. Either would leave a read waiting on a
+  provider that cannot produce this vector, and asking the *text* provider for it. The consistency-mode axis
+  simply does not apply: these reads are unconditionally non-blocking under all three modes and inside a
+  persistence flush.
+
+  ⚠️ **And it is the one kind of vector outside the mutation rule.** Validity is re-derived on every read by
+  comparing a short content key against the field holding it, rather than tracked through an intercepted
+  write — affordable exactly because the key stands in for content JavAI never touches. A key written by
+  reflection or by a framework is caught like one written through a woven setter. A vector for content the
+  object has moved on from reads *absent* rather than stale: it is not out of date, it is a confident
+  description of different content.
+
+  Stored at the usual per-field grain but partitioned by the **declared** model — a new `computed_for` column
+  on Postgres, `ComputedFor` properties on Neo4j and MongoDB. `supplyVector(id, name, vector, computedFor)`
+  is the queue-consumer entry point (one read, one vector written, no merge or summary recomputation);
+  `findPendingVector` is the backlog for backfills and dead-letter re-drives. `reindex` carries them across
+  untouched rather than dropping vectors it cannot recompute. All three backends.
+
+- **Model-scoped aggregates: `vector(modelId)` / `summaryVector(modelId)` (OMI-290).** Two models' vectors
+  cannot be combined — their cosine similarity is not a weaker answer but no answer — so once an object
+  carries an image embedding beside a text one, "this object's vector" is two questions. Purely additive: the
+  unqualified forms are untouched, including their caching, and nothing is computed speculatively (asking for
+  one model's aggregate never embeds another's text in order to discard it).
+
+- **`JavAITagRepository.applyClassification` (OMI-290)** — the reconciliation half of `classify()`, reachable
+  without a `Cortex`, so a classifier that is not an LLM drives the identical diff against `source = "auto"`.
+  One tag-summary recomputation per call rather than one per tag: that path resolves every association through
+  `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups.
+
+### Fixed
+
+- ⚠️ **An entity carrying a `static` field broke both reflective backends (OMI-290).**
+  `EntityReflection.allFields` did not exclude them, and Neo4j and MongoDB map an entity by walking that
+  list — so a constant as ordinary as `static final String MODEL = "..."` was written as a node/document
+  property on save and then written *back* on load, failing outright with `Cannot write field static final
+  java.lang.String ...`. Postgres never saw it, because Hibernate does its own mapping and ignores statics,
+  and no entity in this repository had ever declared one. The whole class of failure sat one ordinary
+  constant away from any consumer.
+
+  `JavAIRuntime.allFields` had the same gap and is fixed alongside. That half would not have thrown: it would
+  have followed a static as a graph edge, putting objects nobody referenced into a `query()` result and into a
+  persistence flush's lock set. The loud failure is what made the quiet one findable.
+
+- ⚠️ **Tagging an entity reached through a lazy association silently wrote an unfindable row (OMI-290).**
+  `JavAITagRepository` built a `TaggableRef` from `instance.getClass().getName()` and the `@Id` *field*, and
+  both are wrong for a persistence proxy: the class name is `Target$HibernateProxy$xyz`, and a proxy holds no
+  state of its own so the field reads `null` whether or not it has been initialized. `addTag(parent.getChild(),
+  tag)` therefore succeeded, and every later `hasTag`/`tagsOf`/`taggedWith` answered "no". Proxies are now
+  resolved first, and an instance that still arrives without an id is refused with a message naming the two
+  situations that produce one.
+
+### Changed
+
+- **`@Taggable` is now `@Inherited` (OMI-290).** A subclass of a taggable class is genuinely taggable —
+  tagging state lives in association rows keyed by type name and id, and a subclass has both.
+  `@JavAIVectorizable` cannot say the same, because it commits the weaver to synthesizing per-class bytecode.
+  Note interface inheritance is a separate matter that this does not affect: a hierarchy whose common
+  supertype is an interface expresses participation by having that interface extend the `Taggable` marker
+  interface, which is all the tagging runtime actually requires.
+
 - **Conformance coverage for the fetch/attachment cells that were named but never measured (OMI-279).** The
   bidirectional `@OneToOne`/`@OneToMany` pairs, `@OneToOne(optional = false)`, `@Any` under `LAZY`, and the
   `EAGER` variants of both collection mappings. No production code changed — every cell is either conformant

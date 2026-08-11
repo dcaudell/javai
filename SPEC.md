@@ -170,6 +170,12 @@ database and, since OMI-187, read straight back into a loaded object's cache slo
 no longer stale merely for that object's lifetime — it is stored, served on every subsequent load, and
 outlives the process that produced it. The rule is the same rule; persistence just makes breaking it durable.
 
+**An `@ExternalVector` is outside this rule entirely** (OMI-290), and is the one kind of vector that is. Its
+validity is re-derived on every read by comparing a short content key against the field that holds it, rather
+than tracked through an intercepted write — affordable precisely because the key stands in for content JavAI
+never reads. A key written by reflection, by a framework, or by any other route that bypasses a woven setter
+is therefore caught exactly like one written through it. See `doc/spec/vector-core.md`'s own section.
+
 Two things that are explicitly *not* violations, because JavAI handles them itself:
 - **`merge()` handing back a different instance.** Hibernate copies mapped field values onto a managed copy
   but not the woven `$javai$state` the caches live in. `javai-persistence` carries the vectors across
@@ -227,7 +233,12 @@ against all three persistence backends, LLM-based classification via `JavAITagRe
 weaving to `javai-substrate` as a prerequisite (see that module's own README). `JavAITagRepository` is an
 instance wrapper, not a static facade — see "Coding standard: static/global scope is the exception" below,
 which this module (alongside `javai-persistence`'s own `JavAIPI.repository(Class, JavAIPersistenceConfig)`)
-is the reference example for. Don't assume anything beyond what's in a given module's actual source and
+is the reference example for. As of OMI-290 Vector Core also carries **externally-supplied
+vectors** (`@ExternalVector`: a vector JavAI stores, versions, serves and searches but never computes,
+supplied from outside the process in its own embedding model) and **model-scoped aggregates**
+(`vector(modelId)`/`summaryVector(modelId)`, since two models' vectors cannot be combined), both realized
+across all three persistence backends; and `javai-tagging` carries `applyClassification`, the reconciliation
+half of `classify()` reachable without an LLM. Don't assume anything beyond what's in a given module's actual source and
 tests reflects working code; check that module's README before relying on a claim from this file,
 `doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
 module's real implementation state at a given moment.

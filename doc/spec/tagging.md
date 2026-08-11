@@ -282,6 +282,30 @@ on the same instance completely untouched, even for tags in the same set. Confid
 from the model is optional in the response schema, consistent with tags being binary by default — a
 classifier is free to say "this applies" without a strength score.
 
+### A classifier that is not an LLM (OMI-290)
+
+`classify()` is one path to a classification; the reconciliation underneath it is the valuable part, and is
+not about LLMs at all. `applyClassification(instance, tagSet, results)` exposes it directly, so an image
+tagger returning `(slug, confidence)` from its own model, out of process, drives the identical diff against
+`source = "auto"` — add, update affinity, remove what is no longer returned, never touch a manual tagging.
+`classify()` is now "ask `Cortex`, then call this", so the two can never disagree.
+
+Two differences from `classify()`, both deliberate:
+
+- **An off-set tag throws** where a hallucinated slug is silently discarded. The asymmetry is about who is
+  wrong: a model inventing a slug is expected noise, whereas a caller passing a tag from another `TagSet` is
+  a bug whose consequence is silent and durable — the removal scan is scoped to this set, so such a tag would
+  be applied as `auto` and never be retractable by any later run.
+- **One tag-summary recomputation per call**, not one per tag. `recomputeTagSummaryVector` resolves every
+  association through `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups; a classifier
+  returning twenty tags does one recomputation here and twenty there.
+
+⚠️ **`JavAITagRepository` resolves a persistence proxy before building a `TaggableRef`.** Both halves of a ref
+are wrong for one, silently: `getClass().getName()` answers `Target$HibernateProxy$xyz`, and a proxy holds no
+state of its own, so field reflection reads a `null` `@Id` from it whether or not it has been initialized.
+Reaching a taggable through a lazy association — `addTag(parent.getChild(), tag)` — was the shape that hit
+it, and the write succeeded while every later lookup answered "no".
+
 ## Structural queries
 
 `JavAIRepository` deliberately rejects any derived query beyond `findNearestBy<Field>Vector` — it is not a

@@ -295,3 +295,24 @@ specification proposals only; do not implement until there's a demonstrated need
   proves this against a real, woven `@JavAIVectorizable` class, not just hand-written test POJOs. Not yet
   implemented: `Contextable` on `KnowledgeGraph`/`SubgraphResult`/`VectorIndex` (`javai-collections`) — see
   the module-placement note above for why.
+
+## Externally-supplied vectors and model-scoped aggregates (OMI-290)
+
+`JavAIRuntime` gained three related capabilities, all additive:
+
+- **`externalVector(self, name)` / `supplyVector(self, name, vector, computedFor)`** — an `@ExternalVector`'s
+  read and write path. The read never computes, never blocks and never dispatches, under every
+  `EmbeddingConsistencyMode` *and* inside `runWithSubgraphLockedForPersistence`; it bypasses `readSlot`
+  entirely rather than configuring it, because "eventually consistent" would still block a first read and
+  still yield to a flush's forced accuracy. Validity is re-derived on each read by comparing a short content
+  key, which is why this is the one kind of vector outside `SPEC.md`'s mutation rule.
+- **`vector(self, fields, modelId)` / `summaryVector(self, summary, fields, modelId)`** — the same aggregates
+  restricted to one model. Uncached, and nothing is computed speculatively: a `@Vectorize` field's model is
+  whatever the provider is, so asking for another model skips those fields without reading them.
+- **`allFields` now excludes statics.** Every caller here treats a field as a property of one object, and
+  class state is not that — a static would be followed as a graph edge into `query()` results and into a
+  flush's lock set.
+
+`CollectionVectorSupport` and the three concrete collections carry the model-scoped forms too, so a container
+of images can be summarized by what its members *look* like in a model no text field on any of them was ever
+embedded under.

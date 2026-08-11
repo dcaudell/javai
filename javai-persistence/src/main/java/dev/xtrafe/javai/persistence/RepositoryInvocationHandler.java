@@ -1,5 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.vector.EmbeddingVector;
+
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -55,6 +57,11 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "reindex":
                 backend.reindex(entityType);
                 return null;
+            case "supplyVector":
+                return backend.supplyVector(entityType, (UUID) args[0], (String) args[1],
+                        (EmbeddingVector) args[2], (String) args[3]);
+            case "findPendingVector":
+                return backend.findPendingVector(entityType, (String) args[0], (Integer) args[1]);
             // The builder idiom (OMI-230). Declared on JavAIRepository itself, so these names are matched
             // here before the findNearestBy* convention below ever sees them -- and are deliberately not
             // spelled findNearestBy*, so the two idioms cannot collide on a name in the first place.

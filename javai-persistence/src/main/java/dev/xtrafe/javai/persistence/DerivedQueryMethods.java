@@ -94,12 +94,30 @@ final class DerivedQueryMethods {
      *  idiom's {@code nearestBy(String)} entry point -- the runtime counterpart of what {@link #parse}
      *  checks at repository-creation time, sharing the check so the two idioms cannot disagree. */
     static String requireVectorizeField(Class<?> entityType, String fieldName) {
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
-        if (fieldName == null || !vectorizeFields.contains(fieldName)) {
-            throw new IllegalArgumentException("'" + fieldName + "' is not a @Vectorize field on "
-                    + entityType.getName() + " -- known @Vectorize fields: " + vectorizeFields);
+        Set<String> searchable = fieldGrainVectorNames(entityType);
+        if (fieldName == null || !searchable.contains(fieldName)) {
+            throw new IllegalArgumentException("'" + fieldName + "' is not a @Vectorize field or"
+                    + " @ExternalVector on " + entityType.getName() + " -- known: " + searchable);
         }
         return fieldName;
+    }
+
+    /**
+     * Every name with a vector of its own at <b>field grain</b> -- {@code @Vectorize} fields and
+     * {@code @ExternalVector}s alike (OMI-290).
+     *
+     * <p>They are one namespace to a query for the same reason they are one namespace to the cache: an
+     * external vector is stored under its own name in exactly the per-field shape a {@code @Vectorize} field
+     * uses, so {@code findNearestByPixelsVector} needs nothing from a backend that
+     * {@code findNearestByCaptionVector} did not already need. What makes the two resolve to different
+     * storage is the reference vector's own model, which every backend already keys on -- so the only thing
+     * that had to change to make an external vector searchable was this check, which was refusing the name
+     * before any of that machinery got a chance to work.
+     */
+    static Set<String> fieldGrainVectorNames(Class<?> entityType) {
+        Set<String> names = new java.util.LinkedHashSet<>(EntityReflection.vectorizeFieldNames(entityType));
+        names.addAll(JavAIRuntime.externalVectorNames(entityType));
+        return names;
     }
 
     /** @see #requireVectorizeField -- the same shared check, for the concatenated-text kind. */
@@ -155,7 +173,7 @@ final class DerivedQueryMethods {
      * {@code NameContaining}, which has no lead-in, so the scan keeps going and lands on the right one.
      */
     private static Split splitAtVectorKeyword(Method method, Class<?> entityType, String afterPrefix) {
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
+        Set<String> vectorizeFields = fieldGrainVectorNames(entityType);
         for (int at = afterPrefix.lastIndexOf(SUFFIX); at >= 0; at = afterPrefix.lastIndexOf(SUFFIX, at - 1)) {
             String middle = afterPrefix.substring(0, at);
             String tail = afterPrefix.substring(at + SUFFIX.length());
@@ -177,8 +195,8 @@ final class DerivedQueryMethods {
             }
         }
         if (afterPrefix.contains(SUFFIX)) {
-            throw new IllegalArgumentException(method + " does not match a @Vectorize field on "
-                    + entityType.getName() + " -- known @Vectorize fields: " + vectorizeFields
+            throw new IllegalArgumentException(method + " does not match a @Vectorize field or"
+                    + " @ExternalVector on " + entityType.getName() + " -- known: " + vectorizeFields
                     + ". The name must be findNearestBy<Field>Vector, optionally followed by And<Predicate>.");
         }
         throw unsupported(method, entityType);

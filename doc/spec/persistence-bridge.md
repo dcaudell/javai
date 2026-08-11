@@ -620,3 +620,57 @@ over field vectors hydration already restored, so recomputing costs nothing; the
 a real embedding, so not restoring it would mean a live model call on every load of every participating
 entity. All three backends read it back into the entity's slot under the same pristine-slot rule that governs
 field hydration.
+
+## Externally-supplied vectors (OMI-290)
+
+`@ExternalVector` (see `doc/spec/vector-core.md`) is stored at the **same per-field grain** as a
+`@Vectorize` field, and partitioned by the model the type *declares* rather than the one currently
+configured — the two have nothing to do with each other. That is the whole of the storage design; no new
+table, no new grain, no new keying rule.
+
+| Backend | Realization |
+|---|---|
+| Postgres | `javai_vectors__<model>`, with a new `computed_for text NULL` column holding the content key. `ALTER TABLE … ADD COLUMN IF NOT EXISTS` alongside `ensureFieldVectorTable` is the migration for a table created earlier — idempotent, same pattern as OMI-191's three columns |
+| Neo4j | `<name>Vector__<model>` node property, plus `…ComputedAt` and `…ComputedFor` siblings — the same shape as `summaryVector__<model>` |
+| MongoDB | `<name>Vector__<model>` document field, plus the same two siblings |
+
+**`computed_for` earns its place on the load path, not the query path.** After hydration the vector sits in
+its cache slot, and every read compares the key it was written for against the entity's current content
+before serving it. Without the stored key, a hydrated vector would be held and never served — which from
+outside is indistinguishable from a pipeline that never ran. The backlog query is a bonus, not the reason.
+
+**Reads hydrate it before the `currentModelId()` guard**, deliberately: an external vector's model is
+declared on the type, so it is readable whether or not a text provider is configured or can name itself.
+
+**A save deletes the row when the vector reads absent** — nothing supplied yet, or superseded by a content
+change — for the same reason `AbsentVectorRemovalTest` gives for a `@Vectorize` field that loses its content.
+A stale row in an ANN index is worse than a missing one: the entity goes on matching searches for content it
+no longer has.
+
+**`reindex` carries them across untouched.** A re-index re-embeds under the currently configured model, and
+this vector is neither in that model nor computable by this process — so it is neither recomputed nor
+dropped.
+
+### The repository surface
+
+```java
+boolean supplyVector(UUID id, String vectorName, EmbeddingVector vector, String computedFor);
+List<T>  findPendingVector(String vectorName, int limit);
+```
+
+`supplyVector` reads the entity — the content-key comparison is against the entity's own field, so there is
+nothing to compare without it — and then writes exactly one vector: no merge, no summary recomputation, no
+walk of the reachable graph, because a consumer storing a vector has not touched the entity. It returns
+`false` rather than throwing when the entity has moved on, which under at-least-once delivery is ordinary.
+
+`findPendingVector` is a **scan**, stated plainly: it needs no store-specific code, is correct on all three
+backends, and is the right shape for the two jobs it exists for — a backfill and a re-drive after a
+dead-letter drain — both of which sweep the whole type anyway. A backend can override it with an anti-join
+against its own vector storage if that stops being true.
+
+### Searching one
+
+`findNearestBy<Name>Vector(reference, limit)` and `nearestBy("<name>")` accept an `@ExternalVector`'s name
+exactly as they accept a `@Vectorize` field's. Nothing in the query machinery had to learn a new concept:
+every backend already resolves *which* storage answers from `reference.modelId()`, so a reference from the
+image model selects the image model's table/property by the mechanism that was already there.

@@ -655,3 +655,114 @@ Persisted on the entity-grain table alongside the summary vector; see `doc/spec/
 `findNearestByConcatenatedTextVector(EmbeddingVector, int)` searches it, and is **rejected at
 repository-creation time** for an entity type that does not participate — otherwise it would return an empty
 list forever, indistinguishable from "nothing was similar".
+
+## Externally-supplied vectors (OMI-290, not in the whitepaper)
+
+Everything above assumes JavAI can compute a vector when it needs one: a read of a stale value calls the
+provider and blocks. `@ExternalVector` is for the case where it cannot, and never will be able to — an image
+embedding whose bytes live in object storage, produced by a model in its own container behind a queue,
+arriving seconds or minutes later in a different model and a different dimensionality from every text vector
+on the same object.
+
+```java
+@Entity
+@JavAIVectorizable
+@ExternalVector(name = "pixels", keyField = "contentHash", model = "siglip2-so400m-p14-384/pp1")
+public class Image extends Asset { ... }
+```
+
+**Declared on the type, and repeatable.** The field identifying the content is usually inherited — a blob
+coordinate or content hash on a shared `@MappedSuperclass` — while only some subclasses have a vector of that
+kind. A field-level annotation applies to everything that inherits the field and cannot be overridden on one
+subclass, so it would force a whole hierarchy to expect a vector most of it can never have. Type-level also
+frees the vector's name from the field's (`pixelsVector()`, `findNearestByPixelsVector`) and lets one class
+declare several over one key field — a video with a keyframe vector and an audio vector.
+
+### What a read guarantees
+
+| | |
+|---|---|
+| Before anything is supplied | `EmbeddingVector.absent()` |
+| After the content it describes changes | `absent()` again — see below |
+| Provider calls | **none, ever** |
+| Blocking | **none, ever** |
+
+**The `EmbeddingConsistencyMode` axis does not apply here**, and this is worth stating precisely because
+"external vectors are eventually consistent" is the obvious wrong answer. `EVENTUAL_CONSISTENCY` still blocks
+a slot's *first* read — there being no prior value to serve — and still yields to
+`runWithSubgraphLockedForPersistence`'s forced-accuracy override. Either would end up waiting on a provider
+that cannot produce this vector, and would ask the *text* provider for it. So the read path bypasses the
+mode machinery rather than configuring it, and is unconditionally non-blocking under all three modes and
+inside a flush.
+
+### Staleness is re-derived, not tracked
+
+A supplier echoes back the `keyField` value it actually embedded. `supplyVector` stores the vector only if
+the object still holds that value, and every read compares again before serving.
+
+Two consequences follow, and the second is the interesting one:
+
+- **A vector for content the object has moved on from reads absent, not stale.** It is not a slightly-out-of-date
+  description; it is a confident description of *different content*. Absence is already a state every caller
+  handles — arithmetic skips it, ranking sorts it last, persistence deletes its row.
+- ⚠️ **This does not depend on the mutation rule.** SPEC.md's "only JavAI may change a `@Vectorize` field" is
+  load-bearing for every computed vector, because re-deriving validity would mean re-reading and re-hashing
+  content that may be arbitrarily large. An external vector's key is a *short identifier standing in for*
+  content JavAI never touches, so comparing it on every read costs nothing — and a key written by reflection,
+  by a framework, or by any other route that bypasses a woven setter is caught exactly like one written
+  through it.
+
+### Storage
+
+The same per-field grain as a `@Vectorize` field, partitioned by the **declared** model rather than the
+configured one — `javai_vectors__<model>` on Postgres (with a new `computed_for` column holding the key),
+`<name>Vector__<model>` plus `ComputedAt`/`ComputedFor` properties on Neo4j and MongoDB. Fold model name,
+weights version and preprocessing version into the one `modelId` string: storage is keyed by it, so a
+preprocessing bump becomes a new table/property and the existing expand/contract migration applies with
+nothing new to build.
+
+`reindex` skips them — there is no provider to re-embed with — and carries them across untouched rather than
+dropping vectors it cannot recompute.
+
+### The pipeline surface
+
+```java
+boolean supplyVector(UUID id, String vectorName, EmbeddingVector vector, String computedFor);
+List<T>  findPendingVector(String vectorName, int limit);
+```
+
+`supplyVector` is what a queue consumer holds: an id, a vector, and the key the model embedded. It reads the
+entity (the key comparison has nothing to compare against otherwise) and writes one vector — no merge, no
+summary recomputation, no graph walk. `findPendingVector` is the backlog, for backfills and dead-letter
+re-drives; it is a scan, deliberately, and per-item "is this one done" belongs in whatever status the
+application already keeps.
+
+## Model-scoped aggregates (OMI-290)
+
+Two models' vectors cannot be combined — `VectorMath` refuses, and rightly: their cosine similarity is not a
+weaker answer but no answer. So once an object carries an image embedding beside a text one, "this object's
+vector" is two questions.
+
+```java
+EmbeddingVector text   = image.vector();                              // unchanged: the configured model
+EmbeddingVector pixels = image.vector("siglip2-so400m-p14-384/pp1");  // the other one
+EmbeddingVector look   = album.summaryVector("siglip2-so400m-p14-384/pp1");
+```
+
+`vector(modelId)` is the centroid of every vector the object carries from that model, `@Vectorize` field and
+`@ExternalVector` alike; `summaryVector(modelId)` is the same decay-weighted formula admitting only that
+model's vectors. **Purely additive** — the unqualified forms are untouched, including their caching, and a
+type declaring no external vector behaves exactly as before.
+
+Two properties worth knowing:
+
+- **Nothing is computed speculatively.** A `@Vectorize` field's model is whatever the provider is, so asking
+  for another model skips those fields *without reading them*. Asking for the image aggregate must not embed
+  the caption in order to discard it.
+- **The scoped forms are uncached**, unlike `summaryVector()`. They recombine vectors that are themselves
+  already cached, so a cache per model would buy little and cost a slot, an invalidation rule and a dirty flag
+  each — the shape OMI-187 established does not work.
+
+⚠️ Note what this is *not* for: it does not make an object with two models' vectors work where it used to
+break. `@ExternalVector` keeps external vectors out of the baked `@Vectorize` list, so `vector()` never met
+them in the first place. These accessors exist to make the other model *reachable*, not to repair a collision.

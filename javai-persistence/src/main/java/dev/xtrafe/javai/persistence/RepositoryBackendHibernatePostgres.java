@@ -1585,6 +1585,29 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             ensureFieldVectorTable(combined.modelId(), combined.dims());
         }
 
+        // @ExternalVector rows (OMI-290). They live in the same per-field table shape, so the write itself
+        // is the ordinary one -- and lands in the right table for free, since the table is chosen from the
+        // vector's own model rather than the configured one. Two things do differ: the content key travels
+        // with the vector, and a deletion has to name the *declared* model, because currentModelId() is the
+        // text model and has nothing to do with where this row lives.
+        Map<String, ExternalVectorRow> externalToWrite = new LinkedHashMap<>();
+        Map<String, String> externalToDelete = new LinkedHashMap<>();
+        for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+            String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+            EmbeddingVector vector = vectorizable.externalVector(vectorName);
+            if (vector.isAbsent()) {
+                // Nothing supplied yet, or superseded by a content change. Deleting rather than leaving the
+                // old row is the same rule an absent @Vectorize field follows, and matters more here: the
+                // stored vector confidently describes content this entity no longer references, and a stale
+                // row in an ANN index goes on matching searches forever.
+                externalToDelete.put(vectorName, declaredModel);
+            } else {
+                externalToWrite.put(vectorName, new ExternalVectorRow(vector,
+                        JavAIRuntime.externalVectorKey(entity, vectorName)));
+                ensureFieldVectorTable(vector.modelId(), vector.dims());
+            }
+        }
+
         session.doWork(connection -> {
             // What is already stored, read once for the whole entity. Skipping a write whose value is
             // unchanged is not a micro-optimisation: at REPEATABLE READ a value-identical UPDATE still
@@ -1602,6 +1625,24 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             for (String fieldName : toDelete) {
                 deleteFieldVectorRow(connection, currentModelId, ownerType, id, fieldName);
+            }
+            for (Map.Entry<String, ExternalVectorRow> entry : externalToWrite.entrySet()) {
+                ExternalVectorRow row = entry.getValue();
+                String table = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(row.vector().modelId());
+                // Read this model's stored row for the same-value skip -- the entity's own model was read
+                // above, and an external vector is by definition in a different one, so it is not in `stored`.
+                Map<String, StoredVector> storedForModel =
+                        readStoredFieldVectors(connection, ownerType, id, row.vector().modelId());
+                StoredVector storedRow = storedForModel.get(entry.getKey());
+                if (isUnchanged(storedRow, row.vector())
+                        && storedRow != null
+                        && java.util.Objects.equals(storedRow.computedFor(), row.computedFor())) {
+                    continue; // OMI-255's argument, unchanged: a value-identical UPDATE still versions the row
+                }
+                upsertVector(connection, table, ownerType, id, entry.getKey(), row.vector(), row.computedFor());
+            }
+            for (Map.Entry<String, String> entry : externalToDelete.entrySet()) {
+                deleteFieldVectorRow(connection, entry.getValue(), ownerType, id, entry.getKey());
             }
         });
 
@@ -2095,8 +2136,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         drainPendingSummaries();
     }
 
-    /** A vector as the database currently holds it, for comparison against the one about to be written. */
-    private record StoredVector(String modelId, int dims, float[] values) {
+    /** A vector as the database currently holds it, for comparison against the one about to be written.
+     *  {@code computedFor} is the {@code @ExternalVector} content key, {@code null} for a {@code @Vectorize}
+     *  field (OMI-290). */
+    private record StoredVector(String modelId, int dims, float[] values, String computedFor) {
+    }
+
+    /** One {@code @ExternalVector} ready to write: the supplied vector and the content key it describes. */
+    private record ExternalVectorRow(EmbeddingVector vector, String computedFor) {
     }
 
     /** The entity-grain row's two vectors, either of which may be absent. */
@@ -2136,14 +2183,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
         Map<String, StoredVector> stored = new HashMap<>();
         try (PreparedStatement statement = connection.prepareStatement(
-                "SELECT field_name, model_id, dims, vector::text FROM " + table
+                "SELECT field_name, model_id, dims, vector::text, computed_for FROM " + table
                         + " WHERE owner_type = ? AND owner_id = ?")) {
             statement.setString(1, ownerType);
             statement.setObject(2, ownerId);
             try (ResultSet rows = statement.executeQuery()) {
                 while (rows.next()) {
-                    stored.put(rows.getString(1), new StoredVector(
-                            rows.getString(2), rows.getInt(3), parseVectorLiteral(rows.getString(4))));
+                    stored.put(rows.getString(1), new StoredVector(rows.getString(2), rows.getInt(3),
+                            parseVectorLiteral(rows.getString(4)), rows.getString(5)));
                 }
             }
         }
@@ -2168,9 +2215,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 int dims = rows.getInt(2);
                 String concatenated = rows.getString(4);
                 return new StoredSummaryRow(
-                        new StoredVector(modelId, dims, parseVectorLiteral(rows.getString(3))),
+                        new StoredVector(modelId, dims, parseVectorLiteral(rows.getString(3)), null),
                         concatenated == null ? null
-                                : new StoredVector(modelId, dims, parseVectorLiteral(concatenated)));
+                                : new StoredVector(modelId, dims, parseVectorLiteral(concatenated), null));
             }
         }
     }
@@ -2616,8 +2663,19 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // model-independent, and is why this is three separate decisions rather than one early return.
         boolean wantsFieldVectors = modelId != null && !fieldNames.isEmpty();
         boolean wantsConcatenated = modelId != null && JavAIRuntime.participatesInConcatenation(entityType);
+        // Each @ExternalVector lives in its own declared model's table, which is by definition not the
+        // configured one -- so these are extra branches rather than extra rows in the branch above. Grouped
+        // by model, since two external vectors may share one (OMI-290).
+        Map<String, List<String>> externalByModel = new LinkedHashMap<>();
+        if (vectorizable) {
+            for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+                externalByModel.computeIfAbsent(
+                        JavAIRuntime.externalVectorModel(entityType, vectorName), key -> new ArrayList<>())
+                        .add(vectorName);
+            }
+        }
         List<Field> pointFields = includeGeo ? pointFieldsOf(entityType) : List.of();
-        if (!wantsFieldVectors && !wantsConcatenated && pointFields.isEmpty()) {
+        if (!wantsFieldVectors && !wantsConcatenated && pointFields.isEmpty() && externalByModel.isEmpty()) {
             return; // the common case for a plain entity: no statement at all
         }
 
@@ -2629,19 +2687,28 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             List<String> branches = new ArrayList<>();
             if (wantsFieldVectors && tableExistsCached(connection, fieldTable)) {
                 branches.add("SELECT 'v'::text, field_name::text, model_id::text, dims::int,"
-                        + " computed_at::timestamptz, vector::text, NULL::float8, NULL::float8"
+                        + " computed_at::timestamptz, vector::text, NULL::float8, NULL::float8, NULL::text"
                         + " FROM " + fieldTable + " WHERE owner_type = ? AND owner_id = ?");
             }
             if (wantsConcatenated && tableExistsCached(connection, summaryTable)) {
                 branches.add("SELECT 'c'::text, NULL::text, model_id::text, dims::int,"
                         + " concatenated_text_computed_at::timestamptz, concatenated_text_vector::text,"
-                        + " NULL::float8, NULL::float8"
+                        + " NULL::float8, NULL::float8, NULL::text"
                         + " FROM " + summaryTable + " WHERE owner_type = ? AND owner_id = ?");
             }
             if (!pointFields.isEmpty() && tableExistsCached(connection, "javai_geo_points")) {
                 branches.add("SELECT 'g'::text, field_name::text, NULL::text, NULL::int,"
-                        + " NULL::timestamptz, NULL::text, longitude::float8, latitude::float8"
+                        + " NULL::timestamptz, NULL::text, longitude::float8, latitude::float8, NULL::text"
                         + " FROM javai_geo_points WHERE owner_type = ? AND owner_id = ?");
+            }
+            for (String externalModel : externalByModel.keySet()) {
+                String externalTable = FIELD_VECTOR_TABLE_PREFIX + ModelIds.sanitize(externalModel);
+                if (tableExistsCached(connection, externalTable)) {
+                    branches.add("SELECT 'x'::text, field_name::text, model_id::text, dims::int,"
+                            + " computed_at::timestamptz, vector::text, NULL::float8, NULL::float8,"
+                            + " computed_for::text"
+                            + " FROM " + externalTable + " WHERE owner_type = ? AND owner_id = ?");
+                }
             }
             if (branches.isEmpty()) {
                 return; // nothing written for this model yet, or no geo table: recompute rather than read
@@ -2660,11 +2727,40 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                             case "v" -> hydrateOneFieldVector(entity, fieldNames, rows);
                             case "c" -> hydrateOneConcatenatedTextVector(entity, rows);
                             case "g" -> hydrateOnePoint(entity, pointFields, rows);
+                            case "x" -> hydrateOneExternalVector(entity, rows);
                             default -> throw new IllegalStateException("unknown out-of-band row kind");
                         }
                     }
                 }
             }
+        });
+    }
+
+    /**
+     * Writes one {@code @ExternalVector}'s row and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290).
+     *
+     * <p>Deliberately not a {@code save()}: a queue consumer storing a vector has not touched the entity,
+     * so merging it, recomputing its summary and walking its graph would all be work for a change that did
+     * not happen.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        String ownerType = entityType.getName();
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        String table = vector.isAbsent() ? null : ensureFieldVectorTable(vector.modelId(), vector.dims());
+        String computedFor = vector.isAbsent() ? null : JavAIRuntime.externalVectorKey(entity, vectorName);
+        inSession(session -> {
+            session.doWork(connection -> {
+                if (vector.isAbsent()) {
+                    deleteFieldVectorRow(connection, declaredModel, ownerType, id, vectorName);
+                } else {
+                    upsertVector(connection, table, ownerType, id, vectorName, vector, computedFor);
+                }
+            });
+            return null;
         });
     }
 
@@ -2702,6 +2798,27 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         float[] values = parseVectorLiteral(literal);
         JavAIRuntime.hydrateConcatenatedTextVector(entity, new EmbeddingVector(
                 values, rows.getString(3), values.length, computedAt.toInstant()));
+    }
+
+    /**
+     * Restores an {@code @ExternalVector} together with the content key it was written for (OMI-290).
+     *
+     * <p>The key is what makes the restored vector answerable: {@code externalVector()} compares it against
+     * the entity's current content on every read, so a vector hydrated without one would be held and never
+     * served -- indistinguishable, from the outside, from one that had been superseded.
+     *
+     * <p>Note the row is filtered by name rather than trusted: this table is shared with any other entity
+     * type using the same model, and a name that is no longer declared is simply a row nothing reads.
+     */
+    private static void hydrateOneExternalVector(Object entity, ResultSet rows) throws SQLException {
+        String vectorName = rows.getString(2);
+        if (!JavAIRuntime.isExternalVectorName(entity.getClass(), vectorName)) {
+            return;
+        }
+        float[] values = parseVectorLiteral(rows.getString(6));
+        JavAIRuntime.hydrateExternalVector(entity, vectorName, new EmbeddingVector(
+                values, rows.getString(3), rows.getInt(4), rows.getTimestamp(5).toInstant()),
+                rows.getString(9));
     }
 
     private static void hydrateOnePoint(Object entity, List<Field> pointFields, ResultSet rows)
@@ -2827,10 +2944,22 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     private static void upsertVector(Connection connection, String table, String ownerType, UUID ownerId,
             String fieldName, EmbeddingVector vector) throws SQLException {
-        String sql = "INSERT INTO " + table + " (owner_type, owner_id, field_name, model_id, dims, vector, computed_at) "
-                + "VALUES (?, ?, ?, ?, ?, ?::vector, ?) "
+        upsertVector(connection, table, ownerType, ownerId, fieldName, vector, null);
+    }
+
+    /**
+     * @param computedFor for an {@code @ExternalVector}, the content key this vector was computed for;
+     *                    {@code null} for an ordinary {@code @Vectorize} field, whose validity is tracked by
+     *                    cache generation rather than by content (OMI-290)
+     */
+    private static void upsertVector(Connection connection, String table, String ownerType, UUID ownerId,
+            String fieldName, EmbeddingVector vector, String computedFor) throws SQLException {
+        String sql = "INSERT INTO " + table + " (owner_type, owner_id, field_name, model_id, dims, vector,"
+                + " computed_at, computed_for) "
+                + "VALUES (?, ?, ?, ?, ?, ?::vector, ?, ?) "
                 + "ON CONFLICT (owner_type, owner_id, field_name) "
-                + "DO UPDATE SET dims = EXCLUDED.dims, vector = EXCLUDED.vector, computed_at = EXCLUDED.computed_at";
+                + "DO UPDATE SET dims = EXCLUDED.dims, vector = EXCLUDED.vector,"
+                + " computed_at = EXCLUDED.computed_at, computed_for = EXCLUDED.computed_for";
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, ownerType);
             statement.setObject(2, ownerId);
@@ -2839,6 +2968,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             statement.setInt(5, vector.dims());
             statement.setString(6, toVectorLiteral(vector.values()));
             statement.setTimestamp(7, Timestamp.from(vector.computedAt()));
+            statement.setString(8, computedFor);
             statement.executeUpdate();
         }
     }
@@ -3038,7 +3168,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     + "dims         integer      NOT NULL,"
                     + "vector       vector(" + dims + ") NOT NULL,"
                     + "computed_at  timestamptz  NOT NULL,"
+                    + "computed_for text         NULL,"
                     + "PRIMARY KEY (owner_type, owner_id, field_name))");
+            // The migration for a table created before OMI-290. CREATE TABLE IF NOT EXISTS does nothing to an
+            // existing table, so a deployment that already has one would otherwise fail on first write --
+            // the same trap, and the same idempotent fix, as OMI-191's three columns on the summary table.
+            statement.execute("ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS computed_for text NULL");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_lookup ON " + table + " (owner_type, field_name)");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
         });

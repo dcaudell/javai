@@ -29,6 +29,7 @@ Controls what gets embedded and how it's searched. See `doc/spec/vector-core.md`
 | `Vectorize` / `VectorizeIgnore` | field | Include/exclude a field from the local embedding |
 | `SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field / class | Search-semantic visibility, independent of Java access modifiers |
 | `Summary` | field / class | Marks contribution to a container's hierarchical summary vector |
+| `ExternalVector(name, keyField, model)` | class, repeatable | Declares a vector JavAI stores, versions and searches but **never computes** — supplied from outside the process, in its own model (OMI-290) |
 | `EmbeddingModel("id")` | class / field | Overrides which embedding model vectorizes this element |
 | `JavAIGraphNode` / `JavAIEdge` | class / record | Declares knowledge-graph participation (Vector Collections) |
 
@@ -71,10 +72,13 @@ is off-limits regardless of how good a proposed fix looks.
 
 ## What's actually implemented
 
-All 17 annotations exist as real, compilable definitions (`AgentWritable`, `Costly`, `EmbeddingModel`,
-`Ensures`, `Frozen`, `HumanOnly`, `Intent`, `Invariant`, `JavAIEdge`, `JavAIGraphNode`,
-`JavAIVectorizable`, `Nondeterministic`, `Provenance`, `Requires`, `SearchVisibility`, `Summary`,
-`Vectorize`, `VectorizeIgnore`), each with correct `@Retention`/`@Target`. `Requires`/`Ensures`/`Invariant`
+All 19 annotations exist as real, compilable definitions (`AgentWritable`, `Costly`, `EmbeddingModel`,
+`Ensures`, `ExternalVector`, `Frozen`, `HumanOnly`, `Intent`, `Invariant`, `JavAIEdge`, `JavAIGraphNode`,
+`JavAIVectorizable`, `Nondeterministic`, `PersistenceIgnore`, `Provenance`, `Requires`, `SearchVisibility`,
+`Summary`, `Taggable`, `TagIgnore`, `Vectorize`, `VectorizeIgnore`), each with correct
+`@Retention`/`@Target`. `ExternalVector` is `@Repeatable` (a class may declare several) and `Taggable` is
+`@Inherited` as of OMI-290 — a subclass of a taggable class is genuinely taggable, which `JavAIVectorizable`
+cannot say of itself, since it commits the weaver to per-class bytecode. `Requires`/`Ensures`/`Invariant`
 are repeatable, each via a nested `List` container annotation. `AnnotationsSmokeTest` reflectively proves
 every annotation is present, retained, and applicable to the right element kind.
 

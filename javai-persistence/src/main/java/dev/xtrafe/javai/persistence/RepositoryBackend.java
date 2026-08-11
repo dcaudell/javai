@@ -139,6 +139,74 @@ interface RepositoryBackend {
                 + "the store's own driver/template transaction API directly for this sequence.");
     }
 
+    /**
+     * Stores an externally-computed vector against one entity (OMI-290).
+     *
+     * <p>Backend-agnostic by construction, and deliberately so: the decision this has to make -- does the
+     * entity still reference the content this vector was computed for? -- lives in Vector Core, and the
+     * write it then performs is one the backend already knows how to do. So the default is the whole
+     * implementation on every backend, and a backend overrides it only if it can do the write more
+     * narrowly.
+     *
+     * <p><b>It loads the entity, and cannot not.</b> The content-key comparison is against the entity's own
+     * field, so there is nothing to compare without reading it. What it avoids is the rest of a
+     * {@code save()}: no merge, no summary recomputation, no walk of the reachable graph.
+     *
+     * @return {@code true} if stored; {@code false} if the vector described content the entity has since
+     *         moved on from -- the ordinary outcome of a slow producer racing an edit, not an error
+     * @throws IllegalArgumentException if no such entity exists, or if the vector's model disagrees with
+     *                                  what the type declares
+     */
+    default boolean supplyVector(Class<?> entityType, UUID id, String vectorName, EmbeddingVector vector,
+            String computedFor) {
+        Object entity = findById(entityType, id).orElseThrow(() -> new IllegalArgumentException(
+                "No " + entityType.getName() + " with id " + id + " -- cannot store an external vector"
+                        + " against an entity that does not exist"));
+        if (!JavAIRuntime.supplyVector(entity, vectorName, vector, computedFor)) {
+            return false;
+        }
+        writeExternalVector(entityType, entity, vectorName);
+        return true;
+    }
+
+    /** Persists one already-supplied {@code @ExternalVector} on {@code entity}, without touching anything
+     *  else about it -- the narrow write behind {@link #supplyVector}. */
+    void writeExternalVector(Class<?> entityType, Object entity, String vectorName);
+
+    /**
+     * Every entity of {@code entityType} whose {@code vectorName} has not been supplied for the content it
+     * currently references -- the backlog a producer works through (OMI-290).
+     *
+     * <p>Necessary because the vector lives outside the entity's own table/label/collection, so a caller
+     * cannot express this as an ordinary derived finder without reaching into storage JavAI owns. Per-item
+     * "is this one done yet" is a different question, and belongs in whatever status the application already
+     * keeps; this is for backfills and for re-driving after a dead-letter drain.
+     *
+     * <p><b>A scan, and honestly so.</b> It reads the type and keeps those whose vector reads absent, which
+     * is exactly the question being asked and is correct on every backend without a line of store-specific
+     * code. It is also O(rows), which is the right shape for the two jobs it exists for -- both of which
+     * sweep the whole type anyway -- and the wrong shape for polling it per upload. A backend can override
+     * with an anti-join against its own vector storage if that ever stops being true.
+     *
+     * <p>Note "absent" already covers both causes: never supplied, and supplied for content since replaced.
+     * They need no separate handling because a save writes the new content key and deletes the superseded
+     * row in the same flush, so the two states are indistinguishable at rest -- as they should be, since
+     * both mean the same thing to a producer.
+     */
+    default List<Object> findPendingVector(Class<?> entityType, String vectorName, int limit) {
+        List<Object> pending = new ArrayList<>();
+        for (Object entity : findAll(entityType)) {
+            if (entity instanceof dev.xtrafe.javai.model.JavAIVectorizable vectorizable
+                    && vectorizable.externalVector(vectorName).isAbsent()) {
+                pending.add(entity);
+                if (pending.size() >= limit) {
+                    break;
+                }
+            }
+        }
+        return pending;
+    }
+
     Optional<Object> findById(Class<?> entityType, UUID id);
 
     List<Object> findAll(Class<?> entityType);

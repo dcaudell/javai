@@ -11,6 +11,7 @@ import dev.xtrafe.javai.vector.VectorCacheSlot;
 import dev.xtrafe.javai.vector.VectorCacheSlot.PendingComputation;
 import dev.xtrafe.javai.vector.VectorMath;
 
+import dev.xtrafe.javai.annotations.ExternalVector;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 
@@ -653,10 +654,279 @@ public final class JavAIRuntime {
      * own javadoc for what each of the three modes guarantees on this read path.
      */
     public static EmbeddingVector fieldVector(Object self, String fieldName) {
+        // An @ExternalVector shares this name space (its slot is an ordinary field slot keyed by its own
+        // name) but nothing about its resolution: it is never computed, so it must not reach readSlot at
+        // all. Checked first, and free for the overwhelmingly common class that declares none.
+        if (isExternalVectorName(self.getClass(), fieldName)) {
+            return externalVector(self, fieldName);
+        }
         DirtyTrackingSupport state = stateOf(self);
         VectorCacheSlot slot = state.fieldSlot(fieldName);
         return readSlot(state, slot, () -> fieldTextOf(self, fieldName));
     }
+
+    // ---- model-scoped aggregates (OMI-290) -------------------------------------------------------
+
+    /**
+     * This object's aggregate <b>restricted to one embedding model</b> -- the centroid of every vector it
+     * carries that {@code modelId} produced, {@code @Vectorize} field and {@code @ExternalVector} alike.
+     *
+     * <p><b>Why an aggregate has to be able to name a model.</b> Cosine similarity between two models'
+     * vectors is not a weaker answer, it is not an answer at all, and {@link VectorMath} enforces that by
+     * refusing to combine them. So once an object carries vectors from two models -- an image embedding
+     * beside a text one -- "this object's vector" stops being a single question. {@link #vector(Object,
+     * String)} continues to answer the text one, unchanged and uncached; this answers whichever is asked
+     * for.
+     *
+     * <p><b>Nothing is computed speculatively.</b> A {@code @Vectorize} field's model is whatever the
+     * configured provider is, so when {@code modelId} is not that, the fields are skipped without being
+     * read -- asking for the image aggregate must not embed the caption in order to discard it. An external
+     * vector's model is declared, so it too is matched without touching the slot.
+     *
+     * <p>Uncached, like {@link #vector(Object, String)}, and for the same reason: it recombines
+     * already-computed vectors, so there is no expensive work to defer and no third staleness question to
+     * answer.
+     */
+    public static EmbeddingVector vector(Object self, String vectorizeFieldNames, String modelId) {
+        if (modelId == null) {
+            return EmbeddingVector.absent();
+        }
+        List<EmbeddingVector> matching = new ArrayList<>();
+        if (!vectorizeFieldNames.isBlank() && modelId.equals(currentModelId())) {
+            for (String fieldName : vectorizeFieldNames.split(",")) {
+                collectIfPresent(matching, fieldVector(self, fieldName), modelId);
+            }
+        }
+        for (Map.Entry<String, ExternalVectorSpec> declared : externalVectors(self.getClass()).entrySet()) {
+            if (modelId.equals(declared.getValue().model())) {
+                collectIfPresent(matching, externalVector(self, declared.getKey()), modelId);
+            }
+        }
+        return VectorMath.centroid(matching);
+    }
+
+    /**
+     * {@link #summaryVector(Object, String, String)} restricted to one embedding model -- this object's
+     * own {@code modelId} aggregate at full weight, plus each {@code @Summary} child's {@code modelId}
+     * summary at the decay factor.
+     *
+     * <p>The formula is unchanged; only the vectors admitted to it are. That is what lets a container
+     * summarize its members' image vectors and its members' text vectors as two separate, individually
+     * coherent aggregates, rather than one that cannot be computed at all.
+     *
+     * <p><b>Deliberately uncached</b>, unlike the unqualified form, which caches into the object's single
+     * summary slot. Caching per model would mean a slot per model, an invalidation rule per model, and a
+     * third dirty-flag family -- for arithmetic over vectors that are themselves already cached. A
+     * container with nothing in that model simply returns absent, cheaply.
+     */
+    public static EmbeddingVector summaryVector(Object self, String summaryFieldNames,
+            String vectorizeFieldNames, String modelId) {
+        if (!enterSummaryComputation(self)) {
+            // Cycle -- treat the repeated node as a leaf for this path, exactly as the unqualified form does.
+            return vector(self, vectorizeFieldNames, modelId);
+        }
+        try {
+            List<VectorMath.WeightedVector> terms = new ArrayList<>();
+            terms.add(new VectorMath.WeightedVector(vector(self, vectorizeFieldNames, modelId), 1.0));
+            if (!summaryFieldNames.isBlank()) {
+                for (String fieldName : summaryFieldNames.split(",")) {
+                    Object value = readField(self, fieldName);
+                    if (value instanceof JavAIVectorizable child) {
+                        terms.add(new VectorMath.WeightedVector(
+                                child.summaryVector(modelId), DEFAULT_SUMMARY_DECAY));
+                    }
+                }
+            }
+            return VectorMath.normalize(VectorMath.weightedSum(terms));
+        } finally {
+            exitSummaryComputation(self);
+        }
+    }
+
+    /** Adds {@code vector} to {@code target} when it is real and from {@code modelId} -- absent and
+     *  foreign vectors are simply not admitted, which is what keeps the centroid computable. */
+    private static void collectIfPresent(List<EmbeddingVector> target, EmbeddingVector vector, String modelId) {
+        if (vector != null && !vector.isAbsent() && modelId.equals(vector.modelId())) {
+            target.add(vector);
+        }
+    }
+
+    // ---- externally-supplied vectors (OMI-290) ---------------------------------------------------
+
+    /**
+     * An {@code @ExternalVector}'s current value -- the vector most recently supplied for the content this
+     * object currently references, or {@link EmbeddingVector#absent()} when there is none.
+     *
+     * <p><b>This never computes, never blocks and never dispatches</b>, under any
+     * {@link EmbeddingConsistencyMode} and including on a thread inside
+     * {@link #runWithSubgraphLockedForPersistence}. Saying "external vectors are eventually consistent"
+     * would not be enough to get that: {@code EVENTUAL_CONSISTENCY} still blocks a slot's very first read
+     * (there being no prior value to serve) and still yields to that method's forced-accuracy override --
+     * so both would end up waiting on a provider that could never produce this vector, and would in fact
+     * ask the *text* provider for it. The mode axis simply does not apply here, which is why this path
+     * bypasses {@link #readSlot} rather than configuring it.
+     *
+     * <p><b>Absence has two causes and one meaning.</b> Nothing has been supplied yet, or what was supplied
+     * describes content this object no longer references -- see {@link #supplyVector}. Both mean "no vector
+     * here", which every arithmetic site already skips and every ranking already sorts last, so no caller
+     * needs a new state to handle. Serving the superseded vector instead would be worse than serving
+     * nothing: it is not stale, it is a confident description of different content.
+     */
+    public static EmbeddingVector externalVector(Object self, String vectorName) {
+        ExternalVectorSpec spec = requireExternalVector(self.getClass(), vectorName);
+        DirtyTrackingSupport state = stateOf(self);
+        EmbeddingVector value = state.fieldSlot(vectorName).cachedValue();
+        if (value == null) {
+            return EmbeddingVector.absent();
+        }
+        String suppliedFor = state.externalVectorKey(vectorName);
+        return suppliedFor != null && suppliedFor.equals(contentKeyOf(self, spec))
+                ? value
+                : EmbeddingVector.absent();
+    }
+
+    /**
+     * Hands JavAI a vector it could not have computed -- the push half of {@code @ExternalVector}.
+     *
+     * <p>This overload is for a caller holding the live object; {@code JavAIRepository.supplyVector} is for
+     * one holding only an id, which is the ordinary shape for a queue consumer and avoids loading an entity
+     * graph purely to store one row. Prefer the repository form in a pipeline; prefer this one when the
+     * object is already in hand (including in tests), since it also warms the in-memory slot.
+     *
+     * <p><b>{@code computedFor} is what makes this safe under at-least-once delivery.</b> The producer
+     * echoes back the {@link dev.xtrafe.javai.annotations.ExternalVector#keyField()} value it actually
+     * embedded; if the object has moved on to different content since, the vector is <em>discarded</em> and
+     * this returns {@code false}. That is the same shape as {@link VectorCacheSlot}'s generation check, in
+     * the only currency an out-of-process producer has -- it has no way to know about generations, and the
+     * content key is the thing it does know.
+     *
+     * @return {@code true} if the vector was stored, {@code false} if it described content this object no
+     *         longer references -- not an error, and the ordinary outcome of a slow producer racing an edit
+     * @throws IllegalArgumentException if {@code vectorName} is not declared on this class, if the vector's
+     *                                  own {@code modelId()} disagrees with the declared model, or if the
+     *                                  vector is null/absent
+     */
+    public static boolean supplyVector(Object self, String vectorName, EmbeddingVector vector,
+            String computedFor) {
+        ExternalVectorSpec spec = requireExternalVector(self.getClass(), vectorName);
+        if (vector == null || vector.isAbsent()) {
+            // Absence is a *derived* state here -- "nothing supplied, or superseded" -- so accepting it as
+            // an input would make two very different situations indistinguishable at rest, and would let a
+            // producer bug quietly erase a good vector.
+            throw new IllegalArgumentException("Cannot supply an absent vector for external vector '"
+                    + vectorName + "' on " + self.getClass().getName() + ". Absence is what this vector"
+                    + " already reports when nothing has been supplied; to withdraw one, change the content"
+                    + " key it was computed for.");
+        }
+        if (!spec.model().equals(vector.modelId())) {
+            throw new IllegalArgumentException("External vector '" + vectorName + "' on "
+                    + self.getClass().getName() + " is declared as model '" + spec.model()
+                    + "' but the supplied vector reports '" + vector.modelId() + "'. Storage is partitioned"
+                    + " by model, so accepting this would file the vector where nothing looks for it.");
+        }
+        if (computedFor == null || !computedFor.equals(contentKeyOf(self, spec))) {
+            return false;
+        }
+        DirtyTrackingSupport state = stateOf(self);
+        VectorCacheSlot slot = state.fieldSlot(vectorName);
+        slot.commitSuccess(slot.currentGeneration(), vector);
+        state.recordExternalVectorKey(vectorName, computedFor);
+        return true;
+    }
+
+    /**
+     * Seeds an external vector read back from storage, together with the content key it was written for --
+     * the {@link #hydrateFieldVector} counterpart for a vector nothing in process could recompute.
+     *
+     * <p>Deliberately <em>not</em> subject to that method's pristine-slot rule. That rule exists to stop a
+     * stored vector overwriting a change the caller has already made in memory, which is a real hazard when
+     * a read could otherwise recompute the right answer. Here nothing can: refusing to hydrate would leave
+     * the slot empty forever rather than merely unoptimised. The content-key comparison covers the same
+     * ground more directly -- a hydrated vector whose key no longer matches the entity simply reads absent.
+     */
+    public static void hydrateExternalVector(Object self, String vectorName, EmbeddingVector vector,
+            String computedFor) {
+        if (vector == null || vector.isAbsent()) {
+            return;
+        }
+        DirtyTrackingSupport state = stateOf(self);
+        VectorCacheSlot slot = state.fieldSlot(vectorName);
+        slot.commitSuccess(slot.currentGeneration(), vector);
+        state.recordExternalVectorKey(vectorName, computedFor);
+    }
+
+    /** Every {@code @ExternalVector} name declared on {@code type} or inherited, in declaration order --
+     *  public for {@code javai-substrate} (which bakes them onto the woven class) and {@code javai-persistence}
+     *  (which stores and hydrates them). */
+    public static List<String> externalVectorNames(Class<?> type) {
+        return List.copyOf(externalVectors(type).keySet());
+    }
+
+    /** The model {@code vectorName} is declared to come from -- what the persistence layer partitions
+     *  storage by, and what {@link #supplyVector} checks a supplied vector against. */
+    public static String externalVectorModel(Class<?> type, String vectorName) {
+        return requireExternalVector(type, vectorName).model();
+    }
+
+    /** The current value of {@code vectorName}'s key field, as stored alongside the vector -- what the
+     *  persistence layer writes into {@code computed_for}. */
+    public static String externalVectorKey(Object self, String vectorName) {
+        return contentKeyOf(self, requireExternalVector(self.getClass(), vectorName));
+    }
+
+    public static boolean isExternalVectorName(Class<?> type, String name) {
+        Map<String, ExternalVectorSpec> declared = externalVectors(type);
+        return !declared.isEmpty() && declared.containsKey(name);
+    }
+
+    private static String contentKeyOf(Object self, ExternalVectorSpec spec) {
+        Object value = readField(self, spec.keyField());
+        return value == null ? null : String.valueOf(value);
+    }
+
+    private static ExternalVectorSpec requireExternalVector(Class<?> type, String vectorName) {
+        ExternalVectorSpec spec = externalVectors(type).get(vectorName);
+        if (spec == null) {
+            throw new IllegalArgumentException(type.getName() + " declares no @ExternalVector named '"
+                    + vectorName + "'" + (externalVectors(type).isEmpty()
+                            ? " (it declares none at all)"
+                            : " -- it declares " + externalVectors(type).keySet()));
+        }
+        return spec;
+    }
+
+    /**
+     * {@code @ExternalVector} declarations for a class, its own first and then each ancestor's, cached per
+     * class exactly like the concatenation opt-ins.
+     *
+     * <p>Walking the hierarchy means a shared base may declare one for a whole family, while a nearer
+     * declaration of the same name wins -- ordinary override intuition. Note this is a walk rather than
+     * {@code @Inherited}: the annotation is {@code @Repeatable}, and the two interact in ways that are far
+     * less obvious to a reader than a loop.
+     */
+    private static Map<String, ExternalVectorSpec> externalVectors(Class<?> type) {
+        return EXTERNAL_VECTORS.computeIfAbsent(type, JavAIRuntime::readExternalVectors);
+    }
+
+    private static Map<String, ExternalVectorSpec> readExternalVectors(Class<?> type) {
+        Map<String, ExternalVectorSpec> declared = new LinkedHashMap<>();
+        for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
+            for (ExternalVector annotation : current.getDeclaredAnnotationsByType(ExternalVector.class)) {
+                // putIfAbsent, walking downward-first: the nearest declaration of a name wins.
+                declared.putIfAbsent(annotation.name(),
+                        new ExternalVectorSpec(annotation.name(), annotation.keyField(), annotation.model()));
+            }
+        }
+        // unmodifiableMap over the LinkedHashMap, not Map.copyOf: declaration order is part of what this
+        // returns (externalVectorNames feeds the weaver and the storage layer), and Map.copyOf does not keep it.
+        return Collections.unmodifiableMap(declared);
+    }
+
+    private record ExternalVectorSpec(String name, String keyField, String model) {
+    }
+
+    private static final Map<Class<?>, Map<String, ExternalVectorSpec>> EXTERNAL_VECTORS =
+            new ConcurrentHashMap<>();
 
     /**
      * Computes every not-yet-computed {@code @Vectorize} field vector across {@code objects} in as few
@@ -886,6 +1156,16 @@ public final class JavAIRuntime {
             VectorCacheSlot sourceSlot = source.fieldSlot(fieldName);
             // Dirty or never-computed: the caller has nothing trustworthy to hand over. Let `to` compute.
             if (sourceSlot.isDirty() || !sourceSlot.everComputed()) {
+                continue;
+            }
+            if (isExternalVectorName(from.getClass(), fieldName)) {
+                // An external vector must carry the content key it was supplied for, or the managed copy
+                // holds a vector it will never serve -- externalVector() compares that key on every read,
+                // so a vector transferred without one is indistinguishable from one that was superseded.
+                // It also bypasses hydrateFieldVector's pristine-slot rule deliberately: nothing here can
+                // recompute, so refusing would silently drop the vector at every merge (OMI-290).
+                hydrateExternalVector(to, fieldName, sourceSlot.cachedValue(),
+                        source.externalVectorKey(fieldName));
                 continue;
             }
             hydrateFieldVector(to, fieldName, sourceSlot.cachedValue());
@@ -1569,11 +1849,26 @@ public final class JavAIRuntime {
         }
     }
 
-    /** Every field declared anywhere in {@code type}'s class hierarchy, not just on {@code type} itself. */
+    /**
+     * Every <b>instance</b> field declared anywhere in {@code type}'s class hierarchy, not just on
+     * {@code type} itself.
+     *
+     * <p>⚠️ {@code static} fields are excluded (OMI-290). Every caller here treats a field as a property of
+     * one object: {@link #walkGraph} follows it as a graph edge, {@link #registerAllFieldDependencies} wires
+     * a back-edge through it, {@link #collectReachableVectorizables} locks what it reaches for a flush. Class
+     * state is none of those things -- a static holding a shared cache or a constant would put objects
+     * nobody referenced into a {@code query()} result and into a persistence flush's lock set. The sibling
+     * defect in {@code javai-persistence}'s own {@code EntityReflection.allFields} was the visible half of
+     * this, failing outright on load; this half would merely have been quietly wrong.
+     */
     private static List<Field> allFields(Class<?> type) {
         List<Field> fields = new ArrayList<>();
         for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {
-            fields.addAll(Arrays.asList(current.getDeclaredFields()));
+            for (Field field : current.getDeclaredFields()) {
+                if (!java.lang.reflect.Modifier.isStatic(field.getModifiers())) {
+                    fields.add(field);
+                }
+            }
         }
         return fields;
     }
