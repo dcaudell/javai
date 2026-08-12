@@ -12,6 +12,12 @@ Note `doc/ai-guidance/` also has a sibling file, `JavAI_Usage_Guide.md`, aimed a
 an AI helping someone *consume* JavAI Extensions as a dependency in their own project, not contribute to
 this repository — not usually relevant to work done here, but good to know it exists.
 
+## Answer precisely, not at length
+
+Avoid excessive verbosity, and **never invent your own terms**. Answer questions precisely and concisely, from evidence. Being chatty with a chatty user is fine; pontificating on technical points is not — it introduces jargon and assumptions that later get mistaken for intended design.
+
+⚠️ **This compounds.** Long answers beget longer answers, cyclically — and an answer can only grow so long before it starts to contain a falsehood.
+
 ## Hard rule: never run `git commit`
 
 **Claude may run any command needed for development — build, test, format, lint, `git status`, `git diff`,
