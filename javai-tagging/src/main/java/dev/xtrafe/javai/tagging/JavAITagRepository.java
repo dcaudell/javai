@@ -103,6 +103,31 @@ public final class JavAITagRepository {
         return tags;
     }
 
+    /**
+     * Every tagging on {@code instance}, carrying the metadata a bare {@link Tag} cannot: how strongly it
+     * applies, and who applied it.
+     *
+     * <p>⚠️ {@link #tagsOf} answers "what is this tagged as"; this answers "how, and by whom". The
+     * difference matters wherever a classifier is involved: affinity is the match strength a model
+     * reported, and {@code source} separates what a person chose ({@link Tagging#SOURCE_MANUAL}) from what
+     * a classifier decided ({@link Tagging#SOURCE_AUTO}). Neither is reachable from a {@code Tag}, which
+     * is catalogue reference data shared by every object carrying it.
+     *
+     * <p>A tagging whose {@code Tag} has since been deleted from the catalogue is skipped rather than
+     * returned with a null tag — the association is stale, and a caller asking what something is tagged as
+     * is not served by an entry that cannot name itself.
+     */
+    public List<Tagging> taggingsOf(Object instance) {
+        TaggableRef ref = refOf(instance);
+        List<Tagging> taggings = new ArrayList<>();
+        for (TagAssociation association : backend.associationsOf(ref)) {
+            delegate.findById(association.tagId()).ifPresent(tag -> taggings.add(new Tagging(
+                association.tagId(), tag, ref.taggableType(), ref.taggableId(),
+                association.affinity(), association.source(), null)));
+        }
+        return taggings;
+    }
+
     /** Every instance -- of any of {@code candidateTypes} -- currently tagged with {@code tag}. */
     public JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes) {
         List<String> typeNames = candidateTypes.stream().map(Class::getName).toList();
