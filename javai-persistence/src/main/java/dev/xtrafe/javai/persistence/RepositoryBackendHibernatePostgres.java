@@ -3176,7 +3176,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             statement.execute("ALTER TABLE " + table + " ADD COLUMN IF NOT EXISTS computed_for text NULL");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_lookup ON " + table + " (owner_type, field_name)");
             statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
-        });
+        }, "computed_for");
         return table;
     }
 

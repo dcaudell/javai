@@ -397,6 +397,147 @@ already establishes for ordinary vectors:
 | Neo4j | A computed node property (`tagSummaryVector__<model>`) on whatever node represents the instance, with its own native vector index — matches the existing `<field>Vector__<model>` node-property convention. |
 | MongoDB | A computed document field, indexed via Atlas `$vectorSearch` — matches the existing per-model document-field convention. |
 
+## Taggregate: derived taggings for containers (designed 2026-08-13, not yet built)
+
+An `Album` holding fifty tagged images is itself *about* something, but nothing says so: taggings
+describe the members, and the container is invisible to every tag query. Taggregate makes a container's
+tags a **derived, automatically-maintained aggregate of its members' tags** — the same move
+`summaryVector()` already makes for vectors, applied to taggings.
+
+That parallel is the design's justification and its constraint at once. The objection to derived tag
+indexes ("an index that can silently disagree with its source") is an objection to *conventionally
+maintained* indexes; Vector Core is itself a derived index made trustworthy by a staleness discipline —
+dirty-mark, lazy recompute, pending sweep. Taggregate adopts the identical discipline.
+
+### ⚠️ The lineage rule
+
+**Vector Core capabilities live *on the object* (woven accessors). Tagging capabilities live *on the
+repository* (reflection and explicit calls).** Taggregate is a tagging capability, so nothing about it is
+woven and nothing about it requires `@JavAIVectorizable`. `@Taggregate` requires exactly what `Taggable`
+requires: the interface and an `@Id UUID`, read reflectively. Members may be woven, unwoven,
+vectorizable or not — the aggregate reads refs, never invokes woven machinery, and heterogeneous graphs
+are a non-issue by construction.
+
+### Declaration
+
+`@Taggregate` mirrors `@Summary`'s grammar exactly — `@Target({FIELD, TYPE})`, with the same
+three-placement table:
+
+| Placement | Meaning |
+|---|---|
+| `@Taggregate(concatenate = true)` on a **TYPE** | This class produces a **tag-text vector** from its own taggings — including any aggregate rows its fields absorbed |
+| `@Taggregate` on a **FIELD** referencing a `Taggable` | Absorb that child's taggings into mine |
+| `@Taggregate` on a **FIELD** holding a JavAI collection of `Taggable`s | Aggregate the members' taggings into mine |
+
+One deliberate asymmetry against `@Summary`: `concatenate` is meaningful **only at TYPE placement**.
+`@Summary` needs a field-level `concatenate` because text is a second channel alongside the vector fold;
+here the field marking already propagates the taggings themselves as rows, and the container's tag-text
+renders from those rows — there is no separate text channel to absorb.
+
+A field declared on a `@MappedSuperclass` applies to every subclass, which the reflective hierarchy walk
+(`TaggingReflection.idField`) supports natively — the weaver constraint that forced `@ExternalVector` to
+type level does not exist in this lineage.
+
+```java
+@Entity
+public class Album implements Taggable {
+    @Taggregate private JavAISet<MediaImage> mediaImages;   // members' machine tags flow up
+    ...
+}
+```
+
+### Semantics
+
+The aggregate is written as **ordinary `Tagging` rows on the container** with a new provenance,
+`Tagging.SOURCE_AGGREGATE` — so `taggedWith`, `taggingsOf`, and the tag-summary machinery all work on
+containers with no new query type. Reconciliation is a diff scoped to `source = "aggregate"` exactly as
+`classify()`'s diff is scoped to `"auto"`: recompute rewrites only its own provenance and never touches a
+`manual` or `auto` row on the container.
+
+**Affinity is the mean contribution over members:**
+
+```
+affinity_agg(tag) = Σ over members m of contribution(tag, m)  /  |members|
+
+contribution(tag, m) = m's affinity for the tag (null → 1.0, as the tag-summary weighting
+                       already treats it), or 0 where m does not carry it
+```
+
+Bounded [0,1], comparable with member-level affinities, and it reads as coverage × strength: a tag on
+every member at 0.99 aggregates to 0.99; on one member of ten, to 0.099. Adding an untagged member
+correctly dilutes everything. (A share-of-total formulation — each tag's fraction of all member taggings
+— was considered and kept only as the *ordering* intuition; as an affinity it is not comparable across
+objects and shrinks as members get richer.)
+
+Inputs are the union of members' taggings **of every source**, including a member's own aggregate rows —
+which is what makes nesting compose: a container of containers reads its children's aggregates,
+recursion-free and O(direct members). Three rules keep it sound:
+
+* **Self-exclusion.** A container's own `aggregate` rows are never inputs to its own recompute.
+* **Cycles are tolerated, not resolved.** Recompute reads stored rows one level deep, so a cycle cannot
+  recurse infinitely — but mutual containment couples the two aggregates' values. Dirty-marking uses a
+  visited set; a detected cycle is logged, not repaired.
+* **Aggregation never mints a tag.** Inputs are existing taggings, so none of the create-on-miss
+  complexity that classification needs (OMI-300) applies here.
+
+Tags carry their `TagSet`, so one aggregate freely spans sets — machine perception and authored interests
+side by side, distinguishable at query time by set. Which *objects* contribute is the field grammar's
+decision; which *sets* you ask about is the query's.
+
+### ⚠️ Staleness: how the aggregate learns things changed
+
+Nothing is woven, so nothing intercepts mutations. Three mechanisms, all repository-side:
+
+1. **Member tag mutations** already flow through the repository choke point (`addTag`, `removeTag`,
+   `applyClassification`). There, one indexed lookup in the **membership snapshot**
+   (`javai_taggregate_members`) finds containing aggregates and marks them pending
+   (`javai_taggregate_pending`, the `javai_summary_pending` precedent). Marking is transitive through
+   nested aggregates, cycle-guarded.
+2. **Membership drift** (a member added or removed) is detected *pull-style*: any operation holding the
+   container **object** — `taggingsOf`, an explicit `reconcileTaggregate` — walks its `@Taggregate`
+   fields reflectively, compares current member refs to the snapshot, and recomputes on drift. The
+   snapshot is **written by recompute, never by interception**.
+3. **The pending sweep** (`reconcilePendingTaggregates(limit, loader)`) trues up aggregates nothing reads
+   directly. ⚠️ It takes a **loader callback** (`TaggableRef → Object`) because the tagging module cannot
+   materialize arbitrary adopter entities — the adopter's repositories can. The sweep is a *repair path
+   the adopter runs deliberately*, never a poller that events originate from.
+
+The honest consequence: pure *search* reads see the last-reconciled state, stale by at most the sweep
+interval — the same posture as `EVENTUAL_CONSISTENCY`. An adopter wanting tighter freshness on a known
+write path calls `markTaggregateStale(container)` there.
+
+⚠️ **Recompute cost discipline** (the `applyClassification` lesson, again): member taggings are read in
+**one batched query over refs**, never per-member lookups; the diff writes only changed rows; the
+tag-summary vector recomputes once per reconcile, not once per tag. Concurrent reconciles of one
+aggregate must converge to the same rows — full-diff, last-write-wins, pinned by a barrier test.
+
+### Concatenated tag text (the F2 opt-in)
+
+Independent of aggregation, **any** `Taggable` type may opt into a **tag-text vector**: its tags rendered
+as one string and embedded, so "what this is tagged as" becomes searchable as *language*. Opt-in is
+`@Taggregate(concatenate = true)` at **TYPE** placement — the same word, the same placement, and the same
+meaning shape as `@Summary(concatenate = true)` on a type ("produce from my own material"). A
+non-aggregating class (a `MediaImage` with its machine tags) uses the type placement alone, with no
+fields marked. `@Taggable` stays purely documentary, as established in OMI-290.
+
+The text is deterministic or it is useless: **display names** (en, slug fallback — `"dirt road"`, never
+`"dirt-road"`), ordered **affinity-descending then slug**, joined `", "`, capped at the **top K**
+(default 50) — a deliberate cap, because provider-side truncation past the model's input limit is silent
+(OMI-216). Stored per ref per model (`javai_tag_text_vectors__<model>`) beside the text itself, recomputed
+at the same trigger points as the tag-summary vector, served by the repository (`tagText(instance)`,
+`tagTextVector(instance)`, `tagTextIndex()`) — never a woven accessor.
+
+Containers that aggregate get this for free, and it quietly bridges domains: pixel-derived tags rendered
+as text put "what is in the pictures" into the **same text-embedding space** as captions and bios, so one
+query answers "albums about lakes" with no cross-model fusion.
+
+### Storage
+
+| Backend | Realization |
+|---|---|
+| Postgres | `javai_taggregate_members(aggregate_type, aggregate_id, member_type, member_id)` indexed both directions; `javai_taggregate_pending`; `javai_tag_text_vectors__<model>`. Aggregate rows live in `taggings` — no new tagging table. |
+| Neo4j / MongoDB | Same shapes in each backend's native convention. Correct-everywhere implementations first (the `findPendingVector` precedent); store-specific optimization only with a measurement. |
+
 ## Persistence, across all three backends
 
 Tags, TagSets, and Taggings are ordinary persisted data, realized per backend the way every other JavAI

@@ -14,6 +14,38 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **Taggregate: derived taggings for containers, and the concatenated tag-text vector (OMI-302).**
+  `javai-tagging` + `javai-annotations`. An `Album` of fifty tagged images is itself *about* something;
+  `@Taggregate` says so. The new annotation mirrors `@Summary`'s grammar exactly — on a **field** (a
+  `Taggable` reference or a JavAI collection of them), the target's taggings are absorbed into the declaring
+  object's aggregate: ordinary `Tagging` rows with the new `source = "aggregate"` provenance, per-tag
+  affinity the mean contribution over members (null counting 1.0, absent counting 0 — coverage × strength,
+  bounded [0,1]), diffed with the same never-touch-other-provenances discipline `applyClassification`
+  established. Containers of containers compose one level deep, recursion-free; cycles are tolerated,
+  logged, never repaired. On a **type**, `@Taggregate(concatenate = true)` opts any taggable into the
+  **tag-text vector**: its tags rendered as one deterministic string (display names, affinity-descending
+  then slug, top-50 capped — provider-side truncation is silent, OMI-216) and embedded, so machine tags
+  land in the same text-embedding space as captions and bios (`tagText`/`tagTextVector`/`tagTextIndex()`).
+
+  Staleness is Vector Core's own discipline, repository-side because nothing here is woven: choke-point
+  mutations mark containing aggregates pending (transitively, via the `javai_taggregate_members` snapshot);
+  reads holding the object (`taggingsOf`, `tagText`) recompute on pending marks or membership drift; and
+  `reconcilePendingTaggregates(limit, loader)` sweeps the rest — the loader callback exists because the
+  library cannot materialize adopter entities. Member taggings are read in one batched query per recompute
+  (`associationsOfAll`), pinned structurally, and the tag-summary vector recomputes once per reconcile.
+  `rankedByTags(tags, types, limit)` adds the exact structural counterpart (Σ affinity, one indexed query,
+  spanning `TagSet`s), with `tagQueryVector(tags)` as its fuzzy twin over `tagSimilarityIndex()`. The
+  lineage rule throughout: container and members need only `implements Taggable` + `@Id UUID`, never
+  `@JavAIVectorizable`, and woven/unwoven types mix freely — pinned in both directions by a genuinely
+  build-time-woven test container.
+
+  Covered end to end by `TaggregateE2ETest` (`e2e-client-test`) against all three real backends and real
+  embeddings, on a persisted three-level domain with lazy member collections: nesting composing three
+  levels up from a leaf tag, updates propagating through the sweep alone, a diamond fanning one leaf update
+  out to both containers, same-display-name/different-slug tags staying distinct through aggregation and
+  ranking, and the concatenated tag text's *retrieval quality* — a cooking container ranking nearer a
+  natural-language cooking query than a security one, sharing no vocabulary with either.
+
 - **A vector JavAI never computes: `@ExternalVector` (OMI-290).** An image embedding is produced by a model
   in its own container behind a queue, from bytes JavAI must not read, arriving minutes later in a different
   model and dimensionality from every text vector on the same object. Nothing about that fits `@Vectorize`,
@@ -53,6 +85,34 @@ version -- a given release usually changes only one or two of them.
   `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups.
 
 ### Fixed
+
+- ⚠️ **OMI-290's own migration could never run (`javai-persistence`).** `ensureFieldVectorTable` ships an
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS computed_for` precisely so a `javai_vectors__<model>` table
+  created before OMI-290 gains the column instead of failing on first write — but it called
+  `provisionTable` without naming that column as required. `isAlreadyProvisioned` then answered "yes, this
+  table exists" for a pre-OMI-290 table and skipped the whole DDL block, migration included, so the upgrade
+  path failed with `column "computed_for" does not exist` on the first vector write. The sibling
+  `ensureSummaryVectorTable` had it right all along, passing OMI-191's three added columns — the same
+  mechanism, used correctly one method away.
+
+  Found by accident, which is worth recording: `e2e-client-test`'s deliberately persistent container was,
+  unintentionally, exactly the deployment shape this migration exists for, and the first run after the
+  Taggregate work reproduced the production failure end to end. A stale-schema harness turned out to be the
+  only thing in this repository testing an upgrade at all — accidentally, and about to stop, since the same
+  run's seeder fix (below) gives every run a fresh schema. `PreExistingVectorTableMigrationTest` replaces
+  that accident with the deliberate version: it creates the pre-OMI-290 table by hand and asserts the first
+  write migrates it. Verified to fail with the original `column "computed_for" does not exist` when the
+  one-argument call is restored.
+
+- **`e2e-client-test`: library-provisioned tables are dropped between runs, not truncated (OMI-302).** The
+  reset step discovered every table in the `public` schema and truncated all of them, which is right for
+  Hibernate's own entity tables (created by hbm2ddl before the reset runs) and wrong for every table the
+  library provisions itself. Those are created on demand with `CREATE TABLE IF NOT EXISTS`, so against this
+  module's deliberately persistent container, `IF NOT EXISTS` meant a table created by an *older* library
+  version kept its old columns forever. OMI-290's new `computed_for` column was the one that surfaced it —
+  the first run after that upgrade failed with `column "computed_for" does not exist`, from a schema the
+  reset had faithfully preserved. `javai_*` tables and `taggings` are now dropped so the current library
+  recreates them at first use; entity tables are still truncated.
 
 - ⚠️ **An entity carrying a `static` field broke both reflective backends (OMI-290).**
   `EntityReflection.allFields` did not exclude them, and Neo4j and MongoDB map an entity by walking that

@@ -1,8 +1,13 @@
 package dev.xtrafe.javai.tagging;
 
-/** A {@link TaggableRef} paired with its cosine similarity to whatever reference vector a tag-summary-
- *  vector query was run against -- what {@link TaggingBackend#nearestByTagSummaryVector} returns, so
- *  {@link TagSimilarityVectorIndex#filterByMinSimilarity} can apply its own threshold without a second,
- *  separate backend query shape. */
-record RankedTaggableRef(TaggableRef ref, double similarity) {
+/**
+ * A {@link TaggableRef} paired with the score that ranked it. For a vector query
+ * ({@link TaggingBackend#nearestByTagSummaryVector}/{@link TaggingBackend#nearestByTagTextVector}) the
+ * score is cosine similarity, which lets {@link TagSimilarityVectorIndex#filterByMinSimilarity} apply its
+ * own threshold without a second, separate backend query shape. For the structural
+ * {@code JavAITagRepository#rankedByTags} query it is the exact sum of the ref's affinities for the query
+ * tags ({@code null} counting 1.0) -- unbounded above, not a similarity, but the same "ref plus how
+ * strongly" shape. Public since {@code rankedByTags} returns it (OMI-302).
+ */
+public record RankedTaggableRef(TaggableRef ref, double similarity) {
 }
