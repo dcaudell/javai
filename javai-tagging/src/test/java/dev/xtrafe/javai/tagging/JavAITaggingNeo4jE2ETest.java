@@ -34,6 +34,7 @@ class JavAITaggingNeo4jE2ETest {
     private static TagRepository tagRepository;
     private static TagSetRepository tagSetRepository;
     private static TestThingRepository thingRepository;
+    private static TestTextedThingRepository textedThingRepository;
     private static JavAITagRepository tagging;
 
     @BeforeAll
@@ -48,6 +49,7 @@ class JavAITaggingNeo4jE2ETest {
         tagRepository = JavAIPI.repository(TagRepository.class, config);
         tagSetRepository = JavAIPI.repository(TagSetRepository.class, config);
         thingRepository = JavAIPI.repository(TestThingRepository.class, config);
+        textedThingRepository = JavAIPI.repository(TestTextedThingRepository.class, config);
 
         tagging = new JavAITagRepository(tagRepository, config);
     }
@@ -150,5 +152,39 @@ class JavAITaggingNeo4jE2ETest {
         JavAIList<TaggableRef> afterRemoval = index.nearestN(reference, 5);
         assertFalse(afterRemoval.stream().anyMatch(ref -> ref.taggableId().equals(onlyThing.getId())),
                 "tag-summary vector must be removed from the index once an instance has zero remaining Taggings");
+    }
+
+    @Test
+    void rankedByTagsReturnsExactSummedScoresInOneQuery() {
+        TagSet setA = tagSetRepository.save(new TagSet("ranked-neo4j-a"));
+        TagSet setB = tagSetRepository.save(new TagSet("ranked-neo4j-b"));
+        Tag first = tagRepository.save(new Tag(setA, "en", "Ranked Neo4j First"));
+        Tag second = tagRepository.save(new Tag(setB, "en", "Ranked Neo4j Second"));
+        TestThing both = thingRepository.save(new TestThing("ranked-neo4j-both"));
+        TestThing one = thingRepository.save(new TestThing("ranked-neo4j-one"));
+        tagging.addTag(both, first, 0.9);
+        tagging.addTag(both, second);       // null affinity -> 1.0
+        tagging.addTag(one, first, 0.4);
+
+        List<RankedTaggableRef> ranked = tagging.rankedByTags(List.of(first, second), List.of(TestThing.class), 10);
+        assertEquals(2, ranked.size());
+        assertEquals(both.getId(), ranked.get(0).ref().taggableId());
+        assertEquals(1.9, ranked.get(0).similarity(), 1e-9);
+        assertEquals(one.getId(), ranked.get(1).ref().taggableId());
+        assertEquals(0.4, ranked.get(1).similarity(), 1e-9);
+    }
+
+    @Test
+    void tagTextIsStoredAndServedForAnOptedInType() {
+        TagSet tagSet = tagSetRepository.save(new TagSet("text-neo4j"));
+        Tag lake = tagRepository.save(new Tag(tagSet, "en", "Neo4j Lake"));
+        Tag road = tagRepository.save(new Tag(tagSet, "en", "Neo4j Road"));
+        TestTextedThing thing = textedThingRepository.save(new TestTextedThing("texted-neo4j"));
+
+        tagging.addTag(thing, lake, 0.9);
+        tagging.addTag(thing, road, 0.5);
+
+        assertEquals("Neo4j Lake, Neo4j Road", tagging.tagText(thing));
+        assertFalse(tagging.tagTextVector(thing).isAbsent());
     }
 }

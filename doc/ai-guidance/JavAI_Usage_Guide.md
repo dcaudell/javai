@@ -31,7 +31,7 @@ mutating it. JavAI Extensions makes that a property of the object model itself:
 | **Provider-agnostic RAG completions** | `Cortex` (six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
 | **Grounding a completion in real object-graph data** | `PromptContext`/`Contextable`/`ContextableObject` — a `query()` result, or any `JavAIList`/`Set`/`Map`, renders directly as prompt material, no manual serialization | `javai-model` (lives here, not `javai-completion` — see "Module layout" below) |
 | **Agentic Supervision** | `@SyncSupervision`/`@AsyncSupervision` on a method or constructor — a registered `SupervisionListener` can veto/rewrite a call (blocking) and/or react to it (fire-and-forget), at PRE/POST/EXCEPTION | `javai-supervision` |
-| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), and cross-type tag-similarity search (`tagSimilarityIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
+| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggingsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`/`rankedByTags`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), cross-type tag-similarity search (`tagSimilarityIndex()`), and Taggregate — `@Taggregate` fields make a container's tags a derived aggregate of its members', and `@Taggregate(concatenate = true)` renders any taggable's tags as an embedded, searchable string (`tagTextIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
 | **Codegen Guidance** | A *different* annotation family (`@Requires`/`@Intent`/`@AgentWritable`/`@Nondeterministic`/`@Provenance`) that constrains what an AI agent may read/generate/modify in annotated code | `javai-annotations`; see `JavAI_Codegen_Guidance.md` |
 
 **The hard interop rule that shapes all of the above:** every class this library produces — woven or
@@ -54,7 +54,7 @@ below is for understanding what each module actually contributes, not for decidi
 | `javai-collections` | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
 | `javai-persistence` | Persistence Bridge | `JavAIPI.repository(Class, JavAIPersistenceConfig)` against Postgres, Neo4j, or MongoDB |
 | `javai-completion` | Completion Fabric | `Cortex`/`CompletionRequest` |
-| `javai-tagging` | Tagging | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`, `JavAITagRepository` (tag-based queries, similarity search, LLM classification) |
+| `javai-tagging` | Tagging | `@Taggable`/`@TagIgnore`/`@Taggregate`, `Tag`/`TagSet`, `JavAITagRepository` (tag-based queries, similarity search, LLM classification, Taggregate + tag text) |
 
 `javai-model` is a *physical*, not conceptual, module — it exists because `JavAIVectorizable.query()`
 returns `JavAIList<T>` and `JavAIList` implements `JavAIVectorizable` right back, so those types (plus the
@@ -228,8 +228,9 @@ annotations, derived-finder capabilities, and collection types — before relyin
 |---|---|---|
 | `@Taggable` | class | Unwoven marker — same shape as `@JavAIGraphNode`, not the fully-woven shape of `@JavAIVectorizable`. Declares that instances of this class can carry Tags, but synthesizes no methods and no interface implementation; independent of `@JavAIVectorizable`/`@JavAIGraphNode` (a class can carry any subset of all three). Always pair it with hand-implementing the *interface* `Taggable` (empty, marker-only) — the annotation alone doesn't give you that interface, and generic tagging APIs (`taggedWith`'s `candidateTypes` parameter) are bounded by it. **Shares its simple name with that interface** (`dev.xtrafe.javai.annotations.Taggable` the annotation vs. `dev.xtrafe.javai.tagging.Taggable` the interface) — different packages, so `@Taggable class Foo implements Taggable` compiles with one `import` covering both simple names, but write the interface fully-qualified (`implements dev.xtrafe.javai.tagging.Taggable`) if your file already imports something else named `Taggable`, or if you're generating code without import statements at all. |
 | `@TagIgnore` | field | Excludes an otherwise-`@dev.xtrafe.javai.annotations.PromptContext` field from the text a classification prompt sees, without affecting what that field renders as for ordinary RAG completions. A field with no `@PromptContext` to begin with needs no `@TagIgnore` — it was never classifier-visible either way. |
+| `@Taggregate` | field, class | Mirrors `@Summary`'s grammar exactly, in the tagging lineage. On a **field** holding a `Taggable` reference or a JavAI collection of them: absorb that target's taggings into the declaring object's aggregate — the container gains derived `Tagging` rows (`source = "aggregate"`, mean-contribution affinities), maintained by `JavAITagRepository`. On a **class**, `@Taggregate(concatenate = true)`: this type's tags render as one deterministic string and embed as a **tag-text vector**, searchable via `tagTextIndex()`; `concatenate` is meaningful only at this placement. Requires exactly what `Taggable` requires — the marker interface and an `@Id UUID` — on container and members alike; never `@JavAIVectorizable`, on either. Nothing is woven: the aggregate and the tag text live repository-side. See "Taggregate" below. |
 
-See "Tagging" below for the full instance-based API (`JavAITagRepository`) these two annotations feed into.
+See "Tagging" below for the full instance-based API (`JavAITagRepository`) these annotations feed into.
 
 ### Codegen Guidance — a distinct feature, see the sibling file
 
@@ -488,6 +489,8 @@ association on top of it.
 | Method | What it does |
 |---|---|
 | `JavAIList<Tag> tagsOf(Object instance)` | Every tag currently applied to `instance`. |
+| `List<Tagging> taggingsOf(Object instance)` | Every tagging on `instance`, carrying what a bare `Tag` cannot: `affinity` (how strongly) and `source` (`"manual"`/`"auto"`/`"aggregate"` — who applied it). On a `@Taggregate` container this read also trues the aggregate up first (see "Taggregate" below). |
+| `List<RankedTaggableRef> rankedByTags(List<Tag> tags, List<Class<? extends Taggable>> candidateTypes, int limit)` | Exact multi-tag ranking: every instance carrying at least one query tag, scored `Σ` of its affinity for each (`null` counting 1.0), descending — one indexed query, freely spanning `TagSet`s. The structural counterpart to querying `tagSimilarityIndex()` with `tagQueryVector(tags)`. |
 | `JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes)` | Every instance, across the given `@Taggable` types, carrying `tag` — genuinely heterogeneous, one query per backend regardless of how many `candidateTypes` you pass. |
 | `void addTag(Object instance, Tag tag)` / `addTag(Object instance, Tag tag, double affinity)` | Applies `tag` to `instance` (`source = "manual"`), optionally with an affinity/match-strength score. Idempotent — a given `(tag, instance)` pair has zero or one association by construction. |
 | `void removeTag(Object instance, Tag tag)` | Removes the association, if present. |
@@ -574,6 +577,63 @@ The underlying vector is a decay-weighted, affinity-scaled sum over `Tag.summary
 applied to an instance (so a tag's own recursive tags — a `Tag` can itself be `@Taggable` — contribute too),
 recomputed eagerly on every `addTag`/`removeTag`/`classify` call rather than lazily, since combining
 already-cached tag vectors is pure arithmetic with nothing to defer.
+
+For an ad hoc collection of tags, `tagging.tagQueryVector(List.of(tagA, tagB))` builds a query vector with
+the same weighted-sum construction the index itself uses — the fuzzy counterpart of `rankedByTags` over the
+same tags.
+
+### Taggregate — a container's tags, derived from its members'
+
+An `Album` of fifty tagged images is itself *about* something; `@Taggregate` fields make that explicit. Mark
+the fields whose targets contribute (a single `Taggable` reference, or a JavAI collection of them — the
+owning field decides, never the member), and the container gains ordinary `Tagging` rows with
+`source = "aggregate"`: per tag, the **mean contribution over members** (a member's affinity, `null`
+counting 1.0, absent counting 0) — so a tag on every member at 0.99 aggregates to 0.99, on one member of
+ten to 0.099, and an untagged member dilutes everything. Every tag query (`taggedWith`, `taggingsOf`,
+`rankedByTags`, the vector indexes) then works on containers with no new query shape, and containers of
+containers compose — a member's own aggregate rows are inputs too, one level deep, recursion-free.
+
+```java
+public class Album implements dev.xtrafe.javai.tagging.Taggable {
+    @Id private UUID id;
+    @Taggregate private JavAISet<MediaImage> mediaImages;   // members' tags flow up
+}
+```
+
+**The lineage rule**: container and members need exactly what tagging always needs — the `Taggable` marker
+interface and an `@Id UUID` — never `@JavAIVectorizable`, on either side. Woven and unwoven types mix
+freely in one graph; nothing about the aggregate is woven; a `@MappedSuperclass` field declaration applies
+to every subclass.
+
+**Staleness** follows Vector Core's own discipline — dirty-mark, lazy recompute, deliberate sweep:
+
+| Method | What it does |
+|---|---|
+| *(automatic)* | Member tag mutations (`addTag`/`removeTag`/`applyClassification`) mark containing aggregates pending, transitively through nesting, cycle-guarded. A read holding the container object (`taggingsOf`/`tagText`/`tagTextVector`) recomputes if pending or if the members drifted from the last-reconciled snapshot. |
+| `reconcileTaggregate(Object container)` | Recompute now, unconditionally — the explicit repair path. Only ever rewrites `source = "aggregate"` rows; `manual`/`auto` rows on the container are never touched, and re-running is a no-op. |
+| `markTaggregateStale(Object container)` | Cheap dirty-mark for a known write path (e.g. right after mutating a member collection) — the recompute happens at the next read or sweep. |
+| `reconcilePendingTaggregates(int limit, Function<TaggableRef, Object> loader)` | The sweep: trues up aggregates nothing reads directly. ⚠️ The `loader` is required — the library cannot materialize *your* entity types; hand it your repositories (`ref -> repositoryFor(ref.taggableType()).findById(ref.taggableId()).orElse(null)`). If the container's `@Taggregate` collections load lazily, initialize them inside the loader's own unit of work (`Hibernate.initialize(...)`) — the recompute's reflective walk runs after the loader returns, on a detached entity. Run the sweep on your own schedule; the library never polls. |
+
+The honest consequence: pure *search* reads (`taggedWith`, the indexes) see the last-reconciled state,
+stale by at most your sweep interval.
+
+### Concatenated tag text — tags as searchable language
+
+Independent of aggregation, any taggable type can opt in with `@Taggregate(concatenate = true)` at class
+level: its tags render as one deterministic string — display names (`en`, slug fallback), strongest first
+(affinity descending, then slug), `", "`-joined, capped at the top 50 — embedded and stored beside the
+text, recomputed at the same trigger points as the tag-summary vector.
+
+| Method | What it does |
+|---|---|
+| `String tagText(Object instance)` | The stored rendered string, or `null` if none. |
+| `EmbeddingVector tagTextVector(Object instance)` | Its stored embedding, or absent. |
+| `VectorIndex<TaggableRef> tagTextIndex()` | The cross-type index over every stored tag-text vector — embed a statement, `nearestN` it, get back the instances whose *tags read most like it*. Like `tagSimilarityIndex()`, its own `add`/`remove` refuse. |
+
+Because the text embeds through the same model as any other text in your system, pixel-derived machine
+tags rendered as words land in the same embedding space as captions and bios — "albums about lakes" is one
+`tagTextIndex().nearestN(...)` call, no cross-model fusion. Containers that aggregate get this for free;
+a non-aggregating class uses the class-level placement alone.
 
 ## Installing the library
 

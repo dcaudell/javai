@@ -39,7 +39,7 @@ stop — that breaks the one constraint everything else is built around.
 | 5 | **Codegen Guidance** | Annotations governing what an LLM coding agent may read, generate, or modify | `doc/spec/codegen-guidance.md` |
 | 6 | **Acceleration Substrate** | The compiler/weaver/dispatch mechanism beneath Vector Core, Vector Collections, and Codegen Guidance | `doc/spec/acceleration-substrate.md` |
 | 7 | **Agentic Supervision** | AoP-style method/constructor interception (sync, read-write + async, observation-only) enabling an LLM-backed listener to observe or intervene on execution | `doc/spec/agentic-supervision.md` |
-| 8 | **Tagging** | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, and tag-collection similarity search — independent of Vector Core, composable with it | `doc/spec/tagging.md` |
+| 8 | **Tagging** | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, tag-collection similarity search, and Taggregate — derived taggings for containers plus the concatenated tag-text vector — independent of Vector Core, composable with it | `doc/spec/tagging.md` |
 
 ## Dependency graph between the areas
 
@@ -129,7 +129,7 @@ see above), each a plain library, each independently buildable in the order belo
 | `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-vector` + `javai-model` | `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
 | `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim + Spring Data MongoDB shim | All three persistence backends real in Phase 0, not aspirational |
 | `javai-completion` (Completion Fabric) | Wraps Spring AI `ChatModel` | Full RAG API — `PromptContext`, `CompletionRequest`/`Result`, `toContext()`, `complete()`/`completeStreaming()` |
-| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagRepository`, the tag-summary-vector `VectorIndex<TaggableRef>` |
+| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`/`@Taggregate`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagRepository`, the tag-summary-vector and tag-text `VectorIndex<TaggableRef>`s, derived container taggings with `rankedByTags` |
 
 Nothing past Phase 0 (a real `javaic` compiler, `invokedynamic` dispatch, GPU acceleration, an optional
 JavAIVM) adds a capability a Phase 0 developer doesn't already have — each replaces an internal mechanism

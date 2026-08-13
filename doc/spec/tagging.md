@@ -420,11 +420,23 @@ are a non-issue by construction.
 
 ### Declaration
 
-`@Taggregate` on a **field** — mirroring `@Summary`'s grammar exactly — marks that field's target as
-contributing its taggings to the declaring object's aggregate. The target may be a single `Taggable`
-reference or a JavAI collection of them. Declared on a `@MappedSuperclass` field it applies to every
-subclass, which the reflective hierarchy walk (`TaggingReflection.idField`) supports natively — the
-weaver constraint that forced `@ExternalVector` to type level does not exist in this lineage.
+`@Taggregate` mirrors `@Summary`'s grammar exactly — `@Target({FIELD, TYPE})`, with the same
+three-placement table:
+
+| Placement | Meaning |
+|---|---|
+| `@Taggregate(concatenate = true)` on a **TYPE** | This class produces a **tag-text vector** from its own taggings — including any aggregate rows its fields absorbed |
+| `@Taggregate` on a **FIELD** referencing a `Taggable` | Absorb that child's taggings into mine |
+| `@Taggregate` on a **FIELD** holding a JavAI collection of `Taggable`s | Aggregate the members' taggings into mine |
+
+One deliberate asymmetry against `@Summary`: `concatenate` is meaningful **only at TYPE placement**.
+`@Summary` needs a field-level `concatenate` because text is a second channel alongside the vector fold;
+here the field marking already propagates the taggings themselves as rows, and the container's tag-text
+renders from those rows — there is no separate text channel to absorb.
+
+A field declared on a `@MappedSuperclass` applies to every subclass, which the reflective hierarchy walk
+(`TaggingReflection.idField`) supports natively — the weaver constraint that forced `@ExternalVector` to
+type level does not exist in this lineage.
 
 ```java
 @Entity
@@ -501,10 +513,12 @@ aggregate must converge to the same rows — full-diff, last-write-wins, pinned 
 
 ### Concatenated tag text (the F2 opt-in)
 
-Independent of Taggregate, **any** `Taggable` type may opt into a **tag-text vector**: its tags rendered
+Independent of aggregation, **any** `Taggable` type may opt into a **tag-text vector**: its tags rendered
 as one string and embedded, so "what this is tagged as" becomes searchable as *language*. Opt-in is
-`@Taggable(concatenate = true)` — deliberately the same word `@Summary(concatenate = true)` uses for the
-same idea, and the moment `@Taggable` stops being purely documentary.
+`@Taggregate(concatenate = true)` at **TYPE** placement — the same word, the same placement, and the same
+meaning shape as `@Summary(concatenate = true)` on a type ("produce from my own material"). A
+non-aggregating class (a `MediaImage` with its machine tags) uses the type placement alone, with no
+fields marked. `@Taggable` stays purely documentary, as established in OMI-290.
 
 The text is deterministic or it is useless: **display names** (en, slug fallback — `"dirt road"`, never
 `"dirt-road"`), ordered **affinity-descending then slug**, joined `", "`, capped at the **top K**

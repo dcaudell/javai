@@ -17,14 +17,19 @@ import java.util.UUID;
  * particular application of it, not of the tag itself. {@code null} means binary "has the tag"; present
  * means a real match-strength signal, typically supplied by a classifier.
  *
- * <p>{@link #source()} is {@code "manual"} or {@code "auto"} -- so an auto-classifier run can be diffed and
- * reapplied without disturbing manually-applied tags on the same instance; see doc/spec/tagging.md's
- * "Classification".
+ * <p>{@link #source()} is {@code "manual"}, {@code "auto"} or {@code "aggregate"} -- so an auto-classifier
+ * run can be diffed and reapplied without disturbing manually-applied tags on the same instance (see
+ * doc/spec/tagging.md's "Classification"), and a Taggregate recompute can rewrite its own derived rows
+ * without disturbing either (see "Taggregate: derived taggings for containers").
  */
 public final class Tagging {
 
     public static final String SOURCE_MANUAL = "manual";
     public static final String SOURCE_AUTO = "auto";
+
+    /** A derived row written by a Taggregate recompute (OMI-302) -- aggregated up from the container's
+     *  members, never applied directly by a person or classifier, and rewritten only by later recomputes. */
+    public static final String SOURCE_AGGREGATE = "aggregate";
 
     private final UUID id;
     private final Tag tag;

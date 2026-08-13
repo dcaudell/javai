@@ -19,8 +19,14 @@ import org.bson.conversions.Bson;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,9 +66,21 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     /** MongoDB's {@code CallbackCanceled} -- see {@link #isTransientSearchServiceError}. */
     private static final int CALLBACK_CANCELED_ERROR_CODE = 90;
 
+    /** Tag-text sibling of {@link #TAG_SUMMARY_VECTORS_COLLECTION} -- same dedicated-collection reasoning
+     *  (one Atlas {@code $vectorSearch} index spanning every {@code Taggable} type), holding the
+     *  deterministic text beside each model's vector. */
+    private static final String TAG_TEXT_VECTORS_COLLECTION = "_javaiTagTextVectors";
+
+    /** {@code javai_taggregate_members} / {@code javai_taggregate_pending} in this backend's convention. */
+    private static final String TAGGREGATE_MEMBERS_COLLECTION = "_javaiTaggregateMembers";
+    private static final String TAGGREGATE_PENDING_COLLECTION = "_javaiTaggregatePending";
+
     private final JavAIPersistenceConfig config;
     private final Set<String> tagSummaryVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
+    private final Set<String> tagTextVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean tagSummaryVectorsUniqueIndexEnsured = new AtomicBoolean();
+    private final AtomicBoolean tagTextVectorsUniqueIndexEnsured = new AtomicBoolean();
+    private final AtomicBoolean taggregateIndexesEnsured = new AtomicBoolean();
     private volatile MongoDatabase database;
 
     TaggingBackendSpringDataMongo(JavAIPersistenceConfig config) {
@@ -178,6 +196,275 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         return (int) tagSummaryVectorsCollection().countDocuments();
     }
 
+    @Override
+    public Map<TaggableRef, List<TagAssociation>> associationsOfAll(Collection<TaggableRef> refs) {
+        Map<TaggableRef, List<TagAssociation>> result = new HashMap<>();
+        Map<String, List<TaggableRef>> refsByType = new LinkedHashMap<>();
+        for (TaggableRef ref : refs) {
+            result.put(ref, new ArrayList<>());
+            refsByType.computeIfAbsent(ref.taggableType(), ignored -> new ArrayList<>()).add(ref);
+        }
+        // One query per distinct type, not per ref -- associations live embedded on each type's own
+        // collection, so per-type is this backend's minimum. Documented deviation from the single-query
+        // Postgres/Neo4j shape; see TaggingBackend#associationsOfAll.
+        for (Map.Entry<String, List<TaggableRef>> entry : refsByType.entrySet()) {
+            MongoCollection<Document> collection = collectionFor(entry.getKey());
+            List<String> ids = entry.getValue().stream().map(ref -> ref.taggableId().toString()).toList();
+            for (Document doc : collection.find(Filters.in("_id", ids))) {
+                TaggableRef ref = new TaggableRef(entry.getKey(), UUID.fromString(doc.getString("_id")));
+                for (Document tagging : doc.getList(TAGGINGS_FIELD, Document.class, List.of())) {
+                    result.get(ref).add(new TagAssociation(
+                            UUID.fromString(tagging.getString("tagId")),
+                            tagging.getDouble("affinity"), tagging.getString("source")));
+                }
+            }
+        }
+        return result;
+    }
+
+    @Override
+    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
+        MongoCollection<Document> collection = taggregateMembersCollection();
+        collection.deleteMany(aggregateFilter(aggregate));
+        if (members.isEmpty()) {
+            return;
+        }
+        List<Document> docs = new ArrayList<>(members.size());
+        for (TaggableRef member : members) {
+            docs.add(new Document("aggregateType", aggregate.taggableType())
+                    .append("aggregateId", aggregate.taggableId().toString())
+                    .append("memberType", member.taggableType())
+                    .append("memberId", member.taggableId().toString()));
+        }
+        collection.insertMany(docs);
+    }
+
+    @Override
+    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
+        List<TaggableRef> members = new ArrayList<>();
+        for (Document doc : taggregateMembersCollection().find(aggregateFilter(aggregate))) {
+            members.add(new TaggableRef(doc.getString("memberType"), UUID.fromString(doc.getString("memberId"))));
+        }
+        return members;
+    }
+
+    @Override
+    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
+        List<TaggableRef> aggregates = new ArrayList<>();
+        for (Document doc : taggregateMembersCollection().find(Filters.and(
+                Filters.eq("memberType", member.taggableType()),
+                Filters.eq("memberId", member.taggableId().toString())))) {
+            aggregates.add(new TaggableRef(doc.getString("aggregateType"), UUID.fromString(doc.getString("aggregateId"))));
+        }
+        return aggregates;
+    }
+
+    @Override
+    public void enqueueTaggregatePending(TaggableRef aggregate) {
+        taggregatePendingCollection().insertOne(new Document("_id", UUID.randomUUID().toString())
+                .append("aggregateType", aggregate.taggableType())
+                .append("aggregateId", aggregate.taggableId().toString())
+                .append("enqueuedAt", Instant.now().toEpochMilli()));
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePending(int limit) {
+        Set<TaggableRef> aggregates = new LinkedHashSet<>();
+        List<UUID> rowIds = new ArrayList<>();
+        for (Document doc : taggregatePendingCollection().find()
+                .sort(new Document("enqueuedAt", 1)).limit(limit)) {
+            rowIds.add(UUID.fromString(doc.getString("_id")));
+            aggregates.add(new TaggableRef(
+                    doc.getString("aggregateType"), UUID.fromString(doc.getString("aggregateId"))));
+        }
+        return new TaggregatePendingClaim(List.copyOf(aggregates), rowIds);
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePendingFor(TaggableRef aggregate) {
+        List<UUID> rowIds = new ArrayList<>();
+        for (Document doc : taggregatePendingCollection().find(Filters.and(
+                Filters.eq("aggregateType", aggregate.taggableType()),
+                Filters.eq("aggregateId", aggregate.taggableId().toString())))) {
+            rowIds.add(UUID.fromString(doc.getString("_id")));
+        }
+        return rowIds.isEmpty() ? TaggregatePendingClaim.EMPTY
+                : new TaggregatePendingClaim(List.of(aggregate), rowIds);
+    }
+
+    @Override
+    public void deleteTaggregatePending(List<UUID> rowIds) {
+        if (rowIds.isEmpty()) {
+            return;
+        }
+        taggregatePendingCollection().deleteMany(
+                Filters.in("_id", rowIds.stream().map(UUID::toString).toList()));
+    }
+
+    @Override
+    public List<RankedTaggableRef> rankedByTags(List<UUID> tagIds, List<String> candidateTypeNames, int limit) {
+        if (tagIds.isEmpty() || candidateTypeNames.isEmpty()) {
+            return List.of();
+        }
+        List<String> tagIdStrings = tagIds.stream().map(UUID::toString).toList();
+        // One aggregation per candidate type, merged and capped here -- associations live embedded on each
+        // type's own collection. Documented deviation; see TaggingBackend#rankedByTags.
+        List<RankedTaggableRef> ranked = new ArrayList<>();
+        for (String typeName : candidateTypeNames) {
+            List<Bson> pipeline = List.of(
+                    new Document("$match", new Document(TAGGINGS_FIELD,
+                            new Document("$elemMatch", new Document("tagId", new Document("$in", tagIdStrings))))),
+                    new Document("$unwind", "$" + TAGGINGS_FIELD),
+                    new Document("$match", new Document(TAGGINGS_FIELD + ".tagId", new Document("$in", tagIdStrings))),
+                    new Document("$group", new Document("_id", "$_id")
+                            .append("score", new Document("$sum",
+                                    new Document("$ifNull", List.of("$" + TAGGINGS_FIELD + ".affinity", 1.0))))));
+            for (Document doc : collectionFor(typeName).aggregate(pipeline)) {
+                ranked.add(new RankedTaggableRef(
+                        new TaggableRef(typeName, UUID.fromString(doc.getString("_id"))),
+                        doc.getDouble("score")));
+            }
+        }
+        ranked.sort(Comparator.comparingDouble(RankedTaggableRef::similarity).reversed()
+                .thenComparing(r -> r.ref().taggableType())
+                .thenComparing(r -> r.ref().taggableId()));
+        return ranked.size() > limit ? List.copyOf(ranked.subList(0, limit)) : ranked;
+    }
+
+    @Override
+    public void upsertTagTextVector(TaggableRef ref, String text, EmbeddingVector vector) {
+        MongoCollection<Document> collection = tagTextVectorsCollection();
+        String field = qualifyTagText(vector.modelId());
+        ensureTagTextVectorIndex(field, vector.dims());
+        Document update = new Document("$set", new Document("taggableType", ref.taggableType())
+                .append("taggableId", ref.taggableId().toString())
+                .append(field, toDoubleList(vector.values()))
+                .append(field + "Text", text)
+                .append(field + "ComputedAt", vector.computedAt().toString()));
+        collection.updateOne(filterFor(ref), update, new UpdateOptions().upsert(true));
+    }
+
+    @Override
+    public void deleteTagTextVector(TaggableRef ref) {
+        tagTextVectorsCollection().deleteOne(filterFor(ref));
+    }
+
+    @Override
+    public String tagText(TaggableRef ref, String modelId) {
+        Document doc = tagTextVectorsCollection().find(filterFor(ref)).first();
+        return doc == null ? null : doc.getString(qualifyTagText(modelId) + "Text");
+    }
+
+    @Override
+    public EmbeddingVector tagTextVector(TaggableRef ref, String modelId) {
+        String field = qualifyTagText(modelId);
+        Document doc = tagTextVectorsCollection().find(filterFor(ref)).first();
+        if (doc == null || doc.get(field) == null) {
+            return EmbeddingVector.absent();
+        }
+        List<Double> stored = doc.getList(field, Double.class);
+        float[] values = new float[stored.size()];
+        for (int i = 0; i < values.length; i++) {
+            values[i] = stored.get(i).floatValue();
+        }
+        return new EmbeddingVector(values, modelId, values.length,
+                Instant.parse(doc.getString(field + "ComputedAt")));
+    }
+
+    @Override
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n) {
+        String field = qualifyTagText(reference.modelId());
+        ensureTagTextVectorIndex(field, reference.dims());
+        String indexName = tagTextVectorIndexName(field);
+        List<Bson> pipeline = List.of(
+                new Document("$vectorSearch", new Document()
+                        .append("index", indexName)
+                        .append("path", field)
+                        .append("queryVector", toDoubleList(reference.values()))
+                        .append("numCandidates", Math.max(n * 10, 100))
+                        .append("limit", n)),
+                new Document("$project", new Document("taggableType", 1)
+                        .append("taggableId", 1)
+                        .append("score", new Document("$meta", "vectorSearchScore"))));
+        List<RankedTaggableRef> ranked = new ArrayList<>();
+        for (Document doc : tagTextVectorsCollection().aggregate(pipeline)) {
+            ranked.add(new RankedTaggableRef(
+                    new TaggableRef(doc.getString("taggableType"), UUID.fromString(doc.getString("taggableId"))),
+                    doc.getDouble("score")));
+        }
+        return ranked;
+    }
+
+    @Override
+    public int tagTextVectorCount() {
+        return (int) tagTextVectorsCollection().countDocuments();
+    }
+
+    private static Document aggregateFilter(TaggableRef aggregate) {
+        return new Document("aggregateType", aggregate.taggableType())
+                .append("aggregateId", aggregate.taggableId().toString());
+    }
+
+    private MongoCollection<Document> taggregateMembersCollection() {
+        MongoCollection<Document> collection = database().getCollection(TAGGREGATE_MEMBERS_COLLECTION);
+        ensureTaggregateIndexes();
+        return collection;
+    }
+
+    private MongoCollection<Document> taggregatePendingCollection() {
+        MongoCollection<Document> collection = database().getCollection(TAGGREGATE_PENDING_COLLECTION);
+        ensureTaggregateIndexes();
+        return collection;
+    }
+
+    private void ensureTaggregateIndexes() {
+        if (!taggregateIndexesEnsured.compareAndSet(false, true)) {
+            return;
+        }
+        database().getCollection(TAGGREGATE_MEMBERS_COLLECTION)
+                .createIndex(Indexes.ascending("aggregateType", "aggregateId"));
+        database().getCollection(TAGGREGATE_MEMBERS_COLLECTION)
+                .createIndex(Indexes.ascending("memberType", "memberId"));
+        database().getCollection(TAGGREGATE_PENDING_COLLECTION)
+                .createIndex(Indexes.ascending("aggregateType", "aggregateId"));
+        database().getCollection(TAGGREGATE_PENDING_COLLECTION)
+                .createIndex(Indexes.ascending("enqueuedAt"));
+    }
+
+    private MongoCollection<Document> tagTextVectorsCollection() {
+        MongoCollection<Document> collection = database().getCollection(TAG_TEXT_VECTORS_COLLECTION);
+        if (tagTextVectorsUniqueIndexEnsured.compareAndSet(false, true)) {
+            collection.createIndex(Indexes.ascending("taggableType", "taggableId"), new IndexOptions().unique(true));
+        }
+        return collection;
+    }
+
+    private void ensureTagTextVectorIndex(String field, int dims) {
+        String indexName = tagTextVectorIndexName(field);
+        if (tagTextVectorIndexesEnsured.contains(indexName)) {
+            return;
+        }
+        Document definition = new Document("fields", List.of(new Document("type", "vector")
+                .append("path", field)
+                .append("numDimensions", dims)
+                .append("similarity", "cosine")));
+        Document command = new Document("createSearchIndexes", TAG_TEXT_VECTORS_COLLECTION)
+                .append("indexes", List.of(new Document("name", indexName)
+                        .append("type", "vectorSearch")
+                        .append("definition", definition)));
+        createSearchIndexWithRetry(command);
+        awaitIndexQueryable(TAG_TEXT_VECTORS_COLLECTION, indexName);
+        tagTextVectorIndexesEnsured.add(indexName);
+    }
+
+    private static String tagTextVectorIndexName(String field) {
+        return "javai_tagtextvectors_" + field;
+    }
+
+    private static String qualifyTagText(String modelId) {
+        return "tagTextVector__" + ModelIds.sanitize(modelId);
+    }
+
     private static Document filterFor(TaggableRef ref) {
         return new Document("taggableType", ref.taggableType()).append("taggableId", ref.taggableId().toString());
     }
@@ -204,7 +491,7 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
                         .append("type", "vectorSearch")
                         .append("definition", definition)));
         createSearchIndexWithRetry(command);
-        awaitIndexQueryable(indexName);
+        awaitIndexQueryable(TAG_SUMMARY_VECTORS_COLLECTION, indexName);
         tagSummaryVectorIndexesEnsured.add(indexName);
     }
 
@@ -233,11 +520,11 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         }
     }
 
-    private void awaitIndexQueryable(String indexName) {
+    private void awaitIndexQueryable(String collectionName, String indexName) {
         Instant deadline = Instant.now().plus(Duration.ofSeconds(90));
         while (Instant.now().isBefore(deadline)) {
             try {
-                for (Document index : database().getCollection(TAG_SUMMARY_VECTORS_COLLECTION).listSearchIndexes()) {
+                for (Document index : database().getCollection(collectionName).listSearchIndexes()) {
                     if (indexName.equals(index.getString("name")) && Boolean.TRUE.equals(index.getBoolean("queryable"))) {
                         return;
                     }
@@ -255,7 +542,7 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
             }
         }
         throw new IllegalStateException(
-                "Vector search index '" + indexName + "' on '" + TAG_SUMMARY_VECTORS_COLLECTION
+                "Vector search index '" + indexName + "' on '" + collectionName
                         + "' did not become queryable within 90s");
     }
 

@@ -119,7 +119,10 @@ class SchemaDdlE2ETest {
         for (String table : fieldVectorTables) {
             assertTrue(table.length() > "javai_vectors__".length(),
                     "a vector table must be model-qualified, not a single shared table: " + table);
-            assertEquals(Set.of("owner_type", "owner_id", "field_name", "model_id", "dims", "vector", "computed_at"),
+            // computed_for is OMI-290's content key for an externally-supplied vector -- null for an
+            // ordinary @Vectorize field, the key the supplier echoed back for an @ExternalVector one.
+            assertEquals(Set.of("owner_type", "owner_id", "field_name", "model_id", "dims", "vector",
+                            "computed_at", "computed_for"),
                     columns(table), "vector table shape is part of the contract");
         }
         // No vector column ever appears on the entity's own table.

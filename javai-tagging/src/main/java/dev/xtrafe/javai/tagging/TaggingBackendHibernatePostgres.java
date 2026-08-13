@@ -14,7 +14,12 @@ import java.sql.Timestamp;
 import java.sql.Types;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -28,6 +33,9 @@ import java.util.UUID;
 final class TaggingBackendHibernatePostgres implements TaggingBackend {
 
     private static final String TAG_SUMMARY_VECTOR_TABLE_PREFIX = "javai_tag_summary_vectors__";
+    private static final String TAG_TEXT_VECTOR_TABLE_PREFIX = "javai_tag_text_vectors__";
+    private static final String TAGGREGATE_MEMBERS_TABLE = "javai_taggregate_members";
+    private static final String TAGGREGATE_PENDING_TABLE = "javai_taggregate_pending";
 
     private final JavAIPersistenceConfig config;
     private final Object lock = new Object();
@@ -219,14 +227,342 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         });
     }
 
+    @Override
+    public Map<TaggableRef, List<TagAssociation>> associationsOfAll(Collection<TaggableRef> refs) {
+        Map<TaggableRef, List<TagAssociation>> result = new HashMap<>();
+        for (TaggableRef ref : refs) {
+            result.put(ref, new ArrayList<>());
+        }
+        if (refs.isEmpty()) {
+            return result;
+        }
+        return call(connection -> {
+            // One query for the whole member set -- the recompute cost discipline. Postgres supports a
+            // composite-row IN list directly.
+            String rowPlaceholders = String.join(",", refs.stream().map(ignored -> "(?,?)").toList());
+            String sql = "SELECT taggable_type, taggable_id, tag_id, affinity, source FROM taggings "
+                    + "WHERE (taggable_type, taggable_id) IN (" + rowPlaceholders + ")";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int index = 1;
+                for (TaggableRef ref : refs) {
+                    statement.setString(index++, ref.taggableType());
+                    statement.setObject(index++, ref.taggableId());
+                }
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        TaggableRef ref = new TaggableRef(
+                                resultSet.getString("taggable_type"), (UUID) resultSet.getObject("taggable_id"));
+                        double affinity = resultSet.getDouble("affinity");
+                        Double affinityOrNull = resultSet.wasNull() ? null : affinity;
+                        result.get(ref).add(new TagAssociation(
+                                (UUID) resultSet.getObject("tag_id"), affinityOrNull, resultSet.getString("source")));
+                    }
+                }
+            }
+            return result;
+        });
+    }
+
+    @Override
+    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
+        run(connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "DELETE FROM " + TAGGREGATE_MEMBERS_TABLE + " WHERE aggregate_type = ? AND aggregate_id = ?")) {
+                statement.setString(1, aggregate.taggableType());
+                statement.setObject(2, aggregate.taggableId());
+                statement.executeUpdate();
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "INSERT INTO " + TAGGREGATE_MEMBERS_TABLE
+                            + " (aggregate_type, aggregate_id, member_type, member_id) VALUES (?, ?, ?, ?) "
+                            + "ON CONFLICT DO NOTHING")) {
+                for (TaggableRef member : members) {
+                    statement.setString(1, aggregate.taggableType());
+                    statement.setObject(2, aggregate.taggableId());
+                    statement.setString(3, member.taggableType());
+                    statement.setObject(4, member.taggableId());
+                    statement.addBatch();
+                }
+                statement.executeBatch();
+            }
+        });
+    }
+
+    @Override
+    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
+        return call(connection -> {
+            List<TaggableRef> members = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT member_type, member_id FROM " + TAGGREGATE_MEMBERS_TABLE
+                            + " WHERE aggregate_type = ? AND aggregate_id = ?")) {
+                statement.setString(1, aggregate.taggableType());
+                statement.setObject(2, aggregate.taggableId());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        members.add(new TaggableRef(
+                                resultSet.getString("member_type"), (UUID) resultSet.getObject("member_id")));
+                    }
+                }
+            }
+            return members;
+        });
+    }
+
+    @Override
+    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
+        return call(connection -> {
+            List<TaggableRef> aggregates = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT aggregate_type, aggregate_id FROM " + TAGGREGATE_MEMBERS_TABLE
+                            + " WHERE member_type = ? AND member_id = ?")) {
+                statement.setString(1, member.taggableType());
+                statement.setObject(2, member.taggableId());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        aggregates.add(new TaggableRef(
+                                resultSet.getString("aggregate_type"), (UUID) resultSet.getObject("aggregate_id")));
+                    }
+                }
+            }
+            return aggregates;
+        });
+    }
+
+    @Override
+    public void enqueueTaggregatePending(TaggableRef aggregate) {
+        run(connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "INSERT INTO " + TAGGREGATE_PENDING_TABLE
+                            + " (id, aggregate_type, aggregate_id, enqueued_at) VALUES (?, ?, ?, ?)")) {
+                statement.setObject(1, UUID.randomUUID());
+                statement.setString(2, aggregate.taggableType());
+                statement.setObject(3, aggregate.taggableId());
+                statement.setTimestamp(4, Timestamp.from(Instant.now()));
+                statement.executeUpdate();
+            }
+        });
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePending(int limit) {
+        return call(connection -> {
+            Set<TaggableRef> aggregates = new LinkedHashSet<>();
+            List<UUID> rowIds = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT id, aggregate_type, aggregate_id FROM " + TAGGREGATE_PENDING_TABLE
+                            + " ORDER BY enqueued_at LIMIT ?")) {
+                statement.setInt(1, limit);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        rowIds.add((UUID) resultSet.getObject("id"));
+                        aggregates.add(new TaggableRef(
+                                resultSet.getString("aggregate_type"), (UUID) resultSet.getObject("aggregate_id")));
+                    }
+                }
+            }
+            return new TaggregatePendingClaim(List.copyOf(aggregates), rowIds);
+        });
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePendingFor(TaggableRef aggregate) {
+        return call(connection -> {
+            List<UUID> rowIds = new ArrayList<>();
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT id FROM " + TAGGREGATE_PENDING_TABLE + " WHERE aggregate_type = ? AND aggregate_id = ?")) {
+                statement.setString(1, aggregate.taggableType());
+                statement.setObject(2, aggregate.taggableId());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        rowIds.add((UUID) resultSet.getObject(1));
+                    }
+                }
+            }
+            return rowIds.isEmpty() ? TaggregatePendingClaim.EMPTY
+                    : new TaggregatePendingClaim(List.of(aggregate), rowIds);
+        });
+    }
+
+    @Override
+    public void deleteTaggregatePending(List<UUID> rowIds) {
+        if (rowIds.isEmpty()) {
+            return;
+        }
+        run(connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "DELETE FROM " + TAGGREGATE_PENDING_TABLE + " WHERE id = ANY (?)")) {
+                statement.setArray(1, connection.createArrayOf("uuid", rowIds.toArray()));
+                statement.executeUpdate();
+            }
+        });
+    }
+
+    @Override
+    public List<RankedTaggableRef> rankedByTags(List<UUID> tagIds, List<String> candidateTypeNames, int limit) {
+        if (tagIds.isEmpty() || candidateTypeNames.isEmpty()) {
+            return List.of();
+        }
+        return call(connection -> {
+            List<RankedTaggableRef> ranked = new ArrayList<>();
+            String tagPlaceholders = String.join(",", tagIds.stream().map(ignored -> "?").toList());
+            String typePlaceholders = String.join(",", candidateTypeNames.stream().map(ignored -> "?").toList());
+            String sql = "SELECT taggable_type, taggable_id, SUM(COALESCE(affinity, 1.0)) AS score FROM taggings "
+                    + "WHERE tag_id IN (" + tagPlaceholders + ") AND taggable_type IN (" + typePlaceholders + ") "
+                    + "GROUP BY taggable_type, taggable_id "
+                    + "ORDER BY score DESC, taggable_type, taggable_id LIMIT ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                int index = 1;
+                for (UUID tagId : tagIds) {
+                    statement.setObject(index++, tagId);
+                }
+                for (String typeName : candidateTypeNames) {
+                    statement.setString(index++, typeName);
+                }
+                statement.setInt(index, limit);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        ranked.add(new RankedTaggableRef(
+                                new TaggableRef(resultSet.getString("taggable_type"),
+                                        (UUID) resultSet.getObject("taggable_id")),
+                                resultSet.getDouble("score")));
+                    }
+                }
+            }
+            return ranked;
+        });
+    }
+
+    @Override
+    public void upsertTagTextVector(TaggableRef ref, String text, EmbeddingVector vector) {
+        run(connection -> {
+            String table = ensureTagTextVectorTable(connection, vector.modelId(), vector.dims());
+            String sql = "INSERT INTO " + table + " (owner_type, owner_id, model_id, dims, tag_text, vector, computed_at) "
+                    + "VALUES (?, ?, ?, ?, ?, ?::vector, ?) "
+                    + "ON CONFLICT (owner_type, owner_id) "
+                    + "DO UPDATE SET dims = EXCLUDED.dims, tag_text = EXCLUDED.tag_text, vector = EXCLUDED.vector, "
+                    + "computed_at = EXCLUDED.computed_at";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, ref.taggableType());
+                statement.setObject(2, ref.taggableId());
+                statement.setString(3, vector.modelId());
+                statement.setInt(4, vector.dims());
+                statement.setString(5, text);
+                statement.setString(6, toVectorLiteral(vector.values()));
+                statement.setTimestamp(7, Timestamp.from(vector.computedAt()));
+                statement.executeUpdate();
+            }
+        });
+    }
+
+    @Override
+    public void deleteTagTextVector(TaggableRef ref) {
+        run(connection -> {
+            for (String table : findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX)) {
+                try (PreparedStatement statement = connection.prepareStatement(
+                        "DELETE FROM " + table + " WHERE owner_type = ? AND owner_id = ?")) {
+                    statement.setString(1, ref.taggableType());
+                    statement.setObject(2, ref.taggableId());
+                    statement.executeUpdate();
+                }
+            }
+        });
+    }
+
+    @Override
+    public String tagText(TaggableRef ref, String modelId) {
+        return call(connection -> {
+            String table = TAG_TEXT_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+            if (!findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX).contains(table)) {
+                return null;
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT tag_text FROM " + table + " WHERE owner_type = ? AND owner_id = ?")) {
+                statement.setString(1, ref.taggableType());
+                statement.setObject(2, ref.taggableId());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    return resultSet.next() ? resultSet.getString(1) : null;
+                }
+            }
+        });
+    }
+
+    @Override
+    public EmbeddingVector tagTextVector(TaggableRef ref, String modelId) {
+        return call(connection -> {
+            String table = TAG_TEXT_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+            if (!findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX).contains(table)) {
+                return EmbeddingVector.absent();
+            }
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "SELECT model_id, vector::text AS vector, computed_at FROM " + table
+                            + " WHERE owner_type = ? AND owner_id = ?")) {
+                statement.setString(1, ref.taggableType());
+                statement.setObject(2, ref.taggableId());
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    if (!resultSet.next()) {
+                        return EmbeddingVector.absent();
+                    }
+                    float[] values = fromVectorLiteral(resultSet.getString("vector"));
+                    return new EmbeddingVector(values, resultSet.getString("model_id"), values.length,
+                            resultSet.getTimestamp("computed_at").toInstant());
+                }
+            }
+        });
+    }
+
+    @Override
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n) {
+        return call(connection -> {
+            List<RankedTaggableRef> ranked = new ArrayList<>();
+            String table = ensureTagTextVectorTable(connection, reference.modelId(), reference.dims());
+            String sql = "SELECT owner_type, owner_id, (vector <=> ?::vector) AS distance FROM " + table
+                    + " ORDER BY distance LIMIT ?";
+            try (PreparedStatement statement = connection.prepareStatement(sql)) {
+                statement.setString(1, toVectorLiteral(reference.values()));
+                statement.setInt(2, n);
+                try (ResultSet resultSet = statement.executeQuery()) {
+                    while (resultSet.next()) {
+                        TaggableRef ref = new TaggableRef(
+                                resultSet.getString("owner_type"), (UUID) resultSet.getObject("owner_id"));
+                        ranked.add(new RankedTaggableRef(ref, 1.0 - resultSet.getDouble("distance")));
+                    }
+                }
+            }
+            return ranked;
+        });
+    }
+
+    @Override
+    public int tagTextVectorCount() {
+        return call(connection -> {
+            List<String> tables = findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX);
+            if (tables.isEmpty()) {
+                return 0;
+            }
+            String union = String.join(" UNION ", tables.stream()
+                    .map(table -> "SELECT owner_type, owner_id FROM " + table).toList());
+            try (Statement statement = connection.createStatement();
+                    ResultSet resultSet = statement.executeQuery("SELECT count(*) FROM (" + union + ") x")) {
+                resultSet.next();
+                return resultSet.getInt(1);
+            }
+        });
+    }
+
     private static List<String> findAllTagSummaryVectorTables(Connection connection) throws SQLException {
+        return findAllVectorTables(connection, TAG_SUMMARY_VECTOR_TABLE_PREFIX);
+    }
+
+    private static List<String> findAllVectorTables(Connection connection, String prefix) throws SQLException {
         List<String> tables = new ArrayList<>();
         try (PreparedStatement statement = connection.prepareStatement(
                 "SELECT table_name FROM information_schema.tables WHERE table_schema = current_schema() "
-                        + "AND table_name LIKE 'javai\\_tag\\_summary\\_vectors\\_\\_%' ESCAPE '\\'");
-                ResultSet resultSet = statement.executeQuery()) {
-            while (resultSet.next()) {
-                tables.add(resultSet.getString(1));
+                        + "AND table_name LIKE ? ESCAPE '\\'")) {
+            statement.setString(1, prefix.replace("_", "\\_") + "%");
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    tables.add(resultSet.getString(1));
+                }
             }
         }
         return tables;
@@ -249,6 +585,26 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         return table;
     }
 
+    /** Same shape as {@link #ensureTagSummaryVectorTable} plus the {@code tag_text} column -- the text is
+     *  stored beside the vector it was embedded into, per doc/spec/tagging.md's "Concatenated tag text". */
+    private static String ensureTagTextVectorTable(Connection connection, String modelId, int dims) throws SQLException {
+        String table = TAG_TEXT_VECTOR_TABLE_PREFIX + ModelIds.sanitize(modelId);
+        try (Statement statement = connection.createStatement()) {
+            statement.execute("CREATE EXTENSION IF NOT EXISTS vector");
+            statement.execute("CREATE TABLE IF NOT EXISTS " + table + " ("
+                    + "owner_type   varchar(512) NOT NULL,"
+                    + "owner_id     uuid         NOT NULL,"
+                    + "model_id     varchar(128) NOT NULL,"
+                    + "dims         integer      NOT NULL,"
+                    + "tag_text     text         NOT NULL,"
+                    + "vector       vector(" + dims + ") NOT NULL,"
+                    + "computed_at  timestamptz  NOT NULL,"
+                    + "PRIMARY KEY (owner_type, owner_id))");
+            statement.execute("CREATE INDEX IF NOT EXISTS " + table + "_hnsw ON " + table + " USING hnsw (vector vector_cosine_ops)");
+        }
+        return table;
+    }
+
     /** pgvector's own text input format for a vector literal, e.g. {@code "[0.1,0.2,0.3]"} -- mirrors
      *  {@code RepositoryBackendHibernatePostgres}'s own identical helper. */
     private static String toVectorLiteral(float[] values) {
@@ -260,6 +616,20 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
             literal.append(values[i]);
         }
         return literal.append(']').toString();
+    }
+
+    /** Inverse of {@link #toVectorLiteral} -- pgvector's own {@code "[0.1,0.2,0.3]"} text output. */
+    private static float[] fromVectorLiteral(String literal) {
+        String body = literal.substring(1, literal.length() - 1).trim();
+        if (body.isEmpty()) {
+            return new float[0];
+        }
+        String[] parts = body.split(",");
+        float[] values = new float[parts.length];
+        for (int i = 0; i < parts.length; i++) {
+            values[i] = Float.parseFloat(parts[i].trim());
+        }
+        return values;
     }
 
     private void run(SqlAction action) {
@@ -303,6 +673,25 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
                     + "UNIQUE (tag_id, taggable_type, taggable_id))");
             statement.execute("CREATE INDEX IF NOT EXISTS taggings_taggable_lookup ON taggings (taggable_type, taggable_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS taggings_tag_lookup ON taggings (tag_id)");
+            statement.execute("CREATE TABLE IF NOT EXISTS " + TAGGREGATE_MEMBERS_TABLE + " ("
+                    + "aggregate_type VARCHAR(512) NOT NULL, "
+                    + "aggregate_id UUID NOT NULL, "
+                    + "member_type VARCHAR(512) NOT NULL, "
+                    + "member_id UUID NOT NULL, "
+                    + "PRIMARY KEY (aggregate_type, aggregate_id, member_type, member_id))");
+            // Indexed both directions: the primary key serves aggregate -> members (drift detection); this
+            // serves member -> aggregates (choke-point pending marking).
+            statement.execute("CREATE INDEX IF NOT EXISTS " + TAGGREGATE_MEMBERS_TABLE + "_member ON "
+                    + TAGGREGATE_MEMBERS_TABLE + " (member_type, member_id)");
+            statement.execute("CREATE TABLE IF NOT EXISTS " + TAGGREGATE_PENDING_TABLE + " ("
+                    + "id UUID PRIMARY KEY, "
+                    + "aggregate_type VARCHAR(512) NOT NULL, "
+                    + "aggregate_id UUID NOT NULL, "
+                    + "enqueued_at TIMESTAMPTZ NOT NULL)");
+            statement.execute("CREATE INDEX IF NOT EXISTS " + TAGGREGATE_PENDING_TABLE + "_aggregate ON "
+                    + TAGGREGATE_PENDING_TABLE + " (aggregate_type, aggregate_id)");
+            statement.execute("CREATE INDEX IF NOT EXISTS " + TAGGREGATE_PENDING_TABLE + "_enqueued ON "
+                    + TAGGREGATE_PENDING_TABLE + " (enqueued_at)");
         }
     }
 

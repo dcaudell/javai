@@ -3,12 +3,15 @@ package dev.xtrafe.javai.e2e.environment;
 import java.time.Duration;
 import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
+import dev.xtrafe.javai.e2e.domain.AnthologyRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.domain.LibraryRepository;
 import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
 import dev.xtrafe.javai.e2e.domain.PlaceRepository;
+import dev.xtrafe.javai.e2e.domain.ShelfRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocHubRepository;
@@ -95,6 +98,12 @@ public final class JavAIEnvironment {
     private static final AssocSelfNodeRepository POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
     private static final AssocBiParentRepository POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
 
+    private static final AnthologyRepository POSTGRES_ANTHOLOGY_REPOSITORY;
+    private static final ShelfRepository POSTGRES_SHELF_REPOSITORY;
+    private static final LibraryRepository POSTGRES_LIBRARY_REPOSITORY;
+    private static final AnthologyRepository NEO4J_ANTHOLOGY_REPOSITORY;
+    private static final AnthologyRepository MONGO_ANTHOLOGY_REPOSITORY;
+
     /** Exposed so a test can compose several repository calls into one unit of work -- which a test that
      *  traverses a lazy association must, since a repository returns a detached entity (OMI-271). */
     private static final JavAIPersistenceConfig POSTGRES_CONFIG;
@@ -129,6 +138,9 @@ public final class JavAIEnvironment {
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
         // AssocLeaf/AssocChainMiddle/AssocBiChild are auto-registered as related types, but each root that
         // tests query independently still needs its own proxy.
+        POSTGRES_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, postgresConfig);
+        POSTGRES_SHELF_REPOSITORY = JavAIPI.repository(ShelfRepository.class, postgresConfig);
+        POSTGRES_LIBRARY_REPOSITORY = JavAIPI.repository(LibraryRepository.class, postgresConfig);
         POSTGRES_ASSOC_HUB_REPOSITORY = JavAIPI.repository(AssocHubRepository.class, postgresConfig);
         POSTGRES_ASSOC_LEAF_REPOSITORY = JavAIPI.repository(AssocLeafRepository.class, postgresConfig);
         POSTGRES_PLAIN_LEAF_REPOSITORY = JavAIPI.repository(PlainLeafRepository.class, postgresConfig);
@@ -153,6 +165,8 @@ public final class JavAIEnvironment {
         NEO4J_ARTICLE_CLUSTER_REPOSITORY = JavAIPI.repository(ArticleClusterRepository.class, neo4jConfig);
         NEO4J_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, neo4jConfig);
         NEO4J_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, neo4jConfig);
+        // Article/Comment are already registered above -- Anthology's own member fields reach both.
+        NEO4J_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, neo4jConfig);
 
         // No CommentRepository/AttachmentRepository pre-registration here either: RepositoryBackendSpringDataMongo
         // recursively auto-registers related types too, matching Postgres's convenience rather than Neo4j's
@@ -168,6 +182,7 @@ public final class JavAIEnvironment {
         MONGO_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, mongoConfig);
         MONGO_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, mongoConfig);
         MONGO_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, mongoConfig);
+        MONGO_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, mongoConfig);
 
         // Willing to wait, because in this harness a slow answer is real work rather than a stall: the model
         // runs on CPU inside the test container, and a long classification prompt legitimately takes minutes
@@ -298,6 +313,26 @@ public final class JavAIEnvironment {
 
     public static AssocBiParentRepository postgresAssocBiParentRepository() {
         return POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
+    }
+
+    public static AnthologyRepository postgresAnthologyRepository() {
+        return POSTGRES_ANTHOLOGY_REPOSITORY;
+    }
+
+    public static ShelfRepository postgresShelfRepository() {
+        return POSTGRES_SHELF_REPOSITORY;
+    }
+
+    public static LibraryRepository postgresLibraryRepository() {
+        return POSTGRES_LIBRARY_REPOSITORY;
+    }
+
+    public static AnthologyRepository neo4jAnthologyRepository() {
+        return NEO4J_ANTHOLOGY_REPOSITORY;
+    }
+
+    public static AnthologyRepository mongoAnthologyRepository() {
+        return MONGO_ANTHOLOGY_REPOSITORY;
     }
 
     public static Cortex cortex() {

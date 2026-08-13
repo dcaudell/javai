@@ -140,6 +140,15 @@
               <goal>transform</goal>
             </goals>
           </execution>
+          <execution>
+            <!-- Test-fixture weaving (OMI-302): TestWovenAlbum is a genuinely woven @JavAIVectorizable
+                 container, pinning that Taggregate works on woven and unwoven containers alike. Same
+                 plugin, same transform, applied to target/test-classes at process-test-classes. -->
+            <id>weave-test-fixtures</id>
+            <goals>
+              <goal>transform-test</goal>
+            </goals>
+          </execution>
         </executions>
         <dependencies>
           <dependency>
