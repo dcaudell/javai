@@ -71,8 +71,8 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
      *  deterministic text beside each model's vector. */
     private static final String TAG_TEXT_VECTORS_COLLECTION = "_javaiTagTextVectors";
 
-    /** {@code javai_taggregate_members} / {@code javai_taggregate_pending} in this backend's convention. */
-    private static final String TAGGREGATE_MEMBERS_COLLECTION = "_javaiTaggregateMembers";
+    /** {@code javai_taggregate_pending} in this backend's convention. The membership snapshot that used to
+     *  sit beside it is gone (OMI-304): the reference arrays already are the membership. */
     private static final String TAGGREGATE_PENDING_COLLECTION = "_javaiTaggregatePending";
 
     private final JavAIPersistenceConfig config;
@@ -222,42 +222,8 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         return result;
     }
 
-    @Override
-    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
-        MongoCollection<Document> collection = taggregateMembersCollection();
-        collection.deleteMany(aggregateFilter(aggregate));
-        if (members.isEmpty()) {
-            return;
-        }
-        List<Document> docs = new ArrayList<>(members.size());
-        for (TaggableRef member : members) {
-            docs.add(new Document("aggregateType", aggregate.taggableType())
-                    .append("aggregateId", aggregate.taggableId().toString())
-                    .append("memberType", member.taggableType())
-                    .append("memberId", member.taggableId().toString()));
-        }
-        collection.insertMany(docs);
-    }
 
-    @Override
-    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
-        List<TaggableRef> members = new ArrayList<>();
-        for (Document doc : taggregateMembersCollection().find(aggregateFilter(aggregate))) {
-            members.add(new TaggableRef(doc.getString("memberType"), UUID.fromString(doc.getString("memberId"))));
-        }
-        return members;
-    }
 
-    @Override
-    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
-        List<TaggableRef> aggregates = new ArrayList<>();
-        for (Document doc : taggregateMembersCollection().find(Filters.and(
-                Filters.eq("memberType", member.taggableType()),
-                Filters.eq("memberId", member.taggableId().toString())))) {
-            aggregates.add(new TaggableRef(doc.getString("aggregateType"), UUID.fromString(doc.getString("aggregateId"))));
-        }
-        return aggregates;
-    }
 
     @Override
     public void enqueueTaggregatePending(TaggableRef aggregate) {
@@ -405,11 +371,6 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
                 .append("aggregateId", aggregate.taggableId().toString());
     }
 
-    private MongoCollection<Document> taggregateMembersCollection() {
-        MongoCollection<Document> collection = database().getCollection(TAGGREGATE_MEMBERS_COLLECTION);
-        ensureTaggregateIndexes();
-        return collection;
-    }
 
     private MongoCollection<Document> taggregatePendingCollection() {
         MongoCollection<Document> collection = database().getCollection(TAGGREGATE_PENDING_COLLECTION);
@@ -421,10 +382,6 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         if (!taggregateIndexesEnsured.compareAndSet(false, true)) {
             return;
         }
-        database().getCollection(TAGGREGATE_MEMBERS_COLLECTION)
-                .createIndex(Indexes.ascending("aggregateType", "aggregateId"));
-        database().getCollection(TAGGREGATE_MEMBERS_COLLECTION)
-                .createIndex(Indexes.ascending("memberType", "memberId"));
         database().getCollection(TAGGREGATE_PENDING_COLLECTION)
                 .createIndex(Indexes.ascending("aggregateType", "aggregateId"));
         database().getCollection(TAGGREGATE_PENDING_COLLECTION)

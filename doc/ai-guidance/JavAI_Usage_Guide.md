@@ -605,17 +605,26 @@ interface and an `@Id UUID` — never `@JavAIVectorizable`, on either side. Wove
 freely in one graph; nothing about the aggregate is woven; a `@MappedSuperclass` field declaration applies
 to every subclass.
 
-**Staleness** follows Vector Core's own discipline — dirty-mark, lazy recompute, deliberate sweep:
+**The container must be a persisted entity with ordinary mapped associations** — a `@OneToMany`,
+`@ManyToMany` or a to-one reference. That is not an extra requirement so much as where membership now
+lives: JavAI reads it from the join tables Hibernate already maintains, rather than keeping a copy.
+
+**Staleness needs nothing from you.** Tagging a member (`addTag`/`removeTag`/`applyClassification`) marks
+every container holding it and recomputes them after your transaction commits — including containers of
+containers, and including a container this process never loaded. There is no reconciler to write, no
+loader callback to supply, no bootstrap pass to run, and no cold start: a container saved a moment ago and
+never touched since is correct the first time one of its members is tagged.
 
 | Method | What it does |
 |---|---|
-| *(automatic)* | Member tag mutations (`addTag`/`removeTag`/`applyClassification`) mark containing aggregates pending, transitively through nesting, cycle-guarded. A read holding the container object (`taggingsOf`/`tagText`/`tagTextVector`) recomputes if pending or if the members drifted from the last-reconciled snapshot. |
-| `reconcileTaggregate(Object container)` | Recompute now, unconditionally — the explicit repair path. Only ever rewrites `source = "aggregate"` rows; `manual`/`auto` rows on the container are never touched, and re-running is a no-op. |
-| `markTaggregateStale(Object container)` | Cheap dirty-mark for a known write path (e.g. right after mutating a member collection) — the recompute happens at the next read or sweep. |
-| `reconcilePendingTaggregates(int limit, Function<TaggableRef, Object> loader)` | The sweep: trues up aggregates nothing reads directly. ⚠️ The `loader` is required — the library cannot materialize *your* entity types; hand it your repositories (`ref -> repositoryFor(ref.taggableType()).findById(ref.taggableId()).orElse(null)`). If the container's `@Taggregate` collections load lazily, initialize them inside the loader's own unit of work (`Hibernate.initialize(...)`) — the recompute's reflective walk runs after the loader returns, on a detached entity. Run the sweep on your own schedule; the library never polls. |
+| *(automatic)* | Everything above. Tag a member; the containers are right. |
+| `int rebuildTaggregates()` | ⚠️ **The after-a-restore repair, not a routine call.** Rebuilds every container from its members. Needed because promotion, a restored backup and direct SQL write rows the tagging calls never observe, and after those the aggregates are wrong with nothing to notice. Cost is proportional to your whole world — a maintenance path, never a request one. |
 
-The honest consequence: pure *search* reads (`taggedWith`, the indexes) see the last-reconciled state,
-stale by at most your sweep interval.
+⚠️ **One honest consequence.** Adding or removing a *member* changes what the aggregate should say (the
+mean dilutes) without any tag being mutated, so nothing recomputes at that instant. The next tag mutation
+beneath that container corrects it, and `rebuildTaggregates()` corrects it without one. The alternative —
+recomputing on every `save()` of anything that happens to be contained — is a cost on a write path most
+applications would never need it on.
 
 ### Concatenated tag text — tags as searchable language
 

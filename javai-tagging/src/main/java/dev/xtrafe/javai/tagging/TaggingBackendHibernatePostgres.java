@@ -1,7 +1,9 @@
 package dev.xtrafe.javai.tagging;
 
+import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.persistence.ModelIds;
+import dev.xtrafe.javai.persistence.TaggregateContainment;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.sql.Connection;
@@ -34,15 +36,60 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
 
     private static final String TAG_SUMMARY_VECTOR_TABLE_PREFIX = "javai_tag_summary_vectors__";
     private static final String TAG_TEXT_VECTOR_TABLE_PREFIX = "javai_tag_text_vectors__";
-    private static final String TAGGREGATE_MEMBERS_TABLE = "javai_taggregate_members";
     private static final String TAGGREGATE_PENDING_TABLE = "javai_taggregate_pending";
 
     private final JavAIPersistenceConfig config;
     private final Object lock = new Object();
     private Connection connection;
 
+    /** See {@link #ambient()} -- resolved on first write, never in the constructor. */
+    private volatile TaggregateContainment ambient;
+    private volatile boolean schemaEnsuredForAmbient;
+
     TaggingBackendHibernatePostgres(JavAIPersistenceConfig config) {
         this.config = config;
+    }
+
+    /**
+     * The entity mapper's view of the ambient transaction, resolved on first write (OMI-304).
+     *
+     * <p>⚠️ <b>Lazily, and that is the whole point.</b> This class deliberately holds a raw
+     * {@link Connection} and not a {@code SessionFactory} so that tagging has no startup ordering
+     * dependency on the entity mapper -- see the class javadoc. Resolving here rather than in the
+     * constructor keeps that true: by the time anything is tagged, the mapper is necessarily up.
+     */
+    private TaggregateContainment ambient() {
+        TaggregateContainment resolved = ambient;
+        if (resolved == null) {
+            synchronized (lock) {
+                resolved = ambient;
+                if (resolved == null) {
+                    resolved = JavAIPI.taggregateContainment(config);
+                    ambient = resolved;
+                }
+            }
+        }
+        return resolved;
+    }
+
+    /**
+     * Runs {@code action} on the caller's own transaction when there is one, so a tag row and the pending
+     * row it enqueues commit or roll back together (OMI-304); otherwise on this backend's own connection.
+     *
+     * <p>The schema is provisioned on this backend's own connection first, once. Doing it on the ambient
+     * connection instead would run DDL inside the caller's transaction -- taking locks their commit then
+     * has to hold -- and would leave the tables uncreated entirely if that transaction rolled back.
+     *
+     * @return {@code true} when the work ran on the caller's transaction
+     */
+    private boolean runOnAmbient(SqlAction action) throws SQLException {
+        if (!schemaEnsuredForAmbient) {
+            synchronized (lock) {
+                connection();   // opens this backend's own connection purely to run ensureSchema once
+                schemaEnsuredForAmbient = true;
+            }
+        }
+        return ambient().inAmbientTransaction(action::run);
     }
 
     @Override
@@ -263,70 +310,8 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         });
     }
 
-    @Override
-    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
-        run(connection -> {
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "DELETE FROM " + TAGGREGATE_MEMBERS_TABLE + " WHERE aggregate_type = ? AND aggregate_id = ?")) {
-                statement.setString(1, aggregate.taggableType());
-                statement.setObject(2, aggregate.taggableId());
-                statement.executeUpdate();
-            }
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "INSERT INTO " + TAGGREGATE_MEMBERS_TABLE
-                            + " (aggregate_type, aggregate_id, member_type, member_id) VALUES (?, ?, ?, ?) "
-                            + "ON CONFLICT DO NOTHING")) {
-                for (TaggableRef member : members) {
-                    statement.setString(1, aggregate.taggableType());
-                    statement.setObject(2, aggregate.taggableId());
-                    statement.setString(3, member.taggableType());
-                    statement.setObject(4, member.taggableId());
-                    statement.addBatch();
-                }
-                statement.executeBatch();
-            }
-        });
-    }
 
-    @Override
-    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
-        return call(connection -> {
-            List<TaggableRef> members = new ArrayList<>();
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "SELECT member_type, member_id FROM " + TAGGREGATE_MEMBERS_TABLE
-                            + " WHERE aggregate_type = ? AND aggregate_id = ?")) {
-                statement.setString(1, aggregate.taggableType());
-                statement.setObject(2, aggregate.taggableId());
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    while (resultSet.next()) {
-                        members.add(new TaggableRef(
-                                resultSet.getString("member_type"), (UUID) resultSet.getObject("member_id")));
-                    }
-                }
-            }
-            return members;
-        });
-    }
 
-    @Override
-    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
-        return call(connection -> {
-            List<TaggableRef> aggregates = new ArrayList<>();
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "SELECT aggregate_type, aggregate_id FROM " + TAGGREGATE_MEMBERS_TABLE
-                            + " WHERE member_type = ? AND member_id = ?")) {
-                statement.setString(1, member.taggableType());
-                statement.setObject(2, member.taggableId());
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    while (resultSet.next()) {
-                        aggregates.add(new TaggableRef(
-                                resultSet.getString("aggregate_type"), (UUID) resultSet.getObject("aggregate_id")));
-                    }
-                }
-            }
-            return aggregates;
-        });
-    }
 
     @Override
     public void enqueueTaggregatePending(TaggableRef aggregate) {
@@ -632,7 +617,22 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         return values;
     }
 
+    /**
+     * Every write this backend makes: on the caller's own transaction when there is one, otherwise on this
+     * backend's own connection.
+     *
+     * <p>Joining the caller's transaction (OMI-304) is what makes a tag mutation and the pending row it
+     * enqueues atomic together. On its own autocommit connection the tag row survived a caller's rollback,
+     * and the aggregate derived from it was then correct about a tagging the caller believed it had undone.
+     */
     private void run(SqlAction action) {
+        try {
+            if (runOnAmbient(action)) {
+                return;
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Tagging operation failed on the caller's transaction", e);
+        }
         synchronized (lock) {
             try {
                 action.run(connection());
@@ -642,7 +642,18 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         }
     }
 
+    /** Reads join the caller's transaction too, for the reason every read in {@code javai-persistence}
+     *  does: rows the caller has written but not yet committed must be visible to its own subsequent read,
+     *  which a separate connection could not see. */
     private <T> T call(SqlFunction<T> action) {
+        List<T> result = new ArrayList<>(1);
+        try {
+            if (runOnAmbient(connection -> result.add(action.apply(connection)))) {
+                return result.get(0);
+            }
+        } catch (SQLException e) {
+            throw new IllegalStateException("Tagging query failed on the caller's transaction", e);
+        }
         synchronized (lock) {
             try {
                 return action.apply(connection());
@@ -673,16 +684,11 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
                     + "UNIQUE (tag_id, taggable_type, taggable_id))");
             statement.execute("CREATE INDEX IF NOT EXISTS taggings_taggable_lookup ON taggings (taggable_type, taggable_id)");
             statement.execute("CREATE INDEX IF NOT EXISTS taggings_tag_lookup ON taggings (tag_id)");
-            statement.execute("CREATE TABLE IF NOT EXISTS " + TAGGREGATE_MEMBERS_TABLE + " ("
-                    + "aggregate_type VARCHAR(512) NOT NULL, "
-                    + "aggregate_id UUID NOT NULL, "
-                    + "member_type VARCHAR(512) NOT NULL, "
-                    + "member_id UUID NOT NULL, "
-                    + "PRIMARY KEY (aggregate_type, aggregate_id, member_type, member_id))");
-            // Indexed both directions: the primary key serves aggregate -> members (drift detection); this
-            // serves member -> aggregates (choke-point pending marking).
-            statement.execute("CREATE INDEX IF NOT EXISTS " + TAGGREGATE_MEMBERS_TABLE + "_member ON "
-                    + TAGGREGATE_MEMBERS_TABLE + " (member_type, member_id)");
+            // The membership snapshot this used to keep is gone (OMI-304): the join tables already are the
+            // membership, so a query against them cannot be stale and needs no reconciliation pass to
+            // become true. Dropped rather than left behind, because a stale copy of containment that
+            // nothing maintains is worse than no copy -- a later reader could not tell it was abandoned.
+            statement.execute("DROP TABLE IF EXISTS javai_taggregate_members");
             statement.execute("CREATE TABLE IF NOT EXISTS " + TAGGREGATE_PENDING_TABLE + " ("
                     + "id UUID PRIMARY KEY, "
                     + "aggregate_type VARCHAR(512) NOT NULL, "

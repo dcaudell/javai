@@ -8,6 +8,7 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.CollationStrength;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
@@ -40,6 +41,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
@@ -111,6 +113,12 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     private final JavAIPersistenceConfig config;
     private final Set<Class<?>> registeredEntityTypes = ConcurrentHashMap.newKeySet();
+
+    /** See {@link #containment()} -- resolved on first use, never in the constructor. */
+    private volatile Containment containment;
+
+    /** One-time index creation per {@code @Taggregate} edge; see {@link #ensureTaggregateIndex}. */
+    private final Set<String> taggregateIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Object bootstrapLock = new Object();
     private volatile MongoTemplate mongoTemplate;
@@ -1312,6 +1320,135 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     private MongoCollection<Document> collectionFor(Class<?> entityType) {
         return mongoTemplate().getCollection(collectionName(entityType));
+    }
+
+    /**
+     * The {@code @Taggregate} containment of the registered model, over this backend's reference-pointer
+     * arrays (OMI-304).
+     *
+     * <p>The <em>declaration</em> comes from {@link Containment}, exactly as on the other two backends; only
+     * the traversal is native. A reference field is stored as {@code {type, id}} -- one such document for a
+     * singular reference, an array of them for a collection -- and MongoDB's dot notation matches both
+     * shapes with one filter, so {@code field.id} finds a container whether the field holds one member or
+     * fifty. That is what makes this a query rather than two.
+     */
+    @Override
+    public TaggregateContainment taggregateContainment() {
+        return new TaggregateContainment() {
+            @Override
+            public boolean isEmpty() {
+                return containment().hasNoTaggregates();
+            }
+
+            @Override
+            public void containersOf(String childTypeName, UUID childId, BiConsumer<String, UUID> sink) {
+                Class<?> childType = typeOrNull(childTypeName);
+                for (Containment.Edge edge : containment().taggregateEdges()) {
+                    // By name first, so a member type that was never registered as a repository of its own
+                    // is still found through the edge that declares it; by assignability second, for a
+                    // subclass held in a field declared as its supertype.
+                    boolean holdsThisChild = edge.childType().getName().equals(childTypeName)
+                            || (childType != null && edge.childType().isAssignableFrom(childType));
+                    if (!holdsThisChild) {
+                        continue;
+                    }
+                    ensureTaggregateIndex(edge);
+                    for (Document doc : collectionFor(edge.parentType()).find(Filters.and(
+                            Filters.eq(edge.fieldName() + ".type", childTypeName),
+                            Filters.eq(edge.fieldName() + ".id", childId.toString())))) {
+                        sink.accept(edge.parentType().getName(), UUID.fromString(doc.getString("_id")));
+                    }
+                }
+            }
+
+            @Override
+            public void membersOf(String containerTypeName, UUID containerId, BiConsumer<String, UUID> sink) {
+                Class<?> containerType = typeOrNull(containerTypeName);
+                if (containerType == null) {
+                    return;
+                }
+                Document container = collectionFor(containerType)
+                        .find(Filters.eq("_id", containerId.toString())).first();
+                if (container == null) {
+                    return;
+                }
+                for (Containment.Edge edge : containment().taggregateEdges()) {
+                    if (!edge.parentType().isAssignableFrom(containerType)) {
+                        continue;
+                    }
+                    Object value = container.get(edge.fieldName());
+                    if (value instanceof List<?> references) {
+                        for (Object reference : references) {
+                            acceptReference(reference, sink);
+                        }
+                    } else {
+                        acceptReference(value, sink);
+                    }
+                }
+            }
+
+            @Override
+            public void allContainers(BiConsumer<String, UUID> sink) {
+                for (Class<?> containerType : containment().taggregateContainerTypes()) {
+                    for (Document doc : collectionFor(containerType).find()) {
+                        sink.accept(containerType.getName(), UUID.fromString(doc.getString("_id")));
+                    }
+                }
+            }
+
+            /** No ambient JDBC transaction on this backend -- see the Neo4j implementation's own note. */
+            @Override
+            public boolean inAmbientTransaction(ConnectionWork work) {
+                return false;
+            }
+
+            /** No ambient transaction to hang a commit callback on either -- the caller drains inline. */
+            @Override
+            public boolean afterCommit(Runnable drain) {
+                return false;
+            }
+
+            private void acceptReference(Object reference, BiConsumer<String, UUID> sink) {
+                if (reference instanceof Document document
+                        && document.getString("type") != null && document.getString("id") != null) {
+                    sink.accept(document.getString("type"), UUID.fromString(document.getString("id")));
+                }
+            }
+        };
+    }
+
+    /** One index per {@code @Taggregate} edge, on the reference id the container lookup filters by --
+     *  without it, finding a member's containers is a collection scan per edge on every tag mutation. */
+    private void ensureTaggregateIndex(Containment.Edge edge) {
+        String key = edge.parentType().getName() + "#" + edge.fieldName();
+        if (taggregateIndexesEnsured.add(key)) {
+            collectionFor(edge.parentType())
+                    .createIndex(Indexes.ascending(edge.fieldName() + ".type", edge.fieldName() + ".id"));
+        }
+    }
+
+    private Class<?> typeOrNull(String typeName) {
+        for (Class<?> registered : registeredEntityTypes) {
+            if (registered.getName().equals(typeName)) {
+                return registered;
+            }
+        }
+        return null;
+    }
+
+    /** See the Postgres backend's own {@code containment()} for why this resolves lazily. */
+    private Containment containment() {
+        Containment resolved = containment;
+        if (resolved == null) {
+            synchronized (this) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = Containment.of(registeredEntityTypes);
+                    containment = resolved;
+                }
+            }
+        }
+        return resolved;
     }
 
     // ---- lazy bootstrap -----------------------------------------------------------------------

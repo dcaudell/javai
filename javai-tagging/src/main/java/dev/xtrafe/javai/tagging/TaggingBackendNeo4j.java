@@ -57,11 +57,11 @@ final class TaggingBackendNeo4j implements TaggingBackend {
      *  disturbs the other's. */
     private static final String TAG_TEXTED_LABEL = "JavAITagTexted";
 
-    /** Membership snapshot and pending set as their own property nodes (`javai_taggregate_members` /
-     *  `javai_taggregate_pending` in this backend's convention) -- ref-shaped data, deliberately not
-     *  relationships between entity nodes: a snapshot row must survive its member node's deletion, and is
-     *  written wholesale by recompute, never navigated as graph structure. Correct-everywhere shape first. */
-    private static final String TAGGREGATE_MEMBER_LABEL = "JavAITaggregateMember";
+    /** The pending set as its own property nodes (`javai_taggregate_pending` in this backend's
+     *  convention) -- ref-shaped data, deliberately not relationships between entity nodes: a pending row
+     *  must survive its member node's deletion, and is never navigated as graph structure. The membership
+     *  snapshot that used to sit beside it is gone (OMI-304): containment is read from the relationships
+     *  that already exist, so a second copy of it had nothing to add and could be stale. */
     private static final String TAGGREGATE_PENDING_LABEL = "JavAITaggregatePending";
 
     private final JavAIPersistenceConfig config;
@@ -261,65 +261,8 @@ final class TaggingBackendNeo4j implements TaggingBackend {
         return result;
     }
 
-    @Override
-    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
-        ensureTaggregateIndexes();
-        List<Map<String, Object>> memberParameters = new ArrayList<>();
-        for (TaggableRef member : members) {
-            memberParameters.add(Map.of("type", member.taggableType(), "id", member.taggableId().toString()));
-        }
-        try (Session session = driver().session()) {
-            session.executeWrite(tx -> {
-                tx.run("MATCH (m:" + TAGGREGATE_MEMBER_LABEL + " {aggregateType: $aggregateType, aggregateId: $aggregateId}) "
-                                + "DELETE m",
-                        Values.parameters(
-                                "aggregateType", aggregate.taggableType(),
-                                "aggregateId", aggregate.taggableId().toString()));
-                tx.run("UNWIND $members AS member "
-                                + "CREATE (:" + TAGGREGATE_MEMBER_LABEL + " {aggregateType: $aggregateType, "
-                                + "aggregateId: $aggregateId, memberType: member.type, memberId: member.id})",
-                        Values.parameters(
-                                "aggregateType", aggregate.taggableType(),
-                                "aggregateId", aggregate.taggableId().toString(),
-                                "members", memberParameters));
-                return null;
-            });
-        }
-    }
 
-    @Override
-    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
-        try (Session session = driver().session()) {
-            var result = session.run(
-                    "MATCH (m:" + TAGGREGATE_MEMBER_LABEL + " {aggregateType: $aggregateType, aggregateId: $aggregateId}) "
-                            + "RETURN m.memberType AS type, m.memberId AS id",
-                    Values.parameters(
-                            "aggregateType", aggregate.taggableType(),
-                            "aggregateId", aggregate.taggableId().toString()));
-            List<TaggableRef> members = new ArrayList<>();
-            for (Record record : result.list()) {
-                members.add(new TaggableRef(record.get("type").asString(), UUID.fromString(record.get("id").asString())));
-            }
-            return members;
-        }
-    }
 
-    @Override
-    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
-        try (Session session = driver().session()) {
-            var result = session.run(
-                    "MATCH (m:" + TAGGREGATE_MEMBER_LABEL + " {memberType: $memberType, memberId: $memberId}) "
-                            + "RETURN m.aggregateType AS type, m.aggregateId AS id",
-                    Values.parameters(
-                            "memberType", member.taggableType(),
-                            "memberId", member.taggableId().toString()));
-            List<TaggableRef> aggregates = new ArrayList<>();
-            for (Record record : result.list()) {
-                aggregates.add(new TaggableRef(record.get("type").asString(), UUID.fromString(record.get("id").asString())));
-            }
-            return aggregates;
-        }
-    }
 
     @Override
     public void enqueueTaggregatePending(TaggableRef aggregate) {
@@ -523,10 +466,6 @@ final class TaggingBackendNeo4j implements TaggingBackend {
         }
         try (Session session = driver().session()) {
             session.executeWrite(tx -> {
-                tx.run("CREATE INDEX javai_taggregate_members_aggregate IF NOT EXISTS FOR (n:"
-                        + TAGGREGATE_MEMBER_LABEL + ") ON (n.aggregateType, n.aggregateId)");
-                tx.run("CREATE INDEX javai_taggregate_members_member IF NOT EXISTS FOR (n:"
-                        + TAGGREGATE_MEMBER_LABEL + ") ON (n.memberType, n.memberId)");
                 tx.run("CREATE INDEX javai_taggregate_pending_aggregate IF NOT EXISTS FOR (n:"
                         + TAGGREGATE_PENDING_LABEL + ") ON (n.aggregateType, n.aggregateId)");
                 return null;

@@ -258,6 +258,24 @@ public final class JavAIPI {
         return postgres.sessionFactory();
     }
 
+    /**
+     * The {@code @Taggregate} containment of the registered model for {@code config} (OMI-304) -- which
+     * containers hold a given member, which members a container holds, and the ambient transaction to write
+     * on. Backed by the very {@code Containment} instance this module already resolved for {@code @Summary}
+     * recomputation, so there is exactly one implementation of parents-from-child in the codebase.
+     *
+     * <p>Exists because {@code javai-tagging} needs that answer and must not keep its own copy of it: it
+     * used to maintain a {@code javai_taggregate_members} snapshot, which was written by reconciliation and
+     * therefore could not name a container nothing had reconciled yet. Every backend answers, each in its
+     * own storage's terms.
+     *
+     * <p>Resolves lazily on first use rather than at construction, preserving the deliberate absence of a
+     * startup ordering dependency between tagging and the entity mapper.
+     */
+    public static TaggregateContainment taggregateContainment(JavAIPersistenceConfig config) {
+        return backendFor(config).taggregateContainment();
+    }
+
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {
         return BACKENDS.computeIfAbsent(config, cfg -> switch (cfg.backend()) {
             case POSTGRES -> new RepositoryBackendHibernatePostgres(cfg);

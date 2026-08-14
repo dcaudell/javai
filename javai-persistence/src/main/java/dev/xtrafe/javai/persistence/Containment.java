@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.annotations.Summary;
+import dev.xtrafe.javai.annotations.Taggregate;
 import jakarta.persistence.Entity;
 import org.hibernate.Session;
 
@@ -54,12 +55,15 @@ final class Containment {
     /**
      * One declared containment edge: {@code parentType.fieldName} can hold {@code childType}.
      *
-     * <p>{@code summary} records whether the field carries {@code @Summary}, because the two consumers want
-     * different subsets. Summary recomputation cares only about annotated fields; detaching an entity before
-     * deleting it cares about <em>every</em> mapped collection, since a foreign key does not check whether
-     * the association was interesting enough to be summarised.
+     * <p>{@code summary} records whether the field carries {@code @Summary} and {@code taggregate} whether it
+     * carries {@code @Taggregate}, because the consumers want different subsets. Summary recomputation cares
+     * only about {@code @Summary} fields; Taggregate only about {@code @Taggregate} ones (OMI-304); detaching
+     * an entity before deleting it cares about <em>every</em> mapped collection, since a foreign key does not
+     * check whether the association was interesting enough to be summarised. The two annotations are
+     * independent — a field may carry both, either, or neither.
      */
-    record Edge(Class<?> parentType, String fieldName, Class<?> childType, Kind kind, boolean summary) {
+    record Edge(Class<?> parentType, String fieldName, Class<?> childType, Kind kind, boolean summary,
+            boolean taggregate) {
     }
 
     enum Kind {
@@ -85,6 +89,7 @@ final class Containment {
         for (Class<?> parentType : registeredEntityTypes) {
             for (Field field : EntityReflection.allFields(parentType)) {
                 boolean summary = field.isAnnotationPresent(Summary.class);
+                boolean taggregate = field.isAnnotationPresent(Taggregate.class);
                 Class<?> declared = field.getType();
                 if (Map.class.isAssignableFrom(declared) || Collection.class.isAssignableFrom(declared)) {
                     Class<?> element = elementType(field, Map.class.isAssignableFrom(declared) ? 1 : 0);
@@ -92,14 +97,20 @@ final class Containment {
                         // Always native: a collection of entities that is not a mapped association is
                         // refused at registration (OMI-277), so there is no second shape left to detect.
                         edges.add(new Edge(parentType, field.getName(), element, Kind.NATIVE_COLLECTION,
-                                summary));
+                                summary, taggregate));
                     }
-                } else if (summary && declared.isAnnotationPresent(Entity.class)) {
-                    // Singular references are collected only when they are @Summary. A to-one is not
-                    // something an entity can be *detached* from on the way to being deleted -- nulling
-                    // someone else's field is a change to their data, not a cleanup -- so the delete path
-                    // has no use for the rest, and letting the foreign key refuse is the honest outcome.
-                    edges.add(new Edge(parentType, field.getName(), declared, Kind.NATIVE_SINGULAR, true));
+                } else if ((summary || taggregate) && declared.isAnnotationPresent(Entity.class)) {
+                    // Singular references are collected only when annotated. A to-one is not something an
+                    // entity can be *detached* from on the way to being deleted -- nulling someone else's
+                    // field is a change to their data, not a cleanup -- so the delete path has no use for
+                    // the rest, and letting the foreign key refuse is the honest outcome.
+                    //
+                    // @Taggregate joins @Summary here rather than riding on it: a singular @Taggregate
+                    // reference is a real adopter shape (an asset absorbing its own social details), and
+                    // collecting only @Summary ones would make that field's taggings invisible to every
+                    // container above it.
+                    edges.add(new Edge(parentType, field.getName(), declared, Kind.NATIVE_SINGULAR,
+                            summary, taggregate));
                 }
             }
         }
@@ -150,17 +161,7 @@ final class Containment {
             // Named from the @Id field rather than assumed to be "id": identity is located by annotation
             // everywhere else in this module, and an entity whose key field is called something else would
             // otherwise fail here with a query-parsing error rather than anywhere near its cause.
-            String parentId = EntityReflection.idField(edge.parentType()).getName();
-            String childIdField = EntityReflection.idField(childType).getName();
-            switch (edge.kind()) {
-                case NATIVE_COLLECTION -> collectHql(session, owners, edge,
-                        "select p." + parentId + " from " + edge.parentType().getName() + " p"
-                                + " join p." + edge.fieldName() + " c where c." + childIdField + " = :childId",
-                        childId);
-                case NATIVE_SINGULAR -> collectHql(session, owners, edge,
-                        "select p." + parentId + " from " + edge.parentType().getName() + " p"
-                                + " where p." + edge.fieldName() + "." + childIdField + " = :childId", childId);
-            }
+            collectHql(session, owners, edge, parentsHql(edge, childType), childId);
         }
         return owners;
     }
@@ -170,18 +171,113 @@ final class Containment {
      *  field to remove the child from, not merely that some field does. */
     Set<OwnerRef> ownersHolding(Session session, Edge edge, Class<?> childType, UUID childId) {
         Set<OwnerRef> owners = new LinkedHashSet<>();
-        String parentId = EntityReflection.idField(edge.parentType()).getName();
-        String childIdField = EntityReflection.idField(childType).getName();
-        switch (edge.kind()) {
-            case NATIVE_COLLECTION -> collectHql(session, owners, edge,
-                    "select p." + parentId + " from " + edge.parentType().getName() + " p"
-                            + " join p." + edge.fieldName() + " c where c." + childIdField + " = :childId",
-                    childId);
-            case NATIVE_SINGULAR -> collectHql(session, owners, edge,
-                    "select p." + parentId + " from " + edge.parentType().getName() + " p"
-                            + " where p." + edge.fieldName() + "." + childIdField + " = :childId", childId);
+        collectHql(session, owners, edge, parentsHql(edge, childType), childId);
+        return owners;
+    }
+
+    // ---- Taggregate (OMI-304) -- the same declared shape, read for the other annotation ----------------
+
+    /** Whether anything at all declares a {@code @Taggregate} field -- lets a model that uses none skip the
+     *  Taggregate machinery entirely, exactly as {@link #hasNoSummaries} does for summaries. */
+    boolean hasNoTaggregates() {
+        return edges.stream().noneMatch(Edge::taggregate);
+    }
+
+    /**
+     * Every container currently holding {@code (childType, childId)} through a {@code @Taggregate} field.
+     *
+     * <p>The Taggregate counterpart of {@link #containersOf}, and the whole reason OMI-304 could delete the
+     * {@code javai_taggregate_members} snapshot: the join table <em>is</em> the membership, so this answer
+     * cannot be stale and needs no prior reconciliation pass to become true. A container that has never been
+     * reconciled is found here the first time one of its members is tagged.
+     */
+    Set<OwnerRef> taggregateContainersOf(Session session, Class<?> childType, UUID childId) {
+        Set<OwnerRef> owners = new LinkedHashSet<>();
+        for (Edge edge : edges) {
+            if (!edge.taggregate() || !edge.childType().isAssignableFrom(childType)) {
+                continue;
+            }
+            collectHql(session, owners, edge, parentsHql(edge, childType), childId);
         }
         return owners;
+    }
+
+    /**
+     * Every member {@code (type, id)} currently held by {@code (containerType, containerId)} through its
+     * {@code @Taggregate} fields -- the forward direction, and what lets a recompute be a query rather than
+     * a walk of a loaded object's lazy collections.
+     *
+     * <p>⚠️ That distinction is a defect class, not a preference: walking the object required the caller to
+     * hold an open session, and an entity read outside one threw {@code LazyInitializationException} the
+     * moment the aggregate touched a {@code @ManyToMany}. A query has no such requirement.
+     */
+    Set<OwnerRef> taggregateMembersOf(Session session, Class<?> containerType, UUID containerId) {
+        Set<OwnerRef> members = new LinkedHashSet<>();
+        for (Edge edge : edges) {
+            if (!edge.taggregate() || !edge.parentType().isAssignableFrom(containerType)) {
+                continue;
+            }
+            String parentId = EntityReflection.idField(edge.parentType()).getName();
+            String childIdField = EntityReflection.idField(edge.childType()).getName();
+            String hql = switch (edge.kind()) {
+                case NATIVE_COLLECTION -> "select c." + childIdField + " from " + edge.parentType().getName()
+                        + " p join p." + edge.fieldName() + " c where p." + parentId + " = :containerId";
+                case NATIVE_SINGULAR -> "select p." + edge.fieldName() + "." + childIdField + " from "
+                        + edge.parentType().getName() + " p where p." + parentId + " = :containerId"
+                        + " and p." + edge.fieldName() + " is not null";
+            };
+            for (UUID memberId : session.createQuery(hql, UUID.class)
+                    .setParameter("containerId", containerId).getResultList()) {
+                members.add(new OwnerRef(edge.childType(), memberId));
+            }
+        }
+        return members;
+    }
+
+    /**
+     * The declared {@code @Taggregate} edges, for a backend that must issue its own store-native query
+     * rather than HQL.
+     *
+     * <p>This is the reuse boundary that keeps one notion of containment across three stores: the
+     * <em>declaration</em> -- which field of which type holds what -- is read once, here, by reflection that
+     * has nothing to do with any database. Only the traversal differs per backend (HQL, Cypher, a reference
+     * array). A backend that re-derived the declaration itself would be the second implementation OMI-304
+     * exists to prevent.
+     */
+    List<Edge> taggregateEdges() {
+        return edges.stream().filter(Edge::taggregate).toList();
+    }
+
+    /** Every type that declares at least one {@code @Taggregate} field -- the containers {@code rebuild} has
+     *  to visit, since a repair pass cannot be driven by a pending set that direct SQL never wrote to. */
+    Set<Class<?>> taggregateContainerTypes() {
+        Set<Class<?>> types = new LinkedHashSet<>();
+        for (Edge edge : edges) {
+            if (edge.taggregate()) {
+                types.add(edge.parentType());
+            }
+        }
+        return types;
+    }
+
+    /** Every persisted id of {@code containerType} -- {@code rebuild}'s work list for one container type. */
+    List<UUID> idsOf(Session session, Class<?> containerType) {
+        String idField = EntityReflection.idField(containerType).getName();
+        return session.createQuery(
+                "select p." + idField + " from " + containerType.getName() + " p", UUID.class).getResultList();
+    }
+
+    /** The parents-of-child HQL both {@link #containersOf} and {@link #taggregateContainersOf} issue -- one
+     *  query shape, so the two annotations cannot drift into two different notions of containment. */
+    private static String parentsHql(Edge edge, Class<?> childType) {
+        String parentId = EntityReflection.idField(edge.parentType()).getName();
+        String childIdField = EntityReflection.idField(childType).getName();
+        return switch (edge.kind()) {
+            case NATIVE_COLLECTION -> "select p." + parentId + " from " + edge.parentType().getName() + " p"
+                    + " join p." + edge.fieldName() + " c where c." + childIdField + " = :childId";
+            case NATIVE_SINGULAR -> "select p." + parentId + " from " + edge.parentType().getName() + " p"
+                    + " where p." + edge.fieldName() + "." + childIdField + " = :childId";
+        };
     }
 
     private static void collectHql(Session session, Set<OwnerRef> owners, Edge edge, String hql, UUID childId) {
