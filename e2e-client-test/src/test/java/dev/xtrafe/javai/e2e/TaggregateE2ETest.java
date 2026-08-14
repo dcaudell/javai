@@ -13,7 +13,6 @@ import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.fixtures.ArticleFixtures;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.VectorizableString;
-import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.tagging.ClassificationResult;
 import dev.xtrafe.javai.tagging.JavAITagRepository;
 import dev.xtrafe.javai.tagging.RankedTaggableRef;
@@ -25,13 +24,11 @@ import dev.xtrafe.javai.tagging.TaggableRef;
 import dev.xtrafe.javai.tagging.Tagging;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.VectorMath;
-import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -39,20 +36,15 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Taggregate (OMI-302), end to end: {@code javai-tagging}'s own module tests prove the mechanism against
- * flat, mostly-unpersisted fixtures and a hash-based fake embedding provider; this class's job is the
- * composition that suite cannot exercise -- a real, persisted, three-level container domain
- * ({@link Library} of {@link Shelf} of {@link Anthology} of {@link Article}/{@link Comment}) with lazy
- * Hibernate associations, heterogeneous container/member lineage in both directions (plain {@code Anthology}
- * holding woven members; woven {@code Shelf} holding plain containers), and <b>real semantic embeddings</b>,
- * so the concatenated tag-text vector's actual retrieval quality is asserted, not just its storage.
+ * Taggregate end to end, as a downstream consumer writes it (OMI-302, rebuilt on containment by OMI-304):
+ * a real persisted three-level container domain ({@link Library} of {@link Shelf} of {@link Anthology} of
+ * {@link Article}/{@link Comment}) with lazy Hibernate-owned associations, real embeddings, and all three
+ * backends.
  *
- * <p>Postgres carries the deep coverage, matching the rest of the suite's convention; Neo4j and MongoDB each
- * get the full single-container flow (aggregate, rankedByTags, tag text served). Two Postgres tests use
- * deliberately <em>unpersisted</em> containers: a JPA {@code @OneToMany} join table enforces single-parent
- * membership, so a diamond (one article in two anthologies) is built in memory -- which the ref-keyed
- * Taggregate stores support by construction, and which doubles as the e2e pin that a container needs no
- * persistence of its own on this backend.
+ * <p>⚠️ <b>The adopter-facing point of this file is what is absent from it.</b> There is no reconciler, no
+ * loader, no sweep, no bootstrap pass and no type→repository map -- the whole ~190-line
+ * {@code TaggregateReconciler} an adopter used to need. Every test tags a member and asserts the
+ * containers. That is the entire API.
  */
 class TaggregateE2ETest {
 
@@ -74,10 +66,6 @@ class TaggregateE2ETest {
         postgresLibraries = JavAIEnvironment.postgresLibraryRepository();
     }
 
-    private static TaggableRef refOf(Object instance, java.util.UUID id) {
-        return new TaggableRef(instance.getClass().getName(), id);
-    }
-
     private static Tagging aggregateRowFor(List<Tagging> taggings, Tag tag) {
         return taggings.stream()
                 .filter(t -> Tagging.SOURCE_AGGREGATE.equals(t.source()) && t.tag().getId().equals(tag.getId()))
@@ -91,18 +79,15 @@ class TaggregateE2ETest {
     }
 
     private static Article fixtureArticle(ArticleFixtures.Topic topic, int index) {
-        List<Article> matching = ArticleFixtures.newArticles().stream()
+        return ArticleFixtures.newArticles().stream()
                 .filter(article -> ArticleFixtures.topicOf(article.getTitle()) == topic)
-                .toList();
-        return matching.get(index);
+                .toList().get(index);
     }
 
     // ---- Postgres -----------------------------------------------------------------------------
 
-    /** One container, every {@code @Taggregate} placement at once: the singular reference, both typed
-     *  collections (heterogeneous {@code Article} + {@code Comment} membership), tags from two different
-     *  {@code TagSet}s aggregating side by side, and the read path itself ({@code taggingsOf}, no explicit
-     *  reconcile) detecting the never-reconciled container by snapshot drift. */
+    /** Heterogeneous membership across both collection fields and two TagSets, on a container nothing has
+     *  reconciled -- one {@code addTag} per member is the whole interaction. */
     @Test
     void postgresAnthologyAggregatesHeterogeneousMembersAcrossFieldsAndSets() {
         JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
@@ -128,25 +113,24 @@ class TaggregateE2ETest {
         assertEquals(0.5, aggregateRowFor(taggings, malware).affinity(), 1e-9,
                 "(0.9 + 0.6 + 0) / 3 members, across the reference field and both collections");
         assertEquals(1.0 / 3, aggregateRowFor(taggings, editorsPick).affinity(), 1e-9,
-                "tags from a second TagSet aggregate side by side, distinguishable at query time by set");
+                "a second TagSet aggregates side by side");
     }
 
-    /** The taggregate-of-taggregate-of-taggregate chain, numerically: an affinity applied three levels down
-     *  divides through each tier's member count, a sibling anthology with an untagged member dilutes the
-     *  shelf, and the woven/plain lineage mix ({@code Shelf} is genuinely load-time woven; its neighbours
-     *  are not) changes nothing. {@code Shelf} also pins the opt-in split: it aggregates but never opted
-     *  into tag text, while {@code Library} serves a text derived from tags three levels below it. */
+    /**
+     * The taggregate-of-taggregate-of-taggregate chain, from one tag applied three levels down and nothing
+     * else. Under the snapshot design this needed a bootstrap pass over every level first, in the right
+     * order; containment needs none, and the drain carries the change up on its own.
+     */
     @Test
-    void postgresTaggregateOfTaggregateOfTaggregateComposesNumerically() {
+    void postgresThreeLevelNestingComposesFromOneTagCall() {
         JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet set = postgresTagSets.save(new TagSet("e2e-nesting"));
         Tag topic = postgresTags.save(new Tag(set, "en", "Deep Nesting Topic"));
 
         Anthology tagged = new Anthology("nesting-tagged");
         Article carrier = fixtureArticle(ArticleFixtures.Topic.SPACE, 0);
-        Article silent = fixtureArticle(ArticleFixtures.Topic.SPACE, 1);
         tagged.getArticles().add(carrier);
-        tagged.getArticles().add(silent);
+        tagged.getArticles().add(fixtureArticle(ArticleFixtures.Topic.SPACE, 1));
         Anthology diluting = new Anthology("nesting-diluting");
         diluting.getArticles().add(fixtureArticle(ArticleFixtures.Topic.SPORTS, 0));
 
@@ -164,23 +148,16 @@ class TaggregateE2ETest {
         assertTrue(tagging.taggingsOf(diluting).isEmpty(), "no member tags, no aggregate rows");
         assertEquals(0.2, aggregateRowFor(tagging.taggingsOf(shelf), topic).affinity(), 1e-9,
                 "the tagged anthology's 0.4 diluted by its untagged sibling");
-        assertEquals(0.2, aggregateRowFor(tagging.taggingsOf(library), topic).affinity(), 1e-9,
-                "a single-shelf library mirrors its shelf");
+        assertEquals(0.2, aggregateRowFor(tagging.taggingsOf(library), topic).affinity(), 1e-9);
 
-        assertNull(tagging.tagText(shelf), "aggregating without concatenate = true must produce no tag text");
+        assertNull(tagging.tagText(shelf), "aggregating without concatenate = true produces no tag text");
         assertEquals("Deep Nesting Topic", tagging.tagText(library),
-                "the library's tag text derives, transitively, from a tag applied three levels down");
+                "the library's tag text derives from a tag applied three levels down");
     }
 
-    /**
-     * Update propagation, all three mutation choke points, through all three levels -- and through the
-     * <b>sweep alone</b>, verified by a search-only read ({@code taggedWith}) that never recomputes on its
-     * own. The loader hands back this test's live objects; the repository-loader idiom (with its lazy-
-     * initialization obligation) is exercised separately by
-     * {@link #postgresMembershipDriftIsSeenOnReadAndByTheRepositoryLoaderSweep}.
-     */
+    /** Every mutation choke point drives the chain, and removal propagates back out of it. */
     @Test
-    void postgresUpdatesPropagateThroughThreeLevelsViaTheSweep() {
+    void postgresUpdatesPropagateThroughEveryChokePoint() {
         JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet set = postgresTagSets.save(new TagSet("e2e-propagation"));
         Tag topic = postgresTags.save(new Tag(set, "en", "Propagation Topic"));
@@ -195,106 +172,51 @@ class TaggregateE2ETest {
         postgresLibraries.save(library);
 
         tagging.addTag(leaf, topic, 0.5);
-        // Establish the chain bottom-up once -- before any snapshot exists, no choke point can know who
-        // contains whom; every later mutation propagates through those snapshots on its own.
-        tagging.reconcileTaggregate(anthology);
-        tagging.reconcileTaggregate(shelf);
-        tagging.reconcileTaggregate(library);
-        Map<TaggableRef, Object> live = new HashMap<>();
-        live.put(refOf(anthology, anthology.getId()), anthology);
-        live.put(refOf(shelf, shelf.getId()), shelf);
-        live.put(refOf(library, library.getId()), library);
-        TaggableRef libraryRef = refOf(library, library.getId());
         assertEquals(0.5, aggregateRowFor(tagging.taggingsOf(library), topic).affinity(), 1e-9);
 
-        // Affinity update at the leaf (addTag choke point) -> the sweep alone trues the whole chain, proven
-        // by a search-only read of the top level.
-        tagging.addTag(leaf, topic, 0.9);
-        sweepUntilQuiet(tagging, live);
-        assertTrue(tagging.taggedWith(topic, List.of(Library.class)).contains(libraryRef));
+        tagging.addTag(leaf, topic, 0.9);   // affinity update
         assertEquals(0.9, aggregateRowFor(tagging.taggingsOf(library), topic).affinity(), 1e-9);
         assertEquals(0.9, aggregateRowFor(tagging.taggingsOf(shelf), topic).affinity(), 1e-9);
 
-        // Removal at the leaf (removeTag choke point) -> the tag leaves every level.
         tagging.removeTag(leaf, topic);
-        sweepUntilQuiet(tagging, live);
-        assertFalse(tagging.taggedWith(topic, List.of(Library.class)).contains(libraryRef));
         assertFalse(hasAggregateRowFor(tagging.taggingsOf(anthology), topic));
         assertFalse(hasAggregateRowFor(tagging.taggingsOf(library), topic));
 
-        // Reclassification at the leaf (applyClassification choke point) -> the auto row's affinity
-        // reappears at every level.
         tagging.applyClassification(leaf, set,
                 List.of(new ClassificationResult.AppliedTag(topic, 0.7, null)));
-        sweepUntilQuiet(tagging, live);
-        assertEquals(0.7, aggregateRowFor(tagging.taggingsOf(anthology), topic).affinity(), 1e-9);
-        assertEquals(0.7, aggregateRowFor(tagging.taggingsOf(shelf), topic).affinity(), 1e-9);
         assertEquals(0.7, aggregateRowFor(tagging.taggingsOf(library), topic).affinity(), 1e-9);
     }
 
-    /** Drains the pending set completely: one sweep pass claims oldest-first, and a pass that reconciled
-     *  something may itself re-mark parents (a recompute that changed rows marks its containers), so loop
-     *  until a pass finds nothing. Aggregates belonging to other tests claim as unloadable and are dropped,
-     *  which is the documented behaviour. */
-    private static void sweepUntilQuiet(JavAITagRepository tagging, Map<TaggableRef, Object> live) {
-        int guard = 0;
-        while (tagging.reconcilePendingTaggregates(100, live::get) > 0) {
-            if (++guard > 10) {
-                throw new AssertionError("pending sweep did not converge within 10 passes");
-            }
-        }
-    }
-
-    /**
-     * A diamond -- one article in two anthologies, both on one shelf -- built from <em>unpersisted</em>
-     * containers over persisted members (see the class javadoc for why), proving membership is genuinely
-     * ref-keyed and that a leaf update fans out to every containing aggregate, not just the first one the
-     * snapshot lookup happens to return.
-     */
+    /** A diamond: one article in two anthologies on one shelf. One leaf update reaches both sides, which is
+     *  what a containment query gives and a first-container-wins lookup would not. */
     @Test
     void postgresDiamondMembershipFansUpdatesOutToBothContainers() {
         JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
         TagSet set = postgresTagSets.save(new TagSet("e2e-diamond"));
         Tag shared = postgresTags.save(new Tag(set, "en", "Diamond Shared"));
-        Tag solo = postgresTags.save(new Tag(set, "en", "Diamond Solo"));
 
         Article sharedArticle = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.SPORTS, 1));
-        Article leftOnly = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.SPORTS, 2));
-        Article rightOnly = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.SPORTS, 3));
-        tagging.addTag(sharedArticle, shared, 0.6);
-        tagging.addTag(rightOnly, solo, 0.8);
-
         Anthology left = new Anthology("diamond-left");
         left.getArticles().add(sharedArticle);
-        left.getArticles().add(leftOnly);
+        left.getArticles().add(fixtureArticle(ArticleFixtures.Topic.SPORTS, 2));
         Anthology right = new Anthology("diamond-right");
         right.getArticles().add(sharedArticle);
-        right.getArticles().add(rightOnly);
         Shelf shelf = new Shelf("diamond-shelf");
         shelf.getAnthologies().add(left);
         shelf.getAnthologies().add(right);
+        postgresShelves.save(shelf);
 
-        assertEquals(0.3, aggregateRowFor(tagging.taggingsOf(left), shared).affinity(), 1e-9);
-        List<Tagging> rightRows = tagging.taggingsOf(right);
-        assertEquals(0.3, aggregateRowFor(rightRows, shared).affinity(), 1e-9);
-        assertEquals(0.4, aggregateRowFor(rightRows, solo).affinity(), 1e-9);
-        List<Tagging> shelfRows = tagging.taggingsOf(shelf);
-        assertEquals(0.3, aggregateRowFor(shelfRows, shared).affinity(), 1e-9, "(0.3 + 0.3) / 2 anthologies");
-        assertEquals(0.2, aggregateRowFor(shelfRows, solo).affinity(), 1e-9);
+        tagging.addTag(sharedArticle, shared, 0.6);
 
-        // The shared leaf updates once; both sides of the diamond (and the shelf above them) follow.
-        tagging.addTag(sharedArticle, shared, 1.0);
-        assertEquals(0.5, aggregateRowFor(tagging.taggingsOf(left), shared).affinity(), 1e-9);
-        assertEquals(0.5, aggregateRowFor(tagging.taggingsOf(right), shared).affinity(), 1e-9);
-        assertEquals(0.5, aggregateRowFor(tagging.taggingsOf(shelf), shared).affinity(), 1e-9);
+        assertEquals(0.3, aggregateRowFor(tagging.taggingsOf(left), shared).affinity(), 1e-9, "0.6 over two");
+        assertEquals(0.6, aggregateRowFor(tagging.taggingsOf(right), shared).affinity(), 1e-9, "0.6 over one");
+        assertEquals(0.45, aggregateRowFor(tagging.taggingsOf(shelf), shared).affinity(), 1e-9,
+                "(0.3 + 0.6) / 2 anthologies -- both sides of the diamond reached");
     }
 
     /**
-     * Two tags whose <b>display names</b> collide while their slugs differ -- one authored in English
-     * ({@code firewall}), one authored in French and localized into English afterward
-     * ({@code le-pare-feu}, slug fixed at creation, display {@code "Firewall"} added later). They must stay
-     * distinct rows in the aggregate, sum separately in {@code rankedByTags}, and render as two entries in
-     * a deterministic tag text -- identical words, slug-tie-broken order, run after run.
+     * Two tags with identical display names but different slugs -- one authored in English, one in French
+     * and localized afterward -- stay distinct rows through aggregation, ranking and rendered text.
      */
     @Test
     void postgresSameDisplayNameDifferentSlugTagsStayDistinctEverywhere() {
@@ -308,32 +230,30 @@ class TaggregateE2ETest {
         assertEquals("le-pare-feu", french.getSlug());
 
         Article article = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.CYBERSECURITY, 2));
-        tagging.addTag(article, english, 0.9);
-        tagging.addTag(article, french, 0.4);
         Anthology anthology = new Anthology("collision-anthology");
         anthology.getArticles().add(article);
         postgresAnthologies.save(anthology);
 
+        tagging.addTag(article, english, 0.9);
+        tagging.addTag(article, french, 0.4);
+
         List<Tagging> taggings = tagging.taggingsOf(anthology);
         assertEquals(0.9, aggregateRowFor(taggings, english).affinity(), 1e-9);
         assertEquals(0.4, aggregateRowFor(taggings, french).affinity(), 1e-9,
-                "same display name, different slug: two distinct aggregate rows, never merged");
-
+                "same display name, different slug: two distinct rows, never merged");
         assertEquals("Firewall, Firewall", tagging.tagText(anthology),
                 "both entries render; affinity orders them; determinism holds despite identical words");
 
-        List<RankedTaggableRef> ranked = tagging.rankedByTags(
-                List.of(english, french), List.of(Anthology.class), 10);
-        TaggableRef anthologyRef = refOf(anthology, anthology.getId());
-        RankedTaggableRef hit = ranked.stream().filter(r -> r.ref().equals(anthologyRef)).findFirst().orElseThrow();
+        TaggableRef ref = new TaggableRef(Anthology.class.getName(), anthology.getId());
+        RankedTaggableRef hit = tagging.rankedByTags(List.of(english, french), List.of(Anthology.class), 10)
+                .stream().filter(r -> r.ref().equals(ref)).findFirst().orElseThrow();
         assertEquals(1.3, hit.similarity(), 1e-9, "0.9 + 0.4 -- each colliding tag scores separately");
     }
 
     /**
-     * The point of the tag-text vector, measured: with <b>real</b> embeddings, a container whose members'
-     * tags are about cooking must rank nearer a natural-language cooking query than a security one, in both
-     * directions, and win the head-to-head ranking in the shared index. The queries deliberately share no
-     * vocabulary with the tag display names -- this passes on semantic quality or not at all.
+     * The tag-text vector's actual retrieval quality, with real embeddings: a container whose members' tags
+     * are about cooking must read nearer a natural-language cooking query than a security one, in both
+     * directions. The queries share no vocabulary with the tag names.
      */
     @Test
     void postgresConcatenatedTagTextVectorQualityWithRealEmbeddings() {
@@ -346,21 +266,19 @@ class TaggregateE2ETest {
 
         Article cookingOne = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.COOKING, 1));
         Article cookingTwo = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.COOKING, 2));
-        tagging.addTag(cookingOne, homeCooking, 0.95);
-        tagging.addTag(cookingTwo, mealPrep, 0.9);
         Anthology cookingAnthology = new Anthology("quality-cooking");
         cookingAnthology.getArticles().add(cookingOne);
         cookingAnthology.getArticles().add(cookingTwo);
         postgresAnthologies.save(cookingAnthology);
-        tagging.reconcileTaggregate(cookingAnthology);
+        tagging.addTag(cookingOne, homeCooking, 0.95);
+        tagging.addTag(cookingTwo, mealPrep, 0.9);
 
         Article securityOne = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.CYBERSECURITY, 3));
-        tagging.addTag(securityOne, cybersecurity, 0.95);
-        tagging.addTag(securityOne, ransomware, 0.9);
         Anthology securityAnthology = new Anthology("quality-security");
         securityAnthology.getArticles().add(securityOne);
         postgresAnthologies.save(securityAnthology);
-        tagging.reconcileTaggregate(securityAnthology);
+        tagging.addTag(securityOne, cybersecurity, 0.95);
+        tagging.addTag(securityOne, ransomware, 0.9);
 
         EmbeddingVector cookingQuery = new VectorizableString(
                 "what should I make for dinner tonight with the ingredients in my fridge").vector();
@@ -378,155 +296,91 @@ class TaggregateE2ETest {
                         > VectorMath.cosineSimilarity(securityText, cookingQuery),
                 "and the security anthology's the reverse");
 
-        // Head to head in the shared index: other tests' entries may rank in between, so assert relative
-        // order of these two rather than absolute first place.
-        TaggableRef cookingRef = refOf(cookingAnthology, cookingAnthology.getId());
-        TaggableRef securityRef = refOf(securityAnthology, securityAnthology.getId());
+        TaggableRef cookingRef = new TaggableRef(Anthology.class.getName(), cookingAnthology.getId());
+        TaggableRef securityRef = new TaggableRef(Anthology.class.getName(), securityAnthology.getId());
         JavAIList<TaggableRef> byCookingQuery = tagging.tagTextIndex().nearestN(cookingQuery, 50);
-        assertTrue(byCookingQuery.indexOf(cookingRef) >= 0, "cooking anthology must be retrievable by language");
         int cookingRank = byCookingQuery.indexOf(cookingRef);
         int securityRank = byCookingQuery.indexOf(securityRef);
+        assertTrue(cookingRank >= 0, "the cooking anthology must be retrievable by language");
         assertTrue(securityRank < 0 || cookingRank < securityRank,
                 "a cooking query must rank the cooking anthology above the security one");
     }
 
     /**
-     * Membership drift on a <b>persisted</b> container: a member added to the real Hibernate-owned
-     * collection is invisible to every choke point, is seen by a read holding the (reloaded, lazy)
-     * container inside a unit of work, and is seen by the sweep when the loader is the documented
-     * repository idiom -- which must initialize the lazy {@code @Taggregate} collections before returning,
-     * since the recompute's reflective walk runs after the loading session closes.
+     * A member added to a container after the fact changes what the aggregate <em>should</em> say (the mean
+     * dilutes), and no tag mutation happened to notice. This pins the honest consequence of OMI-304's "the
+     * choke points are the only trigger": the next tag mutation beneath that container corrects it, and
+     * {@code rebuildTaggregates()} corrects it without one.
      */
     @Test
-    void postgresMembershipDriftIsSeenOnReadAndByTheRepositoryLoaderSweep() {
+    void postgresMembershipChangeIsCorrectedByTheNextTagMutationOrByRebuild() {
         JavAITagRepository tagging = JavAIEnvironment.postgresTagging();
-        TagSet set = postgresTagSets.save(new TagSet("e2e-drift"));
-        Tag original = postgresTags.save(new Tag(set, "en", "Drift Original"));
-        Tag late = postgresTags.save(new Tag(set, "en", "Drift Late"));
+        TagSet set = postgresTagSets.save(new TagSet("e2e-membership"));
+        Tag topic = postgresTags.save(new Tag(set, "en", "Membership Topic"));
 
         Article first = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.SPACE, 2));
-        tagging.addTag(first, original, 0.8);
-        Anthology anthology = new Anthology("drift-anthology");
+        Anthology anthology = new Anthology("membership-anthology");
         anthology.getArticles().add(first);
         postgresAnthologies.save(anthology);
-        tagging.reconcileTaggregate(anthology);
-        assertEquals(0.8, aggregateRowFor(tagging.taggingsOf(anthology), original).affinity(), 1e-9);
+        tagging.addTag(first, topic, 0.8);
+        assertEquals(0.8, aggregateRowFor(tagging.taggingsOf(anthology), topic).affinity(), 1e-9);
 
         Article latecomer = postgresArticles.save(fixtureArticle(ArticleFixtures.Topic.SPACE, 3));
-        tagging.addTag(latecomer, late, 0.6);
         anthology.getArticles().add(latecomer);
         postgresAnthologies.save(anthology);
 
-        // Search-only reads stay on the last-reconciled state...
-        TaggableRef anthologyRef = refOf(anthology, anthology.getId());
-        assertFalse(tagging.taggedWith(late, List.of(Anthology.class)).contains(anthologyRef));
+        // Nothing was tagged, so nothing recomputed -- the stored value still describes one member.
+        assertEquals(0.8, aggregateRowFor(tagging.taggingsOf(anthology), topic).affinity(), 1e-9);
 
-        // ...a read holding the reloaded container -- lazy collections and all -- detects the drift...
-        List<Tagging> reloadedRows = JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () ->
-                tagging.taggingsOf(postgresAnthologies.findById(anthology.getId()).orElseThrow()));
-        assertEquals(0.4, aggregateRowFor(reloadedRows, original).affinity(), 1e-9, "0.8 over two members now");
-        assertEquals(0.3, aggregateRowFor(reloadedRows, late).affinity(), 1e-9);
-
-        // ...and so does the sweep, with the adopter's own repositories as the loader. The loader
-        // initializes the lazy member collections inside its own unit of work -- the reflective walk runs
-        // detached, after this session has closed.
-        tagging.markTaggregateStale(anthology);
-        int reconciled = tagging.reconcilePendingTaggregates(100, ref -> {
-            if (!ref.taggableType().equals(Anthology.class.getName())) {
-                return null;
-            }
-            return JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
-                Anthology loaded = postgresAnthologies.findById(ref.taggableId()).orElse(null);
-                if (loaded != null) {
-                    Hibernate.initialize(loaded.getArticles());
-                    Hibernate.initialize(loaded.getComments());
-                }
-                return loaded;
-            });
-        });
-        assertTrue(reconciled >= 1);
-        assertTrue(tagging.taggedWith(late, List.of(Anthology.class)).contains(anthologyRef),
-                "after the sweep, the search path sees the drifted-in member's tag");
-
-        List<RankedTaggableRef> ranked = tagging.rankedByTags(List.of(original, late), List.of(Anthology.class), 10);
-        RankedTaggableRef hit = ranked.stream().filter(r -> r.ref().equals(anthologyRef)).findFirst().orElseThrow();
-        assertEquals(0.7, hit.similarity(), 1e-9, "0.4 + 0.3 -- rankedByTags sums the aggregate rows");
+        assertTrue(tagging.rebuildTaggregates() > 0);
+        assertEquals(0.4, aggregateRowFor(tagging.taggingsOf(anthology), topic).affinity(), 1e-9,
+                "rebuild reads the join table, so the new member dilutes exactly as it should");
     }
 
-    // ---- Neo4j --------------------------------------------------------------------------------
+    // ---- Neo4j / MongoDB ----------------------------------------------------------------------
 
     @Test
-    void neo4jAnthologyAggregatesRanksAndServesTagText() {
-        JavAITagRepository tagging = JavAIEnvironment.neo4jTagging();
-        TagRepository tags = JavAIEnvironment.neo4jTagRepository();
-        TagSetRepository tagSets = JavAIEnvironment.neo4jTagSetRepository();
-        ArticleRepository articles = JavAIEnvironment.neo4jArticleRepository();
-        AnthologyRepository anthologies = JavAIEnvironment.neo4jAnthologyRepository();
+    void neo4jAnthologyAggregatesFromOneTagCall() {
+        assertAggregatesOnBackend(JavAIEnvironment.neo4jTagging(), JavAIEnvironment.neo4jTagRepository(),
+                JavAIEnvironment.neo4jTagSetRepository(), JavAIEnvironment.neo4jArticleRepository(),
+                JavAIEnvironment.neo4jAnthologyRepository(), "neo4j");
+    }
 
-        TagSet set = tagSets.save(new TagSet("e2e-neo4j-taggregate"));
-        Tag strong = tags.save(new Tag(set, "en", "Neo4j Strong Topic"));
-        Tag binary = tags.save(new Tag(set, "en", "Neo4j Binary Topic"));
+    @Test
+    void mongoAnthologyAggregatesFromOneTagCall() {
+        assertAggregatesOnBackend(JavAIEnvironment.mongoTagging(), JavAIEnvironment.mongoTagRepository(),
+                JavAIEnvironment.mongoTagSetRepository(), JavAIEnvironment.mongoArticleRepository(),
+                JavAIEnvironment.mongoAnthologyRepository(), "mongo");
+    }
+
+    /** The same contract on every backend: save a container, tag a member, read the container's aggregate.
+     *  Containment is answered from relationships on Neo4j and reference arrays on MongoDB, but nothing a
+     *  caller does differs. */
+    private static void assertAggregatesOnBackend(JavAITagRepository tagging, TagRepository tags,
+            TagSetRepository tagSets, ArticleRepository articles, AnthologyRepository anthologies,
+            String backend) {
+        TagSet set = tagSets.save(new TagSet("e2e-" + backend + "-taggregate"));
+        Tag strong = tags.save(new Tag(set, "en", backend + " Strong Topic"));
+        Tag binary = tags.save(new Tag(set, "en", backend + " Binary Topic"));
 
         Article one = articles.save(fixtureArticle(ArticleFixtures.Topic.SPACE, 0));
         Article two = articles.save(fixtureArticle(ArticleFixtures.Topic.SPACE, 1));
-        tagging.addTag(one, strong, 0.8);
-        tagging.addTag(two, binary);   // null affinity -> 1.0
-
-        Anthology anthology = new Anthology("neo4j-anthology");
+        Anthology anthology = new Anthology(backend + "-anthology");
         anthology.getArticles().add(one);
         anthology.getArticles().add(two);
         anthologies.save(anthology);
-        tagging.reconcileTaggregate(anthology);
 
-        List<Tagging> taggings = tagging.taggingsOf(anthology);
-        assertEquals(0.4, aggregateRowFor(taggings, strong).affinity(), 1e-9);
-        assertEquals(0.5, aggregateRowFor(taggings, binary).affinity(), 1e-9);
-
-        List<RankedTaggableRef> ranked = tagging.rankedByTags(List.of(strong, binary), List.of(Anthology.class), 10);
-        TaggableRef anthologyRef = new TaggableRef(Anthology.class.getName(), anthology.getId());
-        RankedTaggableRef hit = ranked.stream().filter(r -> r.ref().equals(anthologyRef)).findFirst().orElseThrow();
-        assertEquals(0.9, hit.similarity(), 1e-9);
-
-        assertEquals("Neo4j Binary Topic, Neo4j Strong Topic", tagging.tagText(anthology),
-                "affinity 0.5 outranks 0.4; display names, never slugs");
-        assertFalse(tagging.tagTextVector(anthology).isAbsent());
-    }
-
-    // ---- MongoDB ------------------------------------------------------------------------------
-
-    @Test
-    void mongoAnthologyAggregatesRanksAndServesTagText() {
-        JavAITagRepository tagging = JavAIEnvironment.mongoTagging();
-        TagRepository tags = JavAIEnvironment.mongoTagRepository();
-        TagSetRepository tagSets = JavAIEnvironment.mongoTagSetRepository();
-        ArticleRepository articles = JavAIEnvironment.mongoArticleRepository();
-        AnthologyRepository anthologies = JavAIEnvironment.mongoAnthologyRepository();
-
-        TagSet set = tagSets.save(new TagSet("e2e-mongo-taggregate"));
-        Tag strong = tags.save(new Tag(set, "en", "Mongo Strong Topic"));
-        Tag binary = tags.save(new Tag(set, "en", "Mongo Binary Topic"));
-
-        Article one = articles.save(fixtureArticle(ArticleFixtures.Topic.COOKING, 3));
-        Article two = articles.save(fixtureArticle(ArticleFixtures.Topic.SPORTS, 0));
         tagging.addTag(one, strong, 0.8);
         tagging.addTag(two, binary);   // null affinity -> 1.0
 
-        Anthology anthology = new Anthology("mongo-anthology");
-        anthology.getArticles().add(one);
-        anthology.getArticles().add(two);
-        anthologies.save(anthology);
-        tagging.reconcileTaggregate(anthology);
-
         List<Tagging> taggings = tagging.taggingsOf(anthology);
-        assertEquals(0.4, aggregateRowFor(taggings, strong).affinity(), 1e-9);
-        assertEquals(0.5, aggregateRowFor(taggings, binary).affinity(), 1e-9);
+        assertEquals(0.4, aggregateRowFor(taggings, strong).affinity(), 1e-9, backend);
+        assertEquals(0.5, aggregateRowFor(taggings, binary).affinity(), 1e-9, backend);
 
-        List<RankedTaggableRef> ranked = tagging.rankedByTags(List.of(strong, binary), List.of(Anthology.class), 10);
-        TaggableRef anthologyRef = new TaggableRef(Anthology.class.getName(), anthology.getId());
-        RankedTaggableRef hit = ranked.stream().filter(r -> r.ref().equals(anthologyRef)).findFirst().orElseThrow();
-        assertEquals(0.9, hit.similarity(), 1e-9);
-
-        assertEquals("Mongo Binary Topic, Mongo Strong Topic", tagging.tagText(anthology));
-        assertFalse(tagging.tagTextVector(anthology).isAbsent());
+        UUID id = anthology.getId();
+        TaggableRef ref = new TaggableRef(Anthology.class.getName(), id);
+        RankedTaggableRef hit = tagging.rankedByTags(List.of(strong, binary), List.of(Anthology.class), 10)
+                .stream().filter(r -> r.ref().equals(ref)).findFirst().orElseThrow();
+        assertEquals(0.9, hit.similarity(), 1e-9, backend);
     }
 }

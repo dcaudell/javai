@@ -278,4 +278,13 @@ interface RepositoryBackend {
 
     /** Deletes every entity matching the derived finder's predicate, returning how many were removed. */
     long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    /**
+     * This backend's answer to "which containers hold this member, and which members does this container
+     * hold", for {@code @Taggregate} (OMI-304) -- what {@code javai-tagging} consumes through
+     * {@link JavAIPI#taggregateContainment(JavAIPersistenceConfig)} in place of the membership snapshot it
+     * used to keep. Resolved lazily, never in a constructor: tagging deliberately does not depend on the
+     * entity mapper being ready at construction time, and by first use registration is necessarily complete.
+     */
+    TaggregateContainment taggregateContainment();
 }

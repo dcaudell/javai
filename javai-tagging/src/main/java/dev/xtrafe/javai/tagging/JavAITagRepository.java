@@ -15,6 +15,7 @@ import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.persistence.JavAIRepository;
 import dev.xtrafe.javai.persistence.PersistentEntities;
+import dev.xtrafe.javai.persistence.TaggregateContainment;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.VectorMath;
 
@@ -77,9 +78,14 @@ public final class JavAITagRepository {
      *  provider drop an arbitrary tail. */
     private static final int TAG_TEXT_TOP_K = 50;
 
+    /** How many pending aggregates one drain pass claims at a time. */
+    private static final int DRAIN_BATCH = 500;
+
     private final JavAIRepository<Tag> delegate;
     private final TaggingBackend backend;
     private final Cortex cortex; // nullable -- only classify()/classifyAll() need one
+    private final JavAIPersistenceConfig config; // nullable only for the test constructor below
+    private volatile TaggregateContainment containment;
 
     public JavAITagRepository(JavAIRepository<Tag> tagRepository, JavAIPersistenceConfig config) {
         this(tagRepository, config, null);
@@ -93,14 +99,17 @@ public final class JavAITagRepository {
         this.delegate = tagRepository;
         this.backend = BACKENDS.computeIfAbsent(config, JavAITagRepository::backendFor);
         this.cortex = cortex;
+        this.config = config;
     }
 
     /** Test-support only: injects the backend directly, so a test can wrap a real one in a counting
      *  decorator and assert the recompute cost discipline (one batched member read) structurally. */
-    JavAITagRepository(JavAIRepository<Tag> tagRepository, TaggingBackend backend, Cortex cortex) {
+    JavAITagRepository(JavAIRepository<Tag> tagRepository, TaggingBackend backend,
+            JavAIPersistenceConfig config, Cortex cortex) {
         this.delegate = tagRepository;
         this.backend = backend;
         this.cortex = cortex;
+        this.config = config;
     }
 
     /** Convenience factory: realizes its own {@link TagRepository} proxy via {@code JavAIPI.repository(...)}
@@ -140,9 +149,7 @@ public final class JavAITagRepository {
      * is not served by an entry that cannot name itself.
      */
     public List<Tagging> taggingsOf(Object instance) {
-        Object resolved = PersistentEntities.resolve(instance);
-        TaggableRef ref = refOf(resolved);
-        reconcileTaggregateIfStale(resolved, ref);
+        TaggableRef ref = refOf(instance);
         List<Tagging> taggings = new ArrayList<>();
         for (TagAssociation association : backend.associationsOf(ref)) {
             delegate.findById(association.tagId()).ifPresent(tag -> taggings.add(new Tagging(
@@ -167,7 +174,7 @@ public final class JavAITagRepository {
         TaggableRef ref = refOf(resolved);
         backend.addTag(ref, tag.getId(), null, Tagging.SOURCE_MANUAL);
         recomputeDerivedVectors(ref, resolved.getClass());
-        markContainingTaggregatesPending(ref);
+        markAndDrain(ref);
     }
 
     public void addTag(Object instance, Tag tag, double affinity) {
@@ -176,7 +183,7 @@ public final class JavAITagRepository {
         TaggableRef ref = refOf(resolved);
         backend.addTag(ref, tag.getId(), affinity, Tagging.SOURCE_MANUAL);
         recomputeDerivedVectors(ref, resolved.getClass());
-        markContainingTaggregatesPending(ref);
+        markAndDrain(ref);
     }
 
     /**
@@ -201,7 +208,7 @@ public final class JavAITagRepository {
         TaggableRef ref = refOf(resolved);
         backend.removeTag(ref, tag.getId());
         recomputeDerivedVectors(ref, resolved.getClass());
-        markContainingTaggregatesPending(ref);
+        markAndDrain(ref);
     }
 
     public boolean hasTag(Object instance, Tag tag) {
@@ -331,7 +338,7 @@ public final class JavAITagRepository {
             }
         }
         recomputeDerivedVectors(ref, resolved.getClass());
-        markContainingTaggregatesPending(ref);
+        markAndDrain(ref);
         return new ClassificationResult(ref, tagSet, applied);
     }
 
@@ -345,113 +352,151 @@ public final class JavAITagRepository {
         return results;
     }
 
-    // ---- Taggregate (OMI-302) -- see doc/spec/tagging.md's "Taggregate: derived taggings for containers" --
+    // ---- Taggregate (OMI-304) -- see doc/spec/tagging.md's "Taggregate: derived taggings for containers" --
 
     /**
-     * Recomputes {@code container}'s aggregate now, unconditionally -- the explicit repair path for a
-     * container the caller holds. Walks its {@code @Taggregate} fields reflectively, diffs the derived
-     * {@code source = "aggregate"} rows (never touching {@code manual}/{@code auto} rows -- the same
-     * provenance discipline {@link #applyClassification} follows for {@code auto}), rewrites the membership
-     * snapshot, recomputes the tag-summary vector once, and drains this container's own pending marks.
-     */
-    public void reconcileTaggregate(Object container) {
-        Object resolved = PersistentEntities.resolve(container);
-        TaggableRef ref = refOf(resolved);
-        TaggregatePendingClaim claim = backend.claimTaggregatePendingFor(ref);
-        recomputeAggregate(resolved, ref, TaggregateReflection.memberRefsOf(resolved));
-        backend.deleteTaggregatePending(claim.rowIds());
-    }
-
-    /**
-     * Marks {@code container} (and, transitively, every aggregate containing it) as owing a recompute --
-     * what an adopter calls on a known write path that wants tighter freshness than the sweep interval,
-     * e.g. right after mutating a member collection. The recompute itself happens lazily: at the next
-     * {@link #taggingsOf}/{@link #tagText} read holding the object, or at the next
-     * {@link #reconcilePendingTaggregates} sweep.
-     */
-    public void markTaggregateStale(Object container) {
-        TaggableRef ref = refOf(container);
-        backend.enqueueTaggregatePending(ref);
-        markContainingTaggregatesPending(ref);
-    }
-
-    /**
-     * Trues up aggregates nothing reads directly -- claims up to {@code limit} pending aggregates (oldest
-     * first) and reconciles each. The repair path an adopter runs deliberately, never a poller this module
-     * starts itself.
+     * Rebuilds every container's aggregate from its members, unconditionally -- <b>the only public
+     * Taggregate entry point</b>, and deliberately not something a normal application calls.
      *
-     * <p>⚠️ {@code loader} materializes a {@link TaggableRef} into the adopter's own entity -- required
-     * because this module cannot load arbitrary adopter types; the adopter's repositories can. A
-     * {@code null} from the loader means the entity is gone (or the adopter cannot load it); its claimed
-     * pending rows are dropped -- with a log line, since silently re-claiming them forever would be worse --
-     * and the aggregate is left as last reconciled.
+     * <p>⚠️ <b>This is the after-a-restore repair.</b> Ordinary operation needs nothing: tagging a member
+     * maintains every container holding it, automatically, through the mutation choke points. What this
+     * exists for is the writes those choke points cannot observe -- a backup restored underneath the
+     * application, an entity promoted from another environment, rows inserted by direct SQL. After any of
+     * those the aggregates are wrong with nothing to notice, and this is what makes them right again.
      *
-     * @return how many aggregates were actually reconciled
+     * <p>Cost is proportional to the world, so it belongs on a maintenance path, never a request one.
+     *
+     * @return how many containers were visited
      */
-    public int reconcilePendingTaggregates(int limit, Function<TaggableRef, Object> loader) {
-        TaggregatePendingClaim claim = backend.claimTaggregatePending(limit);
-        if (claim.isEmpty()) {
-            return 0;
+    public int rebuildTaggregates() {
+        List<TaggableRef> containers = new ArrayList<>();
+        containment().allContainers((type, id) -> containers.add(new TaggableRef(type, id)));
+        for (TaggableRef container : containers) {
+            recomputeAggregate(container);
         }
-        int reconciled = 0;
-        for (TaggableRef ref : claim.aggregates()) {
-            Object container = loader.apply(ref);
-            if (container == null) {
-                LOG.log(System.Logger.Level.WARNING, () -> "Pending Taggregate " + ref + " could not be"
-                        + " loaded -- dropping its pending marks and leaving its aggregate as last"
-                        + " reconciled. If the entity still exists, the loader passed to"
-                        + " reconcilePendingTaggregates must be able to materialize it.");
-                continue;
+        // Recomputing a nested container marks whatever holds it, so draining here is what makes one pass
+        // converge regardless of the order the containers came back in -- no "assets before albums" rule
+        // for a caller to know, which is exactly the kind of ordering an adopter should never have to own.
+        drainPendingTaggregates();
+        return containers.size();
+    }
+
+    /**
+     * The {@code @Taggregate} containment of the registered model -- which containers hold a member, and
+     * which members a container holds -- resolved lazily on first use.
+     *
+     * <p>⚠️ <b>This replaced a membership snapshot table</b> (OMI-304). That table was written <em>by
+     * reconciliation</em>, so a container nothing had reconciled yet appeared in no snapshot and tagging its
+     * members marked nothing: the incremental path could not start without a full bootstrap pass someone
+     * had to remember to run. Containment is read from the join tables that already hold the membership, so
+     * it is true the first time it is asked, and cold start stops being a concept.
+     */
+    private TaggregateContainment containment() {
+        TaggregateContainment resolved = containment;
+        if (resolved == null) {
+            synchronized (this) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = config == null
+                            ? TaggregateContainment.NONE   // test-constructed against a bare backend
+                            : JavAIPI.taggregateContainment(config);
+                    containment = resolved;
+                }
             }
-            Object resolved = PersistentEntities.resolve(container);
-            recomputeAggregate(resolved, refOf(resolved), TaggregateReflection.memberRefsOf(resolved));
-            reconciled++;
         }
-        backend.deleteTaggregatePending(claim.rowIds());
-        return reconciled;
+        return resolved;
     }
 
     /**
-     * The lazy half of the staleness discipline, for reads that hold the container object: recompute if
-     * this aggregate has pending marks (a member's tags changed) or its current members drifted from the
-     * membership snapshot (a member was added/removed -- detectable only pull-style, since nothing is
-     * woven). Search-only paths ({@link #taggedWith}, the vector indexes) deliberately never come through
-     * here -- they see the last-reconciled state, stale by at most the sweep interval.
-     */
-    private void reconcileTaggregateIfStale(Object resolved, TaggableRef ref) {
-        if (!TaggregateReflection.isAggregate(resolved.getClass())) {
-            return;
-        }
-        TaggregatePendingClaim claim = backend.claimTaggregatePendingFor(ref);
-        List<TaggableRef> members = TaggregateReflection.memberRefsOf(resolved);
-        boolean drift = !new HashSet<>(members).equals(new HashSet<>(backend.taggregateMembers(ref)));
-        if (claim.isEmpty() && !drift) {
-            return;
-        }
-        recomputeAggregate(resolved, ref, members);
-        backend.deleteTaggregatePending(claim.rowIds());
-    }
-
-    /**
-     * The Taggregate recompute itself. Inputs are the union of {@code members}' taggings of <b>every</b>
-     * source -- including a member's own aggregate rows, which is what makes nesting compose one level
-     * deep, recursion-free -- read in <b>one batched query</b>. The one exception is self-exclusion: where
-     * the container is its own member (a containment cycle), its own {@code aggregate} rows are not inputs
-     * to its own recompute. Per-tag affinity is the mean contribution over members
-     * ({@code Σ contribution / |members|}, a member's null affinity counting 1.0, an absent tag counting
-     * 0) -- coverage × strength, bounded [0,1], diluted by untagged members.
+     * What every mutation choke point does once its own write is done: mark the containers holding
+     * {@code mutated} as owing a recompute, then drain -- <b>after the caller's transaction commits</b>,
+     * following {@code @Summary}'s own precedent exactly.
      *
-     * <p>The diff writes only changed rows, scoped to {@code source = "aggregate"}; the membership
-     * snapshot is rewritten wholesale; the tag-summary vector recomputes once per reconcile. If rows
-     * changed, aggregates containing this one are marked pending -- they now aggregate stale rows -- which
-     * is what keeps membership-drift recomputes (which no choke point saw) propagating upward.
+     * <p>The distinction is not cosmetic. Inside a caller's transaction the tag row is not visible to any
+     * other connection yet, so an aggregate computed now would be computed from a state nothing else can
+     * see -- and if that transaction rolls back, from one that never existed. When there is no ambient
+     * transaction the write is already committed and the drain runs inline.
      */
-    private void recomputeAggregate(Object container, TaggableRef ref, List<TaggableRef> members) {
+    private void markAndDrain(TaggableRef mutated) {
+        if (containment().isEmpty()) {
+            return;   // nothing in this model declares @Taggregate; pay nothing for it
+        }
+        containment().containersOf(mutated.taggableType(), mutated.taggableId(),
+                (type, id) -> backend.enqueueTaggregatePending(new TaggableRef(type, id)));
+        if (!containment().afterCommit(this::drainPendingTaggregates)) {
+            drainPendingTaggregates();
+        }
+    }
+
+    /**
+     * Recomputes every aggregate the pending queue names, and everything containing them.
+     *
+     * <p>Upward one hop at a time, from what containment says holds each recomputed container -- never from
+     * an object graph, which the draining thread may not hold at all. The visited set bounds the walk and
+     * is also the cycle guard: mutual containment terminates rather than recursing, per
+     * doc/spec/tagging.md's "cycles are tolerated, not resolved".
+     *
+     * <p>Rows are deleted by id once their work is done, never by aggregate: a mutation committed while
+     * this drain was running enqueued a new row for the same container, and that row describes a change
+     * this pass may not have included -- the {@code PendingSummaries} rule, for the same reason.
+     */
+    private void drainPendingTaggregates() {
+        while (true) {
+            TaggregatePendingClaim claim = backend.claimTaggregatePending(DRAIN_BATCH);
+            if (claim.isEmpty()) {
+                return;
+            }
+            Set<TaggableRef> visited = new HashSet<>();
+            Deque<TaggableRef> queue = new ArrayDeque<>(claim.aggregates());
+            while (!queue.isEmpty()) {
+                TaggableRef container = queue.poll();
+                if (!visited.add(container)) {
+                    continue;
+                }
+                if (recomputeAggregate(container)) {
+                    containment().containersOf(container.taggableType(), container.taggableId(),
+                            (type, id) -> queue.add(new TaggableRef(type, id)));
+                }
+            }
+            backend.deleteTaggregatePending(claim.rowIds());
+            if (claim.rowIds().size() < DRAIN_BATCH) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * The Taggregate recompute itself -- a set-based store operation over {@code container}'s members,
+     * needing no container instance and no session held by the caller.
+     *
+     * <p>⚠️ <b>That is a defect class, not a preference.</b> This used to walk the container object's
+     * {@code @Taggregate} fields, which are ordinarily lazy {@code @ManyToMany} collections -- so an entity
+     * read outside a session threw {@code LazyInitializationException} the moment the recompute touched
+     * one, and an adopter's first boot pass failed for every album while still reporting success, because
+     * each failure was caught per object. A query cannot have that bug.
+     *
+     * <p>Inputs are the union of the members' taggings of <b>every</b> source -- including a member's own
+     * aggregate rows, which is what makes nesting compose one level at a time, recursion-free -- read in
+     * <b>one batched query</b>. Self-exclusion: where a container is its own member (a containment cycle),
+     * its own {@code aggregate} rows are not inputs to its own recompute. Per-tag affinity is the mean
+     * contribution over members ({@code Σ contribution / |members|}, a member's null affinity counting 1.0,
+     * an absent tag counting 0) -- coverage × strength, bounded [0,1], diluted by untagged members.
+     *
+     * <p>The diff writes only changed rows and only its own {@code source = "aggregate"} provenance, never
+     * a {@code manual} or {@code auto} row on the container.
+     *
+     * @return whether any row changed -- what tells the drain to carry on upward
+     */
+    private boolean recomputeAggregate(TaggableRef container) {
+        List<TaggableRef> members = new ArrayList<>();
+        containment().membersOf(container.taggableType(), container.taggableId(),
+                (type, id) -> members.add(new TaggableRef(type, id)));
+
         Map<TaggableRef, List<TagAssociation>> byMember = backend.associationsOfAll(members);
         Map<UUID, Double> sums = new LinkedHashMap<>();
         for (TaggableRef member : members) {
-            for (TagAssociation association : byMember.get(member)) {
-                if (member.equals(ref) && Tagging.SOURCE_AGGREGATE.equals(association.source())) {
+            for (TagAssociation association : byMember.getOrDefault(member, List.of())) {
+                if (member.equals(container) && Tagging.SOURCE_AGGREGATE.equals(association.source())) {
                     continue;
                 }
                 sums.merge(association.tagId(),
@@ -464,7 +509,7 @@ public final class JavAITagRepository {
         }
 
         Map<UUID, Double> existing = new HashMap<>();
-        for (TagAssociation association : backend.associationsOf(ref)) {
+        for (TagAssociation association : backend.associationsOf(container)) {
             if (Tagging.SOURCE_AGGREGATE.equals(association.source())) {
                 existing.put(association.tagId(), association.affinity());
             }
@@ -473,54 +518,35 @@ public final class JavAITagRepository {
         for (Map.Entry<UUID, Double> entry : target.entrySet()) {
             Double current = existing.get(entry.getKey());
             if (current == null || current.doubleValue() != entry.getValue()) {
-                backend.addTag(ref, entry.getKey(), entry.getValue(), Tagging.SOURCE_AGGREGATE);
+                backend.addTag(container, entry.getKey(), entry.getValue(), Tagging.SOURCE_AGGREGATE);
                 changed = true;
             }
         }
         for (UUID previousId : existing.keySet()) {
             if (!target.containsKey(previousId)) {
-                backend.removeTag(ref, previousId);
+                backend.removeTag(container, previousId);
                 changed = true;
             }
         }
-
-        backend.replaceTaggregateMembers(ref, members);
         if (changed) {
-            recomputeDerivedVectors(ref, container.getClass());
-            markContainingTaggregatesPending(ref);
+            recomputeDerivedVectors(container, typeOf(container));
+        }
+        return changed;
+    }
+
+    /** The container's own class, for the tag-text opt-in check. A type this JVM cannot load (a row left by
+     *  a renamed or since-removed class) simply does not concatenate, rather than failing a repair pass. */
+    private static Class<?> typeOf(TaggableRef ref) {
+        try {
+            return Class.forName(ref.taggableType());
+        } catch (ClassNotFoundException e) {
+            LOG.log(System.Logger.Level.WARNING, () -> "Taggregate container type " + ref.taggableType()
+                    + " is not on this classpath; its aggregate rows are still maintained, but it cannot be"
+                    + " checked for the @Taggregate(concatenate = true) tag-text opt-in.");
+            return Object.class;
         }
     }
 
-    /**
-     * The choke-point (and post-recompute) dirty propagation: every aggregate whose membership snapshot
-     * lists {@code mutated} is marked pending, transitively through nested aggregates. A visited set keeps
-     * the walk finite; a true containment cycle (an aggregate reachable from itself) is logged and
-     * tolerated, never repaired -- per doc/spec/tagging.md's "Cycles are tolerated, not resolved".
-     */
-    private void markContainingTaggregatesPending(TaggableRef mutated) {
-        Set<TaggableRef> visited = new HashSet<>();
-        visited.add(mutated);
-        markContainersOf(mutated, visited, new ArrayDeque<>());
-    }
-
-    private void markContainersOf(TaggableRef ref, Set<TaggableRef> visited, Deque<TaggableRef> path) {
-        path.push(ref);
-        for (TaggableRef container : backend.taggregatesContaining(ref)) {
-            if (path.contains(container)) {
-                LOG.log(System.Logger.Level.WARNING, () -> "Taggregate containment cycle detected: "
-                        + container + " is reachable from itself (path " + path + "). Tolerated, not"
-                        + " repaired -- the coupled aggregates converge over successive reconciles; see"
-                        + " doc/spec/tagging.md's Taggregate section.");
-                continue;
-            }
-            if (!visited.add(container)) {
-                continue;
-            }
-            backend.enqueueTaggregatePending(container);
-            markContainersOf(container, visited, path);
-        }
-        path.pop();
-    }
 
     // ---- Concatenated tag text and ranked tag queries (OMI-302) ----------------------------------------
 
@@ -531,18 +557,14 @@ public final class JavAITagRepository {
      * {@link #taggingsOf}: an operation holding the object trues it up.
      */
     public String tagText(Object instance) {
-        Object resolved = PersistentEntities.resolve(instance);
-        TaggableRef ref = refOf(resolved);
-        reconcileTaggregateIfStale(resolved, ref);
+        TaggableRef ref = refOf(instance);
         return backend.tagText(ref, requireModelId());
     }
 
     /** The stored tag-text vector for {@code instance} under the currently configured embedding model, or
      *  {@code EmbeddingVector.absent()} if none is stored. Reconciles first, exactly as {@link #tagText}. */
     public EmbeddingVector tagTextVector(Object instance) {
-        Object resolved = PersistentEntities.resolve(instance);
-        TaggableRef ref = refOf(resolved);
-        reconcileTaggregateIfStale(resolved, ref);
+        TaggableRef ref = refOf(instance);
         return backend.tagTextVector(ref, requireModelId());
     }
 

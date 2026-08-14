@@ -71,6 +71,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.WeakHashMap;
@@ -3461,6 +3462,145 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             return supplied;
         }
         return supplied.unwrap(SessionFactoryImplementor.class);
+    }
+
+    /**
+     * The {@code @Taggregate} view of this backend's own {@link Containment} (OMI-304) -- see
+     * {@link TaggregateContainment}. Every method resolves {@link #containment()} at call time, so the
+     * entity set is complete by the time it is read and nothing here forces the mapper to be ready earlier
+     * than it otherwise would be.
+     *
+     * <p>Reads run on the ambient session when there is one and a short-lived session otherwise, exactly as
+     * {@link #inSession} decides for every other read: a container whose membership the caller has written
+     * but not yet committed must be visible to the recompute that caller's own commit will trigger.
+     */
+    @Override
+    public TaggregateContainment taggregateContainment() {
+        return new TaggregateContainment() {
+            @Override
+            public boolean isEmpty() {
+                return containment().hasNoTaggregates();
+            }
+
+            @Override
+            public void containersOf(String childTypeName, UUID childId, BiConsumer<String, UUID> sink) {
+                Class<?> childType = resolveOwnerType(childTypeName);
+                if (childType == null) {
+                    return;
+                }
+                inSession(session -> {
+                    for (Containment.OwnerRef owner
+                            : containment().taggregateContainersOf(session, childType, childId)) {
+                        sink.accept(owner.ownerType().getName(), owner.ownerId());
+                    }
+                    return null;
+                });
+            }
+
+            @Override
+            public void membersOf(String containerTypeName, UUID containerId, BiConsumer<String, UUID> sink) {
+                Class<?> containerType = resolveOwnerType(containerTypeName);
+                if (containerType == null) {
+                    return;
+                }
+                inSession(session -> {
+                    for (Containment.OwnerRef member
+                            : containment().taggregateMembersOf(session, containerType, containerId)) {
+                        sink.accept(member.ownerType().getName(), member.ownerId());
+                    }
+                    return null;
+                });
+            }
+
+            @Override
+            public void allContainers(BiConsumer<String, UUID> sink) {
+                inSession(session -> {
+                    for (Class<?> containerType : containment().taggregateContainerTypes()) {
+                        for (UUID id : containment().idsOf(session, containerType)) {
+                            sink.accept(containerType.getName(), id);
+                        }
+                    }
+                    return null;
+                });
+            }
+
+            /**
+             * One callback per transaction, not per mutation -- a loop tagging two hundred members drains
+             * once at the end over everything it queued, rather than opening two hundred drains after the
+             * fact. The same shape, and the same reasoning, as {@link SummaryDrainScope}.
+             */
+            @Override
+            public boolean afterCommit(Runnable drain) {
+                Session ambient = ambientSession();
+                if (ambient == null) {
+                    return false;
+                }
+                Set<Object> registered = TAGGREGATE_DRAINS_REGISTERED.get();
+                Object key = RepositoryBackendHibernatePostgres.this;
+                if (!registered.add(key)) {
+                    return true;   // this transaction already has one; it will pick up what we just queued
+                }
+                try {
+                    ambient.getTransaction().registerSynchronization(new jakarta.transaction.Synchronization() {
+                        @Override
+                        public void beforeCompletion() {
+                            // Nothing: the point is to act strictly after the commit, never before it.
+                        }
+
+                        @Override
+                        public void afterCompletion(int status) {
+                            forgetTaggregateDrain(key);
+                            if (status == jakarta.transaction.Status.STATUS_COMMITTED) {
+                                drain.run();
+                            }
+                        }
+                    });
+                } catch (RuntimeException e) {
+                    // The transaction would not take a callback. Leave the queue rows for a later drain
+                    // rather than recomputing now, which would read a graph that is not committed.
+                    forgetTaggregateDrain(key);
+                    throw e;
+                }
+                return true;
+            }
+
+            @Override
+            public boolean inAmbientTransaction(ConnectionWork work) throws SQLException {
+                Session ambient = ambientSession();
+                if (ambient == null) {
+                    return false;
+                }
+                // doWork hands over the very connection the ambient transaction is using, so the caller's
+                // rows and these commit or roll back as one.
+                SQLException[] failure = new SQLException[1];
+                ambient.doWork(connection -> {
+                    try {
+                        work.run(connection);
+                    } catch (SQLException e) {
+                        failure[0] = e;
+                        throw e;
+                    }
+                });
+                if (failure[0] != null) {
+                    throw failure[0];
+                }
+                return true;
+            }
+        };
+    }
+
+    /** Which backends already have a Taggregate drain callback registered on this thread's current
+     *  transaction -- see the {@code afterCommit} implementation above, and {@link SummaryDrainScope} for
+     *  why this is thread-bound rather than a constructor argument. */
+    private static final ThreadLocal<Set<Object>> TAGGREGATE_DRAINS_REGISTERED =
+            ThreadLocal.withInitial(LinkedHashSet::new);
+
+    private static void forgetTaggregateDrain(Object key) {
+        Set<Object> registered = TAGGREGATE_DRAINS_REGISTERED.get();
+        registered.remove(key);
+        if (registered.isEmpty()) {
+            TAGGREGATE_DRAINS_REGISTERED.remove();
+        }
     }
 
     private Session ambientSession() {

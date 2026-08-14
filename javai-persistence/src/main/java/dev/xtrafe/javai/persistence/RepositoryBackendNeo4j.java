@@ -37,6 +37,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -98,6 +99,9 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     private final JavAIPersistenceConfig config;
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Map<String, Class<?>> typesByLabel = new ConcurrentHashMap<>();
+
+    /** See {@link #containment()} -- resolved on first use, never in the constructor. */
+    private volatile Containment containment;
     private volatile Driver driver;
 
     RepositoryBackendNeo4j(JavAIPersistenceConfig config) {
@@ -1423,6 +1427,124 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             result.append(Character.toUpperCase(c));
         }
         return result.toString();
+    }
+
+    /**
+     * The {@code @Taggregate} containment of the registered model, as relationship traversal (OMI-304).
+     *
+     * <p>The <em>declaration</em> comes from {@link Containment} exactly as it does on Postgres -- which
+     * field of which type holds what is reflection over the model and has nothing to do with a store. Only
+     * the traversal is native here: this backend maps a collection or reference field to a relationship
+     * named after it, so "which containers hold this member" is the same edge read backwards.
+     */
+    @Override
+    public TaggregateContainment taggregateContainment() {
+        return new TaggregateContainment() {
+            @Override
+            public boolean isEmpty() {
+                return containment().hasNoTaggregates();
+            }
+
+            @Override
+            public void containersOf(String childTypeName, UUID childId, BiConsumer<String, UUID> sink) {
+                Class<?> childType = typeOf(childTypeName);
+                if (childType == null) {
+                    return;
+                }
+                try (Session session = driver().session()) {
+                    for (Containment.Edge edge : containment().taggregateEdges()) {
+                        if (!edge.childType().isAssignableFrom(childType)) {
+                            continue;
+                        }
+                        var result = session.run("MATCH (p:`" + label(edge.parentType()) + "`)-[:`"
+                                        + relationshipType(edge.fieldName()) + "`]->(c:`" + label(childType)
+                                        + "` {id: $childId}) RETURN p.id AS id",
+                                Values.parameters("childId", childId.toString()));
+                        for (Record record : result.list()) {
+                            sink.accept(edge.parentType().getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void membersOf(String containerTypeName, UUID containerId, BiConsumer<String, UUID> sink) {
+                Class<?> containerType = typeOf(containerTypeName);
+                if (containerType == null) {
+                    return;
+                }
+                try (Session session = driver().session()) {
+                    for (Containment.Edge edge : containment().taggregateEdges()) {
+                        if (!edge.parentType().isAssignableFrom(containerType)) {
+                            continue;
+                        }
+                        var result = session.run("MATCH (p:`" + label(containerType) + "` {id: $containerId})-[:`"
+                                        + relationshipType(edge.fieldName()) + "`]->(c:`"
+                                        + label(edge.childType()) + "`) RETURN c.id AS id",
+                                Values.parameters("containerId", containerId.toString()));
+                        for (Record record : result.list()) {
+                            sink.accept(edge.childType().getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void allContainers(BiConsumer<String, UUID> sink) {
+                try (Session session = driver().session()) {
+                    for (Class<?> containerType : containment().taggregateContainerTypes()) {
+                        var result = session.run(
+                                "MATCH (p:`" + label(containerType) + "`) RETURN p.id AS id");
+                        for (Record record : result.list()) {
+                            sink.accept(containerType.getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            /** No ambient JDBC transaction exists on this backend -- tagging writes on its own connection,
+             *  and says so by getting {@code false} rather than a silently-ignored callback. */
+            @Override
+            public boolean inAmbientTransaction(ConnectionWork work) {
+                return false;
+            }
+
+            /** No ambient transaction to hang a commit callback on either -- the caller drains inline. */
+            @Override
+            public boolean afterCommit(Runnable drain) {
+                return false;
+            }
+        };
+    }
+
+    /**
+     * The declared containment of every registered type, resolved once on first use.
+     *
+     * <p>Lazily rather than in the constructor for the same reason the Postgres backend does it: registration
+     * is still in progress there, and by the first containment question every repository this application
+     * needs has necessarily been created.
+     */
+    private Containment containment() {
+        Containment resolved = containment;
+        if (resolved == null) {
+            synchronized (this) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = Containment.of(typesByLabel.values());
+                    containment = resolved;
+                }
+            }
+        }
+        return resolved;
+    }
+
+    private Class<?> typeOf(String typeName) {
+        for (Class<?> registered : typesByLabel.values()) {
+            if (registered.getName().equals(typeName)) {
+                return registered;
+            }
+        }
+        return null;
     }
 
     private static String label(Class<?> entityType) {

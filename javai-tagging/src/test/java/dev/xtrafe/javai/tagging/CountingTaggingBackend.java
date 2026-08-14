@@ -102,23 +102,8 @@ final class CountingTaggingBackend implements TaggingBackend {
         return delegate.associationsOfAll(refs);
     }
 
-    @Override
-    public void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members) {
-        count("replaceTaggregateMembers");
-        delegate.replaceTaggregateMembers(aggregate, members);
-    }
 
-    @Override
-    public List<TaggableRef> taggregateMembers(TaggableRef aggregate) {
-        count("taggregateMembers");
-        return delegate.taggregateMembers(aggregate);
-    }
 
-    @Override
-    public List<TaggableRef> taggregatesContaining(TaggableRef member) {
-        count("taggregatesContaining");
-        return delegate.taggregatesContaining(member);
-    }
 
     @Override
     public void enqueueTaggregatePending(TaggableRef aggregate) {

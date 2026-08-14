@@ -484,32 +484,50 @@ Tags carry their `TagSet`, so one aggregate freely spans sets — machine percep
 side by side, distinguishable at query time by set. Which *objects* contribute is the field grammar's
 decision; which *sets* you ask about is the query's.
 
-### ⚠️ Staleness: how the aggregate learns things changed
+### ⚠️ Staleness: how the aggregate learns things changed (rebuilt on containment, OMI-304)
 
-Nothing is woven, so nothing intercepts mutations. Three mechanisms, all repository-side:
+Nothing is woven, so nothing intercepts mutations. The answer is the one `@Summary` already uses:
+**`Containment`** — "which containers hold this child", read from the declared model plus the stored
+relationships (`javai-persistence/Containment.java`, OMI-255). Taggregate asks it the same question about
+`@Taggregate` fields that summary recomputation asks about `@Summary` ones, through the narrow
+`TaggregateContainment` view.
 
-1. **Member tag mutations** already flow through the repository choke point (`addTag`, `removeTag`,
-   `applyClassification`). There, one indexed lookup in the **membership snapshot**
-   (`javai_taggregate_members`) finds containing aggregates and marks them pending
-   (`javai_taggregate_pending`, the `javai_summary_pending` precedent). Marking is transitive through
-   nested aggregates, cycle-guarded.
-2. **Membership drift** (a member added or removed) is detected *pull-style*: any operation holding the
-   container **object** — `taggingsOf`, an explicit `reconcileTaggregate` — walks its `@Taggregate`
-   fields reflectively, compares current member refs to the snapshot, and recomputes on drift. The
-   snapshot is **written by recompute, never by interception**.
-3. **The pending sweep** (`reconcilePendingTaggregates(limit, loader)`) trues up aggregates nothing reads
-   directly. ⚠️ It takes a **loader callback** (`TaggableRef → Object`) because the tagging module cannot
-   materialize arbitrary adopter entities — the adopter's repositories can. The sweep is a *repair path
-   the adopter runs deliberately*, never a poller that events originate from.
+That single reuse removed the whole apparatus this section used to describe:
 
-The honest consequence: pure *search* reads see the last-reconciled state, stale by at most the sweep
-interval — the same posture as `EVENTUAL_CONSISTENCY`. An adopter wanting tighter freshness on a known
-write path calls `markTaggregateStale(container)` there.
+| Gone | Why |
+|---|---|
+| `javai_taggregate_members` snapshot | the join tables already *are* the membership; a second copy could only be staler |
+| the cold-start problem | the snapshot was written *by* reconciliation, so a never-reconciled container was in no snapshot and tagging its members marked nothing |
+| the adopter's bootstrap pass | existed only to prime that snapshot |
+| the `loader` callback | containment resolves owners without the adopter's repositories |
+| membership drift as a concept | a query against the join table cannot be stale |
 
-⚠️ **Recompute cost discipline** (the `applyClassification` lesson, again): member taggings are read in
-**one batched query over refs**, never per-member lookups; the diff writes only changed rows; the
-tag-summary vector recomputes once per reconcile, not once per tag. Concurrent reconciles of one
-aggregate must converge to the same rows — full-diff, last-write-wins, pinned by a barrier test.
+**The mutation choke points are the only trigger.** `addTag`, `removeTag` and `applyClassification` mark
+the containers holding the mutated member pending (`javai_taggregate_pending` — kept, and still insert-only
+for the reason `PendingSummaries` documents: one row per owner would otherwise make two writers beneath one
+container refuse each other at `REPEATABLE READ`), then **drain after the caller's transaction commits** —
+immediately when there was no ambient transaction, via a commit callback when there was, registered once
+per transaction. Work done before the commit would read a state nothing else can see, and a rollback must
+leave no derived rows behind.
+
+Recompute is a **set-based store operation**: members come from containment, so it needs no container
+instance and no session held by the caller. ⚠️ That is a defect class, not a preference — the previous
+design walked the container's `@Taggregate` fields, which are ordinarily lazy `@ManyToMany` collections, so
+an entity read outside a session threw `LazyInitializationException`; an adopter's first boot pass failed
+for 192 assets and every album while still reporting success, because each failure was caught per object.
+
+**One public method, `rebuildTaggregates()`** — and it is genuinely needed rather than a leftover:
+promotion, a restored backup and direct SQL all write rows the choke points never observe, and after any of
+those the aggregates are wrong with nothing to notice. Document it as the after-a-restore repair, never as
+something a normal application calls.
+
+⚠️ **The honest consequence of "the choke points are the only trigger":** adding or removing a *member*
+changes what the aggregate should say (the mean dilutes) without any tag being mutated, so nothing
+recomputes at that moment. The next tag mutation beneath that container corrects it, and
+`rebuildTaggregates()` corrects it without one. This is a deliberate trade — the alternative is
+recomputing on every `save()` of any entity that happens to be contained, which is a cost every adopter
+would pay on a write path most of them never need it on.
+
 
 ### Concatenated tag text (the F2 opt-in)
 
@@ -535,7 +553,7 @@ query answers "albums about lakes" with no cross-model fusion.
 
 | Backend | Realization |
 |---|---|
-| Postgres | `javai_taggregate_members(aggregate_type, aggregate_id, member_type, member_id)` indexed both directions; `javai_taggregate_pending`; `javai_tag_text_vectors__<model>`. Aggregate rows live in `taggings` — no new tagging table. |
+| Postgres | `javai_taggregate_pending`; `javai_tag_text_vectors__<model>`. Aggregate rows live in `taggings` — no new tagging table. **Membership has no storage of its own** (OMI-304): it is the ordinary join tables, read through `Containment`. The `javai_taggregate_members` table this once specified is dropped on first use. |
 | Neo4j / MongoDB | Same shapes in each backend's native convention. Correct-everywhere implementations first (the `findPendingVector` precedent); store-specific optimization only with a measurement. |
 
 ## Persistence, across all three backends

@@ -6,6 +6,8 @@ import dev.xtrafe.javai.model.JavAIList;
 import jakarta.persistence.CascadeType;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.JoinTable;
+import jakarta.persistence.ManyToMany;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 
@@ -26,9 +28,9 @@ import java.util.UUID;
  * <p>The member fields are ordinary OMI-142-shaped associations (JavAI interface type, non-final, plain JPA
  * annotation), so a persisted anthology's members load lazily and the Taggregate machinery's reflective
  * walk must resolve real Hibernate state -- exactly what an adopter's {@code Album} will look like.
- * {@code @OneToMany} implies each member belongs to at most one anthology; the e2e test that needs shared
- * members (a diamond) builds unpersisted anthologies instead, which the ref-keyed Taggregate stores support
- * on Postgres by construction.
+ * The article collection is {@code @ManyToMany} so one article can belong to several anthologies, which is
+ * what lets a test pin an update fanning out across a diamond -- containment reads the join table, so every
+ * container holding a tagged member is found, not merely the first.
  */
 @Entity
 @dev.xtrafe.javai.annotations.Taggable
@@ -44,7 +46,10 @@ public class Anthology implements dev.xtrafe.javai.tagging.Taggable {
     @Taggregate
     private Article featureArticle;
 
-    @OneToMany(cascade = CascadeType.ALL)
+    // @ManyToMany, so one article can sit in several anthologies -- the diamond an aggregate has to fan
+    // an update out across, and impossible to express with a single-parent @OneToMany.
+    @ManyToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    @JoinTable(name = "anthology_articles")
     @Taggregate
     private JavAIList<Article> articles = new JavAIArrayList<>();
 

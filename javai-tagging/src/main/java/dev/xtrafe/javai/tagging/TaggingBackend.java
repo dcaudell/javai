@@ -74,22 +74,6 @@ interface TaggingBackend {
     Map<TaggableRef, List<TagAssociation>> associationsOfAll(Collection<TaggableRef> refs);
 
     /**
-     * Replaces {@code aggregate}'s membership snapshot wholesale ({@code javai_taggregate_members}) --
-     * written by recompute, never by interception, per doc/spec/tagging.md's "Staleness". Wholesale
-     * replacement is what makes concurrent reconciles of one aggregate converge: last write wins with no
-     * partial merge.
-     */
-    void replaceTaggregateMembers(TaggableRef aggregate, List<TaggableRef> members);
-
-    /** {@code aggregate}'s membership snapshot as of its last recompute -- what drift detection compares
-     *  the current reflective field walk against. Empty for a never-reconciled aggregate. */
-    List<TaggableRef> taggregateMembers(TaggableRef aggregate);
-
-    /** Every aggregate whose snapshot lists {@code member} -- the one indexed lookup the mutation choke
-     *  points use to find who to mark pending. */
-    List<TaggableRef> taggregatesContaining(TaggableRef member);
-
-    /**
      * Records that {@code aggregate} owes a recompute ({@code javai_taggregate_pending}) -- insert-only,
      * duplicates expected and collapsed at claim time, exactly the {@code javai_summary_pending} shape
      * (see {@code javai-persistence}'s {@code PendingSummaries} for why enqueue must never read first).

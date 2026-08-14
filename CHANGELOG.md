@@ -84,6 +84,54 @@ version -- a given release usually changes only one or two of them.
   One tag-summary recomputation per call rather than one per tag: that path resolves every association through
   `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups.
 
+### Changed
+
+- ⚠️ **Taggregate's plumbing moved into the library; an adopter no longer writes a reconciler (OMI-304).**
+  OMI-302 shipped Taggregate with three methods an adopter had to orchestrate — `reconcileTaggregate`,
+  `markTaggregateStale`, `reconcilePendingTaggregates(limit, loader)` — plus a `Function<TaggableRef,
+  Object>` loader the library could not supply. The first adopter's cost was a ~190-line reconciler holding
+  a ten-entry type→repository map, a transaction template, a boot-time bootstrap pass and an event
+  listener. That is a kit, not an API: `@Summary`'s bar is "annotate a field, call `save()`", and this now
+  meets it. **`rebuildTaggregates()` is the only public Taggregate method**, documented as the
+  after-a-restore repair — genuinely needed, because promotion, a restored backup and direct SQL write rows
+  the choke points cannot observe.
+
+  **The whole thing is one reuse.** `javai-persistence`'s `Containment` already answered "which containers
+  hold this child" for `@Summary`, resolved against the database rather than whatever object graph happened
+  to be in memory, and its `Edge` already carried a `summary` flag *"because the two consumers want
+  different subsets"*. Taggregate is the third consumer that design anticipated: `Edge` gained a
+  `taggregate` flag, singular references are collected when either annotation is present (a to-one
+  `@Taggregate` is a real adopter shape), and `javai-tagging` reaches it through one narrow
+  `TaggregateContainment` view rather than four newly-public types. There is exactly one implementation of
+  parents-from-child, and the two pre-existing call sites now share its query builder too.
+
+  What that deleted: `javai_taggregate_members` and its Neo4j/Mongo equivalents (the join tables already
+  *are* the membership, so a second copy could only be staler — dropped on first use), the cold-start
+  problem (the snapshot was written *by* reconciliation, so a never-reconciled container was in no snapshot
+  and tagging its members marked nothing), the bootstrap pass that existed only to prime it, the loader,
+  and membership drift as a concept.
+
+  ⚠️ **It also fixes a defect class.** Recompute is now a set-based store operation over members resolved
+  from containment, needing no container instance. The previous design walked the container's
+  `@Taggregate` fields — ordinarily lazy `@ManyToMany` collections — so an entity read outside a session
+  threw `LazyInitializationException`; the adopter's first boot pass failed for 192 assets and every album
+  *while reporting success*, because each failure was caught per object.
+
+  Drain follows `@Summary`'s own precedent exactly: mark inside the write path, recompute after the
+  caller's transaction commits, one callback per transaction. Tagging now joins that transaction for its
+  own reads and writes — resolved lazily at first write, so the deliberate absence of a startup ordering
+  dependency between tagging and the entity mapper survives — which is what makes a rolled-back tag
+  mutation leave no tagging row, no pending row and no aggregate row. `javai_taggregate_pending` stays,
+  insert-only, for the reason `PendingSummaries` documents.
+
+  All three backends: Postgres by HQL, Neo4j by relationship traversal, MongoDB by reference arrays with an
+  index per edge. The declaration is read once by `Containment` for all three; only the traversal differs.
+
+  ⚠️ **One honest consequence, documented rather than hidden:** a membership change with no tag mutation
+  (adding an untagged member dilutes the mean) recomputes at the next tag mutation beneath that container,
+  or at `rebuildTaggregates()`. Recomputing on every `save()` of anything contained was the alternative,
+  and is a cost on a write path most applications never need it on.
+
 ### Fixed
 
 - ⚠️ **Model-scoped aggregates went absent once a container was persisted (OMI-303, `javai-persistence`).**
