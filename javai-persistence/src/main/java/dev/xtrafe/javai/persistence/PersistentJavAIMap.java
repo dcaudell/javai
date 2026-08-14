@@ -67,6 +67,20 @@ public class PersistentJavAIMap<K, V> extends PersistentMap<K, V> implements Jav
         return CollectionVectorSupport.summaryVector($javai$state, values());
     }
 
+    /** This map's centroid over its <em>values</em>, restricted to one embedding model -- the same element
+     *  source its unqualified pair uses. See {@link JavAIVectorizable#vector(String)}. */
+    @Override
+    public EmbeddingVector vector(String modelId) {
+        return CollectionVectorSupport.vector($javai$state, values(), modelId);
+    }
+
+    /** This map's decay-weighted summary over its values, restricted to one embedding model. See
+     *  {@link JavAIVectorizable#summaryVector(String)}. */
+    @Override
+    public EmbeddingVector summaryVector(String modelId) {
+        return CollectionVectorSupport.summaryVector($javai$state, values(), modelId);
+    }
+
     @Override
     public double similarityTo(JavAIVectorizable other) {
         return VectorMath.cosineSimilarity(vector(), other.vector());
