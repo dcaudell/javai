@@ -766,3 +766,12 @@ Two properties worth knowing:
 ⚠️ Note what this is *not* for: it does not make an object with two models' vectors work where it used to
 break. `@ExternalVector` keeps external vectors out of the baked `@Vectorize` list, so `vector()` never met
 them in the first place. These accessors exist to make the other model *reachable*, not to repair a collision.
+
+**Every JavAI collection must implement both scoped forms, in-memory and persistent alike (OMI-303).**
+`JavAIVectorizable` declares them `default`-ing to `absent()`, which is right for a type that carries no
+vector of that model and wrong — silently — for one that simply forgot to override. The Hibernate-backed
+`PersistentJavAIList`/`Set`/`Map` forgot, so a container's scoped summary worked in memory and went absent
+the moment it was reloaded: `summaryVector(modelId)` folds any `JavAIVectorizable` child unconditionally,
+so an absent term normalizes into an absent result with nothing skipped and nothing logged. A new
+collection implementation inherits that trap by default; overriding both scoped accessors is part of what
+being a JavAI collection means, not an optimization.

@@ -86,6 +86,21 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- ⚠️ **Model-scoped aggregates went absent once a container was persisted (OMI-303, `javai-persistence`).**
+  `vector(modelId)`/`summaryVector(modelId)` worked over an in-memory JavAI collection and returned
+  `EmbeddingVector.absent()` over the Hibernate-backed one, so an album could be summarized in its images'
+  own model right up until it was saved. `PersistentJavAIList`, `PersistentJavAISet` and
+  `PersistentJavAIMap` never overrode the scoped pair and inherited `JavAIVectorizable`'s `default`, which
+  is `absent()`. The arithmetic they needed already existed and was already model-aware — three missing
+  overrides, not a design gap.
+
+  **What made it invisible is worth more than the fix.** `JavAIRuntime.summaryVector` folds any
+  `JavAIVectorizable` child unconditionally, and a `PersistentJavAISet` is one — so the absent term was not
+  skipped or warned about, it was normalized into an absent result. The unqualified path was untouched
+  throughout, meaning text summaries kept working and only the scoped answers went quiet. A `default` that
+  returns "nothing here" cannot distinguish a type that has nothing from one that forgot to look;
+  doc/spec/vector-core.md now says so where the accessors are specified.
+
 - ⚠️ **OMI-290's own migration could never run (`javai-persistence`).** `ensureFieldVectorTable` ships an
   `ALTER TABLE ... ADD COLUMN IF NOT EXISTS computed_for` precisely so a `javai_vectors__<model>` table
   created before OMI-290 gains the column instead of failing on first write — but it called

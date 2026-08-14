@@ -80,6 +80,20 @@ public class PersistentJavAIList<E> extends PersistentBag<E> implements JavAILis
         return CollectionVectorSupport.summaryVector($javai$state, this);
     }
 
+    /** This collection's centroid restricted to one embedding model -- see
+     *  {@link JavAIVectorizable#vector(String)}. Uncached; the members' own vectors are not. */
+    @Override
+    public EmbeddingVector vector(String modelId) {
+        return CollectionVectorSupport.vector($javai$state, this, modelId);
+    }
+
+    /** This collection's decay-weighted summary restricted to one embedding model -- what makes a container
+     *  of images summarizable by what its members look like. See {@link JavAIVectorizable#summaryVector(String)}. */
+    @Override
+    public EmbeddingVector summaryVector(String modelId) {
+        return CollectionVectorSupport.summaryVector($javai$state, this, modelId);
+    }
+
     @Override
     public double similarityTo(JavAIVectorizable other) {
         return VectorMath.cosineSimilarity(vector(), other.vector());
