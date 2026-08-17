@@ -14,6 +14,78 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **Declared queries, targeted writes, and `@Any` predicates (OMI-398).** `javai-persistence` +
+  `javai-annotations`. A derived name expresses a predicate over an entity's own properties and nothing else,
+  so a **grouped aggregate** — one count per id rather than one total — had no expression at all, leaving N+1
+  counts, counting in memory, or reaching past the repository to `JavAIPI.sessionFactory(config)`. `@Query`
+  (JPQL or `nativeQuery`) puts it on the method, with `@Modifying` for writes. `@Param` is **reused** from
+  `spring-data-commons`; `@Query`/`@Modifying` are JavAI's own, because `spring-data-jpa` is not a dependency
+  and its repository infrastructure is not wanted behind two annotations. `DeclaredQuery` reuses
+  `DerivedFinderQuery`'s shape outright — parse and return-type adaptation there, three primitives per
+  backend, the same `Constraints` record. Returns cover entity/`Optional`/single/`Stream`/scalar/`Object[]`
+  and **records**, the last two needing no projection machinery at all (Hibernate 7 instantiates a record from
+  `select new …`), so `(id, count)` pairs come back typed. `Page` requires an explicit `countQuery` —
+  deliberately not derived by rewriting the select, since a rewriter that misreads one returns a plausible
+  wrong number instead of failing. A dynamic `Sort` is applied through `SelectionSpecification`, never by
+  editing query text, so it is offered on entity-returning JPQL and refused on projections and native SQL.
+  **Postgres only**; Neo4j and MongoDB refuse at repository-creation time, the SPI defaults throwing rather
+  than accepting, as `inTransaction` already does.
+
+  **Validation splits in two, and it is stated rather than discovered.** Every other creation-time check in
+  the module is pure reflection; parsing a query is the first that is not, and building the query engine
+  freezes the entity set — exactly what OMI-214 removed from `repository(...)`. So the signature is validated
+  when the repository is realized and the query *text* as soon as an ORM exists to parse it, which still means
+  before any repository method runs. Native SQL is parsed by the database on first execution; its parameter
+  binding is not.
+
+  **The refusal Spring Data has no equivalent of.** A bulk write fires no woven accessor, so nothing
+  recomputes what it invalidated — and since OMI-187 a stored vector is hydrated straight back on load, so the
+  inconsistency outlives the process rather than the call, exactly as `SPEC.md` warns. Assignments to a
+  `@Vectorize` field, an `@ExternalVector`'s `keyField`, a `@Summary` field or a `@Taggregate` field are
+  refused, resolved against the **statement's own** target entity rather than the repository's type parameter.
+  An ordinary column on a vectorized entity stays writable — a summary is arithmetic over vectors, so a column
+  no vector reads cannot move one. `nativeQuery = true` is refused whenever JavAI owns storage for the type,
+  since SQL has no assignments to inspect. A `@Modifying` delete resolves ids and deletes through
+  `deleteById`'s path, as `deleteBy…` already does: a bulk delete cascades to nothing, detaches from no
+  container, and orphans vector rows. A bulk update does not bump `@Version` unless it says `update versioned`.
+
+  **Two findings changed the design.** `@Column(updatable = false)` already does what the ticket asked for —
+  measured: it protects a column from `save()` while a `@Modifying` query writes past it — so "a column
+  writable only by a dedicated path" needed no new annotation. And an `@Any`, which cannot be *joined*
+  through, turns out to be perfectly *filterable*: `Path.type()` resolves to the discriminator, so
+  `findByTarget(x)`/`…In`/`…IsNull` work through the existing grammar and `findByTargetOfType(Class)` adds the
+  one new keyword (`OfType`, also on the search builder as `.where("target").ofType(...)`). That removes the
+  workaround of mapping an `@Any`'s discriminator and key a second time as read-only columns, which every
+  queryable `@Any` would have repeated with two mappings free to drift. `OfType` is matched to its parsed part
+  by **counting parts** rather than re-tokenizing the method name, so a property whose name contains another's
+  cannot be miscounted; the single ambiguous shape is refused rather than guessed.
+
+  **Proven end to end against real weaving.** `e2e-client-test`'s `DeclaredQueryE2ETest` runs all of it as a
+  client of the published artifacts, on genuinely woven classes -- which `javai-persistence`'s own tests
+  structurally cannot do, since that module has no `javai-substrate` dependency and its fixtures are
+  hand-written stand-ins. Grouped aggregates over the real `Article` -> `JavAIList<Comment>` association, real
+  stored embeddings asserted byte-identical across a targeted write, and the `@Any` half against `AssocHub`'s
+  eager/lazy/`@Summary` polymorphic references. It surfaced a structural consequence worth knowing: **a
+  declared query cannot share a repository interface with a backend that refuses one**, since the refusal
+  happens when the repository is realized -- so an entity served from several backends keeps its declared
+  queries in a second, Postgres-only interface.
+
+### Fixed
+
+- **An `@Any` field whose name is a suffix of another's broke the `OfType` rewrite (found by OMI-398's e2e
+  pass).** `javai-persistence`. `findBySummaryLazyAnyOfType` also ends in `LazyAnyOfType`, so attributing the
+  keyword to the first matching field stripped on behalf of `lazyAny`, flagged a part that did not exist, and
+  rejected a perfectly unambiguous method as ambiguous. Each occurrence now goes to the **longest** `@Any`
+  field name ending where it begins; nothing shorter separates the two, since the preceding character is
+  lowercase in both `findBy|LazyAny` and `Summary|LazyAny`. Invisible to the unit fixtures, which declared a
+  single `@Any` apiece -- a two-`@Any` fixture (`TestPoster`) now reproduces it without needing the container.
+
+- **An `int`-returning `countBy…`/`deleteBy…` threw `ClassCastException` (found by OMI-398).**
+  `javai-persistence`. `cond ? Math.toIntExact(n) : n` reads as if it yields an `Integer`, but binary numeric
+  promotion widens both branches to `long` and boxes to `Long`, so the repository proxy threw on return.
+  Latent because nothing declared an `int`-returning count or delete until now; `DerivedFinderTestSupport`
+  declares one on all three backends so it stays fixed.
+
 - **Taggregate: derived taggings for containers, and the concatenated tag-text vector (OMI-302).**
   `javai-tagging` + `javai-annotations`. An `Album` of fifty tagged images is itself *about* something;
   `@Taggregate` says so. The new annotation mirrors `@Summary`'s grammar exactly — on a **field** (a

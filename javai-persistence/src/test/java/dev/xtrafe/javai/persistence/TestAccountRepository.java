@@ -26,6 +26,11 @@ interface TestAccountRepository extends JavAIRepository<TestAccount> {
 
     long countByActive(boolean active);
 
+    /** Declared {@code int} rather than {@code long} on purpose: the count/delete adapters box to whichever
+     *  the method asked for, and until OMI-398 a ternary quietly widened both branches to {@code long}, so an
+     *  {@code int}-returning finder was handed a {@code Long} and the proxy threw. Nothing declared one. */
+    int countByAgeGreaterThan(int age);
+
     List<TestAccount> findByActiveTrue();
 
     List<TestAccount> findByAgeGreaterThanEqual(int age);

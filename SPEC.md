@@ -207,10 +207,12 @@ split across the two — see above — with `javai-model` also including the `Co
 RAG-integration primitives and the `JavAIList`/`Set`/`Map` Vector Collections interfaces), `javai-substrate`
 (Acceleration Substrate's weaving, including the full lifecycle state machine and summary-vector
 propagation), `javai-collections` (Vector Collections' `KnowledgeGraph`/`SubgraphResult`/`VectorIndex`), and
-`javai-persistence` (Persistence Bridge, all three backends, including model-versioning/reindex/revert, and
+`javai-persistence` (Persistence Bridge, all three backends, including model-versioning/reindex/revert,
 `KnowledgeGraph`-typed field persistence -- Neo4j-only, since it's the one backend with a native equivalent
 to `nearestSubgraph()`'s hybrid traversal-plus-similarity query; Postgres/MongoDB reject such a field with a
-clear error at registration time instead) all have real, tested implementations — see each module's own
+clear error at registration time instead -- and, as of OMI-398, declared queries: `@Query`/`@Modifying` on a
+repository method for what a derived name cannot ask, plus `@Any` predicates including the `OfType`
+target-type keyword, both Postgres-only) all have real, tested implementations — see each module's own
 README for exactly what's covered and what's still deliberately out of scope. `javai-completion` (Completion Fabric) has both its connector layer (`Cortex`,
 six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
 provider-specific tuning parameters, Handlebars-based prompt templating via `CompletionRequest.render()`)

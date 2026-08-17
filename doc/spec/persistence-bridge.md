@@ -14,6 +14,8 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 | `JavAIRepository<T>` | Interface | Spring-Data-style repository base; delegates to existing derived-query-method machinery |
 | `findNearestBy<Field>(EmbeddingVector, int limit)` | Derived query method convention | E.g. `findNearestByBodyVector` — repository-level nearest-neighbor search |
 | `findBy<Field>`/`existsBy…`/`countBy…`/`deleteBy…` | Ordinary derived finders | Full Spring-Data-style relational finders (parsed via `PartTree`), resolved against the entity's own mapped columns — so one repository serves both an entity's relational access and its vector search. See "Ordinary relational derived finders" below |
+| `@Query` / `@Modifying` (+ `@Param`) | Declared query on a method | JPQL or native SQL a method carries itself, for what a derived name cannot ask — grouped aggregates, projections, and targeted single-column writes. Postgres only; see "Declared queries" below |
+| `findBy<AnyField>OfType(Class)` | `@Any` discriminator predicate | Filters on a polymorphic to-one's target *type* without mapping its discriminator a second time as a shadow column. Postgres only; see "`@Any` predicates" below |
 | Hibernate-based enhancement shim | Mechanism | ByteBuddy enhancement via Hibernate's `EnhancementContext`-style SPI |
 | `hibernate-vector` module | Dependency | Native pgvector column mapping (`@JdbcTypeCode(SqlTypes.VECTOR)`) |
 | Neo4j-facing shim | Mechanism | Parallel graph-native persistence backend, same `JavAIPI` contract |
@@ -513,6 +515,159 @@ silently match nothing. The Postgres backend needs no such step — Hibernate bi
 is why the note is specific to the two reflective backends. (Range comparisons on a value stored as an
 ISO-8601 string, e.g. an `Instant`, remain correct because ISO-8601 sorts lexicographically; comparisons that
 are meaningless on a converted value, e.g. `>` on a UUID string, are permitted but not meaningful.)
+
+## Declared queries: `@Query` and `@Modifying` (OMI-398)
+
+A derived name can express a predicate over an entity's own properties, and nothing else. A **grouped
+aggregate** is the plainest thing it cannot: "how many rows does each of these thirty ids have" is one
+`GROUP BY`, while `countBy…In` returns a single total. That left N+1 counts, counting in memory, or reaching
+past the repository to `JavAIPI.sessionFactory(config)` — and it is the last one this exists to stop being
+the answer.
+
+```java
+public interface LikeRepository extends JavAIRepository<Like> {
+
+    @Query("select new com.example.LikeCount(l.targetId, count(l)) from Like l "
+            + "where l.targetId in :ids group by l.targetId")
+    List<LikeCount> countsByTarget(@Param("ids") Collection<UUID> ids);
+
+    @Modifying
+    @Query("update MediaSocialDetails d set d.likeCount = d.likeCount + 1 where d.id = :id")
+    int incrementLikeCount(@Param("id") UUID id);
+}
+```
+
+`@Query`/`@Modifying` are JavAI's own (`javai-annotations`); **`@Param` is reused** from
+`spring-data-commons`, already a dependency, the same reuse-not-reinvent choice `@Id` makes. `spring-data-jpa`
+is not a dependency, and taking on a whole repository framework to borrow one annotation is not worth it.
+`DeclaredQuery` sits beside `DerivedFinderQuery` and reuses its shape — parse, signature analysis,
+return-type adaptation, binding here; three primitives in each backend — including its `Constraints` record,
+so ordering and windowing mean the same thing whichever path produced them.
+
+**Postgres only.** Neo4j and MongoDB refuse at repository-creation time, and the SPI defaults *throw* rather
+than accept, following `inTransaction`'s precedent: a JPQL string means nothing to either store, and
+translating one would be a query engine rather than a shim.
+
+**Returns**: entity, `Optional`, single, `Stream`, scalar, `Object[]`, and a record. The last two needed no
+projection machinery — Hibernate 7 instantiates a record from an ordinary `select new …` constructor
+expression and hands back a tuple as `Object[]`. `Page` requires `countQuery = "…"`, which is **not** derived
+by rewriting the query: counting an arbitrary select means understanding its projection, joins and grouping,
+and a rewriter that gets that wrong returns a plausible wrong number instead of failing. `Slice` needs none,
+since it fetches one extra row.
+
+**A dynamic `Sort` is applied through Hibernate's `SelectionSpecification`, never by editing the query text.**
+It therefore works only on an entity-returning JPQL query — there is no attribute to order a projection by —
+and a native query refuses one outright, since applying it there could only mean rewriting SQL. A `Pageable`'s
+*window* needs no rewriting and is honoured on both.
+
+**Vector hydration is free.** Hibernate's `POST_LOAD` fires for HQL and native entity queries alike, so an
+entity a declared query returns arrives with its stored vectors already in its slots, exactly as `findById`
+does. Measured at the embedding provider, not inferred.
+
+**A declared query cannot share an interface with a backend that refuses one.** The refusal happens when the
+repository is *realized*, not when the method is called, so a `@Query` on an interface that is also handed to
+`JavAIPI.repository(..., neo4jConfig)` fails that whole repository -- including the methods that would have
+worked. If an entity is served from more than one backend, keep its declared queries in their own
+Postgres-only interface; both proxies are independent, and the same entity is reachable through either. This
+is what `ArticleQueryRepository` beside `ArticleRepository` looks like in `e2e-client-test`.
+
+### When a declared query is validated
+
+Every other creation-time check in this module is pure reflection. Parsing a query is the first that is not:
+it needs Hibernate's query engine, and building that engine freezes the entity set — precisely what OMI-214
+arranged should *not* happen when a repository is realized. So validation splits, and this is a property to
+know rather than an accident:
+
+- **Signature, at repository-creation time** — `@Param` names against the query's own, parameter counts,
+  return-type feasibility, trailing-parameter placement, `Page` without a `countQuery`.
+- **Query text, as early as the ORM allows** — immediately when the `SessionFactory` already exists,
+  otherwise queued and translated the moment it is built. Either way it fails before any repository method
+  runs, never on the first call of the annotated one.
+
+Native SQL is the exception, stated plainly: there is no SQL grammar in this module, so a native statement is
+parsed by the database on first execution. Its *parameter binding* is still checked at creation time.
+
+**A query is not a registration.** Naming an entity in query text does not map it; a type reachable no other
+way must be named on the configuration (`entityType(...)`/`entityPackages(...)`). The error says so.
+
+### `@Modifying`, and what it is not allowed to touch
+
+`save(entity)` persists the whole row, which makes a single-column write inexpressible and any column
+maintained *outside* the entity's own editing path clobberable — load a row before some counter moved, edit
+something unrelated, save, and the stale counter goes back with it. A repository handing out detached entities
+is exactly the shape that goes stale. It is also the only way to get an atomic `SET c = c + 1`.
+
+**Point 5 of the ticket needed no new annotation.** Measured: JPA's own `@Column(updatable = false)` already
+protects a column from `save()` (7 stays 7 through a save of a mutated detached entity) while a `@Modifying`
+query writes straight past it (7 → 8). Declare the column with the JPA annotation and write it through a
+targeted method; JavAI adds no marker of its own.
+
+**A bulk write that would break Vector Core's mutation rule is refused, not documented.** It fires no woven
+accessor, so nothing recomputes what it invalidated — and since OMI-187 a stored vector is hydrated straight
+back into a loaded object's slots, so the inconsistency is served on every later load rather than lasting one
+process. `SqmUpdateStatement`'s set clause is readable without a session, so the check is static and happens
+when the repository is realized. Refused assignments, resolved against **the statement's own target entity**
+rather than the repository's type parameter — so a repository over a plain entity is not a way around it:
+
+| Assigned to | Why it cannot be allowed |
+|---|---|
+| `@Vectorize` field | its embedding keeps the value the field had before the write |
+| `@ExternalVector`'s `keyField` | the vector supplied for the old content goes on being served for the new |
+| `@Summary` field | reassigning it moves containment; both containers' summary vectors are wrong, nothing enqueued |
+| `@Taggregate` field | the same drift one layer up, invisible to tagging's own reconciliation |
+
+An **ordinary column on a vectorized entity stays writable**, and that half matters as much: a summary is
+arithmetic over vectors, so a column no vector reads cannot move one. A guard that refused these too would
+have blocked the feature on any entity carrying an embedding.
+
+**`nativeQuery = true` is refused outright when JavAI owns storage for the type** (it is `@JavAIVectorizable`,
+or declares a `Point`). The check above reads a parsed statement's assignments and SQL has none to read, so
+the repository is the only signal there is — coarse on purpose, and better than a rule that lives in a
+document and is therefore never enforced. Native writes on a type JavAI keeps nothing for are ordinary.
+
+**A `@Modifying` delete resolves the matching ids and deletes each through `deleteById`'s path**, for the same
+three reasons `deleteBy…` already does: a bulk `delete` cascades to nothing, detaches from no container (so a
+join table's foreign key refuses it), and leaves `javai_vectors__*`/`javai_geo_points` rows orphaned — and a
+stale vector row is worse than an orphan, since it keeps matching similarity searches for an entity that no
+longer exists. One extra statement buys a deletion path that is already correct and already tested.
+
+**A bulk update does not increment `@Version`** unless the query says `update versioned`. Both spellings are
+pinned by tests.
+
+## `@Any` predicates, without shadow columns (OMI-407)
+
+An `@Any` cannot be *joined* through, and that had been taken to mean it could not be *filtered* on either —
+so the discriminator and the foreign key were mapped a second time as plain read-only columns purely to give a
+derived finder something to see, duplication every queryable `@Any` would repeat and two mappings free to
+drift. Measured on Hibernate 7, the premise is false for predicates: `Path.type()` resolves straight to the
+discriminator column, and ordinary equality straight to the pair.
+
+```java
+List<Like> findByTarget(Likeable target);            // by instance -- no new grammar; @Any is a real field
+List<Like> findByTargetIn(Collection<Likeable> targets);
+List<Like> findByTargetIsNull();
+
+List<Like> findByTargetOfType(Class<?> targetType);  // by discriminator alone -- one new keyword
+List<Like> findByTargetOfTypeIn(Collection<Class<?>> targetTypes);
+
+likes.nearestBy("caption").to(reference).where("target").ofType(MediaAsset.class).limit(20).ranked();
+```
+
+`OfType` is the one keyword added to `PartTree`'s closed vocabulary. It is stripped before the tree is built
+and re-attached to the matching part afterwards, and the match is made **by counting parts**, not by
+re-tokenizing the name — so a property whose name contains another's cannot be miscounted. Each occurrence is
+attributed to the **longest** `@Any` field name ending where it begins, which is load-bearing rather than
+defensive: one `@Any` field's name is frequently a suffix of another's (`lazyAny` inside `summaryLazyAny`),
+and the character before the token is lowercase in both `findBy|LazyAny` and `Summary|LazyAny`, so nothing
+short of longest-match separates them. The single
+ambiguous shape (one `@Any` property named twice with the keyword on only some) is refused rather than
+guessed. The same stripping runs on the vector convention's narrowing tail, so the two grammars cannot mean
+different things by it.
+
+Refusals stay refusals, with messages that now name `@Any` rather than "not a singular @Entity": traversing
+*into* one (`findByTargetLabel`), sorting by one, and any operator beyond equality/`In`/`IsNull` — there is no
+text in a discriminator-and-key pair to match. **Postgres-only for free**, since Neo4j and MongoDB already
+refuse `@Any` fields at registration.
 
 ## Vector search combined with a relational predicate (OMI-230)
 

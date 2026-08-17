@@ -171,6 +171,25 @@ public final class NearestQuery<T> {
         return this;
     }
 
+    private NearestQuery<T> addAnyDiscriminator(PropertyPath property, Part.Type type, List<Object> arguments) {
+        orGroups.get(orGroups.size() - 1)
+                .add(new DerivedFinderQuery.BoundPart(property, type, false, arguments, true));
+        return this;
+    }
+
+    /** Fails on the call that made the mistake, matching {@link #resolve}'s own discipline -- the builder's
+     *  counterpart to the creation-time check the method-name idiom gets. */
+    private void requireAnyField(PropertyPath property) {
+        String dotPath = property.toDotPath();
+        if (dotPath.contains(".")
+                || !EntityReflection.isAny(EntityReflection.findField(entityType, dotPath))) {
+            throw new IllegalArgumentException("ofType(...) narrows by an @Any field's discriminator, but '"
+                    + dotPath + "' on " + entityType.getName() + " is not an @Any field. Known @Any fields: "
+                    + EntityReflection.anyFields(entityType).stream().map(java.lang.reflect.Field::getName).toList()
+                    + ".");
+        }
+    }
+
     /**
      * One condition mid-construction: the property is chosen, the operator is not yet. Every method here
      * returns to the {@link NearestQuery} so the chain continues.
@@ -259,6 +278,26 @@ public final class NearestQuery<T> {
 
         public NearestQuery<T> isNotNull() {
             return query.add(property, Part.Type.IS_NOT_NULL, ignoreCase, List.of());
+        }
+
+        /**
+         * Narrows to rows whose {@code @Any} target is of {@code targetType}, whichever instance it is --
+         * the builder's spelling of the {@code OfType} keyword (OMI-407).
+         *
+         * @throws IllegalArgumentException if this condition's property is not an {@code @Any} field
+         */
+        public NearestQuery<T> ofType(Class<?> targetType) {
+            return anyDiscriminator(Part.Type.SIMPLE_PROPERTY, List.of(targetType));
+        }
+
+        /** {@link #ofType} against several target types at once. */
+        public NearestQuery<T> ofTypeIn(Collection<Class<?>> targetTypes) {
+            return anyDiscriminator(Part.Type.IN, List.of(List.copyOf(targetTypes)));
+        }
+
+        private NearestQuery<T> anyDiscriminator(Part.Type type, List<Object> arguments) {
+            query.requireAnyField(property);
+            return query.addAnyDiscriminator(property, type, arguments);
         }
 
         public NearestQuery<T> isTrue() {

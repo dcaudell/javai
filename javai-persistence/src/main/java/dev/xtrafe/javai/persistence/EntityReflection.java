@@ -39,6 +39,23 @@ final class EntityReflection {
         return fieldNamesAnnotatedWith(type, Vectorize.class);
     }
 
+    /** Every {@code @Any} field anywhere in {@code type}'s hierarchy -- a polymorphic to-one whose target may
+     *  be any of several unrelated entities, resolved by a discriminator rather than a foreign key. Only the
+     *  Postgres backend maps one at all; the other two refuse it at registration. */
+    static List<Field> anyFields(Class<?> type) {
+        List<Field> fields = new ArrayList<>();
+        for (Field field : allFields(type)) {
+            if (isAny(field)) {
+                fields.add(field);
+            }
+        }
+        return fields;
+    }
+
+    static boolean isAny(Field field) {
+        return field.isAnnotationPresent(org.hibernate.annotations.Any.class);
+    }
+
     static Field idField(Class<?> type) {
         for (Field field : allFields(type)) {
             if (field.isAnnotationPresent(Id.class)) {
