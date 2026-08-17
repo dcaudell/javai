@@ -822,6 +822,100 @@ runtime, or the shape isn't worth a method.
 narrowing needs, and index definitions are not amended in place. If a narrowed search fails on an index an
 older version created, drop it and let JavAI recreate it.
 
+## Writing a query out: `@Query`, and targeted writes with `@Modifying`
+
+A derived name can express a predicate over an entity's own properties and nothing else. When you need a
+**grouped aggregate** — one count per id rather than one total — a projection, or a write that touches one
+column, put the query on the method.
+
+```java
+public interface LikeRepository extends JavAIRepository<Like> {
+
+    // a grouped aggregate: countByTargetIdIn(...) would give you one number, not one per target
+    @Query("select new com.example.LikeCount(l.targetId, count(l)) from Like l "
+            + "where l.targetId in :ids group by l.targetId")
+    List<LikeCount> countsByTarget(@Param("ids") Collection<UUID> ids);
+
+    // an atomic single-column write
+    @Modifying
+    @Query("update MediaSocialDetails d set d.likeCount = d.likeCount + 1 where d.id = :id")
+    int incrementLikeCount(@Param("id") UUID id);
+}
+```
+
+**Import `dev.xtrafe.javai.annotations.Query` and `…Modifying`** — not Spring Data JPA's. `@Param` *is*
+Spring Data's (`org.springframework.data.repository.query.Param`), reused rather than reinvented. If your
+project also uses Spring Data JPA, qualify wherever the two meet.
+
+- **Postgres only.** Neo4j and MongoDB refuse a declared query when the repository is created rather than
+  silently never running it. A JPQL string has no meaning in Cypher or an aggregation pipeline.
+- **Returns**: entity, `Optional`, single, `Stream`, a scalar, `Object[]`, or a **record** via an ordinary
+  `select new …` constructor expression — which is how a grouped aggregate comes back typed. A `Page` return
+  needs `countQuery = "…"`; a `Slice` does not.
+- **A dynamic `Sort`** works on an entity-returning JPQL query. It is refused on a projection (nothing to
+  order by) and on a native query (it would mean rewriting your SQL). A `Pageable`'s window works on both.
+- **Entities come back with their vectors already loaded**, exactly as `findById` does.
+- **Name your entity types on the config.** Mentioning an entity in query text does not register it — use
+  `entityType(...)`/`entityPackages(...)`, as with everything else.
+
+⚠️ **Don't put a `@Query` on a repository interface you also use with Neo4j or MongoDB.** The refusal happens
+when the repository is *realized*, not when the method is called, so the whole repository fails on those
+backends -- including the methods that would have worked. If an entity is served from more than one backend,
+put its declared queries in a second, Postgres-only interface over the same entity. Both proxies are
+independent and the same rows are reachable through either.
+
+### What a `@Modifying` write may not touch
+
+`save(entity)` writes the whole row, which is why a column maintained *outside* the entity's editing path is
+easy to clobber: load a row before the counter moved, edit a caption, save, and the stale counter goes back
+with it. Two things address that, and the first needs nothing from JavAI:
+
+**Declare the column `@Column(updatable = false)`.** JPA's own flag stops ordinary `save()` traffic writing
+it, while a `@Modifying` query writes it anyway. That combination is the mechanism; there is no JavAI
+annotation for it.
+
+**And know what is refused.** A bulk write fires none of the woven accessors, so JavAI is never told the
+value moved — and because vectors are stored and read back on every load, that staleness would outlive the
+process rather than the call. So a statement assigning to any of these is refused *when the repository is
+created*:
+
+| Assigned to | Why |
+|---|---|
+| a `@Vectorize` field | its embedding would keep the old value's meaning, permanently |
+| an `@ExternalVector`'s `keyField` | the vector supplied for the old content would go on being served |
+| a `@Summary` field | both containers' summary vectors would be wrong, with nothing queued to fix them |
+| a `@Taggregate` field | aggregate taggings would drift with nothing to notice |
+
+An **ordinary column on a vectorized entity is fine** — a summary is arithmetic over vectors, so a column no
+vector reads cannot move one. Change a `@Vectorize` field through `save(entity)`, which re-embeds it in the
+same flush.
+
+`nativeQuery = true` is refused for a `@Modifying` method whenever JavAI stores anything for that entity
+(vectors, or a `Point`): a SQL string gives nothing to check, so the repository is the only signal available.
+Write it in JPQL, where each assignment is inspected.
+
+Two more things worth knowing: a `@Modifying` **delete** resolves the matching rows and deletes each properly
+(cascades, container membership, vector rows) rather than issuing one bulk statement — the same thing
+`deleteBy…` does, and for the same reasons. And a bulk update **does not** increment `@Version` unless the
+query says `update versioned`.
+
+### Filtering on an `@Any` association
+
+An `@Any` cannot be joined *through*, but it can be filtered *on* — so you no longer need to map its
+discriminator and foreign key a second time as read-only columns just to query them:
+
+```java
+List<Like> findByTarget(Likeable target);            // this exact target
+List<Like> findByTargetIn(Collection<Likeable> targets);
+List<Like> findByTargetOfType(Class<?> targetType);  // any target of this type
+List<Like> findByTargetOfTypeIn(Collection<Class<?>> targetTypes);
+```
+
+`OfType` also works in a narrowed vector search (`findNearestByCaptionVectorAndTargetOfType(...)`) and on the
+builder (`.where("target").ofType(MediaAsset.class)`). Postgres only — the other two backends refuse `@Any`
+fields entirely. Traversing into one (`findByTargetLabel`) or sorting by one is still refused: the key points
+into several tables, so there is no join and no column to order by.
+
 ## Registering entity types
 
 A `JavAIRepository` is realized with `JavAIPI.repository(YourRepository.class, config)`. That call registers

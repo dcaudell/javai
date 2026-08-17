@@ -12,6 +12,7 @@ import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIMap;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 import jakarta.persistence.JoinTable;
@@ -119,6 +120,25 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
     @OneToOne(cascade = CascadeType.ALL)
     private Attachment attachment;
 
+    // ---- counters maintained outside this entity's own editing path (OMI-398) --------------------
+    //
+    // Neither is @Vectorize, and that is the point: they sit on a genuinely woven @JavAIVectorizable class,
+    // so a targeted write to one has to be allowed while a write to title/body is refused. The two differ in
+    // the one dimension the ticket cared about.
+
+    /** Ordinary: writable by save() and by a targeted @Modifying query alike. */
+    private long viewCount;
+
+    /**
+     * Read-only to save(), writable only through a targeted @Modifying query -- the ticket's motivating
+     * shape. A count moved by its own path (a like, a settled charge) is otherwise clobberable by any
+     * unrelated edit: load the article before the count moved, fix a typo in the title, save, and the stale
+     * count goes back with it. This repository hands out detached entities, which is exactly the shape that
+     * goes stale. JPA's own flag is the whole mechanism; JavAI adds no annotation for it.
+     */
+    @Column(updatable = false)
+    private long likeCount;
+
     public Article() {
     }
 
@@ -145,6 +165,22 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
 
     public void setBody(String body) {
         this.body = body;
+    }
+
+    public long getViewCount() {
+        return viewCount;
+    }
+
+    public void setViewCount(long viewCount) {
+        this.viewCount = viewCount;
+    }
+
+    public long getLikeCount() {
+        return likeCount;
+    }
+
+    public void setLikeCount(long likeCount) {
+        this.likeCount = likeCount;
     }
 
     public Comment getFeaturedComment() {

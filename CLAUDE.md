@@ -65,7 +65,9 @@ for the full physical module graph, and `javai-model`'s own package-info.java fo
 reasoning behind the split.
 
 `javai-annotations` also carries Vector Core's and Vector Collections' annotation vocabulary (`@Vectorize`,
-`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.), Agentic Supervision's
+`@SearchVisibility`, `@Summary`, `@JavAIGraphNode`, `@JavAIEdge`, etc.), Persistence Bridge's
+`@Query`/`@Modifying` (declared repository queries -- `@Param` is reused from `spring-data-commons` rather
+than redefined), Agentic Supervision's
 (`@SyncSupervision`, `@AsyncSupervision`, `SupervisionPointcut`), and Tagging's (`@Taggable`, `@TagIgnore`
 — both unwoven markers, see `doc/spec/tagging.md`'s "Orthogonality" section for why) — it is the one module
 every other module depends on, directly or transitively.

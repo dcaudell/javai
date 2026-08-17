@@ -74,6 +74,8 @@ import java.util.UUID;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.WeakHashMap;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -970,6 +972,18 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         for (int i = 0; i < segments.length; i++) {
             Field field = EntityReflection.findField(owner, segments[i]);
             if (i < segments.length - 1) {
+                if (EntityReflection.isAny(field)) {
+                    // Genuinely impossible rather than merely unimplemented: an @Any's key column points into
+                    // several tables at once, so there is no join for Criteria to make. Predicates *on* the
+                    // association are fine -- see anyDiscriminatorPredicate and the leaf rules below.
+                    throw new IllegalArgumentException("Postgres derived finder cannot traverse into '"
+                            + segments[i] + "' on " + owner.getName() + " -- it is an @Any, a polymorphic to-one "
+                            + "whose targets live in different tables, so there is no join to make through it. "
+                            + "Filter on the association itself (findBy" + capitalizeSegment(segments[i])
+                            + "(target)), on its target type (findBy" + capitalizeSegment(segments[i])
+                            + DerivedFinderQuery.ANY_TYPE_KEYWORD + "(SomeTarget.class)), or query the target's "
+                            + "own repository.");
+                }
                 if (field.getType().isAnnotationPresent(Entity.class)) {
                     owner = field.getType(); // singular association
                 } else if (DerivedFinderQuery.isToMany(field)
@@ -986,7 +1000,25 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
+    private static String capitalizeSegment(String segment) {
+        return Character.toUpperCase(segment.charAt(0)) + segment.substring(1);
+    }
+
     private static void validateLeaf(Class<?> owner, Field field, Part.Type type) {
+        if (EntityReflection.isAny(field)) {
+            // An @Any answers identity and nullity and nothing else: it is a discriminator plus a key, with no
+            // ordering and no text to match against. Listing what works beats letting Hibernate fail later on
+            // a Like against a column pair.
+            switch (type) {
+                case SIMPLE_PROPERTY, NEGATING_SIMPLE_PROPERTY, IN, NOT_IN, IS_NULL, IS_NOT_NULL, EXISTS -> {
+                    return;
+                }
+                default -> throw new IllegalArgumentException("Postgres derived finder cannot apply " + type
+                        + " to '" + field.getName() + "' on " + owner.getName() + " -- it is an @Any, so only "
+                        + "equality (bare or Not), In/NotIn, IsNull/IsNotNull, and the "
+                        + DerivedFinderQuery.ANY_TYPE_KEYWORD + " target-type comparison have meaning for it.");
+            }
+        }
         switch (type) {
             case IS_EMPTY, IS_NOT_EMPTY -> {
                 if (!DerivedFinderQuery.isToMany(field)) {
@@ -1019,6 +1051,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         String[] segments = dotPath.split("\\.");
         for (int i = 0; i < segments.length; i++) {
             Field field = EntityReflection.findField(owner, segments[i]);
+            if (EntityReflection.isAny(field)) {
+                throw new IllegalArgumentException("Postgres derived finder cannot sort by '" + segments[i]
+                        + "' of " + owner.getName() + " -- it is an @Any, whose targets live in different "
+                        + "tables, so there is no column to order by (and no join to reach one through).");
+            }
             if (i < segments.length - 1) {
                 if (!field.getType().isAnnotationPresent(Entity.class)) {
                     throw new IllegalArgumentException("Postgres derived finder can only sort through singular "
@@ -1133,6 +1170,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             Class<?> rootType, DerivedFinderQuery.BoundPart part) {
         Part.Type type = part.type();
         String dotPath = part.property().toDotPath();
+        if (part.anyDiscriminator()) {
+            return anyDiscriminatorPredicate(cb, resolveJoinedPath(root, rootType, dotPath), part);
+        }
         boolean collectionLeaf = isCollectionLeaf(rootType, dotPath);
         boolean geo = type == Part.Type.NEAR || type == Part.Type.WITHIN;
         boolean emptiness = type == Part.Type.IS_EMPTY || type == Part.Type.IS_NOT_EMPTY
@@ -1162,6 +1202,30 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         return scalarPredicate(cb, path, part);
     }
 
+
+    /**
+     * A predicate over an {@code @Any}'s <em>discriminator</em> -- the {@code OfType} keyword (OMI-407).
+     *
+     * <p>{@code Path.type()} is the whole implementation, and that it works at all is the finding this feature
+     * rests on: an {@code @Any} cannot be joined through, which had been taken to mean it could not be
+     * filtered on either, so the discriminator and key were being mapped a second time as plain read-only
+     * columns purely to give a derived finder something to see. Hibernate resolves {@code type()} straight to
+     * the discriminator column, so no shadow mapping, no native SQL and no id-set walk is needed.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Predicate anyDiscriminatorPredicate(
+            HibernateCriteriaBuilder cb, Path<?> path, DerivedFinderQuery.BoundPart part) {
+        Expression discriminator = path.type();
+        Object argument = part.arguments().get(0);
+        return switch (part.type()) {
+            case SIMPLE_PROPERTY -> cb.equal(discriminator, cb.literal(argument));
+            case NEGATING_SIMPLE_PROPERTY -> cb.notEqual(discriminator, cb.literal(argument));
+            case IN -> discriminator.in((Collection<?>) argument);
+            case NOT_IN -> cb.not(discriminator.in((Collection<?>) argument));
+            default -> throw new IllegalArgumentException("Unsupported operator " + part.type()
+                    + " for an @Any discriminator predicate on '" + part.property().toDotPath() + "'.");
+        };
+    }
 
     /** Navigates a dot path by {@code join()}ing each intermediate hop. A plural attribute cannot be
      *  dereferenced with {@code get()} at all, and for a singular one an explicit join is the same inner join
@@ -1228,6 +1292,299 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             default -> throw new IllegalArgumentException(
                     "Unsupported derived-query operator " + part.type() + " for the Postgres backend.");
         };
+    }
+
+    // ---- declared queries: @Query / @Modifying (OMI-398) --------------------------------------
+
+    /** Declared queries whose text could not be parsed yet, because no {@code SessionFactory} existed when the
+     *  repository was realized -- drained by {@link #sessionFactory()} the moment one does. */
+    private final List<DeclaredQuery> awaitingTextValidation = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    @Override
+    public void validateDeclaredQuery(Class<?> entityType, DeclaredQuery query) {
+        if (query.isNative() && query.isModifying()) {
+            // The set-clause check below reads a parsed statement's assignments, and SQL has none this module
+            // can read. So the only signal left is what the repository is for -- coarse, and preferred to a
+            // rule that lives in a document and is therefore never enforced.
+            requireNoJavAIOwnedStorage(entityType, query);
+        }
+        if (sessionFactory != null) {
+            validateDeclaredQueryText(query);
+        } else {
+            awaitingTextValidation.add(query);
+        }
+    }
+
+    private void drainDeclaredQueryValidation() {
+        for (DeclaredQuery query : awaitingTextValidation) {
+            validateDeclaredQueryText(query);
+        }
+        awaitingTextValidation.clear();
+    }
+
+    /**
+     * Parses the query text, and -- for a write -- refuses one that would move state JavAI maintains itself.
+     *
+     * <p>A native query is parsed by the database on first execution rather than here: there is no SQL grammar
+     * in this module and no way to check one without running it. Said plainly rather than left as an
+     * unexplained asymmetry; JPQL is what gets the earlier answer.
+     */
+    private void validateDeclaredQueryText(DeclaredQuery query) {
+        if (query.isNative()) {
+            return;
+        }
+        org.hibernate.query.sqm.tree.SqmStatement<?> statement = translate(query, query.queryText());
+        if (query.isModifying()) {
+            if (statement instanceof org.hibernate.query.sqm.tree.update.SqmUpdateStatement<?> update) {
+                requireNoJavAIManagedAssignments(query, update);
+            } else if (!(statement instanceof org.hibernate.query.sqm.tree.delete.SqmDeleteStatement<?>)) {
+                throw new IllegalArgumentException("@Modifying method " + query.method() + " carries a query "
+                        + "that is not an update or a delete -- remove @Modifying, or write a statement that "
+                        + "changes something.");
+            }
+        } else if (!(statement instanceof org.hibernate.query.sqm.tree.select.SqmSelectStatement<?>)) {
+            throw new IllegalArgumentException("@Query method " + query.method() + " carries an update or "
+                    + "delete statement but is not annotated @Modifying, so nothing would execute it.");
+        }
+        if (!query.countQueryText().isEmpty()) {
+            translate(query, query.countQueryText());
+        }
+    }
+
+    private org.hibernate.query.sqm.tree.SqmStatement<?> translate(DeclaredQuery query, String text) {
+        try {
+            return ((SessionFactoryImplementor) sessionFactory()).getQueryEngine()
+                    .getHqlTranslator().translate(text, null);
+        } catch (org.hibernate.query.sqm.UnknownEntityException e) {
+            // Distinguished from a syntax error because the fix is completely different, and is the one this
+            // module already has a story for: the entity set closes when the SessionFactory is built, so a type
+            // a query names but nothing else reaches was never mapped (OMI-214).
+            throw new IllegalArgumentException("@Query on " + query.method() + " names an entity this "
+                    + "configuration does not know: " + e.getMessage()
+                    + "\n  Query: " + text
+                    + "\n  A query is not a registration: naming a type here does not map it. Add it with "
+                    + "JavAIPersistenceConfig.Builder.entityType(...)/entityPackages(...), or realize a "
+                    + "repository for it before the SessionFactory is built.", e);
+        } catch (RuntimeException e) {
+            throw new IllegalArgumentException("@Query on " + query.method() + " is not a valid JPQL/HQL query -- "
+                    + e.getMessage() + "\n  Query: " + text
+                    + "\n  (Add nativeQuery = true if this is meant to be SQL.)", e);
+        }
+    }
+
+    /**
+     * Refuses a bulk assignment to anything JavAI derives from that field, because nothing would tell it.
+     *
+     * <p>A bulk update fires no woven accessor, so Vector Core never learns the value moved -- {@code SPEC.md}'s
+     * mutation rule. What makes this worth a refusal rather than a warning is that persistence outlives the
+     * process: since OMI-187 a stored vector is hydrated straight back into a loaded object's slots, so the
+     * stale vector is served on every later load, forever, and nothing ever recomputes it.
+     *
+     * <p>Three annotations, three different derived things: a {@code @Vectorize} field's own vector (and an
+     * {@code @ExternalVector}'s content key, which decides whether its vector is still valid), a
+     * {@code @Summary} field's containment (reassigning it leaves the summary vectors of both the old and new
+     * container wrong, with nothing enqueued on {@code javai_summary_pending}), and a {@code @Taggregate}
+     * field's membership (the same drift, invisible to tagging's own reconciliation). An ordinary column stays
+     * allowed on a vectorized entity: a summary is arithmetic over vectors, so a column no vector reads cannot
+     * move one.
+     */
+    private void requireNoJavAIManagedAssignments(
+            DeclaredQuery query, org.hibernate.query.sqm.tree.update.SqmUpdateStatement<?> update) {
+        Class<?> target = resolveStatementTarget(update.getTarget().getEntityName());
+        if (target == null) {
+            return; // not a type this backend knows; Hibernate will have refused it already
+        }
+        for (var assignment : update.getSetClause().getAssignments()) {
+            String attribute = firstLevelAttribute(assignment.getTargetPath());
+            String reason = BulkWriteGuard.refusalReason(target, attribute);
+            if (reason != null) {
+                throw new IllegalArgumentException("@Modifying method " + query.method() + " assigns to "
+                        + target.getSimpleName() + "." + attribute + ", which JavAI maintains derived state "
+                        + "from: " + reason + ". A bulk update fires no woven accessor, so nothing recomputes "
+                        + "it -- and because the stale value is stored and hydrated back on every later load, "
+                        + "the inconsistency outlives this process rather than this call. Change it through "
+                        + "save(entity), which recomputes what it owes in the same flush.");
+            }
+        }
+    }
+
+    /** The entity's own attribute a set-clause assignment ultimately targets -- {@code address} for
+     *  {@code set a.address.city = …}, since that is the field an annotation could sit on. */
+    private static String firstLevelAttribute(org.hibernate.query.sqm.tree.domain.SqmPath<?> targetPath) {
+        org.hibernate.query.sqm.tree.domain.SqmPath<?> current = targetPath;
+        while (current.getLhs() instanceof org.hibernate.query.sqm.tree.domain.SqmPath<?> lhs
+                && !(lhs instanceof org.hibernate.query.sqm.tree.from.SqmRoot<?>)) {
+            current = lhs;
+        }
+        return current.getNavigablePath().getLocalName();
+    }
+
+    /** A statement's target type, matched by FQCN or by the simple/entity name Hibernate resolved it to --
+     *  which may not be this repository's own type, and that is exactly why it is resolved rather than assumed. */
+    private Class<?> resolveStatementTarget(String entityName) {
+        for (Class<?> registered : registeredEntityTypes) {
+            if (registered.getName().equals(entityName) || registered.getSimpleName().equals(entityName)) {
+                return registered;
+            }
+        }
+        return null;
+    }
+
+    /** The coarse guard for a native write: refuse when JavAI keeps anything of its own for this type, since a
+     *  SQL string gives nothing finer to check. */
+    private static void requireNoJavAIOwnedStorage(Class<?> entityType, DeclaredQuery query) {
+        boolean vectorized = JavAIVectorizable.class.isAssignableFrom(entityType);
+        boolean hasGeo = !pointFieldsOf(entityType).isEmpty();
+        if (vectorized || hasGeo) {
+            throw new IllegalArgumentException("@Modifying @Query(nativeQuery = true) on " + query.method()
+                    + " is refused because JavAI keeps storage of its own for " + entityType.getSimpleName()
+                    + " (" + (vectorized ? "vectors" : "") + (vectorized && hasGeo ? " and " : "")
+                    + (hasGeo ? "geo points" : "") + "), and a SQL statement gives nothing this module can "
+                    + "inspect to tell whether the write invalidates it. Write the statement in JPQL, where "
+                    + "each assignment is checked against the fields JavAI derives from, or make the change "
+                    + "through save(entity).");
+        }
+    }
+
+    @Override
+    public List<Object> runDeclaredQuery(Class<?> entityType, DeclaredQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        return inSession(session -> {
+            org.hibernate.query.SelectionQuery<?> selection = selectionFor(session, query, constraints.sort());
+            bind(selection, query, args);
+            if (constraints.skip() != null) {
+                selection.setFirstResult(constraints.skip());
+            }
+            if (constraints.maxResults() != null) {
+                selection.setMaxResults(constraints.maxResults());
+            }
+            return new ArrayList<Object>(selection.list());
+        });
+    }
+
+    /**
+     * Builds the query, applying any dynamic {@link Sort} through Hibernate's own {@code Order} rather than by
+     * editing the query text -- which is what makes offering one safe at all. Rewriting a query string means
+     * parsing it well enough to know where its own ordering ends, and a rewriter that gets that wrong produces
+     * a statement that still runs and quietly answers a different question.
+     *
+     * <p>{@code SelectionSpecification} is Hibernate 7's seam for this; the {@code SelectionQuery.setOrder}
+     * that earlier versions had is gone. It compiles the HQL to a criteria tree and appends the ordering
+     * there, after whatever the query text already ordered by.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static org.hibernate.query.SelectionQuery<?> selectionFor(
+            Session session, DeclaredQuery query, Sort sort) {
+        if (sort == null || sort.isUnsorted()) {
+            return query.isNative()
+                    ? session.createNativeQuery(query.queryText(), query.resultType())
+                    : session.createQuery(query.queryText(), query.resultType());
+        }
+        var specification = org.hibernate.query.specification.SelectionSpecification.create(
+                (Class) query.resultType(), query.queryText());
+        for (Sort.Order order : sort) {
+            specification.sort(order.isAscending()
+                    ? org.hibernate.query.Order.asc((Class) query.resultType(), order.getProperty())
+                    : org.hibernate.query.Order.desc((Class) query.resultType(), order.getProperty()));
+        }
+        return specification.createQuery(session);
+    }
+
+    @Override
+    public long runDeclaredCount(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        return inSession(session -> {
+            var counting = query.isNative()
+                    ? session.createNativeQuery(query.countQueryText(), Long.class)
+                    : session.createQuery(query.countQueryText(), Long.class);
+            bind(counting, query, args);
+            return counting.getSingleResult();
+        });
+    }
+
+    @Override
+    public long runDeclaredUpdate(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        // Translated once, here, rather than asked twice what kind of statement it is. Hibernate caches
+        // interpretations, but a method that parses the same string two ways reads as if it might get two
+        // answers.
+        var statement = query.isNative() ? null : translate(query, query.queryText());
+        return inTransactionalSession(session -> {
+            if (query.modifying().flushAutomatically()) {
+                session.flush();
+            }
+            long affected = statement instanceof org.hibernate.query.sqm.tree.delete.SqmDeleteStatement<?> delete
+                    ? deleteThroughEntityPath(session, query, args, delete)
+                    : executeMutation(session, query, args);
+            if (query.modifying().clearAutomatically()) {
+                session.clear();
+            }
+            return affected;
+        });
+    }
+
+    private long executeMutation(Session session, DeclaredQuery query, Object[] args) {
+        var mutation = query.isNative()
+                ? session.createNativeMutationQuery(query.queryText())
+                : session.createMutationQuery(query.queryText());
+        bind(mutation, query, args);
+        return mutation.executeUpdate();
+    }
+
+    /**
+     * Runs a declared {@code delete} by resolving the matching ids and removing each entity through
+     * {@link #deleteById} -- the same choice {@link #deleteByDerivedQuery} already makes, for the same three
+     * reasons, none of which a bulk statement can be made to handle.
+     *
+     * <p>A bulk {@code delete} cascades to nothing, so a member Hibernate would have removed with its owner is
+     * orphaned instead. It detaches the entity from no container, so a join table's foreign key refuses the
+     * statement outright. And it leaves this backend's own {@code javai_vectors__*}/{@code javai_geo_points}
+     * rows behind, which is worse than an orphan: a stale vector row goes on matching similarity searches for
+     * an entity that no longer exists.
+     *
+     * <p>The cost is one extra statement -- the id resolution -- against inheriting a deletion path that is
+     * already correct and already tested, rather than keeping a second one in step with it.
+     */
+    private long deleteThroughEntityPath(Session session, DeclaredQuery query, Object[] args,
+            org.hibernate.query.sqm.tree.delete.SqmDeleteStatement<?> statement) {
+        Class<?> target = resolveStatementTarget(statement.getTarget().getEntityName());
+        if (target == null) {
+            throw new IllegalStateException("@Modifying delete on " + query.method() + " targets "
+                    + statement.getTarget().getEntityName() + ", which is not a registered entity type.");
+        }
+        String alias = statement.getTarget().getExplicitAlias();
+        String root = alias != null ? alias : "javaiDeleteTarget";
+        String idName = EntityReflection.idField(target).getName();
+        String selectIds = "select " + root + "." + idName + " from " + target.getName() + " " + root
+                + whereClauseOf(query);
+
+        var selection = session.createQuery(selectIds, UUID.class);
+        bind(selection, query, args);
+        List<UUID> ids = selection.list();
+        for (UUID id : ids) {
+            deleteById(target, id);
+        }
+        return ids.size();
+    }
+
+    /**
+     * The statement's own {@code where} clause, verbatim, or empty when it has none.
+     *
+     * <p>The first {@code where} in a delete is always the statement's: its target clause is a single entity
+     * name and an optional alias, so there is nowhere earlier for a subquery to hide one.
+     */
+    private static String whereClauseOf(DeclaredQuery query) {
+        Matcher matcher = Pattern.compile("(?i)\\bwhere\\b").matcher(query.queryText());
+        return matcher.find() ? " " + query.queryText().substring(matcher.start()) : "";
+    }
+
+    private static void bind(org.hibernate.query.CommonQueryContract query, DeclaredQuery declared, Object[] args) {
+        for (DeclaredQuery.Binding binding : declared.bindings()) {
+            Object value = args[binding.argumentIndex()];
+            if (binding.isNamed()) {
+                query.setParameter(binding.name(), value);
+            } else {
+                query.setParameter(binding.position(), value);
+            }
+        }
     }
 
     // ---- id-set resolution for to-many / geo / emptiness predicates ---------------------------
@@ -3364,6 +3721,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 registerFlushVectorListener(sessionFactory);
                 registerPostLoadVectorListener(sessionFactory);
                 initializeSchema(sessionFactory);
+                // Now, and not before: a declared query cannot be parsed without an ORM, and building one
+                // early is precisely what OMI-214 removed. Draining here keeps the promise that matters --
+                // a malformed query fails before any repository method runs -- rather than the narrower one
+                // it cannot keep, which is failing in the same instant the signature does (OMI-398).
+                drainDeclaredQueryValidation();
             }
             return sessionFactory;
         }

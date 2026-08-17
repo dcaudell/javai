@@ -5,6 +5,7 @@ import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
 import dev.xtrafe.javai.e2e.domain.AnthologyRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
+import dev.xtrafe.javai.e2e.domain.ArticleQueryRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
@@ -14,6 +15,7 @@ import dev.xtrafe.javai.e2e.domain.PlaceRepository;
 import dev.xtrafe.javai.e2e.domain.ShelfRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocHubQueryRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocHubRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocLeafRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocSelfNodeRepository;
@@ -106,6 +108,11 @@ public final class JavAIEnvironment {
 
     /** Exposed so a test can compose several repository calls into one unit of work -- which a test that
      *  traverses a lazy association must, since a repository returns a detached entity (OMI-271). */
+    /** Declared queries (OMI-398) and `@Any` predicates (OMI-407) -- Postgres-only interfaces, deliberately
+     *  separate from the repositories realized against all three backends. */
+    private static final ArticleQueryRepository POSTGRES_ARTICLE_QUERY_REPOSITORY;
+    private static final AssocHubQueryRepository POSTGRES_ASSOC_HUB_QUERY_REPOSITORY;
+
     private static final JavAIPersistenceConfig POSTGRES_CONFIG;
 
     private static final Cortex CORTEX;
@@ -142,6 +149,11 @@ public final class JavAIEnvironment {
         POSTGRES_SHELF_REPOSITORY = JavAIPI.repository(ShelfRepository.class, postgresConfig);
         POSTGRES_LIBRARY_REPOSITORY = JavAIPI.repository(LibraryRepository.class, postgresConfig);
         POSTGRES_ASSOC_HUB_REPOSITORY = JavAIPI.repository(AssocHubRepository.class, postgresConfig);
+        // A @Query is refused when the repository is REALIZED, and only Postgres serves one -- so these two
+        // interfaces exist solely to keep declared queries off ArticleRepository/AssocHubRepository, which
+        // are (or could be) realized against the other two backends. See ArticleQueryRepository's javadoc.
+        POSTGRES_ARTICLE_QUERY_REPOSITORY = JavAIPI.repository(ArticleQueryRepository.class, postgresConfig);
+        POSTGRES_ASSOC_HUB_QUERY_REPOSITORY = JavAIPI.repository(AssocHubQueryRepository.class, postgresConfig);
         POSTGRES_ASSOC_LEAF_REPOSITORY = JavAIPI.repository(AssocLeafRepository.class, postgresConfig);
         POSTGRES_PLAIN_LEAF_REPOSITORY = JavAIPI.repository(PlainLeafRepository.class, postgresConfig);
         POSTGRES_ASSOC_CHAIN_TOP_REPOSITORY = JavAIPI.repository(AssocChainTopRepository.class, postgresConfig);
@@ -217,6 +229,14 @@ public final class JavAIEnvironment {
     }
 
     /** The Postgres configuration, for {@link JavAIPI#inTransaction} -- see {@link #POSTGRES_CONFIG}. */
+    public static ArticleQueryRepository postgresArticleQueryRepository() {
+        return POSTGRES_ARTICLE_QUERY_REPOSITORY;
+    }
+
+    public static AssocHubQueryRepository postgresAssocHubQueryRepository() {
+        return POSTGRES_ASSOC_HUB_QUERY_REPOSITORY;
+    }
+
     public static JavAIPersistenceConfig postgresConfig() {
         return POSTGRES_CONFIG;
     }

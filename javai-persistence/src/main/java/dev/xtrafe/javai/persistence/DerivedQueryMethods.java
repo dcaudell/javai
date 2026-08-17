@@ -76,7 +76,8 @@ final class DerivedQueryMethods {
      * @param ranked            whether the method returns {@code List<Ranked<T>>} rather than {@code List<T>}
      */
     record ParsedQuery(Kind kind, String fieldName, PartTree predicate, int limitParamIndex, int firstBindable,
-            int bindableCount, int pageableIndex, int limitObjectIndex, boolean ranked) {
+            int bindableCount, int pageableIndex, int limitObjectIndex, boolean ranked,
+            boolean[] anyDiscriminatorFlags) {
 
         boolean isNarrowed() {
             return predicate != null;
@@ -152,8 +153,21 @@ final class DerivedQueryMethods {
                 throw new IllegalArgumentException(method + " needs " + e.getMessage(), e);
             }
         }
-        PartTree predicate = parsePredicateTail(method, entityType, split.tail());
-        return resolveSignature(method, entityType, kind, split.fieldName(), predicate);
+        // The OfType keyword (OMI-407) is stripped from the narrowing tail exactly as DerivedFinderQuery
+        // strips it from a whole method name -- the two grammars share the machinery so an @Any discriminator
+        // predicate cannot mean one thing in a findBy… and another in a findNearestBy…VectorAnd… .
+        DerivedFinderQuery.AnyTypeRewrite rewrite =
+                DerivedFinderQuery.stripAnyTypeKeyword(split.tail(), entityType);
+        PartTree predicate = parsePredicateTail(method, entityType, rewrite.cleanName());
+        boolean[] anyFlags = predicate == null
+                ? new boolean[0]
+                : DerivedFinderQuery.anyDiscriminatorFlags(predicate, rewrite, method);
+        if (predicate == null && !rewrite.isEmpty()) {
+            throw new IllegalArgumentException(method + " uses '" + DerivedFinderQuery.ANY_TYPE_KEYWORD
+                    + "' outside a narrowing predicate -- it belongs after And, as in "
+                    + "findNearestByCaptionVectorAndTargetOfType(reference, limit, MediaAsset.class).");
+        }
+        return resolveSignature(method, entityType, kind, split.fieldName(), predicate, anyFlags);
     }
 
     private record Split(Kind kind, String fieldName, String tail) {
@@ -231,7 +245,7 @@ final class DerivedQueryMethods {
      * search with no bound at all is never what a caller means.
      */
     private static ParsedQuery resolveSignature(Method method, Class<?> entityType, Kind kind, String fieldName,
-            PartTree predicate) {
+            PartTree predicate, boolean[] anyDiscriminatorFlags) {
         Class<?>[] params = method.getParameterTypes();
         if (params.length == 0 || params[0] != EmbeddingVector.class) {
             throw badShape(method, entityType);
@@ -289,8 +303,25 @@ final class DerivedQueryMethods {
         if (!List.class.isAssignableFrom(method.getReturnType())) {
             throw badShape(method, entityType);
         }
+        // Checked against the parameters the atoms will actually bind, which start after the reference vector
+        // and the optional int limit rather than at zero -- the one way this differs from the relational half.
+        int ordinal = 0;
+        int cursor = firstBindable;
+        if (predicate != null) {
+            for (PartTree.OrPart orPart : predicate) {
+                for (Part part : orPart) {
+                    int arity = part.getNumberOfArguments();
+                    if (anyDiscriminatorFlags[ordinal]) {
+                        DerivedFinderQuery.validateAnyDiscriminatorPart(part, entityType,
+                                java.util.Arrays.copyOfRange(params, cursor, cursor + arity), method);
+                    }
+                    cursor += arity;
+                    ordinal++;
+                }
+            }
+        }
         return new ParsedQuery(kind, fieldName, predicate, limitParamIndex, firstBindable, bindableCount,
-                pageableIndex, limitObjectIndex, returnsRanked(method));
+                pageableIndex, limitObjectIndex, returnsRanked(method), anyDiscriminatorFlags);
     }
 
     /** Whether the declared return type is {@code List<Ranked<…>>} rather than {@code List<T>}. */
@@ -336,12 +367,13 @@ final class DerivedQueryMethods {
      */
     static NearestSpec shapeOnly(ParsedQuery parsed) {
         List<List<DerivedFinderQuery.BoundPart>> groups = new ArrayList<>();
+        int ordinal = 0;
         if (parsed.isNarrowed()) {
             for (PartTree.OrPart orPart : parsed.predicate()) {
                 List<DerivedFinderQuery.BoundPart> group = new ArrayList<>();
                 for (Part part : orPart) {
-                    group.add(new DerivedFinderQuery.BoundPart(
-                            part.getProperty(), part.getType(), false, List.of()));
+                    group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), false,
+                            List.of(), parsed.anyDiscriminatorFlags()[ordinal++]));
                 }
                 groups.add(List.copyOf(group));
             }
@@ -357,6 +389,7 @@ final class DerivedQueryMethods {
         }
         List<List<DerivedFinderQuery.BoundPart>> groups = new ArrayList<>();
         int cursor = parsed.firstBindable();
+        int ordinal = 0;
         for (PartTree.OrPart orPart : parsed.predicate()) {
             List<DerivedFinderQuery.BoundPart> group = new ArrayList<>();
             for (Part part : orPart) {
@@ -366,7 +399,8 @@ final class DerivedQueryMethods {
                     partArgs.add(args[cursor++]);
                 }
                 boolean ignoreCase = part.shouldIgnoreCase() != Part.IgnoreCaseType.NEVER;
-                group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), ignoreCase, partArgs));
+                group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), ignoreCase,
+                        partArgs, parsed.anyDiscriminatorFlags()[ordinal++]));
             }
             groups.add(List.copyOf(group));
         }

@@ -25,6 +25,7 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     private final Class<?> entityType;
     private final Map<Method, DerivedQueryMethods.ParsedQuery> parsedQueries = new ConcurrentHashMap<>();
     private final Map<Method, DerivedFinderQuery> derivedFinders = new ConcurrentHashMap<>();
+    private final Map<Method, DeclaredQuery> declaredQueries = new ConcurrentHashMap<>();
 
     RepositoryInvocationHandler(RepositoryBackend backend, Class<?> entityType) {
         this.backend = backend;
@@ -84,6 +85,13 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 return proxy == args[0];
             default:
                 break;
+        }
+        // Checked before either derived-name grammar (OMI-398): a declared query says what it is, so the
+        // method may be named anything at all -- including something that would otherwise parse as a finder.
+        if (DeclaredQuery.isDeclaredQuery(method)) {
+            DeclaredQuery declared =
+                    declaredQueries.computeIfAbsent(method, m -> DeclaredQuery.parse(m, entityType));
+            return declared.execute(backend, entityType, args);
         }
         if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
             DerivedQueryMethods.ParsedQuery parsed =

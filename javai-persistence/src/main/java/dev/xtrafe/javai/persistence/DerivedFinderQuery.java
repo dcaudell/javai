@@ -19,6 +19,7 @@ import org.springframework.data.repository.query.parser.PartTree;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -54,8 +55,18 @@ final class DerivedFinderQuery {
      *  backend translates into a single native condition. {@code property} may be nested (walk it with
      *  {@link PropertyPath#getSegment()}/{@link PropertyPath#next()}); {@code arguments} has exactly
      *  {@link Part#getNumberOfArguments()} entries (0 for {@code IsNull}/{@code True}, 1 for most, 2 for
-     *  {@code Between}). */
-    record BoundPart(PropertyPath property, Part.Type type, boolean ignoreCase, List<Object> arguments) {
+     *  {@code Between}).
+     *
+     *  <p>{@code anyDiscriminator} is set only by the {@code OfType} keyword (OMI-407): the property names an
+     *  {@code @Any} field and the bound argument is a {@code Class}, so the condition is over the target's
+     *  <em>discriminator</em> rather than over the target itself. Every other atom leaves it false, which is
+     *  why the four-argument constructor below exists. */
+    record BoundPart(PropertyPath property, Part.Type type, boolean ignoreCase, List<Object> arguments,
+            boolean anyDiscriminator) {
+
+        BoundPart(PropertyPath property, Part.Type type, boolean ignoreCase, List<Object> arguments) {
+            this(property, type, ignoreCase, arguments, false);
+        }
     }
 
     /** Ordering + windowing resolved for one call, merging the method name's static {@code OrderBy}/
@@ -72,9 +83,11 @@ final class DerivedFinderQuery {
     private final int sortParamIndex;
     private final int pageableParamIndex;
     private final int limitParamIndex;
+    private final boolean[] anyDiscriminatorFlags;
 
     private DerivedFinderQuery(Method method, Class<?> entityType, PartTree partTree, ReturnKind returnKind,
-            int bindableCount, int sortParamIndex, int pageableParamIndex, int limitParamIndex) {
+            int bindableCount, int sortParamIndex, int pageableParamIndex, int limitParamIndex,
+            boolean[] anyDiscriminatorFlags) {
         this.method = method;
         this.entityType = entityType;
         this.partTree = partTree;
@@ -83,6 +96,7 @@ final class DerivedFinderQuery {
         this.sortParamIndex = sortParamIndex;
         this.pageableParamIndex = pageableParamIndex;
         this.limitParamIndex = limitParamIndex;
+        this.anyDiscriminatorFlags = anyDiscriminatorFlags;
     }
 
     /** True for any method name Spring Data's {@link PartTree} recognizes as a derived query -- i.e.
@@ -111,22 +125,204 @@ final class DerivedFinderQuery {
             "deleteBy", "removeBy"
     };
 
+    // ---- the OfType keyword: a predicate over an @Any's discriminator (OMI-407) --------------------
+
+    /**
+     * The one keyword this grammar adds to {@link PartTree}'s own vocabulary.
+     *
+     * <p>{@code findByTargetOfType(MediaAsset.class)} asks "every row whose polymorphic {@code target} points
+     * at a {@code MediaAsset}", regardless of <em>which</em> one -- the question that previously needed the
+     * {@code @Any}'s discriminator column mapped a second time as a plain read-only property. {@code PartTree}
+     * cannot be taught a keyword (its operator set is a closed enum), so the token is stripped before the tree
+     * is built and re-attached to the resulting part afterwards.
+     */
+    static final String ANY_TYPE_KEYWORD = "OfType";
+
+    /** A method name with every {@code <AnyField>OfType} reduced to {@code <AnyField>}, plus how many times
+     *  each {@code @Any} property was stripped -- which is what {@link #anyDiscriminatorFlags} matches against
+     *  the parsed parts. */
+    record AnyTypeRewrite(String cleanName, java.util.Map<String, Integer> strippedCounts) {
+
+        boolean isEmpty() {
+            return strippedCounts.isEmpty();
+        }
+    }
+
+    /**
+     * Strips {@link #ANY_TYPE_KEYWORD} from {@code name} wherever it directly follows the name of an
+     * {@code @Any} field on {@code entityType}.
+     *
+     * <p>Only an {@code @Any} field's own token is ever rewritten, and a real property literally named
+     * {@code <field>OfType} wins over the keyword -- so the rewrite can never eat a name that means something
+     * else. A residual {@code OfType} is left alone rather than diagnosed here: {@code PartTree} will fail to
+     * resolve it and name the offending property itself, which is the better message.
+     */
+    static AnyTypeRewrite stripAnyTypeKeyword(String name, Class<?> entityType) {
+        if (!name.contains(ANY_TYPE_KEYWORD)) {
+            return new AnyTypeRewrite(name, java.util.Map.of());
+        }
+        List<Field> anyFields = EntityReflection.anyFields(entityType);
+        StringBuilder clean = new StringBuilder();
+        java.util.Map<String, Integer> stripped = new java.util.LinkedHashMap<>();
+        int cursor = 0;
+        for (int at = name.indexOf(ANY_TYPE_KEYWORD); at >= 0;
+                at = name.indexOf(ANY_TYPE_KEYWORD, at + ANY_TYPE_KEYWORD.length())) {
+            Field owner = longestAnyFieldEndingAt(anyFields, entityType, name, at);
+            if (owner == null) {
+                continue; // not our keyword here; PartTree will name the property it cannot resolve
+            }
+            clean.append(name, cursor, at);
+            cursor = at + ANY_TYPE_KEYWORD.length();
+            stripped.merge(owner.getName(), 1, Integer::sum);
+        }
+        clean.append(name.substring(cursor));
+        return new AnyTypeRewrite(clean.toString(), stripped);
+    }
+
+    /**
+     * Which {@code @Any} field an {@code OfType} at {@code at} belongs to -- the <b>longest</b> one whose
+     * capitalized name ends exactly there.
+     *
+     * <p>Longest, not first, and this is the whole correctness of the rewrite. One {@code @Any} field's name
+     * is very often a suffix of another's: an owner with both {@code lazyAny} and {@code summaryLazyAny} makes
+     * {@code findBySummaryLazyAnyOfType} end in {@code LazyAnyOfType} too, so a scan that accepted any match
+     * would strip on behalf of the wrong field, flag a part that does not exist, and report the whole method
+     * as ambiguous. Looking at the character before the token cannot separate the two either -- it is a
+     * lowercase letter in both {@code findBy|LazyAny} and {@code Summary|LazyAny}. Only the longest match is
+     * right, and it is always unique, because two distinct field names cannot both end at the same index and
+     * have the same length.
+     */
+    private static Field longestAnyFieldEndingAt(
+            List<Field> anyFields, Class<?> entityType, String name, int at) {
+        Field longest = null;
+        for (Field candidate : anyFields) {
+            String token = capitalize(candidate.getName());
+            int start = at - token.length();
+            if (start < 0 || !name.startsWith(token, start)) {
+                continue;
+            }
+            // A real property literally named `<field>OfType` beats the keyword, so the rewrite can never eat
+            // a name that means something else.
+            if (hasFieldNamed(entityType, candidate.getName() + ANY_TYPE_KEYWORD)) {
+                continue;
+            }
+            if (longest == null || candidate.getName().length() > longest.getName().length()) {
+                longest = candidate;
+            }
+        }
+        return longest;
+    }
+
+    /**
+     * Which parsed parts, in {@link PartTree} iteration order, carry the stripped keyword.
+     *
+     * <p>Matched by <em>counting parts</em> rather than by re-tokenizing the method name, which is what makes
+     * this exact instead of approximate: a property whose name merely contains another's cannot be miscounted,
+     * because the count comes from the tree the parser itself produced. The one case it cannot resolve is a
+     * single {@code @Any} property appearing more than once with the keyword on only some of them -- there is
+     * genuinely nothing in the name saying which, so it is refused rather than guessed.
+     */
+    static boolean[] anyDiscriminatorFlags(PartTree partTree, AnyTypeRewrite rewrite, Object owner) {
+        List<Part> parts = new ArrayList<>();
+        for (PartTree.OrPart orPart : partTree) {
+            for (Part part : orPart) {
+                parts.add(part);
+            }
+        }
+        boolean[] flags = new boolean[parts.size()];
+        for (var stripped : rewrite.strippedCounts().entrySet()) {
+            List<Integer> matching = new ArrayList<>();
+            for (int i = 0; i < parts.size(); i++) {
+                if (parts.get(i).getProperty().toDotPath().equals(stripped.getKey())) {
+                    matching.add(i);
+                }
+            }
+            if (matching.size() != stripped.getValue()) {
+                throw new IllegalArgumentException(owner + " uses '" + stripped.getKey() + ANY_TYPE_KEYWORD
+                        + "' but also names '" + stripped.getKey() + "' without it, and nothing in the method "
+                        + "name says which predicate is which. Split it into two methods, or express it with "
+                        + "@Query.");
+            }
+            for (int index : matching) {
+                flags[index] = true;
+            }
+        }
+        return flags;
+    }
+
+    /** Validates one {@code OfType} atom: it must sit on an {@code @Any} field at the root, use an operator a
+     *  discriminator comparison has meaning for, and bind a {@code Class} (or a collection of them). */
+    static void validateAnyDiscriminatorPart(Part part, Class<?> entityType, Class<?>[] boundTypes, Object owner) {
+        String dotPath = part.getProperty().toDotPath();
+        if (dotPath.contains(".") || !EntityReflection.isAny(EntityReflection.findField(entityType, dotPath))) {
+            throw new IllegalArgumentException(owner + ": '" + ANY_TYPE_KEYWORD + "' applies to an @Any field on "
+                    + entityType.getName() + " itself, but '" + dotPath + "' is not one. Known @Any fields: "
+                    + EntityReflection.anyFields(entityType).stream().map(Field::getName).toList() + ".");
+        }
+        boolean collectionOperator = part.getType() == Part.Type.IN || part.getType() == Part.Type.NOT_IN;
+        if (part.getType() != Part.Type.SIMPLE_PROPERTY && part.getType() != Part.Type.NEGATING_SIMPLE_PROPERTY
+                && !collectionOperator) {
+            throw new IllegalArgumentException(owner + ": '" + dotPath + ANY_TYPE_KEYWORD + "' compares a target's"
+                    + " type, so " + part.getType() + " has no meaning for it -- use it bare (equality),"
+                    + " with Not, or with In.");
+        }
+        for (Class<?> bound : boundTypes) {
+            boolean acceptable = collectionOperator
+                    ? java.util.Collection.class.isAssignableFrom(bound)
+                    : Class.class.isAssignableFrom(bound);
+            if (!acceptable) {
+                throw new IllegalArgumentException(owner + ": '" + dotPath + ANY_TYPE_KEYWORD + "' binds "
+                        + (collectionOperator ? "a Collection<Class<?>>" : "a Class<?>") + ", but the declared "
+                        + "parameter is " + bound.getName() + ".");
+            }
+        }
+    }
+
+    /** Said only when the name still carries an unstripped {@code OfType} -- otherwise a plain unknown-property
+     *  error would leave a caller who used the keyword on the wrong field with nothing to go on. */
+    private static String anyTypeKeywordHint(AnyTypeRewrite rewrite, Class<?> entityType) {
+        if (!rewrite.cleanName().contains(ANY_TYPE_KEYWORD)) {
+            return "";
+        }
+        List<String> anyFields = EntityReflection.anyFields(entityType).stream().map(Field::getName).toList();
+        return ". Note '" + ANY_TYPE_KEYWORD + "' is a keyword only directly after an @Any field's name"
+                + (anyFields.isEmpty()
+                        ? ", and " + entityType.getSimpleName() + " declares no @Any field at all."
+                        : "; the @Any fields here are " + anyFields + ".");
+    }
+
+    private static boolean hasFieldNamed(Class<?> type, String fieldName) {
+        try {
+            EntityReflection.findField(type, fieldName);
+            return true;
+        } catch (IllegalStateException absent) {
+            return false;
+        }
+    }
+
+    private static String capitalize(String value) {
+        return Character.toUpperCase(value.charAt(0)) + value.substring(1);
+    }
+
     /** Parses and fully validates {@code method} against {@code entityType}, throwing a clear
      *  {@code IllegalArgumentException} for an unknown property or a signature whose bindable-parameter
      *  count doesn't match the predicate's argument demand. Backend feasibility (e.g. whether a nested path
      *  is reachable on that specific store) is a separate check -- see
      *  {@link RepositoryBackend#validateDerivedQuery}. */
     static DerivedFinderQuery parse(Method method, Class<?> entityType) {
+        AnyTypeRewrite rewrite = stripAnyTypeKeyword(method.getName(), entityType);
         PartTree partTree;
         try {
-            partTree = new PartTree(method.getName(), entityType);
+            partTree = new PartTree(rewrite.cleanName(), entityType);
         } catch (PropertyReferenceException e) {
             throw new IllegalArgumentException("Derived query method " + method + " references a property that "
-                    + "does not exist on " + entityType.getName() + " -- " + e.getMessage(), e);
+                    + "does not exist on " + entityType.getName() + " -- " + e.getMessage()
+                    + anyTypeKeywordHint(rewrite, entityType), e);
         } catch (RuntimeException e) {
             throw new IllegalArgumentException("Cannot parse derived query method " + method + " on repository for "
                     + entityType.getName() + " -- " + e.getMessage(), e);
         }
+        boolean[] anyDiscriminatorFlags = anyDiscriminatorFlags(partTree, rewrite, method);
 
         Class<?>[] paramTypes = method.getParameterTypes();
         int sortIndex = -1;
@@ -161,10 +357,30 @@ final class DerivedFinderQuery {
                         + "Sort/Pageable/Limit parameter after all bindable predicate parameters.");
             }
         }
+        validateAnyDiscriminatorParts(method, entityType, partTree, anyDiscriminatorFlags, paramTypes);
 
         ReturnKind returnKind = resolveReturnKind(method, partTree, entityType);
-        return new DerivedFinderQuery(
-                method, entityType, partTree, returnKind, bindableCount, sortIndex, pageableIndex, limitIndex);
+        return new DerivedFinderQuery(method, entityType, partTree, returnKind, bindableCount, sortIndex,
+                pageableIndex, limitIndex, anyDiscriminatorFlags);
+    }
+
+    /** Walks the parts alongside the declared parameter list so an {@code OfType} atom is checked against the
+     *  parameter it will actually bind, at repository-creation time like every other signature check. */
+    private static void validateAnyDiscriminatorParts(Method method, Class<?> entityType, PartTree partTree,
+            boolean[] flags, Class<?>[] paramTypes) {
+        int ordinal = 0;
+        int cursor = 0;
+        for (PartTree.OrPart orPart : partTree) {
+            for (Part part : orPart) {
+                int arity = effectiveArgumentCount(part);
+                if (flags[ordinal]) {
+                    validateAnyDiscriminatorPart(part, entityType,
+                            Arrays.copyOfRange(paramTypes, cursor, cursor + arity), method);
+                }
+                cursor += arity;
+                ordinal++;
+            }
+        }
     }
 
     private static ReturnKind resolveReturnKind(Method method, PartTree partTree, Class<?> entityType) {
@@ -234,6 +450,7 @@ final class DerivedFinderQuery {
     List<List<BoundPart>> boundOrGroups(Object[] args) {
         Object[] bindables = bindableArguments(args);
         int cursor = 0;
+        int ordinal = 0;
         List<List<BoundPart>> groups = new ArrayList<>();
         for (PartTree.OrPart orPart : partTree) {
             List<BoundPart> group = new ArrayList<>();
@@ -244,11 +461,18 @@ final class DerivedFinderQuery {
                     partArgs.add(bindables[cursor++]);
                 }
                 boolean ignoreCase = part.shouldIgnoreCase() != Part.IgnoreCaseType.NEVER;
-                group.add(new BoundPart(part.getProperty(), part.getType(), ignoreCase, partArgs));
+                group.add(new BoundPart(part.getProperty(), part.getType(), ignoreCase, partArgs,
+                        anyDiscriminatorFlags[ordinal++]));
             }
             groups.add(group);
         }
         return groups;
+    }
+
+    /** The parsed parts' {@code OfType} flags, in the same iteration order {@link #boundOrGroups} uses -- what
+     *  a backend's creation-time feasibility check reads, since it sees the tree rather than a bound call. */
+    boolean[] anyDiscriminatorFlags() {
+        return anyDiscriminatorFlags;
     }
 
     /** How many method parameters a part actually binds. Matches {@link Part#getNumberOfArguments()} for
@@ -404,8 +628,7 @@ final class DerivedFinderQuery {
     }
 
     private Object adaptCount(long count) {
-        Class<?> returnType = method.getReturnType();
-        return returnType == int.class || returnType == Integer.class ? Math.toIntExact(count) : count;
+        return boxedCount(method.getReturnType(), count);
     }
 
     private Object adaptDelete(long deleted) {
@@ -413,7 +636,23 @@ final class DerivedFinderQuery {
         if (returnType == void.class || returnType == Void.class) {
             return null;
         }
-        return returnType == int.class || returnType == Integer.class ? Math.toIntExact(deleted) : deleted;
+        return boxedCount(returnType, deleted);
+    }
+
+    /**
+     * Boxes to whichever of {@code Integer}/{@code Long} the method actually declared.
+     *
+     * <p>Written as statements rather than a ternary deliberately. {@code cond ? Math.toIntExact(n) : n} looks
+     * like it returns an {@code Integer} on the true branch, but binary numeric promotion widens both branches
+     * to {@code long} and boxes the result to {@code Long} -- so an {@code int}-returning finder was handed a
+     * {@code Long} and the repository proxy threw {@code ClassCastException} on return. Latent here until
+     * OMI-398 wrote an {@code int}-returning method and hit it immediately.
+     */
+    private static Object boxedCount(Class<?> returnType, long value) {
+        if (returnType == int.class || returnType == Integer.class) {
+            return Integer.valueOf(Math.toIntExact(value));
+        }
+        return Long.valueOf(value);
     }
 
     private Object executeSingle(RepositoryBackend backend, Class<?> entityTypeArg, Object[] args) {

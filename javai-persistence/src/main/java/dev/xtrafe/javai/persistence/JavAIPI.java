@@ -101,6 +101,12 @@ public final class JavAIPI {
             if (method.getDeclaringClass() == JavAIRepository.class || method.getDeclaringClass() == Object.class) {
                 continue; // the base CRUD contract itself, always fine
             }
+            if (DeclaredQuery.isDeclaredQuery(method)) {
+                // First, so a @Query method's own name is never held to a grammar it isn't using (OMI-398).
+                DeclaredQuery declared = DeclaredQuery.parse(method, entityType); // signature; throws if invalid
+                backend.validateDeclaredQuery(entityType, declared); // query text + store feasibility
+                continue;
+            }
             if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
                 DerivedQueryMethods.ParsedQuery parsed =
                         DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
@@ -116,7 +122,8 @@ public final class JavAIPI {
                 continue;
             }
             throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
-                    + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, the "
+                    + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, a @Query "
+                    + "carrying its own JPQL or SQL (optionally @Modifying), the "
                     + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector vector "
                     + "convention (optionally narrowed as ...VectorAnd<Predicate>, returning List<Ranked<T>>, "
                     + "and/or paged with a trailing Pageable/Limit), and ordinary Spring-Data-style derived "

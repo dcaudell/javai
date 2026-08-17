@@ -279,6 +279,52 @@ interface RepositoryBackend {
     /** Deletes every entity matching the derived finder's predicate, returning how many were removed. */
     long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
 
+    // ---- declared queries: @Query / @Modifying (OMI-398) -------------------------------------------
+    // Three primitives, mirroring the four above: DeclaredQuery owns the annotation, the parameter binding,
+    // the return-type adaptation and Pageable/Sort/Limit; a backend runs a query and hands back rows, a
+    // count, or an affected-row count.
+    //
+    // The defaults REFUSE rather than accept, unlike validateDerivedQuery's. That follows inTransaction's
+    // precedent, and for the same reason: this is a capability one backend has and the others structurally
+    // do not, so a new backend must answer it deliberately instead of inheriting a silent no-op. A JPQL or
+    // SQL string means nothing to Neo4j or MongoDB, and translating one would be a query engine, not a shim.
+
+    /**
+     * Rejects, at repository-creation time, a declared query this backend cannot serve -- and on the two
+     * backends that serve none, rejects every one of them.
+     *
+     * <p>{@link DeclaredQuery#parse} has already validated everything reflection can see. What is left is
+     * store-specific: on Postgres, whether the query text parses at all and whether a write touches state
+     * JavAI maintains out of band.
+     */
+    default void validateDeclaredQuery(Class<?> entityType, DeclaredQuery query) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs a declared select under {@code constraints}, hydrating entity results exactly as {@link #findAll}
+     *  hydrates them. */
+    default List<Object> runDeclaredQuery(Class<?> entityType, DeclaredQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs the {@code countQuery} of a {@code Page}-returning declared query. */
+    default long runDeclaredCount(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs a {@code @Modifying} declared query, returning how many rows it affected. */
+    default long runDeclaredUpdate(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    private String declaredQueriesUnsupported(DeclaredQuery query) {
+        return "@Query is supported on the Postgres backend only -- " + getClass().getSimpleName()
+                + " has no query language JPQL or SQL could be translated into, and " + query.method()
+                + " declares one. Express it as a derived finder (findBy…/findNearestBy…Vector), as a runtime "
+                + "predicate through nearestBy(...), or use the store's own driver for this one query.";
+    }
+
     /**
      * This backend's answer to "which containers hold this member, and which members does this container
      * hold", for {@code @Taggregate} (OMI-304) -- what {@code javai-tagging} consumes through
