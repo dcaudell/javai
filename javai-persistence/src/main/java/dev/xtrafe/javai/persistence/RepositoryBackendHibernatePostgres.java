@@ -2039,8 +2039,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // Provisioned before the connection is borrowed, not inside doWork: provisioning opens a session of
         // its own, and taking a second connection while holding one is a pool-exhaustion risk under load as
         // well as the lock-ordering hazard ensureFieldVectorTable documents.
-        String summaryTable = summary.isAbsent() ? null
-                : ensureSummaryVectorTable(summary.modelId(), summary.dims());
+        // ⚠️ Whichever of the two is present decides the table, summary first. Resolving it from the summary
+        // alone left it null exactly when the row held a concatenated vector and no summary — the case
+        // OMI-435 made writable — and the write would have gone to a table name of null.
+        EmbeddingVector dimensioned = summary.isAbsent() ? concatenated : summary;
+        String summaryTable = dimensioned.isAbsent() ? null
+                : ensureSummaryVectorTable(dimensioned.modelId(), dimensioned.dims());
         session.doWork(connection ->
                 writeEntityGrainRow(connection, summaryTable, vectorizable, ownerType, id,
                         currentModelId, summary, concatenated));
@@ -2053,17 +2057,20 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             deleteSummaryVectorRow(connection, currentModelId, ownerType, id);
             return;
         }
-        if (summary.isAbsent()) {
-            // The `vector` column is NOT NULL, so a row cannot hold concatenated text without a summary
-            // vector. Reasoning says the two always co-occur -- text implies content, and content implies a
-            // non-absent summary contribution -- but that is inference, so this refuses loudly rather than
-            // silently dropping the text or tripping a bare constraint violation. If this ever fires, the
-            // fix is to make `vector` nullable, not to skip the write.
-            throw new IllegalStateException("Entity " + ownerType + "#" + id + " has a concatenated text"
-                    + " vector but an absent summary vector, which the entity-grain table cannot"
-                    + " represent (its `vector` column is NOT NULL). This combination was believed"
-                    + " impossible; please report it with the entity's shape.");
-        }
+        // ⚠️ **A concatenated text vector with no summary vector is a real state, and is now stored as one**
+        // (Dom, 2026-08-23 -- OMI-435). This used to throw: the `vector` column was NOT NULL, the reasoning
+        // being that the two always co-occur -- text implies content, and content implies a non-absent
+        // summary contribution. That was inference, and it was wrong. An entity that loses its last
+        // @Vectorize content has an absent summary immediately, while a concatenated vector computed
+        // earlier is still on file and is served back by hydrateVectors on the drain path; the pair arrives
+        // at this writer through no fault of the entity.
+        //
+        // Refusing it cost far more than it caught. On the inline path the whole save rolled back -- an
+        // owner's edit lost to a vector-bookkeeping constraint -- and on the drain path the recomputation
+        // requeued forever, leaving the container's summaries stale. `vector` is nullable now (see
+        // ensureSummaryVectorTable, which also migrates tables created before this), so the row simply
+        // records what is true: this text, and no summary. `rankIds` already skips NULL vectors, so a
+        // half-populated row is invisible to a summary search and findable by a concatenated-text one.
         StoredSummaryRow storedRow = readStoredSummaryRow(connection, summaryTable, ownerType, id);
         if (storedRow != null && isUnchanged(storedRow.summary(), summary)
                 && isUnchanged(storedRow.concatenated(), concatenated)) {
@@ -2571,9 +2578,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 }
                 String modelId = rows.getString(1);
                 int dims = rows.getInt(2);
+                // ⚠️ Both nullable since OMI-435: a row may hold a concatenated text vector and no summary.
+                // `isUnchanged` already reads a null stored half as "absent", so the read-then-skip check
+                // above goes on working without knowing which half is missing.
+                String summary = rows.getString(3);
                 String concatenated = rows.getString(4);
                 return new StoredSummaryRow(
-                        new StoredVector(modelId, dims, parseVectorLiteral(rows.getString(3)), null),
+                        summary == null ? null
+                                : new StoredVector(modelId, dims, parseVectorLiteral(summary), null),
                         concatenated == null ? null
                                 : new StoredVector(modelId, dims, parseVectorLiteral(concatenated), null));
             }
@@ -3350,13 +3362,22 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 + " concatenated_text = EXCLUDED.concatenated_text,"
                 + " concatenated_text_vector = EXCLUDED.concatenated_text_vector,"
                 + " concatenated_text_computed_at = EXCLUDED.concatenated_text_computed_at";
+        // ⚠️ `model_id`, `dims` and `computed_at` are NOT NULL and describe the *row*, so they come from
+        // whichever vector is present -- the summary where there is one, the concatenated text vector
+        // otherwise (OMI-435). Both are this entity's, under the same model, so neither answer is a guess.
+        EmbeddingVector dimensioned = vector.isAbsent() ? concatenated : vector;
         try (PreparedStatement statement = connection.prepareStatement(sql)) {
             statement.setString(1, ownerType);
             statement.setObject(2, ownerId);
-            statement.setString(3, vector.modelId());
-            statement.setInt(4, vector.dims());
-            statement.setString(5, toVectorLiteral(vector.values()));
-            statement.setTimestamp(6, Timestamp.from(vector.computedAt()));
+            statement.setString(3, dimensioned.modelId());
+            statement.setInt(4, dimensioned.dims());
+            if (vector.isAbsent()) {
+                // No summary: the entity has no content of its own to summarise, and says so.
+                statement.setNull(5, java.sql.Types.VARCHAR);
+            } else {
+                statement.setString(5, toVectorLiteral(vector.values()));
+            }
+            statement.setTimestamp(6, Timestamp.from(dimensioned.computedAt()));
             if (concatenated == null || concatenated.isAbsent()) {
                 statement.setNull(7, java.sql.Types.VARCHAR);
                 statement.setNull(8, java.sql.Types.VARCHAR);
@@ -3561,7 +3582,20 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     + "owner_id     uuid         NOT NULL,"
                     + "model_id     varchar(128) NOT NULL,"
                     + "dims         integer      NOT NULL,"
-                    + "vector       vector(" + dims + ") NOT NULL,"
+                    // ⚠️ NULL-able, which it was not until OMI-435. An entity can legitimately hold a
+                    // concatenated text vector and no summary vector: clearing its last @Vectorize content
+                    // leaves the summary absent while a previously-stored concatenated vector is still on
+                    // file. NOT NULL made that pair unrepresentable, so the writer refused it outright and
+                    // the whole save failed on an entity nothing was wrong with.
+                    //
+                    // ⚠️ **A database created before this keeps its NOT NULL, and that is the adopter's to
+                    // fix.** JavAI has no concept of a migration -- it is a library, and it provisions a
+                    // table it finds missing rather than altering one it finds present. An ALTER issued from
+                    // here would need an ACCESS EXCLUSIVE lock on a table the calling transaction is already
+                    // holding a lock on, which deadlocks the request that triggered it. See
+                    // doc/javai-guidance/persistence-support-matrix.md in an adopter's repository for the
+                    // one statement to run.
+                    + "vector       vector(" + dims + ") NULL,"
                     + "concatenated_text             text        NULL,"
                     + "concatenated_text_vector      vector(" + dims + ") NULL,"
                     + "concatenated_text_computed_at timestamptz NULL,"

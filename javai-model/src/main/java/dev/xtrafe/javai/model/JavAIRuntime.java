@@ -1811,8 +1811,18 @@ public final class JavAIRuntime {
         }
         StringBuilder text = new StringBuilder();
         for (String fieldName : vectorizeFieldNames.split(",")) {
-            Object value = readField(self, fieldName);
-            if (value != null) {
+            String value = fieldTextOf(self, fieldName);
+            // ⚠️ Blank, not merely null -- and via fieldTextOf, so this and the per-field vector read the
+            // field exactly the same way. embedText treats blank text as *absent*, deliberately: it is what
+            // makes "this field lost its content" representable at rest. Testing only != null here made the
+            // two disagree, and an entity whose @Vectorize fields were all empty strings emitted labels with
+            // nothing after them -- "title: \ncaption: \n" -- which is not blank, and got a real embedding
+            // while every field vector, and therefore the summary, stayed absent. That pair is precisely
+            // what RepositoryBackendHibernatePostgres.writeEntityGrainRow declares impossible, and it threw
+            // on it in production (Dom, 2026-08-23: setting an album cover).
+            //
+            // The label alone says a field exists and nothing about what it holds. That is not content.
+            if (!value.isBlank()) {
                 text.append(fieldName).append(": ").append(value).append('\n');
             }
         }
