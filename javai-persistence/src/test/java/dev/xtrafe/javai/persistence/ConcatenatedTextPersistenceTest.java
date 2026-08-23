@@ -204,7 +204,71 @@ class ConcatenatedTextPersistenceTest {
                 dev.xtrafe.javai.vector.EmbeddingVector reference, int limit);
     }
 
+    /**
+     * **A concatenated text vector with no summary vector is stored, not refused** (Dom, 2026-08-23 —
+     * OMI-435).
+     *
+     * <h2>How the pair arises, which is the part that is not obvious</h2>
+     *
+     * Within one computation the two aggregates agree: text implies content implies a summary. What breaks
+     * the symmetry is <b>time</b>. A {@code @Summary} container is recomputed <em>after</em> commit, by
+     * {@code recomputeOwner}, which reloads the entity in a fresh session and calls {@code hydrateVectors} —
+     * restoring the <b>stored</b> concatenated vector into a clean slot. So the reloaded instance carries
+     * the cleared fields <em>and</em> the concatenated vector computed from the text it used to hold. Its
+     * summary recomputes to absent; its concatenated vector is served from storage, present.
+     *
+     * <p>⚠️ That pair used to throw. On the inline path the owner's whole save rolled back over a vector
+     * bookkeeping constraint, and on the drain path the recomputation requeued forever, leaving every
+     * container above it stale. The column is nullable now and the row records what is true.
+     */
+    @Test
+    void aConcatenatedVectorWithNoSummaryIsStoredRatherThanRefused() throws Exception {
+        TestChapter chapter = postgresChapters.save(new TestChapter("Departure", "The tide went out."));
+        UUID id = chapter.getId();
+        assertNotNull(postgresConcatenatedText(id), "precondition: it stored text to go stale");
+
+        chapter.setHeading(null);
+        chapter.setProse(null);
+        postgresChapters.save(chapter);
+
+        // ⚠️ The row must still be **there**, holding the pair. A bare "the summary is null" would pass just
+        // as well if the row had been deleted outright — which is the other thing this writer does, and not
+        // what is being tested. Deleting is for both-absent; this is one-absent, and the text survives.
+        assertTrue(postgresSummaryRowExists(id), "the row holds the pair rather than being deleted");
+        assertNull(postgresSummaryVector(id), "no content of its own means no summary vector, and says so");
+        assertTrue(postgresConcatenatedVectorExists(id),
+                "and the concatenated vector it was hydrated with is what made the pair");
+    }
+
     // ---- raw datastore inspection, deliberately bypassing JavAI's own read path ----
+
+    private static boolean postgresSummaryRowExists(UUID id) throws Exception {
+        String table = "javai_summary_vectors__" + ModelIds.sanitize(FakeEmbeddingProvider.MODEL_ID);
+        try (Connection connection = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+                PreparedStatement statement = connection.prepareStatement(
+                        "SELECT 1 FROM " + table + " WHERE owner_id = ?")) {
+            statement.setObject(1, id);
+            try (ResultSet rows = statement.executeQuery()) {
+                return rows.next();
+            }
+        }
+    }
+
+    private static String postgresSummaryVector(UUID id) throws Exception {
+        String table = "javai_summary_vectors__" + ModelIds.sanitize(FakeEmbeddingProvider.MODEL_ID);
+        try (Connection connection = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+                PreparedStatement statement = connection.prepareStatement(
+                        "SELECT vector::text FROM " + table + " WHERE owner_id = ?")) {
+            statement.setObject(1, id);
+            try (ResultSet rows = statement.executeQuery()) {
+                return rows.next() ? rows.getString(1) : null;
+            }
+        }
+    }
+
+
 
     private static String postgresConcatenatedText(UUID id) throws Exception {
         String table = "javai_summary_vectors__" + ModelIds.sanitize(FakeEmbeddingProvider.MODEL_ID);
