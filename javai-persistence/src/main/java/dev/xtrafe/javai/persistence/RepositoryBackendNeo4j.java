@@ -266,6 +266,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     @Override
     public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
         validateNearestQuery(entityType, spec); // the builder idiom reaches here without a creation-time check
+        // A summary search in a model this backend never wrote a property for still has an answer, and
+        // returning nothing would be indistinguishable from "nothing is similar" (OMI-458). Folding is that
+        // answer; the flag that makes it an indexed lookup is Postgres-only for now.
+        spec.requireModelAgreement();
+        requireConcatenatedTextInConfiguredModel(spec);
+        if (foldsSummaryInMemory(containment(), entityType, spec)) {
+            return foldNearestBySummary(entityType, spec);
+        }
         return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
@@ -316,6 +324,15 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         EmbeddingVector reference = spec.reference();
         String label = label(entityType);
         String property = qualify(basePropertyName, reference.modelId());
+        // ⚠️ **Nothing carries this property, so there is nothing to index and nothing to find.** Creating a
+        // vector index here anyway -- which this did -- left a permanent, empty index behind for every
+        // search whose reference named a model no node had ever been written in, and blocked the caller
+        // while waiting for that junk index to come online. Unlike Postgres, whose write path provisions
+        // its own tables, a query is the only thing that ever creates an index here, so this cannot simply
+        // stop creating: it creates when there is something to create it for.
+        if (!anyNodeCarries(label, property)) {
+            return List.of();
+        }
         ensureVectorIndex(label, property, reference.dims());
         String indexName = vectorIndexName(label, property);
         try (Session session = driver().session()) {
@@ -346,6 +363,16 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     private record Scored(Node node, double score) {
+    }
+
+    /** Whether a single node of {@code label} carries {@code property} at all -- one indexed-free lookup
+     *  bounded by {@code LIMIT 1}, which is all "is there anything to index" needs to ask. */
+    private boolean anyNodeCarries(String label, String property) {
+        try (Session session = driver().session()) {
+            return session.executeRead(tx -> tx.run(
+                    "MATCH (n:`" + label + "`) WHERE n.`" + property + "` IS NOT NULL RETURN n LIMIT 1")
+                    .hasNext());
+        }
     }
 
     private void ensureVectorIndex(String label, String property, int dims) {

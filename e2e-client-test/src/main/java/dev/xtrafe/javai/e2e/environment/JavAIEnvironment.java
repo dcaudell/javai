@@ -8,6 +8,10 @@ import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleQueryRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoAlbumRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoAssetRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoCollageRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoExhibitionRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
 import dev.xtrafe.javai.e2e.domain.LibraryRepository;
 import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
@@ -100,6 +104,13 @@ public final class JavAIEnvironment {
     private static final AssocSelfNodeRepository POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
     private static final AssocBiParentRepository POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
 
+    // OMI-458's fixture: a three-tier @Summary chain whose leaves carry an @ExternalVector, plus the
+    // same middle tier without the persistModelSummaries opt-in so both paths can be exercised.
+    private static final PhotoAssetRepository POSTGRES_PHOTO_ASSET_REPOSITORY;
+    private static final PhotoAlbumRepository POSTGRES_PHOTO_ALBUM_REPOSITORY;
+    private static final PhotoExhibitionRepository POSTGRES_PHOTO_EXHIBITION_REPOSITORY;
+    private static final PhotoCollageRepository POSTGRES_PHOTO_COLLAGE_REPOSITORY;
+
     private static final AnthologyRepository POSTGRES_ANTHOLOGY_REPOSITORY;
     private static final ShelfRepository POSTGRES_SHELF_REPOSITORY;
     private static final LibraryRepository POSTGRES_LIBRARY_REPOSITORY;
@@ -145,6 +156,11 @@ public final class JavAIEnvironment {
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
         // AssocLeaf/AssocChainMiddle/AssocBiChild are auto-registered as related types, but each root that
         // tests query independently still needs its own proxy.
+        POSTGRES_PHOTO_ASSET_REPOSITORY = JavAIPI.repository(PhotoAssetRepository.class, postgresConfig);
+        POSTGRES_PHOTO_ALBUM_REPOSITORY = JavAIPI.repository(PhotoAlbumRepository.class, postgresConfig);
+        POSTGRES_PHOTO_EXHIBITION_REPOSITORY =
+                JavAIPI.repository(PhotoExhibitionRepository.class, postgresConfig);
+        POSTGRES_PHOTO_COLLAGE_REPOSITORY = JavAIPI.repository(PhotoCollageRepository.class, postgresConfig);
         POSTGRES_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, postgresConfig);
         POSTGRES_SHELF_REPOSITORY = JavAIPI.repository(ShelfRepository.class, postgresConfig);
         POSTGRES_LIBRARY_REPOSITORY = JavAIPI.repository(LibraryRepository.class, postgresConfig);
@@ -345,6 +361,24 @@ public final class JavAIEnvironment {
 
     public static LibraryRepository postgresLibraryRepository() {
         return POSTGRES_LIBRARY_REPOSITORY;
+    }
+
+    // ---- OMI-458: persisted per-model summaries ------------------------------------------------
+
+    public static PhotoAssetRepository postgresPhotoAssetRepository() {
+        return POSTGRES_PHOTO_ASSET_REPOSITORY;
+    }
+
+    public static PhotoAlbumRepository postgresPhotoAlbumRepository() {
+        return POSTGRES_PHOTO_ALBUM_REPOSITORY;
+    }
+
+    public static PhotoExhibitionRepository postgresPhotoExhibitionRepository() {
+        return POSTGRES_PHOTO_EXHIBITION_REPOSITORY;
+    }
+
+    public static PhotoCollageRepository postgresPhotoCollageRepository() {
+        return POSTGRES_PHOTO_COLLAGE_REPOSITORY;
     }
 
     public static AnthologyRepository neo4jAnthologyRepository() {

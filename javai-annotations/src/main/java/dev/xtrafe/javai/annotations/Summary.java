@@ -52,4 +52,38 @@ public @interface Summary {
      * reader was field-only. That is what left the TYPE placement free to be given this meaning.
      */
     boolean concatenate() default false;
+
+    /**
+     * Opts this <b>container type</b> into having its <b>per-model summary vectors persisted</b>, so they can
+     * be ranked against a real index instead of folded in memory on every query (OMI-458).
+     *
+     * <p>{@code summaryVector(String modelId)} (OMI-290) already computes a container's summary restricted
+     * to one embedding model -- what its subtree <em>looks</em> like, as against what it <em>reads</em>
+     * like. Nothing stored it. The persistence bridge writes only the ambient text model's row, so a model
+     * that arrives exclusively through {@code @ExternalVector} -- image pixels, an audio waveform -- has a
+     * computable container summary and nowhere to rank it. This flag is what puts it in the
+     * {@code javai_summary_vectors__<model>} table the bridge already names and already indexes.
+     *
+     * <p><b>Which models</b> is derived, not configured: every model declared by an {@code @ExternalVector}
+     * anywhere in this container's {@code @Summary} subtree, transitively, minus the ambient one (which is
+     * written regardless and always has been). Derived from <em>declarations</em> rather than from whatever
+     * happens to be in a table, so the answer does not depend on how much of the corpus has been embedded
+     * yet.
+     *
+     * <p><b>TYPE placement only.</b> Unlike {@link #concatenate()}, this has no per-field meaning -- a
+     * summary row is the container's, and a field cannot opt half of one in. It is refused on a field at
+     * registration rather than ignored.
+     *
+     * <p><b>Defaults to {@code false}, and off is the pre-OMI-458 behaviour exactly.</b> Nothing is
+     * provisioned, nothing extra is written, and no queue row is enqueued for a supplied external vector.
+     * A {@code nearestBySummary()} against a non-ambient model still <em>answers</em> when this is off --
+     * it folds the candidates in memory rather than reading an index, which is slower by a factor of the
+     * corpus but is not a different answer. See {@code doc/spec/persistence-bridge.md}.
+     *
+     * <p>⚠️ <b>It costs a write per model on every recomputation of this container, and a queue row per
+     * external vector supplied anywhere beneath it.</b> That is the trade being opted into: a ranking that
+     * was O(containers x their members) per query becomes an indexed lookup, paid for at write time. A
+     * container nobody ranks this way should leave it off.
+     */
+    boolean persistModelSummaries() default false;
 }

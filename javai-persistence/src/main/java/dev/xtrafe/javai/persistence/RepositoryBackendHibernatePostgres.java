@@ -4,6 +4,7 @@ import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.vector.VectorMath;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIMap;
 import dev.xtrafe.javai.model.JavAISet;
@@ -60,6 +61,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Deque;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashSet;
@@ -315,6 +317,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         for (Class<?> type : closure) {
             validateNoKnowledgeGraphFields(type);
             validateCollectionFieldMapping(type);
+            Containment.validatePlacement(type);
             registeredEntityTypes.add(type);
         }
     }
@@ -900,11 +903,23 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     @Override
     public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
         EmbeddingVector reference = spec.reference();
+        // Checked here too, not only in NearestQuery: a spec can reach a backend from either idiom, and
+        // ranking across two embedding spaces must be refused wherever it is attempted (OMI-458).
+        spec.requireModelAgreement();
+        requireConcatenatedTextInConfiguredModel(spec);
+        if (foldsInMemory(entityType, spec)) {
+            return foldedNearestBySummary(entityType, spec);
+        }
         boolean entityGrain = spec.kind() == DerivedQueryMethods.Kind.SUMMARY
                 || spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT;
-        String table = entityGrain
-                ? ensureSummaryVectorTable(reference.modelId(), reference.dims())
-                : ensureFieldVectorTable(reference.modelId(), reference.dims());
+        // ⚠️ **Resolved, never provisioned.** This used to call ensure*VectorTable, which meant a search
+        // whose reference named a model nothing had ever been written in *created* that model's table --
+        // two HNSW indexes and all -- and then returned no rows from it, because there were none to return.
+        // A failed query left a permanent, empty, indexed table in the adopter's schema, and a typo'd or
+        // mismatched model id minted one every time it was made. Provisioning belongs to the write path,
+        // which knows a vector exists to store; a read knows only what it is looking for.
+        String table = (entityGrain ? SUMMARY_VECTOR_TABLE_PREFIX : FIELD_VECTOR_TABLE_PREFIX)
+                + ModelIds.sanitize(reference.modelId());
         String vectorColumn = spec.kind() == DerivedQueryMethods.Kind.CONCATENATED_TEXT
                 ? "concatenated_text_vector" : "vector";
         String fieldName = entityGrain ? null : spec.fieldName();
@@ -917,14 +932,120 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
         }
         List<UUID> allowed = allowedIds;
-        List<RankedId> ranked = inSession(session -> session.doReturningWork(connection -> rankIds(connection,
-                table, entityType, fieldName, reference, spec.limitIncludingOffset(), vectorColumn, allowed)));
+        List<RankedId> ranked = inSession(session -> session.doReturningWork(connection ->
+                tableExistsCached(connection, table)
+                        ? rankIds(connection, table, entityType, fieldName, reference,
+                                spec.limitIncludingOffset(), vectorColumn, allowed)
+                        // Nothing has ever been written in this model, so no row can match. Empty is the
+                        // honest answer and creating the table to prove it would be vandalism.
+                        : List.<RankedId>of()));
         if (spec.offset() > 0) {
             ranked = ranked.size() <= spec.offset()
                     ? List.of() : new ArrayList<>(ranked.subList(spec.offset(), ranked.size()));
         }
         return hydrateRanked(entityType, ranked);
     }
+
+    // ---- the unindexed half of a model-scoped summary search (OMI-458) --------------------------
+
+    /**
+     * {@link #foldsSummaryInMemory}'s rule, against this backend's own containment.
+     *
+     * <p>⚠️ Worth naming what folding avoids <em>here</em> specifically: without it,
+     * {@code ensureSummaryVectorTable} would provision an empty table for the named model and the search
+     * would return no hits -- which reads as "nothing is similar" rather than "nothing is stored", and is
+     * the one failure mode a caller has no way to tell apart from a correct empty answer.
+     */
+    private boolean foldsInMemory(Class<?> entityType, NearestSpec spec) {
+        return foldsSummaryInMemory(containment(), entityType, spec);
+    }
+
+    /**
+     * Ranks by {@code summaryVector(modelId)} computed on the spot, for a model whose summaries are not
+     * persisted -- the honest answer to a question with no index (OMI-458).
+     *
+     * <p>Identical in result to the indexed path, and identical in shape: the predicate is resolved first
+     * and the limit applied after, so "the nearest N that also match" means the same thing here as it does
+     * there. A candidate whose summary is absent in this model is skipped rather than ranked last, which is
+     * what {@code rankIds}' own {@code vector IS NOT NULL} does -- a content-free vector has no direction
+     * and must never occupy a slot in someone's top N.
+     *
+     * <p>⚠️ <b>Cost is proportional to the corpus, not to the result</b>, and to the size of each
+     * candidate's {@code @Summary} subtree on top of that. That is the whole argument for
+     * {@code @Summary(persistModelSummaries = true)}, and the reason this is logged rather than performed
+     * quietly: a fallback nobody can see is indistinguishable from an index, right up to the corpus size
+     * where it is not.
+     *
+     * <p><b>It cannot embed anything.</b> {@code summaryVector(modelId)} skips a {@code @Vectorize} field
+     * without reading it when {@code modelId} is not the configured provider's, and this path runs only for
+     * models that are not. So a scan is slow in reads, never in model calls.
+     */
+    private List<Ranked<Object>> foldedNearestBySummary(Class<?> entityType, NearestSpec spec) {
+        String modelId = spec.resolvedModelId();
+        warnAboutFoldOnce(entityType, modelId);
+        List<UUID> allowedIds = null;
+        if (spec.isNarrowed()) {
+            allowedIds = matchingIds(entityType, spec.predicate());
+            if (allowedIds.isEmpty()) {
+                return List.of();
+            }
+        }
+        List<UUID> allowed = allowedIds;
+        List<Ranked<Object>> scored = inSession(session -> {
+            List<Ranked<Object>> hits = new ArrayList<>();
+            for (Object candidate : candidatesFor(session, entityType, allowed)) {
+                if (!(candidate instanceof JavAIVectorizable vectorizable)) {
+                    continue;
+                }
+                // Both halves, exactly as recomputeOwner does before it writes: the candidate's own stored
+                // vectors, and its @Summary descendants' -- an unhydrated child folds an absent vector into
+                // its container and the container ranks as though it held nothing.
+                hydrateVectors(session, candidate);
+                hydrateSummaryChildren(session, candidate, Collections.newSetFromMap(new IdentityHashMap<>()));
+                EmbeddingVector summary = vectorizable.summaryVector(modelId);
+                if (summary.isAbsent()) {
+                    continue;
+                }
+                hits.add(new Ranked<>(candidate, VectorMath.cosineSimilarity(spec.reference(), summary)));
+            }
+            return hits;
+        });
+        scored.sort(Comparator.comparingDouble(Ranked<Object>::similarity).reversed());
+        int from = Math.min(spec.offset(), scored.size());
+        int to = Math.min(Math.addExact(from, spec.limit()), scored.size());
+        return List.copyOf(scored.subList(from, to));
+    }
+
+    /** The candidate set for a fold: every row of the type, or exactly the ids the predicate admitted. */
+    @SuppressWarnings("unchecked")
+    private static <T> List<Object> candidatesFor(Session session, Class<T> entityType, List<UUID> allowedIds) {
+        HibernateCriteriaBuilder cb = session.getCriteriaBuilder();
+        JpaCriteriaQuery<T> query = cb.createQuery(entityType);
+        JpaRoot<T> root = query.from(entityType);
+        query.select(root);
+        if (allowedIds != null) {
+            query.where(root.get(EntityReflection.idField(entityType).getName()).in(allowedIds));
+        }
+        return (List<Object>) (List<?>) session.createQuery(query).list();
+    }
+
+    /** Logged once per (type, model), not once per query: a console action running this every few seconds
+     *  would otherwise bury the log it is trying to appear in, and the fact being reported is a property of
+     *  the mapping rather than of any one call. */
+    private void warnAboutFoldOnce(Class<?> entityType, String modelId) {
+        if (!foldWarnings.add(entityType.getName() + "/" + modelId)) {
+            return;
+        }
+        LOG.log(System.Logger.Level.INFO, () -> "JavAI is ranking " + entityType.getSimpleName()
+                + " by its '" + modelId + "' summary vector by folding every candidate in memory: that model's"
+                + " summaries are not persisted, so there is no index to rank against. The answer is correct"
+                + " and its cost is proportional to the corpus. To make it an indexed lookup, declare"
+                + " @Summary(persistModelSummaries = true) on " + entityType.getSimpleName()
+                + " and run reindex() once to backfill.");
+    }
+
+    /** Types and models already reported by {@link #warnAboutFoldOnce}. */
+    private final Set<String> foldWarnings = ConcurrentHashMap.newKeySet();
 
     /**
      * The ids satisfying {@code orGroups}, as an ordinary Criteria query over the entity's own table.
@@ -2008,13 +2129,19 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // this entity is a @Summary container -- see writeEntityGrainVectors, and OMI-255's own section in
         // doc/ai-guidance/persistence-support-matrix.md for the contract that follows from it.
         if (!isSummaryContainer(entityType)) {
-            writeEntityGrainVectors(session, vectorizable, ownerType, id);
+            writeEntityGrainVectors(session, entityType, vectorizable, ownerType, id);
         }
     }
 
     /**
      * Writes {@code javai_summary_vectors__<model>}'s single row for one owner: the summary vector, plus the
      * concatenated text and its vector when the entity participates (OMI-191).
+     *
+     * <p><b>One row, unless the container asked for more.</b> A type carrying
+     * {@code @Summary(persistModelSummaries = true)} also gets a row per embedding model its {@code @Summary}
+     * subtree declares an {@code @ExternalVector} in (OMI-458) -- see {@link #planPerModelSummaries}. Every
+     * one of them is planned, and its table provisioned, before the connection is borrowed, for the reason
+     * the ambient row already is.
      *
      * <p><b>Who calls this, and when, is the whole of OMI-255.</b> For an entity that declares no
      * {@code @Summary} field, this runs inline in the caller's transaction exactly as it always has -- such a
@@ -2031,8 +2158,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * {@code @Summary(concatenate = true)} off clears a previously-stored text vector instead of leaving it
      * to keep matching searches.
      */
-    private void writeEntityGrainVectors(Session session, JavAIVectorizable vectorizable,
-            String ownerType, UUID id) {
+    private void writeEntityGrainVectors(Session session, Class<?> entityType,
+            JavAIVectorizable vectorizable, String ownerType, UUID id) {
         String currentModelId = JavAIRuntime.currentModelId();
         EmbeddingVector summary = vectorizable.summaryVector();
         EmbeddingVector concatenated = vectorizable.concatenatedTextVector();
@@ -2045,9 +2172,68 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         EmbeddingVector dimensioned = summary.isAbsent() ? concatenated : summary;
         String summaryTable = dimensioned.isAbsent() ? null
                 : ensureSummaryVectorTable(dimensioned.modelId(), dimensioned.dims());
-        session.doWork(connection ->
-                writeEntityGrainRow(connection, summaryTable, vectorizable, ownerType, id,
-                        currentModelId, summary, concatenated));
+        // Every additional model this container opts into, planned in the same pass and for the same reason
+        // (OMI-458). Empty unless the type carries @Summary(persistModelSummaries = true), which is what
+        // keeps this whole branch off the path of a model that never asked for it.
+        List<PerModelSummary> perModel = planPerModelSummaries(entityType, vectorizable, currentModelId);
+        session.doWork(connection -> {
+            writeEntityGrainRow(connection, summaryTable, vectorizable, ownerType, id,
+                    currentModelId, summary, concatenated);
+            for (PerModelSummary row : perModel) {
+                // ⚠️ `concatenated` is absent, always, and that is not a shortcut. Concatenated text is one
+                // real embedding of one assembled string, produced by the configured provider -- so it
+                // exists in the ambient model and in no other. Carrying the ambient text vector into a
+                // pixel model's table would file a 1024-dim text embedding under a 1152-dim image model.
+                // Absent rather than skipped, per the writer's standing rule: the columns are assigned, so
+                // anything a previous configuration left there is cleared rather than left to match.
+                writeEntityGrainRow(connection, row.table(), vectorizable, ownerType, id,
+                        row.modelId(), row.summary(), EmbeddingVector.absent());
+            }
+        });
+    }
+
+    /**
+     * One container's summary in one non-ambient model, with the table it goes to already provisioned
+     * (OMI-458).
+     *
+     * <p>{@code table} is null exactly when {@code summary} is absent, which is the delete case -- there is
+     * no table to name for a value that is not there, and a table must not be provisioned to hold nothing.
+     */
+    private record PerModelSummary(String modelId, String table, EmbeddingVector summary) {
+    }
+
+    /**
+     * Computes and provisions for every model {@code entityType} owes a summary row in beyond the ambient
+     * one -- the whole of what {@code @Summary(persistModelSummaries = true)} adds (OMI-458).
+     *
+     * <p><b>The ambient model is excluded here rather than in the discovery walk</b>, because it is a
+     * runtime fact: the same declared container answers a different set depending on which provider is
+     * configured. Including it would recompute the ambient summary a second time, uncached, and race the
+     * cached one for the same row.
+     *
+     * <p><b>Nothing here can trigger an embedding.</b> {@code summaryVector(modelId)} skips a
+     * {@code @Vectorize} field without reading it whenever {@code modelId} is not the configured provider's
+     * (see {@code JavAIRuntime.vector(Object, String, String)}), and every model this returns is by
+     * definition not that. So the added cost of the flag is arithmetic over vectors already in hand, plus
+     * one upsert per model -- never a model call.
+     */
+    private List<PerModelSummary> planPerModelSummaries(Class<?> entityType, JavAIVectorizable vectorizable,
+            String currentModelId) {
+        Set<String> models = containment().perModelSummaryModels(entityType);
+        if (models.isEmpty()) {
+            return List.of();
+        }
+        List<PerModelSummary> planned = new ArrayList<>(models.size());
+        for (String modelId : models) {
+            if (modelId.equals(currentModelId)) {
+                continue; // written by the ordinary path above, and cached there
+            }
+            EmbeddingVector summary = vectorizable.summaryVector(modelId);
+            planned.add(new PerModelSummary(modelId,
+                    summary.isAbsent() ? null : ensureSummaryVectorTable(modelId, summary.dims()),
+                    summary));
+        }
+        return planned;
     }
 
     private static void writeEntityGrainRow(Connection connection, String summaryTable,
@@ -2336,7 +2522,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         // embedding call, per child, on every recomputation. One SELECT each is the cheaper half of that
         // trade by a wide margin.
         hydrateSummaryChildren(session, entity, Collections.newSetFromMap(new IdentityHashMap<>()));
-        writeEntityGrainVectors(session, vectorizable, owner.ownerType().getName(), owner.ownerId());
+        writeEntityGrainVectors(session, owner.ownerType(), vectorizable, owner.ownerType().getName(),
+                owner.ownerId());
     }
 
     private void hydrateSummaryChildren(Session session, Object entity, Set<Object> visited) {
@@ -3122,6 +3309,13 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
         String table = vector.isAbsent() ? null : ensureFieldVectorTable(vector.modelId(), vector.dims());
         String computedFor = vector.isAbsent() ? null : JavAIRuntime.externalVectorKey(entity, vectorName);
+        // ⚠️ **This, not save(), is where a container's per-model summary goes stale** (OMI-458). An
+        // @ExternalVector arrives after the save by construction -- the model runs in another container
+        // behind a queue and answers seconds or minutes later -- so every container above this entity was
+        // summarised when there was nothing yet to summarise. Enqueuing here is what makes the persisted
+        // row track the data instead of the save that preceded it; the drain's own upward walk finds the
+        // containers, transitively, so an Exhibition above an Album above this asset is reached too.
+        Set<Containment.OwnerRef> owners = perModelSummaryOwners(entityType, id);
         inSession(session -> {
             session.doWork(connection -> {
                 if (vector.isAbsent()) {
@@ -3130,8 +3324,33 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     upsertVector(connection, table, ownerType, id, vectorName, vector, computedFor);
                 }
             });
+            enqueueSummaries(session, owners);
             return null;
         });
+        if (!owners.isEmpty()) {
+            recomputeAfterCommit(owners);
+        }
+    }
+
+    /**
+     * The queue entry a supplied {@code @ExternalVector} owes, or empty when nothing in this model wants one.
+     *
+     * <p>Returns the <b>entity itself</b> rather than its containers, exactly as {@code save} does. The
+     * drain skips it (it is not a {@code @Summary} container, so it has nothing of its own to recompute) and
+     * then walks upward from it against committed state -- which is the only reading of containment that
+     * survives a multi-pod deployment, and the reason not to resolve containers here.
+     *
+     * <p><b>Gated on some registered type actually opting in.</b> Without that gate this would add a queue
+     * row and a drain to every {@code supplyVector} in an application that never asked for a persisted
+     * per-model summary -- a real cost on the existing path, for a row nothing would ever read.
+     */
+    private Set<Containment.OwnerRef> perModelSummaryOwners(Class<?> entityType, UUID id) {
+        Containment containment = containment();
+        if (containment.hasNoSummaries() || containment.hasNoPerModelSummaries()
+                || !containment.participates(entityType)) {
+            return Set.of();
+        }
+        return Set.of(new Containment.OwnerRef(entityType, id));
     }
 
     /** Vectors only, for the write path -- see {@link #hydrateOutOfBand}'s {@code includeGeo} parameter. */

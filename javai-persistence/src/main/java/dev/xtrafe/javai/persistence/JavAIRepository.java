@@ -184,8 +184,20 @@ public interface JavAIRepository<T> {
      */
     NearestQuery<T> nearestBy(String vectorizeField);
 
-    /** Starts a search against the summary vector -- the decay-weighted arithmetic over the entity and its
-     *  {@code @Summary} descendants. */
+    /**
+     * Starts a search against the summary vector -- the decay-weighted arithmetic over the entity and its
+     * {@code @Summary} descendants.
+     *
+     * <p><b>In whichever model the reference vector came from</b>, which is every model, not only the
+     * configured one: the backend resolves which storage answers from {@code reference.modelId()}, so a
+     * container's summary in a model that only ever arrives through {@code @ExternalVector} is searchable
+     * here with nothing extra (OMI-458). Whether that is an indexed lookup or an in-memory fold depends on
+     * {@code @Summary(persistModelSummaries = true)}; the answer is the same either way.
+     *
+     * <p>A container carrying both a {@code @Vectorize} field and an {@code @ExternalVector} has <em>two</em>
+     * coherent summaries, and which one this searches is decided by the vector you pass. When that is worth
+     * saying out loud -- and worth having checked -- add {@link NearestQuery#inModel(String)}.
+     */
     NearestQuery<T> nearestBySummary();
 
     /**

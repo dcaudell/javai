@@ -735,7 +735,7 @@ row but one, with an arbitrary convention for which row carries it.
 ```sql
 -- javai_summary_vectors__<model>
 owner_type, owner_id, model_id, dims,
-vector                        vector(N) NOT NULL,   -- summary vector, unchanged
+vector                        vector(N)   NULL,     -- summary vector; NULL-able since OMI-435
 concatenated_text             text        NULL,     -- new
 concatenated_text_vector      vector(N)   NULL,     -- new
 concatenated_text_computed_at timestamptz NULL,     -- new
@@ -760,11 +760,51 @@ table's per-field grain.
   exists — a pre-OMI-191 deployment would keep a three-column-short table and fail on first write. The three
   `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements alongside it are the migration, and are idempotent.
 
-`vector NOT NULL` means a row cannot hold concatenated text without a summary vector. Reasoning says the two
-always co-occur (text implies content, content implies a non-absent summary contribution), but that is
-inference, so the write path **refuses loudly** if it ever meets the combination rather than silently
-dropping the text or tripping a bare constraint violation. If it ever fires, the fix is to make `vector`
-nullable, not to skip the write.
+### ⚠️ `vector` is NULL-able, and the reasoning that said it need not be was wrong (OMI-435)
+
+This column was `NOT NULL`, on the inference that the two values always co-occur: text implies content,
+content implies a non-absent summary contribution. The write path **refused loudly** when it met the
+combination, and the note here said that if it ever fired, the fix was to make the column nullable rather
+than to skip the write.
+
+It fired, and that was the fix. **A concatenated text vector with no summary vector is a real state**: an
+entity that loses its last `@Vectorize` content has an absent summary immediately, while a concatenated
+vector computed earlier is still on file and is served back by hydration on the drain path. The pair reaches
+the writer through no fault of the entity.
+
+Refusing it cost far more than it caught. On the inline path the whole save rolled back — an owner's edit
+lost to a vector-bookkeeping constraint — and on the drain path the recomputation requeued forever, leaving
+the container's summaries stale. The row now records what is true: this text, and no summary. `rankIds`
+already skips NULL vectors, so a half-populated row is invisible to a summary search and findable by a
+concatenated-text one.
+
+⚠️ **A database created before this keeps its `NOT NULL`, and that is the adopter's to fix.** JavAI has no
+concept of a migration — it provisions a table it finds missing rather than altering one it finds present,
+and an `ALTER` issued from the write path would need an `ACCESS EXCLUSIVE` lock on a table the calling
+transaction already holds a lock on, which deadlocks the request that triggered it. One statement per
+existing summary table:
+
+```sql
+ALTER TABLE javai_summary_vectors__<model> ALTER COLUMN vector DROP NOT NULL;
+```
+
+### ⚠️ A reference from another model is refused, not answered empty (OMI-458)
+
+The concatenated text vector is **one embedding of one assembled string, produced by the configured
+provider** — so it exists in that provider's model and in no other, for every participating entity, by
+construction. A search whose reference comes from anywhere else is asking for something nothing can hold.
+
+That case used to return an empty list. Empty is a lie here, and a consistent one: it is exactly what a
+corpus with no near matches returns, so the query looks answered, and looks answered the same way every time
+it is run. It is the one place a wrong model produces a plausible non-answer rather than a missing table,
+which is why it is the one place that has to say so out loud. All three backends refuse it, through both the
+builder and the `findNearestByConcatenatedTextVector` idiom, and the message points at `nearestBySummary()` —
+which *does* serve that model, and is the likely intent when someone reaches here with an image vector.
+
+**There is no fold to fall back to**, unlike a summary search: folding needs a value that exists to be
+folded, and this one does not exist in that model for anything. Silent when the provider cannot name its own
+model — there is nothing to compare against, and a refusal derived from an unknown is worse than the search
+it would block.
 
 **Neo4j and MongoDB need no special handling.** Both already store `summaryVector__<model>` as a per-entity
 property/field; `concatenatedText__<model>` and `concatenatedTextVector__<model>` are the same shape, and
@@ -829,3 +869,152 @@ against its own vector storage if that stops being true.
 exactly as they accept a `@Vectorize` field's. Nothing in the query machinery had to learn a new concept:
 every backend already resolves *which* storage answers from `reference.modelId()`, so a reference from the
 image model selects the image model's table/property by the mechanism that was already there.
+
+## ⚠️ A read never provisions storage (OMI-458)
+
+**Reading is not a reason to create anything.** `findNearest` used to resolve its table by calling
+`ensure*VectorTable(reference.modelId(), reference.dims())`, so a search whose reference named a model
+nothing had ever been written in *created that model's table* — two HNSW indexes and all — and then returned
+no rows, because there were none to return. A failed query left a permanent, empty, indexed table in the
+adopter's schema, and every repetition of a typo'd or mismatched model id minted another.
+
+The rule now, on all three backends:
+
+| | Who provisions | What a read does when it is absent |
+|---|---|---|
+| Postgres | the write path, which knows a vector exists to store | resolves the table name, finds it absent, answers empty |
+| Neo4j | ⚠️ the read — it is the only trigger, since writes set properties and never create indexes | creates the index **only if some node actually carries the property**; otherwise answers empty |
+| MongoDB | ⚠️ the read, same reason | creates the search index **only if some document actually carries the field**; otherwise answers empty |
+
+Neo4j and MongoDB could not simply stop creating — nothing else ever would, and vector search would break
+outright. So they ask one bounded question first (`… IS NOT NULL … LIMIT 1`, `{$exists: true}` limit 1) and
+create when there is something to create it for. That also removes a second cost those two carried: both
+*block the caller* while a newly created index comes online, so a junk index was a junk wait as well.
+
+`QueryTimeSchemaCreationTest` pins the rule rather than the bug: it inventories every table and index,
+runs every shape of read each backend can serve against an unwritten model, and requires the inventory to be
+unchanged. A future read path that provisions anything fails there without anyone having predicted it.
+
+## Persisted per-model summary vectors (OMI-458)
+
+`summaryVector(String modelId)` computes a container's summary restricted to one embedding model — what its
+subtree *looks* like, as against what it *reads* like. Storing it was the missing half: the entity-grain
+writer asked for `currentModelId()` and the unscoped `summaryVector()`, so a model arriving only through
+`@ExternalVector` — image pixels, an audio waveform — had a computable container summary and no row anywhere.
+Ranking a corpus by it therefore meant folding **every** candidate in memory, at O(containers × their
+members) per query.
+
+Opt in on the container **type**:
+
+```java
+@Entity
+@JavAIVectorizable
+@Summary(persistModelSummaries = true)     // ← the whole opt-in
+public class Album {
+    @Summary
+    private JavAISet<Image> images;        // Image declares @ExternalVector(model = "siglip2…")
+}
+```
+
+```java
+albums.nearestBySummary().to(reference).limit(10).ranked();                        // reference names the model
+albums.nearestBySummary().inModel(Image.PIXELS_MODEL).to(reference).limit(10);     // …and says so out loud
+```
+
+**Which models is derived, never configured.** Every `@ExternalVector(model = …)` reachable from the
+container through `@Summary` fields, **transitively**, minus the ambient one (which the ordinary path already
+writes). Read from declarations rather than from what happens to be in a table: an un-embedded corpus and a
+corpus with no such model are indistinguishable in storage, so the second would silently and permanently stop
+writing rows the first is merely waiting for. The declared element type is expanded to its registered
+subtypes, since a `@Summary` collection typed to a `@MappedSuperclass` whose subclass carries the declaration
+is the ordinary adopter shape.
+
+**Transitive, because containment is.** `Exhibition → Album → Image` is one `@Summary` chain, and the
+exhibition's pixel summary is a real vector — `summaryVector(modelId)` recurses and `VectorMath` skips the
+absent terms at each tier that carries nothing of its own. A walk stopping at the first hop would store the
+album's row and leave the exhibition doing the in-memory fold this exists to remove.
+
+**Storage is the table that was already there.** `javai_summary_vectors__<model>`, keyed
+`(owner_type, owner_id)`, provisioned by `ensureSummaryVectorTable` with its `hnsw (vector vector_cosine_ops)`
+index — so a new model's table arrives fully indexed with no migration. The concatenated columns are written
+**absent**: concatenated text is one embedding of one assembled string, so it exists in the configured
+provider's model and no other, and carrying it across would file a text embedding under an image model. They
+are assigned rather than skipped, per the writer's standing rule, so nothing a previous configuration left
+there survives.
+
+**Nothing here can trigger an embedding.** `summaryVector(modelId)` skips a `@Vectorize` field *without
+reading it* when `modelId` is not the configured provider's, and every model this writes is by definition not
+that. The added cost is arithmetic over vectors already in hand plus one upsert per model.
+
+### ⚠️ Invalidation happens at `supplyVector`, not at `save`
+
+This is the part that is easy to get wrong, and getting it wrong produces a row that is correct exactly when
+it is empty. **An `@ExternalVector` arrives after the save, by construction** — the model runs in its own
+container behind a queue and answers seconds or minutes later — so every container above the entity was
+summarised at a moment when there was nothing in that model to summarise. A writer that only ran on `save`
+would never see the data arrive.
+
+So `writeExternalVector` enqueues the entity on `javai_summary_pending` and drains after commit, reusing
+OMI-255's mechanism rather than adding a second. The drain's own upward walk does the rest: it skips the
+entity (not a container, nothing of its own to recompute) and walks one hop at a time against *committed*
+state, so a tier above the container is reached too. Duplicates are expected and collapse by owner, which is
+what makes a burst of thousands of supplied vectors cost one recomputation per container.
+
+The enqueue is **gated on some registered type actually opting in**. Without that gate every `supplyVector` in
+an application that never asked for this would pay a queue row and a drain for a row nothing would read.
+
+### The query answers whether or not the rows exist
+
+**Nothing new is needed to search one.** Every backend already resolves *which* storage answers from
+`reference.modelId()`, so `nearestBySummary().to(pixelSummary)` reaches the pixel table by the mechanism that
+was already there, and so does the derived `findNearestBySummaryVector(pixelSummary, 10)` — model ids are not
+Java identifiers, and the method-name idiom needs none. Ranking across two embedding spaces is therefore not
+a hazard here: the index is *derived from* the reference rather than chosen beside it, so the two cannot
+disagree.
+
+`NearestQuery.inModel(String)` exists for the hazard that is real, which is the caller's:
+
+```java
+albums.nearestBySummary().to(album.summaryVector());          // the text one
+albums.nearestBySummary().to(album.summaryVector(PIXELS));    // the pixel one
+```
+
+A container carrying both a `@Vectorize` field and an `@ExternalVector` has *two* coherent summaries, and
+those two lines differ by one token. Both compile, both run, both return sensible hits against their own
+storage — so passing the wrong one answers the **other** of the container's two questions with nothing to
+notice. `inModel(...)` names which was meant and refuses a reference from anywhere else.
+
+⚠️ **It is an assertion, not a selector**, and that is why it is optional and why it is refused on every other
+grain. A field-grain search names the vector, and an `@ExternalVector`'s model is fixed by its own
+declaration; the combined vector and the concatenated text vector exist in the configured provider's model
+and no other. On those there is no second answer for a qualifier to give, so accepting one would invite the
+belief that it does something.
+
+When the type has **not** opted in, the same question is answered by folding the candidates in memory: the
+same value, the same ranking, at a cost proportional to the corpus. That fallback exists because the
+alternative is not a slower answer but a wrong one — `ensureSummaryVectorTable` would provision an empty table
+and the search would return nothing, which reads as *"nothing is similar"* rather than *"nothing is stored"*,
+and a caller cannot tell those apart. ⚠️ **Which path runs is decided from the declaration, never from whether
+the table holds rows**, so a deployment mid-backfill does not silently change both its cost and its answer
+partway through. The fold logs once per `(type, model)`: a fallback nobody can see is indistinguishable from
+an index, right up to the corpus size where it is not.
+
+| | Opted in | Not opted in |
+|---|---|---|
+| `save` / drain | one upsert per declared non-ambient model | nothing extra |
+| `supplyVector` | queue row + drain | nothing extra |
+| `nearestBySummary()` in that model | indexed lookup, HNSW | in-memory fold, O(corpus) |
+| Answer | identical | identical |
+
+**Backfill is `reindex()`**, which already runs `QUEUE_ONLY` then drains — the drain recomputes each container
+from committed state and writes every model's row, so turning the flag on needs no separate migration.
+
+⚠️ **Turning the flag back off, or removing a model from a subtree, leaves the rows behind.** JavAI provisions
+what it finds missing rather than altering what it finds present, and it has no record of models a container
+*used to* declare. Deleting the entity still clears every table, since `deleteById` sweeps the catalog rather
+than a remembered list.
+
+**Neo4j and MongoDB** store `summaryVector__<model>` as a per-entity property/field already, so the shape
+generalizes — but their writers remain single-model in this phase. Both answer a non-ambient summary search by
+folding, through the same shared SPI default, rather than returning the empty result an unwritten property
+would give.

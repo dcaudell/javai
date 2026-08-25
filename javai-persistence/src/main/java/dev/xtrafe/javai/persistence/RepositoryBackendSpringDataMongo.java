@@ -303,6 +303,14 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     @Override
     public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        // A summary search in a model this backend never wrote a property for still has an answer, and
+        // returning nothing would be indistinguishable from "nothing is similar" (OMI-458). Folding is that
+        // answer; the flag that makes it an indexed lookup is Postgres-only for now.
+        spec.requireModelAgreement();
+        requireConcatenatedTextInConfiguredModel(spec);
+        if (foldsSummaryInMemory(containment(), entityType, spec)) {
+            return foldNearestBySummary(entityType, spec);
+        }
         return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
@@ -338,6 +346,15 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         String collectionName = collectionName(entityType);
         String qualifiedField = qualify(basePropertyName, reference.modelId());
         String indexName = vectorIndexName(collectionName, qualifiedField);
+        // ⚠️ **No document carries this field, so there is nothing to index and nothing to find.** Creating
+        // the search index anyway -- which this did -- left a permanent, empty Atlas search index behind for
+        // every query whose reference named a model nothing had been written in, and blocked the caller
+        // while waiting for that junk index to become queryable. As on Neo4j, a query is the only thing that
+        // ever creates an index here, so it creates when there is something to create it for.
+        if (collectionFor(entityType).find(new Document(qualifiedField, new Document("$exists", true)))
+                .limit(1).first() == null) {
+            return List.of();
+        }
         ensureVectorIndex(collectionName, indexName, qualifiedField, reference.dims());
 
         Document search = new Document()
