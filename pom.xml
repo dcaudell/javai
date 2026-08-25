@@ -140,7 +140,7 @@
          (the standard relational finders on all three backends, OMI-138); a direct use shouldn't rely on a
          transitive it doesn't name. Must stay equal to whatever spring-data-mongodb.version above resolves
          to; bumping one without the other risks two spring-data-commons lines on one classpath. -->
-    <spring-data-commons.version>4.1.0</spring-data-commons.version>
+    <spring-data-commons.version>4.1.1</spring-data-commons.version>
     <!-- Spring Framework itself is otherwise never named here: spring-core/tx/context/beans arrive
          transitively via spring-data-mongodb (7.0.8, confirmed via `mvn dependency:tree`). This property
          exists only so javai-persistence can name spring-orm explicitly for OMI-146's Spring-transaction
