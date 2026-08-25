@@ -718,6 +718,10 @@ public final class JavAIRuntime {
      * summary slot. Caching per model would mean a slot per model, an invalidation rule per model, and a
      * third dirty-flag family -- for arithmetic over vectors that are themselves already cached. A
      * container with nothing in that model simply returns absent, cheaply.
+     *
+     * <p>⚠️ That is an argument about one lookup. Ranking a whole corpus by this computes every container's,
+     * per query, and no cache in this object would help -- the answer there is to <em>store</em> the value,
+     * which the persistence bridge does on request (OMI-458). Nothing about this method changes for it.
      */
     public static EmbeddingVector summaryVector(Object self, String summaryFieldNames,
             String vectorizeFieldNames, String modelId) {

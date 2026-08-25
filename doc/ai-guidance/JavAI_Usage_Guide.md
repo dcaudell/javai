@@ -104,7 +104,7 @@ have to live together upstream of everything else. Don't be surprised to find `P
 | `EmbeddingVector fieldVector(String fieldName)` | `JavAIVectorizable` | Yes | Dynamic (string-keyed) counterpart to the per-field accessors below. |
 | `<field>Vector()` — e.g. `titleVector()` for a field named `title` | Synthesized, one per `@Vectorize` field | Yes | Named accessor for that one field's own contribution — real method, real name, not reflection-only. |
 | `EmbeddingVector vector(String modelId)` | `JavAIVectorizable` | Yes | The same aggregate **restricted to one embedding model** — `@Vectorize` fields and `@ExternalVector`s alike. Absent when this object carries nothing from that model. Only matters once an object has more than one model on it; see "@ExternalVector" below. |
-| `EmbeddingVector summaryVector(String modelId)` | `JavAIVectorizable` | Yes | `summaryVector()` restricted to one model — same decay-weighted formula, admitting only that model's vectors. Uncached (it recombines vectors that are themselves cached). |
+| `EmbeddingVector summaryVector(String modelId)` | `JavAIVectorizable` | Yes | `summaryVector()` restricted to one model — same decay-weighted formula, admitting only that model's vectors. Uncached (it recombines vectors that are themselves cached). Persist it with `@Summary(persistModelSummaries = true)` when you rank a corpus by it rather than asking one object. |
 | `EmbeddingVector externalVector(String vectorName)` | `JavAIVectorizable` | Yes | An `@ExternalVector`'s current value, or absent. **Never computes, never blocks, never calls a provider.** Throws if the class declares no such name. |
 | `<name>Vector()` — e.g. `pixelsVector()` for `@ExternalVector(name = "pixels")` | Synthesized, one per `@ExternalVector` | Yes | Named accessor for that external vector, exactly like the `@Vectorize` one above. |
 | `addDependent(Object)` / `dependents()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Registers/lists what to mark dirty when this object changes. `JavAIRuntime` calls this for you via the woven setter. |
@@ -132,6 +132,7 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
 | `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. **When persisted, this makes the container a write-coordination point** — see the note below. |
 | `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
+| `@Summary(persistModelSummaries = true)` | **class only** | Persists this container's per-model summary vectors, so a non-ambient `nearestBySummary()` is an indexed lookup instead of an in-memory fold. Which models is derived from the `@ExternalVector`s its `@Summary` subtree declares, transitively. Postgres. Refused on a field. See "Ranking containers by a non-text model" below. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
 | `@ExternalVector(name, keyField, model)` | class, **repeatable** | Declares a vector JavAI **stores but never computes** — supplied from outside the process, in its own model. Gains a `<name>Vector()` accessor and a `findNearestBy<Name>Vector` query. See the section below. |
 | `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. ⚠️ Defined but **not yet read by anything** — declaring it changes no behaviour today. |
@@ -351,6 +352,52 @@ They are separate on purpose. Two models' vectors cannot be combined — their c
 weaker answer but no answer — and JavAI refuses rather than producing a meaningless number. Combining two
 models' *rankings* (reciprocal rank fusion and friends) is a real technique, but the weighting is specific to
 your domain, so it is your code, not the library's.
+
+### Ranking containers by a non-text model
+
+`album.summaryVector(imageModel)` answers for *one* album. Ranking a corpus by it is a different cost: every
+candidate has to be folded, per query. Persist the summaries and it becomes an indexed lookup:
+
+```java
+@Entity
+@JavAIVectorizable
+@Summary(persistModelSummaries = true)             // ← opt in, on the container type
+public class Album {
+    @Summary
+    private JavAISet<Image> images;                // Image declares @ExternalVector(model = "siglip2…")
+}
+
+// then, either way:
+albums.nearestBySummary().to(reference).limit(10).ranked();
+```
+
+**You never name the model, and you never had to.** JavAI picks the storage from `reference.modelId()`, so
+the same call searches the text summary or the pixel summary depending on the vector you hand it — including
+through the method-name idiom, `findNearestBySummaryVector(reference, 10)`.
+
+**When that is worth saying out loud, say it:**
+
+```java
+albums.nearestBySummary().inModel("siglip2-so400m-p14-384/pp1")
+      .to(reference).limit(10).ranked();
+```
+
+An album has *two* coherent summaries, and `.to(album.summaryVector())` versus
+`.to(album.summaryVector(PIXELS))` differ by one token — both valid, both ranked correctly against their own
+storage, so the wrong one answers the *other* question with nothing to notice. `inModel(...)` names which you
+meant and refuses a reference from anywhere else. ⚠️ It is an assertion, not a selector: it buys legibility
+and a check, never a capability, and it is refused on a field, combined or concatenated-text search, where
+there is only ever one model the vector could be in.
+
+**The search answers with or without the flag.** Without it, JavAI folds the candidates in memory — the same
+value and the same ranking, at a cost proportional to your corpus, logged once so it is not invisible. The
+flag buys the index, not the answer. Nested containers work at every tier (`Exhibition → Album → Image`), and
+the models are read from your declarations rather than from what happens to be stored, so turning the flag on
+mid-project is a `reindex()` and nothing more.
+
+⚠️ **What it costs:** one extra row written per model on every recomputation of the container, and a queue row
+each time an external vector is supplied anywhere beneath it — because that, not `save`, is when a container's
+per-model summary actually goes stale. A container nobody ranks this way should leave the flag off.
 
 ### The one rule it is exempt from
 

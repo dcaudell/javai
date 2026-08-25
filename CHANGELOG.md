@@ -12,7 +12,76 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A concatenated-text search from the wrong model is refused rather than answered empty (OMI-458).**
+  `javai-persistence`. `concatenatedTextVector()` is a single embedding of assembled text produced by the
+  configured provider, so it exists in that model and in no other — for every participating entity, by
+  construction. A reference from anywhere else could match nothing, and used to get back an empty list:
+  exactly what a corpus with no near matches returns, so the query looked answered, and looked answered the
+  same way every time. Unlike a summary search there is nothing to fold, because the value does not exist in
+  that model for anything. All three backends now refuse, through the builder and the
+  `findNearestByConcatenatedTextVector` idiom alike, naming both models and pointing at `nearestBySummary()`
+  — which does serve that model, and is the likely intent. Silent when the provider cannot name its own
+  model: a refusal derived from an unknown is worse than the search it would block.
+
+- **A query no longer creates storage (OMI-458).** `javai-persistence`. `findNearest` resolved its table by
+  calling `ensure*VectorTable(reference.modelId(), reference.dims())`, so a search whose reference named a
+  model nothing had ever been written in **created that model's table** — two HNSW indexes and all — and then
+  returned no rows, because there were none. A failed query left a permanent, empty, indexed table in the
+  schema, and each repetition of a typo'd or mismatched model id minted another. Postgres now resolves the
+  name, finds it absent and answers empty; provisioning belongs to the write path, which knows a vector
+  exists to store. Neo4j and MongoDB had the same shape with worse manners — they created a junk vector index
+  **and blocked the caller** while it came online — but there a read is the *only* thing that ever creates an
+  index, so they cannot simply stop: each now asks one bounded question first (`… IS NOT NULL … LIMIT 1`,
+  `{$exists: true}`) and creates only when something actually carries the property. `QueryTimeSchemaCreationTest`
+  pins the rule rather than the case: it inventories every table and index, runs every shape of read each
+  backend serves against an unwritten model, and requires the inventory unchanged.
+
+  ⚠️ **Adopters may already have junk tables**, one per model id ever passed to a search that matched nothing.
+  They are empty and harmless, and JavAI will not remove them — it provisions what it finds missing and never
+  drops what it finds present. `DROP TABLE javai_vectors__<model>` / `javai_summary_vectors__<model>` for any
+  model you do not recognise, after checking it is empty.
+
 ### Added
+
+- **Persisted per-model summary vectors (OMI-458).** `javai-persistence` + `javai-annotations`.
+  `summaryVector(modelId)` has computed a container's per-model summary since OMI-290; nothing stored it. The
+  entity-grain writer asked for `currentModelId()` and the *unscoped* summary, so a model arriving only
+  through `@ExternalVector` — image pixels, an audio waveform — had a computable container summary and no row
+  anywhere, making a corpus ranking O(containers × their members) per query with no index to help.
+  `@Summary(persistModelSummaries = true)` on the container **type** writes one row per model its `@Summary`
+  subtree declares, into the `javai_summary_vectors__<model>` table `ensureSummaryVectorTable` already
+  provisions with an HNSW index. Which models is **derived from declarations**, transitively and expanded to
+  registered subtypes — never from what happens to be in a table, since an un-embedded corpus and a corpus
+  with no such model are indistinguishable there. Concatenated columns are written absent: that vector is one
+  embedding of one assembled string and exists in the configured provider's model alone.
+
+  **The invalidation trigger is `supplyVector`, not `save`, and that is the whole difficulty.** An
+  `@ExternalVector` arrives *after* the save by construction — the model runs elsewhere and answers seconds
+  or minutes later — so every container above it was summarised when there was nothing in that model to
+  summarise. `writeExternalVector` now enqueues on `javai_summary_pending` and drains after commit, reusing
+  OMI-255 rather than adding a second mechanism; the drain's upward walk reaches a tier above the container
+  too, so `Exhibition → Album → Image` works at every level. Gated on some type actually opting in, so an
+  application that never asked pays nothing.
+
+  **The query side needed no new entry point.** Every backend already resolves which storage answers from
+  `reference.modelId()`, so `nearestBySummary().to(pixelSummary)` — and the derived
+  `findNearestBySummaryVector(pixelSummary, n)` — reach the pixel table by the mechanism that was already
+  there. Ranking across two embedding spaces is not a hazard here: the index is *derived from* the reference
+  rather than chosen beside it. The hazard that is real is the caller's, since a container carrying both a
+  `@Vectorize` field and an `@ExternalVector` has *two* coherent summaries and `.to(album.summaryVector())`
+  versus `.to(album.summaryVector(PIXELS))` differ by one token — both valid, both correctly ranked against
+  their own storage, so the wrong one answers the other question with nothing to notice. `NearestQuery` gains
+  **`inModel(String)`** for that: optional, refuses a reference from another model, and refused itself on a
+  field, combined or concatenated-text search, where there is only one model the vector could be in. It is an
+  assertion, not a selector — it buys legibility and a check, never a capability.
+
+  **The search answers whether or not the rows exist** — without the opt-in it folds the candidates in memory,
+  because the alternative is not a slower answer but a wrong one: an empty provisioned table returns nothing,
+  which reads as "nothing is similar" rather than "nothing is stored". Which path runs is decided from the
+  declaration, never from whether the table holds rows. Backfill is `reindex()`. Postgres indexes; Neo4j and
+  MongoDB fold through the shared SPI default.
 
 - **Declared queries, targeted writes, and `@Any` predicates (OMI-398).** `javai-persistence` +
   `javai-annotations`. A derived name expresses a predicate over an entity's own properties and nothing else,

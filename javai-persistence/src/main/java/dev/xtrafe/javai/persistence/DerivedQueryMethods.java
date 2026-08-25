@@ -351,8 +351,10 @@ final class DerivedQueryMethods {
                 && explicit.isLimited()) {
             limit = explicit.max();
         }
+        // No model named: the findNearestBy...Vector convention has no room for one, so it means the
+        // reference's own -- which is what it has always meant (OMI-458).
         return new NearestSpec(parsed.kind(), parsed.fieldName(), reference, limit, offset,
-                bindPredicate(parsed, args));
+                bindPredicate(parsed, args), null);
     }
 
     /**
@@ -378,7 +380,7 @@ final class DerivedQueryMethods {
                 groups.add(List.copyOf(group));
             }
         }
-        return new NearestSpec(parsed.kind(), parsed.fieldName(), null, 1, 0, List.copyOf(groups));
+        return new NearestSpec(parsed.kind(), parsed.fieldName(), null, 1, 0, List.copyOf(groups), null);
     }
 
     /** The narrowing tail's atoms with this call's arguments sliced in, in method-name order -- the same

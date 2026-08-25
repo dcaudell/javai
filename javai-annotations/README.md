@@ -28,7 +28,7 @@ Controls what gets embedded and how it's searched. See `doc/spec/vector-core.md`
 | `JavAIVectorizable` | class | Opts a class into the woven `JavAIVectorizable` interface (see `javai-model`) |
 | `Vectorize` / `VectorizeIgnore` | field | Include/exclude a field from the local embedding |
 | `SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field / class | Search-semantic visibility, independent of Java access modifiers |
-| `Summary` | field / class | Marks contribution to a container's hierarchical summary vector |
+| `Summary` | field / class | Marks contribution to a container's hierarchical summary vector. `concatenate = true` additionally opts into concatenated text vectoring (OMI-191); `persistModelSummaries = true`, **class only**, persists the container's per-model summaries so `nearestBySummary(modelId)` is an indexed lookup rather than an in-memory fold (OMI-458) |
 | `ExternalVector(name, keyField, model)` | class, repeatable | Declares a vector JavAI stores, versions and searches but **never computes** — supplied from outside the process, in its own model (OMI-290) |
 | `EmbeddingModel("id")` | class / field | Overrides which embedding model vectorizes this element |
 | `JavAIGraphNode` / `JavAIEdge` | class / record | Declares knowledge-graph participation (Vector Collections) |

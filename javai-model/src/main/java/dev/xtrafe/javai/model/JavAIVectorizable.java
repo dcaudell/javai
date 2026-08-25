@@ -95,6 +95,13 @@ public interface JavAIVectorizable {
      * <p>Deliberately uncached, unlike {@link #summaryVector()}: it is arithmetic over vectors that are
      * themselves already cached, so caching per model would buy little and cost a slot, an invalidation
      * rule and a dirty flag per model.
+     *
+     * <p>⚠️ <b>That reasoning is about one lookup, and it does not survive a ranking.</b> Computing one
+     * container's summary is cheap; ranking a corpus computes every container's, per query, at
+     * O(containers x their members) with nothing to index. A per-model cache is still the wrong answer to
+     * that -- the right one is storage, which is the persistence bridge's to provide rather than Vector
+     * Core's: see {@code @Summary(persistModelSummaries = true)} (OMI-458) and
+     * {@code doc/spec/persistence-bridge.md}.
      */
     default EmbeddingVector summaryVector(String modelId) {
         return EmbeddingVector.absent();

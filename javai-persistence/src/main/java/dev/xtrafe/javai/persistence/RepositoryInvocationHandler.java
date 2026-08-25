@@ -73,6 +73,9 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                         DerivedQueryMethods.Kind.FIELD, DerivedQueryMethods.requireVectorizeField(
                                 entityType, (String) args[0]));
             case "nearestBySummary":
+                // No model arity here: the model is asserted mid-chain with NearestQuery.inModel(...), not
+                // selected at the entry point, because the reference vector already selects the storage
+                // (OMI-458).
                 return newNearestQuery(DerivedQueryMethods.Kind.SUMMARY, null);
             case "nearestByConcatenatedText":
                 DerivedQueryMethods.requireConcatenationParticipant(entityType);

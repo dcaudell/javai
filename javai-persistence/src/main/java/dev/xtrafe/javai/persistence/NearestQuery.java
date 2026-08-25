@@ -54,6 +54,8 @@ public final class NearestQuery<T> {
 
     private final List<List<DerivedFinderQuery.BoundPart>> orGroups = new ArrayList<>();
     private EmbeddingVector reference;
+    /** The embedding model this search asserts, or null when it asserts none -- see {@link #inModel}. */
+    private String modelId;
     private Integer limit;
     private int offset;
     private boolean spent;
@@ -73,6 +75,75 @@ public final class NearestQuery<T> {
         }
         this.reference = reference;
         return this;
+    }
+
+    /**
+     * Asserts which embedding model this summary search is in (OMI-458).
+     *
+     * <pre>{@code
+     * albums.nearestBySummary().inModel(Image.PIXELS_MODEL).to(reference).limit(10).ranked();
+     * }</pre>
+     *
+     * <h2>⚠️ This is an assertion, not a selector, and the distinction is the whole of why it is optional</h2>
+     *
+     * Every backend already resolves <em>which</em> storage answers from {@code reference.modelId()}, so
+     * {@link #to} alone selects the right table or property and always has -- a summary search in a model
+     * that only ever arrives through {@code @ExternalVector} works with no call to this method at all.
+     * Ranking across two embedding spaces is therefore not something this prevents; it cannot happen, because
+     * the index is derived from the reference rather than chosen beside it.
+     *
+     * <p>What it prevents is a <b>caller's</b> slip. A container carrying both a {@code @Vectorize} field and
+     * an {@code @ExternalVector} has two coherent summaries, and
+     *
+     * <pre>{@code
+     * albums.nearestBySummary().to(album.summaryVector());          // the text one
+     * albums.nearestBySummary().to(album.summaryVector(PIXELS));    // the pixel one
+     * }</pre>
+     *
+     * differ by one token. Both compile, both run, and both return sensible hits against their own storage --
+     * so passing the wrong one answers the <em>other</em> of the container's two questions with nothing to
+     * notice. Naming the model here turns that into a refusal on the call. It buys legibility at the call
+     * site and a checked assumption; it buys no capability, which is why nothing requires it.
+     *
+     * <p><b>Meaningful only for a summary search.</b> A field-grain search names the vector, and an
+     * {@code @ExternalVector}'s model is fixed by its own declaration, so there is exactly one model it could
+     * be in; the combined vector and the concatenated text vector exist in the configured provider's model
+     * and no other. Called on any of those this refuses, rather than accepting a qualifier that does nothing
+     * and inviting the belief that it does something.
+     *
+     * @param modelId the embedding model to rank in, as {@code EmbeddingVector.modelId()} reports it
+     * @throws IllegalArgumentException if blank, if this is not a summary search, or -- on execution -- if
+     *                                  the reference vector is from a different model
+     */
+    public NearestQuery<T> inModel(String modelId) {
+        if (modelId == null || modelId.isBlank()) {
+            throw new IllegalArgumentException("inModel(...) needs an embedding model id -- the same string "
+                    + "EmbeddingVector.modelId() reports, e.g. \"siglip2-so400m-p16-384/pp1\". Omit the call "
+                    + "entirely to search whichever model the reference vector came from.");
+        }
+        if (kind != DerivedQueryMethods.Kind.SUMMARY) {
+            throw new IllegalArgumentException("inModel(...) is meaningful only for a summary search, and "
+                    + "this one is " + describeKind() + ". A summary is the one vector an object has several "
+                    + "of, one per model, so it is the one where naming the model says something the call "
+                    + "does not already say. Drop the inModel(...) call -- the reference vector already "
+                    + "selects the storage.");
+        }
+        this.modelId = modelId;
+        return this;
+    }
+
+    /** How this search reads in an error message -- the grain, in the caller's own vocabulary. */
+    private String describeKind() {
+        return switch (kind) {
+            case SUMMARY -> "a summary search";
+            case CONCATENATED_TEXT -> "a concatenated-text search, and concatenated text is one embedding of "
+                    + "one assembled string, so it exists in the configured provider's model and no other";
+            case COMBINED -> "a search of the object's own combined vector, which is stored in the configured "
+                    + "provider's model";
+            case FIELD -> "a search of '" + fieldName + "', which names one vector -- a @Vectorize field is "
+                    + "in the configured provider's model and an @ExternalVector is in the one its own "
+                    + "declaration fixes";
+        };
     }
 
     /** Maximum hits to return, applied <em>after</em> any narrowing. Required: an unbounded vector search
@@ -150,7 +221,12 @@ public final class NearestQuery<T> {
                 predicate.add(List.copyOf(group));
             }
         }
-        return new NearestSpec(kind, fieldName, reference, limit, offset, List.copyOf(predicate));
+        NearestSpec spec = new NearestSpec(kind, fieldName, reference, limit, offset,
+                List.copyOf(predicate), modelId);
+        // Checked here rather than in the backend so it fails on the builder that made the mistake, the
+        // same discipline resolve(...) follows for a bad property name (OMI-458).
+        spec.requireModelAgreement();
+        return spec;
     }
 
     private PropertyPath resolve(String property) {
