@@ -4,6 +4,7 @@ import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.JavAIDirtyTracking;
+import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.VectorMath;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAIMap;
@@ -826,6 +827,22 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     @Override
     public List<Object> findAll(Class<?> entityType) {
         return findAllTyped(entityType);
+    }
+
+    @Override
+    public long count(Class<?> entityType) {
+        return countTyped(entityType);
+    }
+
+    /** {@code select count(root) from <entity> root} through the same criteria API {@link #findAllTyped}
+     *  uses, so the count and the query it counts read the same mapping. */
+    private <T> long countTyped(Class<T> entityType) {
+        return inSession(session -> {
+            JpaCriteriaQuery<Long> query = session.getCriteriaBuilder().createQuery(Long.class);
+            JpaRoot<T> root = query.from(entityType);
+            query.select(session.getCriteriaBuilder().count(root));
+            return session.createQuery(query).getSingleResult();
+        });
     }
 
     @SuppressWarnings("unchecked")

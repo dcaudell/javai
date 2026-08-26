@@ -65,6 +65,12 @@ public interface ArticleQueryRepository extends JavAIRepository<Article> {
     @Query("select a from Article a where a.title like :pattern order by a.title asc")
     Slice<Article> sliceByTitleLike(@Param("pattern") String pattern, Pageable pageable);
 
+    /** The forever-scroll shape (OMI-460): a stable ordering plus a caller-chosen window, so asking for one
+     *  row more than the page holds answers "is there a next page?" without a count query. Reachable only
+     *  with an offset that need not be a multiple of the limit -- see {@code Windows}. */
+    @Query("select a from Article a where a.title like :pattern order by a.title asc")
+    List<Article> windowByTitleLike(@Param("pattern") String pattern, Pageable pageable);
+
     @Query("select a from Article a where a.title like :pattern")
     List<Article> sortedByTitleLike(@Param("pattern") String pattern, Sort sort);
 

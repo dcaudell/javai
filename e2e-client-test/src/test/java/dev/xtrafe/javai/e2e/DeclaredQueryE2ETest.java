@@ -17,6 +17,7 @@ import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
 import dev.xtrafe.javai.persistence.JavAIRepository;
+import dev.xtrafe.javai.persistence.Windows;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -76,6 +77,61 @@ class DeclaredQueryE2ETest {
             article.getComments().add(new Comment(author, "comment by " + author));
         }
         return article;
+    }
+
+    // ---- offset windows (OMI-460) ------------------------------------------------------------------
+
+    /**
+     * The forever-scroll idiom, against a real declared query: page 3 of 2, fetched as 3 rows so the extra
+     * row answers "is there more?" -- an offset of 4 with a limit of 3, which no page number can express.
+     *
+     * <p>The comparison against {@code PageRequest} is the point. Both calls are legal, both return rows,
+     * and only one returns the rows the caller asked for; before {@code Windows} the adopter's choice was to
+     * write their own {@code Pageable} or to be quietly off by two.
+     */
+    @Test
+    void anOffsetWindowPagesADeclaredQueryWhereAPageNumberCannot() {
+        ArticleQueryRepository articles = JavAIEnvironment.postgresArticleQueryRepository();
+        String tag = tag();
+        String pattern = "window-" + tag + "-%";
+        for (int index = 1; index <= 6; index++) {
+            articles.save(new Article("window-" + tag + "-" + index,
+                    "Body of windowed article number " + index + " for run " + tag + "."));
+        }
+
+        List<String> window = articles.windowByTitleLike(pattern, Windows.of(4, 3))
+                .stream().map(Article::getTitle).toList();
+        assertEquals(List.of("window-" + tag + "-5", "window-" + tag + "-6"), window,
+                "offset 4 of a title-ordered query -- and only two rows left, so this is the last page");
+
+        List<String> probe = articles.windowByTitleLike(pattern, Windows.of(2, 3))
+                .stream().map(Article::getTitle).toList();
+        assertEquals(3, probe.size(), "three rows came back for a page of two, so a next page exists -- "
+                + "learned without a second count query");
+        assertEquals(List.of("window-" + tag + "-3", "window-" + tag + "-4", "window-" + tag + "-5"), probe);
+
+        List<String> nearestPageNumber = articles.windowByTitleLike(pattern, PageRequest.of(4 / 3, 3))
+                .stream().map(Article::getTitle).toList();
+        assertEquals(List.of("window-" + tag + "-4", "window-" + tag + "-5", "window-" + tag + "-6"),
+                nearestPageNumber, "PageRequest lands on offset 3, not 4 -- different rows, silently");
+    }
+
+    /** An offset window drives the ordinary {@code Page} return too, total count and all. */
+    @Test
+    void anOffsetWindowAlsoBacksAPageReturn() {
+        ArticleQueryRepository articles = JavAIEnvironment.postgresArticleQueryRepository();
+        String tag = tag();
+        String pattern = "paged-" + tag + "-%";
+        for (int index = 1; index <= 5; index++) {
+            articles.save(new Article("paged-" + tag + "-" + index, "Body " + index + " for run " + tag + "."));
+        }
+
+        Page<Article> page = articles.pageByTitleLike(pattern, Windows.of(1, 2, Sort.by("title")));
+
+        assertEquals(2, page.getContent().size());
+        assertEquals(5, page.getTotalElements(), "the count query ignores the window, as it should");
+        assertEquals(List.of("paged-" + tag + "-2", "paged-" + tag + "-3"),
+                page.getContent().stream().map(Article::getTitle).toList());
     }
 
     // ---- the grouped aggregate, over a real JavAI collection ---------------------------------------

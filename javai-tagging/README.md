@@ -179,6 +179,55 @@ gap `RepositoryBackendSpringDataMongoTest` already documents for ordinary field/
 classes account for this: a looser similarity threshold than Postgres's own equivalent test, and a
 poll-until-visible helper before asserting on a Mongo query result.
 
+## Narrowing a tag index to one type (OMI-460)
+
+Both indexes (`tagSimilarityIndex()`, `tagTextIndex()`) span **every** `@Taggable` type at once -- which is
+the requirement they exist for, and also why an unnarrowed `nearestN` is so rarely the question anyone has.
+
+```java
+// the index's own vocabulary -- narrowing chains, so this composes
+JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+        .ofType(Album.class)
+        .nearestN(reference, 20);
+
+// this module's vocabulary -- Class<? extends Taggable>, matching taggedWith/rankedByTags
+JavAIList<TaggableRef> same  = tagging.nearestByTagSimilarity(reference, 20, List.of(Album.class));
+JavAIList<TaggableRef> byText = tagging.nearestByTagText(reference, 20, List.of(Album.class));
+```
+
+**The candidate types reach the store's own query**, applied before the top-N is chosen rather than to its
+result. Filtering the result is the over-fetch-and-discard workaround this replaces: wasteful within
+whatever multiplier a caller guessed, and *undetectably* wrong outside it, since an instance ranked below
+the draw is simply absent with nothing in the result to say so.
+
+| Backend | Mechanism |
+|---|---|
+| Postgres | `WHERE owner_type IN (…)` ahead of `ORDER BY … LIMIT` -- exact and indexed. |
+| MongoDB | `$vectorSearch`'s own `filter`, a genuine pre-filter applied during the search. Needs `taggableType` declared as a filter field, so an index written by an older JavAI is **dropped and recreated once, automatically** -- an in-place `updateSearchIndex` is rejected for a `vectorSearch` index (`"mappings" is required`, measured, not assumed), and the index is derived data over a collection this module owns, so a rebuild loses nothing. |
+| Neo4j | **Abandons the vector index when narrowed.** `db.index.vector.queryNodes` is a top-K call, so a type restriction could only ever be applied to what the index already chose; a narrowed search instead scores the matching nodes with `vector.similarity.cosine` -- exact, filtered in the query, O(nodes of those types). Unnarrowed searches still use the index, unchanged. |
+
+Neo4j's choice differs from `RepositoryBackendNeo4j`'s, which *refuses* the analogous narrowing for a
+repository vector search, and the difference is deliberate: a repository search is already scoped to one
+entity type, so narrowing there is an optional extra and refusing costs a caller little. This index spans
+every type by design, so its unnarrowed answer is not a broader version of the question -- it is a different
+question. An exact linear scan is the honest way to answer it, the same trade
+`RepositoryBackend.foldNearestBySummary` already documents.
+
+Matching is on **exact runtime class** (the stored discriminator is `instance.getClass().getName()`), naming
+no types matches nothing, and narrowing intersects -- the `VectorIndex` contract in full is in
+`doc/spec/vector-collections.md`.
+
+### Scores are cosine on every backend now
+
+`nearestNRanked` exposes the similarity each hit was ranked on. Postgres always reported raw cosine
+(`1 - distance`); Neo4j and MongoDB passed their own store's score straight through, and both report a
+cosine index's score rescaled into `(0, 1]` as `(1 + cosine) / 2`. Both now undo it as they read their own
+result, so `RankedTaggableRef.similarity` is the same number `JavAIVectorizable.similarityTo` returns in
+process, and a `filterByMinSimilarity` threshold means one thing everywhere. **Thresholds previously tuned
+against a Neo4j or MongoDB tag index may need lowering.** A perfect match still reads 1.0 either way, which
+is exactly why this went unnoticed -- it is a fixed point of the rescaling, so only a partial match reveals
+the difference.
+
 ## What the classifier sees
 
 Only each candidate `Tag`'s **slug**. Never localized display strings, never the description by default --
@@ -191,13 +240,20 @@ see "Classification via `Cortex`" above.
 a `Map<String, String>` field); `JavAITagRepository`'s full structural surface (`addTag`/`removeTag`/`hasTag`/
 `tagsOf`/`taggedWith`) against all three backends; classification via `Cortex` (`classify`/`classifyAll`,
 `ClassifierContext`, `ClassificationResult`); the tag-summary-vector index and `tagSimilarityIndex()`
-against all three backends. Covered by `TagTest` (hermetic unit tests: slug derivation/immutability,
+against all three backends, including OMI-460's type narrowing (`ofType`, `nearestByTagSimilarity`,
+`nearestByTagText`) and ranked results, pushed into each store's own query -- one `TagVectorIndex` serves
+both indexes, since the two differed only in which pair of backend methods they called and narrowing would
+otherwise have been written twice. Covered by `TagTest` (hermetic unit tests: slug derivation/immutability,
 `instanceof Taggable`), `TagNearDuplicateDiagnosticTest` (hermetic: proves two different-slug, near-identical
 tags coexist unblocked in one `TagSet`, discoverable only via a `similarityTo()` scan -- see doc/spec/
 tagging.md's "Uniqueness"), and `JavAITaggingPostgresE2ETest`/`Neo4jE2ETest`/`MongoE2ETest` (real containers
 -- there's no meaningful way to hermetically fake whether a real association/similarity search actually
 round-trips or ranks correctly) plus `JavAITaggingClassificationE2ETest` (`FakeCortex` + a real Postgres
-container, since the diff logic genuinely needs a real, configured `TaggingBackend`).
+container, since the diff logic genuinely needs a real, configured `TaggingBackend`) and
+`NarrowedTagIndexAllBackendsTest` (all three containers in one class: the same narrowing contract against
+three different mechanisms, over a fixture where every instance of the unwanted type outranks every instance
+of the wanted one, with the similarities asserted in closed form so a backend that forgot to convert its own
+store's score is caught by the value even though the ordering looks right).
 
 **A real, previously-latent bug in all three `javai-persistence` `RepositoryBackend` implementations was
 found and fixed while building this module**: `writeVectors`/`saveNode`/`saveDocument` all unconditionally

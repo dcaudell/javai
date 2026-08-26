@@ -253,6 +253,44 @@ class DeclaredQueryTest {
     }
 
     @Test
+    void windowsADeclaredQueryAtAnOffsetNoPageNumberCanExpress() {
+        save(1, 0);
+        save(2, 0);
+        save(3, 0);
+        save(4, 0);
+        save(5, 0);
+
+        // Ordered by votes ascending, so the row at each offset is known by name.
+        List<Integer> window = counters.nativePagedByLabel(label, Windows.of(3, 2))
+                .stream().map(TestCounterRow::getVotes).toList();
+        assertEquals(List.of(4, 5), window, "offset 3, limit 2 -- an offset that is not a multiple of the "
+                + "limit, which is what PageRequest cannot say");
+
+        List<Integer> pageRequest = counters.nativePagedByLabel(label, PageRequest.of(3 / 2, 2))
+                .stream().map(TestCounterRow::getVotes).toList();
+        assertEquals(List.of(3, 4), pageRequest, "the nearest page number lands on offset 2 and returns "
+                + "different rows -- the gap OMI-460 reported, demonstrated rather than described");
+    }
+
+    @Test
+    void windowsSupportTheOneExtraRowForeverScrollIdiom() {
+        save(1, 0);
+        save(2, 0);
+        save(3, 0);
+        save(4, 0);
+        save(5, 0);
+
+        // A page of 2 starting at 2, fetched as 3 rows: the extra row is the answer to "is there more?"
+        List<TestCounterRow> probe = counters.nativePagedByLabel(label, Windows.of(2, 3));
+        assertEquals(3, probe.size());
+        assertTrue(probe.size() > 2, "the extra row exists, so a next page does too -- learned without a "
+                + "count query");
+
+        List<TestCounterRow> lastProbe = counters.nativePagedByLabel(label, Windows.of(4, 3));
+        assertEquals(1, lastProbe.size(), "no extra row past the end, so this is the last page");
+    }
+
+    @Test
     void refusesASortedPageableOnANativeQuery() {
         save(1, 0);
 

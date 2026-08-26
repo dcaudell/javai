@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.vector.Ranked;
 import org.hibernate.SessionFactory;
 
 import java.lang.reflect.InvocationHandler;

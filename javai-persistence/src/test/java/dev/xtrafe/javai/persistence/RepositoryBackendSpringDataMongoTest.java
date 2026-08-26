@@ -439,4 +439,27 @@ class RepositoryBackendSpringDataMongoTest {
         }
         return result;
     }
+
+    @Test
+    void countAnswersTheSameNumberAsFindAllWithoutMaterializingIt() {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before, "count() and findAll().size() are the same "
+                + "question -- one of them just does not hydrate every row to answer it");
+
+        repository.save(new TestArticle("Counted one", "First of two rows added for the count."));
+        repository.save(new TestArticle("Counted two", "Second of two rows added for the count."));
+
+        assertEquals(before + 2, repository.count());
+        assertEquals(repository.findAll().size(), repository.count());
+    }
+
+    @Test
+    void countIsScopedToThisRepositorysOwnType() {
+        long articlesBefore = repository.count();
+
+        accountRepository.save(new TestAccount("counting-user", "counting@example.com", 30, true, null));
+
+        assertEquals(articlesBefore, repository.count(),
+                "another type's rows must not reach this repository's count");
+    }
 }

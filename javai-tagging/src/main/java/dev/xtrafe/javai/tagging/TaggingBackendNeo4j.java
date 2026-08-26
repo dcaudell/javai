@@ -202,29 +202,79 @@ final class TaggingBackendNeo4j implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         String property = qualify(reference.modelId());
-        ensureTagSummaryVectorIndex(property, reference.dims());
-        String indexName = tagSummaryVectorIndexName(property);
+        if (candidateTypeNames.isEmpty()) {
+            // Only the unnarrowed path reads the index, so only it provisions one -- a narrowed-only caller
+            // would otherwise leave a vector index behind that nothing ever queries.
+            ensureTagSummaryVectorIndex(property, reference.dims());
+        }
+        return nearestByVector(TAGGED_LABEL, property, tagSummaryVectorIndexName(property),
+                reference, n, candidateTypeNames);
+    }
+
+    @Override
+    public int tagSummaryVectorCount(List<String> candidateTypeNames) {
+        return countIndexed(TAGGED_LABEL, candidateTypeNames);
+    }
+
+    /**
+     * One vector search over whichever of the two tag indexes {@code label}/{@code property} name, narrowed
+     * to {@code candidateTypeNames} when there are any (OMI-460).
+     *
+     * <h2>Narrowed, this abandons the vector index -- deliberately</h2>
+     *
+     * {@code db.index.vector.queryNodes} is a top-K call: it picks its K nearest nodes and only then can
+     * Cypher see them, so a type restriction could only ever be applied to what the index already chose.
+     * That is exactly the over-fetch-and-discard OMI-460 exists to remove, and moving it inside the library
+     * would only hide it -- the same reasoning {@code RepositoryBackendNeo4j.validateNearestQuery} spells out
+     * for relational narrowing, where it refuses the query outright.
+     *
+     * <p>Here it does not refuse, because unlike a repository search there is an exact alternative and the
+     * unnarrowed answer is not a usable substitute. A repository search is already scoped to one entity type,
+     * so narrowing is an extra; this index deliberately spans <em>every</em> {@code @Taggable} type at once,
+     * so "the nearest 20" of it is the wrong question rather than a broader one. {@code
+     * vector.similarity.cosine} scores the matching nodes directly, which is exact, filtered in the query,
+     * and O(nodes of those types) rather than sublinear -- the same honest-but-linear trade
+     * {@code RepositoryBackend.foldNearestBySummary} already documents for a summary search with no index.
+     *
+     * <p>Unnarrowed, nothing changes: the index answers, as it always has.
+     */
+    private List<RankedTaggableRef> nearestByVector(String label, String property, String indexName,
+            EmbeddingVector reference, int n, List<String> candidateTypeNames) {
+        boolean narrowed = !candidateTypeNames.isEmpty();
+        String cypher = narrowed
+                ? "MATCH (node:" + label + ") "
+                        + "WHERE node.taggableType IN $types AND node.`" + property + "` IS NOT NULL "
+                        + "WITH node, vector.similarity.cosine(node.`" + property + "`, $reference) AS score "
+                        + "RETURN node.taggableType AS taggableType, node.taggableId AS taggableId, score "
+                        + "ORDER BY score DESC LIMIT $limit"
+                : "CALL db.index.vector.queryNodes($indexName, $limit, $reference) YIELD node, score "
+                        + "RETURN node.taggableType AS taggableType, node.taggableId AS taggableId, score AS score";
         try (Session session = driver().session()) {
-            var result = session.run(
-                    "CALL db.index.vector.queryNodes($indexName, $limit, $reference) YIELD node, score "
-                            + "RETURN node.taggableType AS taggableType, node.taggableId AS taggableId, score AS score",
-                    Values.parameters("indexName", indexName, "limit", n, "reference", reference.values()));
+            var result = session.run(cypher, Values.parameters(
+                    "indexName", indexName, "limit", n, "reference", reference.values(),
+                    "types", candidateTypeNames));
             List<RankedTaggableRef> ranked = new ArrayList<>();
             for (Record record : result.list()) {
                 TaggableRef ref = new TaggableRef(
                         record.get("taggableType").asString(), UUID.fromString(record.get("taggableId").asString()));
-                ranked.add(new RankedTaggableRef(ref, record.get("score").asDouble()));
+                // Neo4j reports a cosine score rescaled into (0, 1] as (1 + cosine) / 2 -- from the index and
+                // from vector.similarity.cosine alike. RankedTaggableRef speaks raw cosine, like the rest of
+                // JavAI, so undo the rescaling here where it is known (OMI-460).
+                ranked.add(new RankedTaggableRef(ref, 2.0 * record.get("score").asDouble() - 1.0));
             }
             return ranked;
         }
     }
 
-    @Override
-    public int tagSummaryVectorCount() {
+    /** Distinct nodes carrying {@code label}, restricted to {@code candidateTypeNames} when there are any. */
+    private int countIndexed(String label, List<String> candidateTypeNames) {
+        String where = candidateTypeNames.isEmpty() ? "" : " WHERE n.taggableType IN $types";
         try (Session session = driver().session()) {
-            Record record = session.run("MATCH (n:" + TAGGED_LABEL + ") RETURN count(n) AS c").single();
+            Record record = session.run("MATCH (n:" + label + ")" + where + " RETURN count(n) AS c",
+                    Values.parameters("types", candidateTypeNames)).single();
             return (int) record.get("c").asLong();
         }
     }
@@ -433,31 +483,19 @@ final class TaggingBackendNeo4j implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         String property = qualifyTagText(reference.modelId());
-        ensureTagTextVectorIndex(property, reference.dims());
-        String indexName = tagTextVectorIndexName(property);
-        try (Session session = driver().session()) {
-            var result = session.run(
-                    "CALL db.index.vector.queryNodes($indexName, $limit, $reference) YIELD node, score "
-                            + "RETURN node.taggableType AS taggableType, node.taggableId AS taggableId, score AS score",
-                    Values.parameters("indexName", indexName, "limit", n, "reference", reference.values()));
-            List<RankedTaggableRef> ranked = new ArrayList<>();
-            for (Record record : result.list()) {
-                TaggableRef ref = new TaggableRef(
-                        record.get("taggableType").asString(), UUID.fromString(record.get("taggableId").asString()));
-                ranked.add(new RankedTaggableRef(ref, record.get("score").asDouble()));
-            }
-            return ranked;
+        if (candidateTypeNames.isEmpty()) {
+            ensureTagTextVectorIndex(property, reference.dims()); // see nearestByTagSummaryVector's own note
         }
+        return nearestByVector(TAG_TEXTED_LABEL, property, tagTextVectorIndexName(property),
+                reference, n, candidateTypeNames);
     }
 
     @Override
-    public int tagTextVectorCount() {
-        try (Session session = driver().session()) {
-            Record record = session.run("MATCH (n:" + TAG_TEXTED_LABEL + ") RETURN count(n) AS c").single();
-            return (int) record.get("c").asLong();
-        }
+    public int tagTextVectorCount(List<String> candidateTypeNames) {
+        return countIndexed(TAG_TEXTED_LABEL, candidateTypeNames);
     }
 
     private void ensureTaggregateIndexes() {

@@ -3,6 +3,7 @@ package dev.xtrafe.javai.persistence;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.VectorMath;
 
 import java.util.ArrayList;
@@ -323,6 +324,16 @@ interface RepositoryBackend {
     Optional<Object> findById(Class<?> entityType, UUID id);
 
     List<Object> findAll(Class<?> entityType);
+
+    /**
+     * How many entities of {@code entityType} the store holds (OMI-460).
+     *
+     * <p>Abstract rather than a {@code findAll(entityType).size()} default on purpose: that default is
+     * exactly the waste {@code JavAIRepository.count()} exists to remove, and inheriting it silently would
+     * leave a backend looking like it had implemented the method. Every store this project targets counts
+     * natively.
+     */
+    long count(Class<?> entityType);
 
     void deleteById(Class<?> entityType, UUID id);
 

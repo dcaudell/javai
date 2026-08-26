@@ -12,6 +12,8 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 |---|---|---|
 | `JavAIPI` | Internal contract | The save/query/re-index contract JavAI objects speak internally; `repository(Class, JavAIPersistenceConfig)` takes its backend config as an explicit argument, no ambient "current config" |
 | `JavAIRepository<T>` | Interface | Spring-Data-style repository base; delegates to existing derived-query-method machinery |
+| `count()` | Method on `JavAIRepository<T>` | How many rows this type has, unconditionally — the count a predicate already had two routes to and "how many are there" had none. See "`count()`" below |
+| `Windows.of(offset, limit[, sort])` | `Pageable` factory | A page window whose offset is independent of its size, which `PageRequest` cannot express. See "Offset windows" below |
 | `findNearestBy<Field>(EmbeddingVector, int limit)` | Derived query method convention | E.g. `findNearestByBodyVector` — repository-level nearest-neighbor search |
 | `findBy<Field>`/`existsBy…`/`countBy…`/`deleteBy…` | Ordinary derived finders | Full Spring-Data-style relational finders (parsed via `PartTree`), resolved against the entity's own mapped columns — so one repository serves both an entity's relational access and its vector search. See "Ordinary relational derived finders" below |
 | `@Query` / `@Modifying` (+ `@Param`) | Declared query on a method | JPQL or native SQL a method carries itself, for what a derived name cannot ask — grouped aggregates, projections, and targeted single-column writes. Postgres only; see "Declared queries" below |
@@ -449,6 +451,50 @@ drops an existing one — a database that has it keeps it, empty, until somebody
 One live path was rebuilt rather than deleted. A geo predicate nested through a to-many hop used the
 membership table to map member ids back to owner ids; it resolves through an HQL join over the association
 now, which is what that hop always was once the collection became native.
+
+## `count()` (OMI-460)
+
+```java
+long total = albums.count();
+```
+
+The unconditional count. A *predicate's* count already had two routes — a derived `countBy…` finder and a
+declared `@Query` — and "how many are there" had none, so it was reached by `findAll().size()`: every row
+hydrated into an entity, its stored vectors read back into its cache slots (`hydrateFieldVector`), and the
+whole lot discarded to learn one number. Spring Data's `CrudRepository.count()` is the precedent.
+
+Each backend answers with the count its own store already knows how to do — `count(root)` through the same
+criteria API `findAll` uses, `MATCH (n:Label) RETURN count(n)`, `countDocuments()`. The `RepositoryBackend`
+method is **abstract rather than defaulted** to `findAll(entityType).size()`: that default would silently
+reintroduce exactly what this exists to remove, and would leave a backend looking as though it had
+implemented the method.
+
+Scoped to the repository's own entity type, like every other read on it — not to the store.
+
+## Offset windows: `Windows.of(offset, limit)` (OMI-460)
+
+```java
+// page 3 of 20, asking for one row more than the page holds
+List<Album> window = albums.browse(ownerId, Windows.of(60, 21, Sort.by("title")));
+boolean hasMore = window.size() > 20;
+```
+
+JavAI's query paths have always read `pageable.getOffset()` and `pageable.getPageSize()` and never the page
+*number* (`DeclaredQuery.resolveConstraints`, `DerivedFinderQuery.resolveConstraints`), so an arbitrary
+offset was already supported and merely unsayable. `PageRequest.of(page, size)` derives its offset as
+`page × size`, so every offset it can express is a multiple of the limit — which breaks the standard
+forever-scroll idiom of asking for one row more than the page holds. Page 3 of 20 wants offset 60 with a
+limit of 21, and `PageRequest.of(60 / 21, 21)` lands on offset **42** and quietly returns the wrong rows.
+
+`Pageable` is an interface, so an adopter can always implement one; this exists because every adopter doing
+one-extra-row paging otherwise writes the same ~70-line class, and discovers the need the same way — from
+rows that are subtly not the ones they asked for.
+
+Three of `Pageable`'s methods have to answer in pages, and an offset window has no page number of its own,
+so they are defined rather than left to be discovered: `getPageNumber()` reports `offset / limit` (floor),
+and `withPage(n)` returns a page-aligned window at `n × limit` — so `withPage(getPageNumber())` does **not**
+round-trip, by construction. `next()`/`previousOrFirst()` do stay exact, moving by the limit from wherever
+the window actually starts.
 
 ## Ordinary relational derived finders
 

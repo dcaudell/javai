@@ -49,17 +49,33 @@ interface TaggingBackend {
      *  remaining Taggings, regardless of which embedding model(s) it was previously indexed under. */
     void deleteTagSummaryVector(TaggableRef ref);
 
-    /** The {@code n} {@link TaggableRef}s (of any type -- this index deliberately spans every {@code
-     *  @Taggable} type at once) whose tag-summary vector is most similar to {@code reference}, each paired
-     *  with its cosine similarity. {@code reference.modelId()} selects which model's realization of the
-     *  index is queried. */
-    List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n);
+    /**
+     * The {@code n} {@link TaggableRef}s whose tag-summary vector is most similar to {@code reference}, each
+     * paired with its <b>cosine similarity in {@code [-1, 1]}</b> -- the same number
+     * {@code JavAIVectorizable.similarityTo} returns in process, whichever store answered (OMI-460). A store
+     * whose vector index reports something else rescales as it reads its own result, exactly as
+     * {@code javai-persistence}'s backends already do for {@code Ranked}.
+     *
+     * <p>{@code reference.modelId()} selects which model's realization of the index is queried.
+     *
+     * <p><b>{@code candidateTypeNames} narrows before the top-N is chosen, never after</b> (OMI-460). The
+     * index deliberately spans every {@code @Taggable} type at once, so "the nearest N" over the whole of it
+     * is rarely the question a caller has; "the nearest N albums" is. Each name is a fully-qualified class
+     * name, matching {@link TaggableRef#taggableType()}'s own convention and {@link #taggedWith}'s. An
+     * <b>empty</b> list means unnarrowed -- the same convention {@code NearestSpec.isNarrowed()} follows,
+     * and safe here because {@code TagVectorIndex} answers "narrowed to no types at all" itself without
+     * asking a backend.
+     */
+    List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames);
 
     /** The number of distinct {@link TaggableRef}s currently in the tag-summary-vector index, across every
-     *  model it's ever been realized under -- what backs {@link TagSimilarityVectorIndex#size()}, and the
-     *  upper bound {@link TagSimilarityVectorIndex#filterByMinSimilarity} uses to fetch the whole index via
-     *  {@link #nearestByTagSummaryVector} before applying its own threshold. */
-    int tagSummaryVectorCount();
+     *  model it's ever been realized under, restricted to {@code candidateTypeNames} (empty = every type) --
+     *  what backs {@code TagVectorIndex.size()}, and the upper bound its {@code filterByMinSimilarity} uses
+     *  to fetch the whole index via {@link #nearestByTagSummaryVector} before applying its own threshold.
+     *  Narrowed, that bound has to be the narrowed count, or a threshold query over a narrowed view would
+     *  fetch too few rows to threshold. */
+    int tagSummaryVectorCount(List<String> candidateTypeNames);
 
     // ---- Taggregate (OMI-302) -- membership snapshot, pending set, batched/aggregate queries, tag text ----
 
@@ -119,11 +135,15 @@ interface TaggingBackend {
      *  if none is stored -- what backs {@code JavAITagRepository#tagTextVector(Object)}. */
     EmbeddingVector tagTextVector(TaggableRef ref, String modelId);
 
-    /** The {@code n} refs whose tag-text vector is most similar to {@code reference} --
-     *  {@code reference.modelId()} selects the model realization, mirroring {@link #nearestByTagSummaryVector}. */
-    List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n);
+    /** The {@code n} refs whose tag-text vector is most similar to {@code reference}, narrowed to
+     *  {@code candidateTypeNames} (empty = every type) -- {@code reference.modelId()} selects the model
+     *  realization, and every other rule above is the same one, mirroring
+     *  {@link #nearestByTagSummaryVector}. */
+    List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames);
 
-    /** Distinct refs currently in the tag-text index, across every model -- backs the tag-text
-     *  {@code VectorIndex}'s {@code size()}/{@code filterByMinSimilarity}, mirroring {@link #tagSummaryVectorCount}. */
-    int tagTextVectorCount();
+    /** Distinct refs currently in the tag-text index, across every model, restricted to
+     *  {@code candidateTypeNames} (empty = every type) -- backs the tag-text {@code VectorIndex}'s
+     *  {@code size()}/{@code filterByMinSimilarity}, mirroring {@link #tagSummaryVectorCount}. */
+    int tagTextVectorCount(List<String> candidateTypeNames);
 }

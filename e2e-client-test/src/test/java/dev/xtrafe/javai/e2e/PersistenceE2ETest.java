@@ -92,6 +92,29 @@ class PersistenceE2ETest {
         return article;
     }
 
+    /**
+     * {@code count()} against a real, already-populated store (OMI-460).
+     *
+     * <p>Asserted relatively rather than absolutely, deliberately: these stores are not reset between runs
+     * (see {@code postgresFindNearestByFieldVectorRanksByRealSimilarity}'s own note), so the invariant worth
+     * pinning is not "there are N articles" but "count() is the number {@code findAll()} would have had to
+     * hydrate every row to produce, and it tracks writes exactly."
+     */
+    private static void assertCountTracksTheStore(ArticleRepository repository, String backend) {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before,
+                backend + ": count() and findAll().size() are the same question");
+
+        repository.save(newArticle("Counted article one " + UUID.randomUUID(),
+                "One of two articles saved to prove count() tracks writes on " + backend + "."));
+        repository.save(newArticle("Counted article two " + UUID.randomUUID(),
+                "Two of two articles saved to prove count() tracks writes on " + backend + "."));
+
+        assertEquals(before + 2, repository.count(), backend + ": two saves, two more rows");
+        assertEquals(repository.findAll().size(), repository.count(),
+                backend + ": still the same question after the writes");
+    }
+
     // ---- Postgres ---------------------------------------------------------------------------
 
     @Test
@@ -137,6 +160,11 @@ class PersistenceE2ETest {
 
         List<Article> bySummary = postgresRepository.findNearestBySummaryVector(vectorizable.summaryVector(), 5);
         assertTrue(bySummary.stream().anyMatch(a -> a.getId().equals(article.getId())));
+    }
+
+    @Test
+    void postgresCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(postgresRepository, "Postgres");
     }
 
     // ---- Neo4j --------------------------------------------------------------------------------
@@ -320,6 +348,11 @@ class PersistenceE2ETest {
         assertEquals(fromPostgres.getFeaturedComment().getText(), fromMongo.getFeaturedComment().getText());
     }
 
+    @Test
+    void neo4jCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(neo4jRepository, "Neo4j");
+    }
+
     // ---- MongoDB ------------------------------------------------------------------------------
 
     @Test
@@ -418,5 +451,10 @@ class PersistenceE2ETest {
             assertEquals(1, relationshipCount,
                     "featuredComment must be persisted as a real :FEATURED_COMMENT relationship to its own Comment node");
         }
+    }
+
+    @Test
+    void mongoCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(mongoRepository, "MongoDB");
     }
 }

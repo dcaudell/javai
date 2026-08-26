@@ -31,7 +31,7 @@ mutating it. JavAI Extensions makes that a property of the object model itself:
 | **Provider-agnostic RAG completions** | `Cortex` (six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
 | **Grounding a completion in real object-graph data** | `PromptContext`/`Contextable`/`ContextableObject` — a `query()` result, or any `JavAIList`/`Set`/`Map`, renders directly as prompt material, no manual serialization | `javai-model` (lives here, not `javai-completion` — see "Module layout" below) |
 | **Agentic Supervision** | `@SyncSupervision`/`@AsyncSupervision` on a method or constructor — a registered `SupervisionListener` can veto/rewrite a call (blocking) and/or react to it (fire-and-forget), at PRE/POST/EXCEPTION | `javai-supervision` |
-| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggingsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`/`rankedByTags`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), cross-type tag-similarity search (`tagSimilarityIndex()`), and Taggregate — `@Taggregate` fields make a container's tags a derived aggregate of its members', and `@Taggregate(concatenate = true)` renders any taggable's tags as an embedded, searchable string (`tagTextIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
+| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggingsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`/`rankedByTags`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), cross-type tag-similarity search (`tagSimilarityIndex()`, narrowable to one type via `ofType(...)`/`nearestByTagSimilarity(...)`), and Taggregate — `@Taggregate` fields make a container's tags a derived aggregate of its members', and `@Taggregate(concatenate = true)` renders any taggable's tags as an embedded, searchable string (`tagTextIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
 | **Codegen Guidance** | A *different* annotation family (`@Requires`/`@Intent`/`@AgentWritable`/`@Nondeterministic`/`@Provenance`) that constrains what an AI agent may read/generate/modify in annotated code | `javai-annotations`; see `JavAI_Codegen_Guidance.md` |
 
 **The hard interop rule that shapes all of the above:** every class this library produces — woven or
@@ -545,7 +545,9 @@ association on top of it.
 | `ClassificationResult classify(Object instance, TagSet tagSet)` | One LLM call via the constructor-supplied `Cortex`: marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones), shows the model only `tagSet`'s candidate **slugs**, and diffs the result against `instance`'s existing `source = "auto"` taggings *for this `TagSet` specifically* — adds/updates/removes as needed, never touching `source = "manual"` taggings even for tags in the same set. Client-invoked only; never triggered automatically by a `TagSet` edit. |
 | `List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet)` | Convenience batch form — still one LLM call per instance internally, not a fan-out you hand-loop yourself. |
 | `ClassificationResult applyClassification(Object instance, TagSet tagSet, List<AppliedTag> results)` | The same reconciliation as `classify`, for a classifier that **is not an LLM** — an image tagger, a rules engine, anything returning `(tag, confidence)` of its own. Needs no `Cortex`. ⚠️ A tag from another `TagSet` throws here, where `classify` silently discards a hallucinated slug: a model inventing a slug is expected noise, but a caller passing the wrong set creates an automatic tagging no later run could ever retract. |
-| `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. |
+| `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. Narrowable to one type with `ofType(...)`. |
+| `JavAIList<TaggableRef> nearestByTagSimilarity(EmbeddingVector reference, int n, List<Class<? extends Taggable>> candidateTypes)` | The nearest `n` instances **of one of `candidateTypes`** by tag-summary vector — the type restriction goes into the store's query, applied before the top-`n` is chosen. Exactly `tagSimilarityIndex().ofType(candidateTypes).nearestN(reference, n)`. |
+| `JavAIList<TaggableRef> nearestByTagText(EmbeddingVector reference, int n, List<Class<? extends Taggable>> candidateTypes)` | The same, over the tag-**text** index. |
 
 `ClassificationResult` is `record ClassificationResult(TaggableRef instance, TagSet tagSet, List<AppliedTag>
 appliedTags)`, where `AppliedTag` is `record AppliedTag(Tag tag, Double affinity, String reasoning)` —
@@ -593,10 +595,10 @@ EmbeddingVector adHoc = VectorMath.centroid(tags.stream().map(Tag::vector).toLis
 JavAIList<TaggableRef> similarByTags = index.nearestN(adHoc, 20);
 ```
 
-**Heterogeneous by default, homogeneous by client-side filter** — `tagSimilarityIndex()` takes no type
-parameter (the underlying vector is a property of the *tagging*, not of the tagged type), so a plain
-`nearestN`/`filterByMinSimilarity` call naturally returns a mix of every `@Taggable` type that happens to
-rank close to the reference:
+**Heterogeneous by default, narrowed on request** — the index spans every `@Taggable` type at once (the
+underlying vector is a property of the *tagging*, not of the tagged type), so a plain `nearestN` returns a
+mix of whatever ranks close to the reference. Ask for one type and the type restriction goes into the
+store's own query, before the top-N is chosen:
 
 ```java
 EmbeddingVector securityVector = ((JavAIVectorizable) security).summaryVector();
@@ -605,13 +607,27 @@ EmbeddingVector securityVector = ((JavAIVectorizable) security).summaryVector();
 // by how similar each one's whole tag collection is to the reference -- no type restriction at all.
 JavAIList<TaggableRef> similarOfAnyType = index.nearestN(securityVector, 10);
 
-// Homogeneous: filter the same result down to one @Taggable type yourself -- there's no "candidateTypes"
-// parameter here the way taggedWith has one, since ranking is over the aggregate tag vector, not a
-// per-type index.
-List<TaggableRef> similarArticlesOnly = similarOfAnyType.stream()
-        .filter(ref -> ref.taggableType().equals(Article.class.getName()))
-        .toList();
+// Narrowed: ofType(...) returns another VectorIndex, so it chains; the search ends the chain.
+JavAIList<TaggableRef> similarArticles = index.ofType(Article.class).nearestN(securityVector, 10);
+
+// Or in this module's own vocabulary, the same shape taggedWith/rankedByTags use:
+JavAIList<TaggableRef> same = tagging.nearestByTagSimilarity(securityVector, 10, List.of(Article.class));
+
+// With the score each hit was ranked on -- plain cosine in [-1, 1], on every backend:
+List<Ranked<TaggableRef>> withScores = index.ofType(Article.class).nearestNRanked(securityVector, 10);
 ```
+
+⚠️ **Do not filter the result instead.** Drawing `limit × some multiple` and discarding the wrong types is
+wasteful inside the multiplier and *silently wrong* outside it: an instance ranked below the draw is simply
+absent, and nothing in the result says so. `ofType(...)` narrows before the limit is applied, so `n` hits
+means `n` hits of that type.
+
+Three rules worth knowing:
+
+- **Exact runtime class, not assignability.** `ofType(Animal.class)` does not match a `Dog` — the stored
+  discriminator is `instance.getClass().getName()`. Same rule `taggedWith`/`rankedByTags` have always used.
+- **Naming no types matches nothing**, not everything. Call the unnarrowed query to say "everything".
+- **Narrowing intersects.** `ofType(A, B).ofType(A)` is `ofType(A)`; `ofType(A).ofType(B)` matches nothing.
 
 `TaggableRef` is `record TaggableRef(String taggableType, UUID taggableId)`, where `taggableType` is the
 tagged instance's **fully-qualified** class name (`instance.getClass().getName()`) — deliberately not the
@@ -684,7 +700,7 @@ text, recomputed at the same trigger points as the tag-summary vector.
 |---|---|
 | `String tagText(Object instance)` | The stored rendered string, or `null` if none. |
 | `EmbeddingVector tagTextVector(Object instance)` | Its stored embedding, or absent. |
-| `VectorIndex<TaggableRef> tagTextIndex()` | The cross-type index over every stored tag-text vector — embed a statement, `nearestN` it, get back the instances whose *tags read most like it*. Like `tagSimilarityIndex()`, its own `add`/`remove` refuse. |
+| `VectorIndex<TaggableRef> tagTextIndex()` | The cross-type index over every stored tag-text vector — embed a statement, `nearestN` it, get back the instances whose *tags read most like it*. Like `tagSimilarityIndex()`, its own `add`/`remove` refuse, and it narrows the same way (`ofType(...)`, or `nearestByTagText(...)`). |
 
 Because the text embeds through the same model as any other text in your system, pixel-derived machine
 tags rendered as words land in the same embedding space as captions and bios — "albums about lakes" is one
@@ -863,7 +879,29 @@ runtime, or the shape isn't worth a method.
   results and paging *do* work on Neo4j.
 - **`Ranked.similarity()` is plain cosine in `[-1, 1]`** on every backend — the same number `similarityTo`
   gives you in process, so a threshold means the same thing whichever store answered. (`Ranked.distance()` is
-  `1 - similarity` if you would rather think in distances.)
+  `1 - similarity` if you would rather think in distances.) `Ranked` is
+  `dev.xtrafe.javai.vector.Ranked` — it moved out of `dev.xtrafe.javai.persistence` when
+  `VectorIndex.nearestNRanked` needed the same type, so an older import needs updating and nothing else.
+
+## Counting, and paging from an arbitrary offset
+
+```java
+long total = albums.count();                                  // no rows hydrated
+
+// page 3 of 20, asking for one row more than the page holds so you learn whether page 4 exists
+List<Album> window = albums.browse(ownerId, Windows.of(60, 21, Sort.by("title")));
+boolean hasMore = window.size() > 20;
+```
+
+- **`count()`** is the unconditional count, scoped to the repository's own entity type. A predicate's count
+  already had `countBy…` and `@Query`; this is "how many are there". Do not reach for `findAll().size()` —
+  that hydrates every row, and its stored vectors, to produce one number.
+- **`Windows.of(offset, limit)`** is a `Pageable` whose offset is independent of its size.
+  `PageRequest.of(page, size)` derives offset as `page × size`, so it cannot express offset 60 with a limit
+  of 21 — `PageRequest.of(60 / 21, 21)` is offset **42** and returns different rows with no error. Use
+  `Windows` wherever the offset is not a multiple of the limit, which is every forever-scroll that probes
+  for a next page. `getPageNumber()` reports `offset / limit` and `withPage(n)` is page-aligned, so the two
+  do not round-trip; `next()`/`previousOrFirst()` move by the limit from where the window actually starts.
 
 ⚠️ **MongoDB only:** a vector search index created before this feature existed lacks the `_id` filter path
 narrowing needs, and index definitions are not amended in place. If a narrowed search fails on an index an

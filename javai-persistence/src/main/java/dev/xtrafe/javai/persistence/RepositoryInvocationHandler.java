@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
+import dev.xtrafe.javai.vector.Ranked;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -49,6 +50,8 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 return backend.findById(entityType, (UUID) args[0]);
             case "findAll":
                 return backend.findAll(entityType);
+            case "count":
+                return backend.count(entityType);
             case "deleteById":
                 backend.deleteById(entityType, (UUID) args[0]);
                 return null;

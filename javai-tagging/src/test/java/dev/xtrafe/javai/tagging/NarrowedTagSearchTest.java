@@ -3,7 +3,7 @@ package dev.xtrafe.javai.tagging;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.persistence.JavAIPersistenceConfig;
-import dev.xtrafe.javai.persistence.Ranked;
+import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.vector.testsupport.ScriptedEmbeddingProvider;
 import org.junit.jupiter.api.BeforeAll;

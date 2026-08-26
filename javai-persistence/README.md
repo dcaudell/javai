@@ -13,11 +13,13 @@ alongside their ORM.
 | Element | Kind | Purpose |
 |---|---|---|
 | `JavAIPI` | Static utility | `repository(Class, JavAIPersistenceConfig)` realizes a `JavAIRepository<T>` subinterface as a dynamic `Proxy`, bound permanently to the config passed in -- no ambient "current config" to configure separately; see "No ambient configuration" below |
-| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`saveAll`/`findById`/`findAll`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
+| `JavAIRepository<T>` | Interface | Base CRUD (`save`/`saveAll`/`findById`/`findAll`/`count`/`deleteById`) plus `reindexAll()` (whole datastore) and `reindex()` (this type only), fixed to `UUID` identity |
 | `saveAll(Iterable<T>)` | Bulk write | Saves a batch with **one** embedding round trip instead of one per entity (OMI-266); one transaction on Postgres, per-entity writes on Neo4j/Mongo -- see "Batching" below |
 | `findNearestBy<Field>Vector` / `findNearestByVector` / `findNearestBySummaryVector` | Vector derived query convention | Repository-level nearest-neighbor search -- validated at repository-creation time, not on first call. Optionally narrowed (`…VectorAnd<Predicate>`), ranked (`List<Ranked<T>>`) and paged (trailing `Pageable`/`Limit`) since OMI-230 |
 | `NearestQuery<T>` | Builder, from `nearest()`/`nearestBy(field)`/`nearestBySummary()`/`nearestByConcatenatedText()` | The same vector search composed at runtime instead of declared as a method name -- `where(…)`, `offset`/`limit`, `results()`/`ranked()`, and `inModel(…)` to assert which of a container's summaries is meant (OMI-458; optional, since the reference vector already selects the storage) |
-| `Ranked<T>` | Result record | A hit plus the cosine similarity it was ranked on, normalized to `[-1, 1]` on every backend |
+| `count()` | Method on `JavAIRepository<T>` | How many rows this type has, unconditionally -- each store's own count, not `findAll().size()` (OMI-460) |
+| `Windows.of(offset, limit[, sort])` | `Pageable` factory | A window whose offset is independent of its size, which `PageRequest.of(page, size)` cannot express -- see "Offset windows" below (OMI-460) |
+| `Ranked<T>` | Result record | A hit plus the cosine similarity it was ranked on, normalized to `[-1, 1]` on every backend. **Lives in `javai-vector` since OMI-460** (`dev.xtrafe.javai.vector.Ranked`), because `javai-collections`' own ranked search needed the same shape from below this module -- adopters update an import |
 | `findBy…` / `existsBy…` / `countBy…` / `deleteBy…` | Ordinary relational derived finders | Full Spring-Data-style finders (parsed via `PartTree`) resolved against the entity's own mapped columns, so one repository serves both an entity's relational access and its vector search; also validated at creation time -- see "Ordinary relational derived finders" below |
 | `@Query` / `@Modifying` (+ `@Param`) | Declared query on a method | JPQL or native SQL the method carries itself -- grouped aggregates, projections, and targeted single-column writes. **Postgres only**; Neo4j/Mongo refuse at creation time. See "Declared queries" below |
 | `findBy<AnyField>OfType(Class)` | `@Any` discriminator predicate | Filters on a polymorphic to-one's target *type*, with no shadow discriminator column to maintain. **Postgres only** (the other two refuse `@Any` fields outright) |
@@ -442,6 +444,27 @@ three backends because "a collection of related entities" has some natural repre
 rolling a real graph-traversal engine on top of a relational/document store, a substantial undertaking
 deliberately out of scope for this project's Phase 0.
 
+## Offset windows: `Windows.of(offset, limit)` (OMI-460)
+
+```java
+// page 3 of 20, asking for one row more than the page holds
+List<Album> window = albums.browse(ownerId, Windows.of(60, 21, Sort.by("title")));
+boolean hasMore = window.size() > 20;
+```
+
+Both query paths here have always read `pageable.getOffset()`/`getPageSize()` and never the page *number*,
+so an arbitrary offset was already supported and merely unsayable. `PageRequest.of(page, size)` derives its
+offset as `page × size`, so every offset it can express is a multiple of the limit -- and the one-extra-row
+forever-scroll idiom needs offset 60 with a limit of 21, which no page number produces
+(`PageRequest.of(60 / 21, 21)` is offset **42**, and quietly the wrong rows).
+
+`Pageable` is an interface, so an adopter can always write one; this exists because every adopter doing
+one-extra-row paging otherwise writes the same class and finds out the same way. Three of `Pageable`'s
+methods must answer in pages and an offset window has no page number, so they are pinned rather than left to
+be discovered: `getPageNumber()` is `offset / limit` (floor) and `withPage(n)` is page-aligned at
+`n × limit`, so `withPage(getPageNumber())` deliberately does not round-trip; `next()`/`previousOrFirst()`
+stay exact, moving by the limit from where the window actually starts.
+
 ## Declared queries: `@Query` / `@Modifying` (OMI-398)
 
 A derived name expresses a predicate over an entity's own properties and nothing else, so a **grouped
@@ -600,8 +623,10 @@ avoids connection-unwrapping uncertainty through Hibernate's layer.
 
 `JavAIRepository`/`JavAIPI`/`JavAIPersistenceConfig` (`RepositoryBackendHibernatePostgres`/
 `RepositoryBackendNeo4j`/`RepositoryBackendSpringDataMongo` behind a `java.lang.reflect.Proxy`), all three
-backends' save/saveAll/findById/findAll/deleteById/reindexAll plus the three `findNearestBy*` variants,
-described above. `reindexAll()` needs almost no backend-specific code -- it's a `findAll()` + `save(...)`
+backends' save/saveAll/findById/findAll/count/deleteById/reindexAll plus the three `findNearestBy*`
+variants, described above. `count()` (OMI-460) is each store's own count -- `count(root)` through the same
+criteria API `findAll` uses, `MATCH (n:Label) RETURN count(n)`, `countDocuments()` -- and is abstract on the
+SPI rather than defaulted to `findAll(...).size()`, since that default is exactly the waste it removes. `reindexAll()` needs almost no backend-specific code -- it's a `findAll()` + `save(...)`
 loop over each backend's existing methods, chunked and batch-warmed by one shared SPI default.
 
 **Batching: how many provider calls a write costs (OMI-266).** A flush reads one field at a time, so lazy

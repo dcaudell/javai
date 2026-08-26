@@ -219,10 +219,36 @@ public final class JavAITagRepository {
      * The persistence-backed {@code VectorIndex<TaggableRef>} over every tagged instance's tag-summary
      * vector -- see doc/spec/tagging.md's "Tag-similarity search". Maintained automatically as a side
      * effect of {@link #addTag}/{@link #removeTag}/{@link #classify}; the returned index's own {@code add}/
-     * {@code remove} refuse (see {@link TagSimilarityVectorIndex}'s own javadoc).
+     * {@code remove} refuse (see {@link TagVectorIndex}'s own javadoc), and it narrows by type with
+     * {@code ofType(...)} -- see {@link #nearestByTagSimilarity}.
      */
     public VectorIndex<TaggableRef> tagSimilarityIndex() {
-        return new TagSimilarityVectorIndex(backend);
+        return new TagVectorIndex(backend, TagVectorIndex.Grain.TAG_SUMMARY);
+    }
+
+    /**
+     * The nearest {@code n} tagged instances <b>of one of {@code candidateTypes}</b>, by tag-summary vector
+     * (OMI-460) -- {@code tagSimilarityIndex().ofType(candidateTypes).nearestN(reference, n)}, in the
+     * vocabulary this class already uses for {@link #taggedWith} and {@link #rankedByTags}.
+     *
+     * <p><b>Why this exists next to the index.</b> The index spans every {@code @Taggable} type at once --
+     * images, profiles, and JavAI's own {@code Tag}s all carry tag-summary vectors -- so an unnarrowed
+     * {@code nearestN} returns {@code n} of <em>everything</em>, and a caller who wanted one type had to draw
+     * a multiple and discard. That is wasteful within the multiplier and silently wrong past it: an instance
+     * ranked below the draw is absent, with nothing in the result to say so. Here the types reach the query,
+     * which applies them before choosing the top N, so {@code n} hits means {@code n} hits of these types.
+     *
+     * <p>Takes {@code Class<? extends Taggable>} where the index takes {@code Class<?>} -- the index is
+     * generic over its element type and cannot require it; this class knows what is in there.
+     *
+     * <p>Matching is on <b>exact runtime class</b>, the same terms {@link #taggedWith}/{@link #rankedByTags}
+     * have always taken candidate types on: the stored discriminator is
+     * {@code instance.getClass().getName()}, so naming a supertype matches nothing rather than its subtypes.
+     * Naming no types at all likewise matches nothing, exactly as {@code taggedWith(tag, List.of())} does.
+     */
+    public JavAIList<TaggableRef> nearestByTagSimilarity(EmbeddingVector reference, int n,
+            List<Class<? extends Taggable>> candidateTypes) {
+        return tagSimilarityIndex().ofType(candidateTypes).nearestN(reference, n);
     }
 
     /**
@@ -576,7 +602,15 @@ public final class JavAITagRepository {
      * index's own {@code add}/{@code remove} refuse.
      */
     public VectorIndex<TaggableRef> tagTextIndex() {
-        return new TagTextVectorIndex(backend);
+        return new TagVectorIndex(backend, TagVectorIndex.Grain.TAG_TEXT);
+    }
+
+    /** The nearest {@code n} instances of one of {@code candidateTypes} by <b>tag-text</b> vector -- the
+     *  tag-text sibling of {@link #nearestByTagSimilarity}, narrowing on identical terms (OMI-460). Embed a
+     *  statement, ask for the nearest 20 albums, get 20 albums whose tags read most like it. */
+    public JavAIList<TaggableRef> nearestByTagText(EmbeddingVector reference, int n,
+            List<Class<? extends Taggable>> candidateTypes) {
+        return tagTextIndex().ofType(candidateTypes).nearestN(reference, n);
     }
 
     /**
