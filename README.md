@@ -293,8 +293,10 @@ smoke tests:
 - **`javai-substrate`** (Acceleration Substrate) — a full ByteBuddy weaver: multi-field `vector()`,
   `summaryVector()` propagation through both single references and collections, `query()`, cycle safety,
   `@SearchVisibility`/`@VectorizeIgnore`, and inherited-field support via synthesized setter overrides.
-- **`javai-collections`** (Vector Collections) — `VectorIndex` and `KnowledgeGraph`/`SubgraphResult`
-  (hybrid similarity + structural queries), both hand-written and reflection-based, not woven.
+- **`javai-collections`** (Vector Collections) — `VectorIndex` (narrowable by type with `ofType(...)`,
+  which returns another `VectorIndex` so narrowings chain, plus a ranked search) and
+  `KnowledgeGraph`/`SubgraphResult` (hybrid similarity + structural queries), both hand-written and
+  reflection-based, not woven.
 - **`javai-persistence`** (Persistence Bridge) — both backends real: Postgres+pgvector (one table per
   embedding model, so a provider swap needs no schema migration) and Neo4j (native vector index, one
   model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
@@ -310,7 +312,8 @@ smoke tests:
   exception propagated from a called method, not just a literal `throw`). See that module's README for two
   JVM-imposed method/constructor asymmetries discovered while building it.
 - **`javai-tagging`** (Tagging) — `@Taggable`/`@TagIgnore` unwoven markers, recursive `Tag`/`TagSet`
-  structures, tag-collection similarity search over a tag-summary-vector `VectorIndex<TaggableRef>`, and
+  structures, tag-collection similarity search over a tag-summary-vector `VectorIndex<TaggableRef>` —
+  narrowable to one `@Taggable` type, with the restriction pushed into each store's own query — and
   LLM-based auto-classification via `javai-completion`'s `Cortex`, tested against all three persistence
   backends. Tagging operations are scoped to a `JavAITagRepository` instance wrapping an already-realized
   `TagRepository`, not a static facade — see `doc/spec/tagging.md` and `SPEC.md`'s "Coding standard:

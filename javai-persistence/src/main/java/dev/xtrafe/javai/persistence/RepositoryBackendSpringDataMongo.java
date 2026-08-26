@@ -15,6 +15,7 @@ import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.Ranked;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.springframework.data.domain.Sort;
@@ -284,6 +285,11 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             return Optional.empty();
         }
         return Optional.of(hydrate(entityType, doc, new HashMap<>()));
+    }
+
+    @Override
+    public long count(Class<?> entityType) {
+        return collectionFor(entityType).countDocuments();
     }
 
     @Override

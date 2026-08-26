@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.Ranked;
 import org.springframework.data.core.PropertyReferenceException;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Pageable;

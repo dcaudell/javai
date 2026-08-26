@@ -43,7 +43,85 @@ version -- a given release usually changes only one or two of them.
   drops what it finds present. `DROP TABLE javai_vectors__<model>` / `javai_summary_vectors__<model>` for any
   model you do not recognise, after checking it is empty.
 
+### Changed
+
+- **`Ranked<T>` moved to `dev.xtrafe.javai.vector` (OMI-460).** Was `dev.xtrafe.javai.persistence.Ranked`.
+  `VectorIndex.nearestNRanked` needed the same shape from `javai-collections`, which sits *below*
+  `javai-persistence` and so could not name it; the alternative was a second record meaning exactly the same
+  thing one module down. What the record describes is a cosine similarity, which is `javai-vector`'s own
+  subject. Nothing about its meaning changed — **adopters update an import**.
+
+- **The tag indexes report raw cosine on every backend (OMI-460).** `javai-tagging`. Postgres already did
+  (`1 - distance`); Neo4j and MongoDB passed their own store's score straight through, and both report a
+  cosine index's score rescaled into `(0, 1]` as `(1 + cosine) / 2`. So `filterByMinSimilarity(ref, 0.9)`
+  meant a different thing per backend, and `RankedTaggableRef.similarity` was not the number
+  `JavAIVectorizable.similarityTo` returns in process. Both now undo the rescaling as they read their own
+  result — the conversion `javai-persistence`'s backends have always applied to `Ranked`. Thresholds written
+  against Neo4j or MongoDB tag indexes are now cosine and may need lowering; a perfect match still reads 1.0,
+  which is exactly why the regression survived (it is a fixed point of the rescaling).
+
 ### Added
+
+- **Filter-by-type on a `VectorIndex`, applied by the query rather than to its result (OMI-460).**
+  `javai-collections` + `javai-tagging`. `tagSimilarityIndex()`/`tagTextIndex()` span **every** `@Taggable`
+  type at once — that is what they are for — so "the nearest 20" of one was unanswerable: a caller wanting
+  albums drew `limit × 5` and discarded everything else. Wasteful inside the multiplier and *undetectably
+  wrong* outside it, since an album ranked below the draw is simply absent with nothing in the result to say
+  so. Measured in the field at a 3:2 ratio on a top-5 query. `VectorIndex.ofType(...)` returns **another
+  `VectorIndex`**, so narrowing composes and the search that ends it is an ordinary search over a smaller
+  index — the shape `SubgraphResult extends KnowledgeGraph` already uses one file over:
+
+  ```java
+  JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+          .ofType(Album.class)
+          .nearestN(reference, 20);
+  ```
+
+  The same query written as one call is `nearestN(reference, 20, List.of(Album.class))`, a `default` over
+  `ofType` so the two spellings cannot drift. `JavAITagRepository` also gains
+  **`nearestByTagSimilarity(reference, n, candidateTypes)`** and **`nearestByTagText(...)`**, which take
+  `Class<? extends Taggable>` where the type-agnostic index cannot — the same vocabulary `taggedWith` and
+  `rankedByTags` have taken candidate types in since before this.
+
+  **The types reach the query on every backend, and the ordering contract is the point.** Postgres narrows
+  with `WHERE owner_type IN (…)` ahead of `ORDER BY`/`LIMIT`. MongoDB passes them to `$vectorSearch`'s own
+  `filter`, a genuine pre-filter — which needed `taggableType` declared as a filter field, so an index
+  written by an older JavAI is **dropped and recreated once, automatically**; in-place `updateSearchIndex` is
+  rejected for a `vectorSearch` index (`"mappings" is required`, measured), and leaving it would turn a
+  capability into an upgrade step discovered from a runtime error. Neo4j *cannot* pre-filter a vector index —
+  `db.index.vector.queryNodes` picks its K first — so a narrowed search there abandons the index for an exact
+  `vector.similarity.cosine` scan: exact, filtered in the query, and O(nodes of those types), the same
+  honest-but-linear trade `foldNearestBySummary` already documents. Unnarrowed searches are untouched on all
+  three.
+
+  Matching is on **exact runtime class**, not assignability — `ofType(Animal.class)` does not match a `Dog` —
+  matching `taggedWith`/`rankedByTags`, and the only rule a store holding a fully-qualified name can answer
+  without enumerating loaded subtypes. Naming *no* types matches nothing rather than everything, the same
+  rule `taggedWith(tag, List.of())` already follows. Narrowing an already-narrowed index intersects.
+
+- **`VectorIndex.nearestNRanked(...)` (OMI-460).** `javai-collections`. `nearestN` returned order and
+  nothing else, so a caller could not show a match strength, threshold on one, or tell a strong 50th hit from
+  a weak 5th. The ranked shape already existed twice (`NearestQuery.ranked()`, `rankedByTags`); this was the
+  one search surface without it. Narrowed or not: `nearestNRanked(reference, n, candidateTypes)` is the one
+  signature covering this and the filter above at once.
+
+- **`JavAIRepository.count()` (OMI-460).** `javai-persistence`. A predicate's count already had two routes
+  (a derived `countBy…`, a `@Query`); "how many are there" had none, so it was reached by
+  `findAll().size()` — every row hydrated into an entity, its stored vectors read back into its cache slots,
+  and the lot discarded to learn one number. Each backend answers with the count its own store already does
+  (`count(root)` / `count(n)` / `countDocuments()`); the SPI method is abstract rather than defaulted to
+  `findAll(...).size()`, since that default would silently reintroduce exactly what this removes.
+
+- **`Windows.of(offset, limit[, sort])` (OMI-460).** `javai-persistence`. An offset-based `Pageable`.
+  JavAI's query paths have always read `getOffset()`/`getPageSize()` and never the page *number*, so an
+  arbitrary offset was already supported and merely unsayable: `PageRequest.of(page, size)` derives offset as
+  `page × size`, so every offset it can express is a multiple of the limit. That breaks the standard
+  forever-scroll idiom of asking for one row more than the page holds — page 3 of 20 wants offset 60 with a
+  limit of 21, and `PageRequest.of(60 / 21, 21)` lands on offset **42** and quietly returns the wrong rows.
+  `Pageable` is an interface, so an adopter could always write this; it exists because every adopter doing
+  one-extra-row paging otherwise writes the same class and discovers the need the same way. `getPageNumber()`
+  reports `offset / limit` and `withPage(n)` is page-aligned, both documented — three of `Pageable`'s methods
+  have to answer in pages, and an offset window has no page number of its own.
 
 - **Persisted per-model summary vectors (OMI-458).** `javai-persistence` + `javai-annotations`.
   `summaryVector(modelId)` has computed a container's per-model summary since OMI-290; nothing stored it. The

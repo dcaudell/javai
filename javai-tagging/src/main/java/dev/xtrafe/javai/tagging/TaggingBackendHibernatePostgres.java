@@ -236,15 +236,20 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         return call(connection -> {
             List<RankedTaggableRef> ranked = new ArrayList<>();
             String table = ensureTagSummaryVectorTable(connection, reference.modelId(), reference.dims());
+            // The type restriction is an ordinary WHERE, so the planner applies it before ORDER BY/LIMIT --
+            // "the nearest n of these types", never "those of the nearest n that are of these types"
+            // (OMI-460).
             String sql = "SELECT owner_type, owner_id, (vector <=> ?::vector) AS distance FROM " + table
-                    + " ORDER BY distance LIMIT ?";
+                    + ownerTypeClause(candidateTypeNames) + " ORDER BY distance LIMIT ?";
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
                 statement.setString(1, toVectorLiteral(reference.values()));
-                statement.setInt(2, n);
+                int index = bindOwnerTypes(statement, 2, candidateTypeNames);
+                statement.setInt(index, n);
                 try (ResultSet resultSet = statement.executeQuery()) {
                     while (resultSet.next()) {
                         TaggableRef ref = new TaggableRef(
@@ -257,21 +262,50 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
         });
     }
 
+    /** {@code  WHERE owner_type IN (?, ?, …)}, or nothing at all when unnarrowed -- shared by both vector
+     *  indexes and both of their counts, so the four cannot narrow differently (OMI-460). */
+    private static String ownerTypeClause(List<String> candidateTypeNames) {
+        if (candidateTypeNames.isEmpty()) {
+            return "";
+        }
+        return " WHERE owner_type IN ("
+                + String.join(",", candidateTypeNames.stream().map(ignored -> "?").toList()) + ")";
+    }
+
+    /** Binds {@link #ownerTypeClause}'s placeholders from {@code firstIndex}, returning the next free one. */
+    private static int bindOwnerTypes(PreparedStatement statement, int firstIndex, List<String> candidateTypeNames)
+            throws SQLException {
+        int index = firstIndex;
+        for (String typeName : candidateTypeNames) {
+            statement.setString(index++, typeName);
+        }
+        return index;
+    }
+
     @Override
-    public int tagSummaryVectorCount() {
-        return call(connection -> {
-            List<String> tables = findAllTagSummaryVectorTables(connection);
-            if (tables.isEmpty()) {
-                return 0;
-            }
-            String union = String.join(" UNION ", tables.stream()
-                    .map(table -> "SELECT owner_type, owner_id FROM " + table).toList());
-            try (Statement statement = connection.createStatement();
-                    ResultSet resultSet = statement.executeQuery("SELECT count(*) FROM (" + union + ") x")) {
+    public int tagSummaryVectorCount(List<String> candidateTypeNames) {
+        return call(connection -> countAcross(connection, findAllTagSummaryVectorTables(connection),
+                candidateTypeNames));
+    }
+
+    /** Distinct owners across every per-model realization of one index, narrowed to {@code candidateTypeNames}
+     *  when there are any -- the shape both {@code tagSummaryVectorCount} and {@code tagTextVectorCount}
+     *  need, written once. */
+    private static int countAcross(Connection connection, List<String> tables, List<String> candidateTypeNames)
+            throws SQLException {
+        if (tables.isEmpty()) {
+            return 0;
+        }
+        String union = String.join(" UNION ", tables.stream()
+                .map(table -> "SELECT owner_type, owner_id FROM " + table).toList());
+        String sql = "SELECT count(*) FROM (" + union + ") x" + ownerTypeClause(candidateTypeNames);
+        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+            bindOwnerTypes(statement, 1, candidateTypeNames);
+            try (ResultSet resultSet = statement.executeQuery()) {
                 resultSet.next();
                 return resultSet.getInt(1);
             }
-        });
+        }
     }
 
     @Override
@@ -496,15 +530,17 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         return call(connection -> {
             List<RankedTaggableRef> ranked = new ArrayList<>();
             String table = ensureTagTextVectorTable(connection, reference.modelId(), reference.dims());
             String sql = "SELECT owner_type, owner_id, (vector <=> ?::vector) AS distance FROM " + table
-                    + " ORDER BY distance LIMIT ?";
+                    + ownerTypeClause(candidateTypeNames) + " ORDER BY distance LIMIT ?";
             try (PreparedStatement statement = connection.prepareStatement(sql)) {
                 statement.setString(1, toVectorLiteral(reference.values()));
-                statement.setInt(2, n);
+                int index = bindOwnerTypes(statement, 2, candidateTypeNames);
+                statement.setInt(index, n);
                 try (ResultSet resultSet = statement.executeQuery()) {
                     while (resultSet.next()) {
                         TaggableRef ref = new TaggableRef(
@@ -518,20 +554,9 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
     }
 
     @Override
-    public int tagTextVectorCount() {
-        return call(connection -> {
-            List<String> tables = findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX);
-            if (tables.isEmpty()) {
-                return 0;
-            }
-            String union = String.join(" UNION ", tables.stream()
-                    .map(table -> "SELECT owner_type, owner_id FROM " + table).toList());
-            try (Statement statement = connection.createStatement();
-                    ResultSet resultSet = statement.executeQuery("SELECT count(*) FROM (" + union + ") x")) {
-                resultSet.next();
-                return resultSet.getInt(1);
-            }
-        });
+    public int tagTextVectorCount(List<String> candidateTypeNames) {
+        return call(connection -> countAcross(connection,
+                findAllVectorTables(connection, TAG_TEXT_VECTOR_TABLE_PREFIX), candidateTypeNames));
     }
 
     private static List<String> findAllTagSummaryVectorTables(Connection connection) throws SQLException {

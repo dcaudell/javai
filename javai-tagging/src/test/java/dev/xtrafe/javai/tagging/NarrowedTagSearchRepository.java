@@ -1,7 +1,7 @@
 package dev.xtrafe.javai.tagging;
 
 import dev.xtrafe.javai.persistence.JavAIRepository;
-import dev.xtrafe.javai.persistence.Ranked;
+import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.util.List;

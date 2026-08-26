@@ -355,6 +355,54 @@ built, but automatically, as a side effect of `JavAITagRepository.addTag()`/`rem
 is persistence-backed, maintained by the library itself, read-mostly from the caller's perspective. See
 "Tag-summary vector index" below for what backs it.
 
+### Narrowing the index to one type (OMI-460)
+
+The index spans **every** `@Taggable` type at once — that is the requirement above, and it is also why an
+unnarrowed `nearestN` is so rarely the question anyone has. Ask for the nearest 20 and you get 20 of
+*everything*: images, profiles, and JavAI's own `Tag`s all carry tag-summary vectors. Measured in the field
+(`doc/spec/media-search-strategies.md` in the reporting project), a top-5 query for one type came back as
+three of another type interleaved with two of the wanted one.
+
+`VectorIndex.ofType(...)` narrows, and returns another `VectorIndex`, so it composes:
+
+```java
+JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+        .ofType(Album.class)
+        .nearestN(reference, 20);
+
+// or, in one call, taking Class<? extends Taggable> where the type-agnostic index cannot:
+JavAIList<TaggableRef> same = tagging.nearestByTagSimilarity(reference, 20, List.of(Album.class));
+```
+
+Both spellings exist deliberately: `nearestByTagSimilarity`/`nearestByTagText` put the query in this
+module's own vocabulary — the one `taggedWith` and `rankedByTags` already use, with the same
+`List<Class<? extends Taggable>>` parameter and the same exact-runtime-class matching — while `ofType`
+chains. See `doc/spec/vector-collections.md`'s "`VectorIndex<T>`, in full" for the narrowing contract in
+full, including why naming no types matches nothing and why narrowing intersects.
+
+**The types reach the query, on all three backends**, applied before the top-N is chosen rather than to its
+result. That distinction is the whole feature: filtering a result is the over-fetch-and-discard workaround
+this replaces, which is wasteful within whatever multiplier a caller guessed and undetectably wrong outside
+it.
+
+| Backend | How the narrowing is applied |
+|---|---|
+| Postgres | `WHERE owner_type IN (…)` ahead of `ORDER BY … LIMIT`. Exact, indexed, and the planner's ordinary business. |
+| MongoDB | `$vectorSearch`'s own `filter` — a genuine pre-filter applied *during* the search. Requires `taggableType` declared as a filter field in the index definition; an index written by an older JavAI is dropped and recreated once, automatically (an in-place `updateSearchIndex` is rejected for a `vectorSearch` index). |
+| Neo4j | **Abandons the vector index.** `db.index.vector.queryNodes` is a top-K call, so a predicate could only ever be applied to what the index already chose. A narrowed search instead scores the matching nodes directly with `vector.similarity.cosine` — exact, filtered in the query, and O(nodes of those types). Unnarrowed searches still use the index. |
+
+Neo4j's departure is worth stating plainly, because `RepositoryBackendNeo4j` refuses the analogous narrowing
+for a *repository* vector search rather than serving it. The difference is what the unnarrowed answer is
+worth: a repository search is already scoped to one entity type, so narrowing is an optional extra and
+refusing costs a caller little; this index deliberately spans every type, so its unnarrowed answer is not a
+broader version of the question but a different question. An exact linear scan is the honest way to answer
+it — the same trade `RepositoryBackend.foldNearestBySummary` already documents for a summary search with no
+index.
+
+A hit's score is available too, via `nearestNRanked`, and is **cosine on every backend** — Neo4j and Atlas
+both report `(1 + cosine) / 2` for a cosine index, and each backend now undoes that as it reads its own
+result, exactly as `javai-persistence`'s backends already did for `Ranked`.
+
 For an ad hoc collection of tags rather than a single reference vector (the original form of this
 requirement — "given a collection of tags, possibly from different TagSets, find objects with a
 semantically similar collection"), compute a centroid first and query with that:

@@ -7,6 +7,7 @@ import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.Ranked;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
@@ -229,6 +230,15 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 return Optional.empty();
             }
             return Optional.of(hydrate(session, entityType, record.get("n").asNode(), new HashMap<>()));
+        }
+    }
+
+    @Override
+    public long count(Class<?> entityType) {
+        try (Session session = driver().session()) {
+            return session.executeRead(tx -> tx
+                    .run("MATCH (n:`" + label(entityType) + "`) RETURN count(n) AS c")
+                    .single().get("c").asLong());
         }
     }
 

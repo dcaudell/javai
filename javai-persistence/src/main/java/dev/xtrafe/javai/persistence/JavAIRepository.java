@@ -86,6 +86,17 @@ public interface JavAIRepository<T> {
 
     List<T> findAll();
 
+    /**
+     * How many entities of this type the store holds (OMI-460).
+     *
+     * <p>The unconditional count. A predicate's count already had two routes -- a derived {@code countBy…}
+     * finder and {@code @Query} -- and "how many are there" had none, so it was reached by
+     * {@code findAll().size()}: every row hydrated into an entity, its vectors read back into its cache
+     * slots, and the whole lot discarded to learn one number. Spring Data's {@code CrudRepository.count()}
+     * is the precedent, and each backend answers it with the count its own store already knows how to do.
+     */
+    long count();
+
     void deleteById(UUID id);
 
     /**

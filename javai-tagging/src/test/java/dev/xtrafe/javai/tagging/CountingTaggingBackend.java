@@ -85,15 +85,16 @@ final class CountingTaggingBackend implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         count("nearestByTagSummaryVector");
-        return delegate.nearestByTagSummaryVector(reference, n);
+        return delegate.nearestByTagSummaryVector(reference, n, candidateTypeNames);
     }
 
     @Override
-    public int tagSummaryVectorCount() {
+    public int tagSummaryVectorCount(List<String> candidateTypeNames) {
         count("tagSummaryVectorCount");
-        return delegate.tagSummaryVectorCount();
+        return delegate.tagSummaryVectorCount(candidateTypeNames);
     }
 
     @Override
@@ -160,14 +161,15 @@ final class CountingTaggingBackend implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         count("nearestByTagTextVector");
-        return delegate.nearestByTagTextVector(reference, n);
+        return delegate.nearestByTagTextVector(reference, n, candidateTypeNames);
     }
 
     @Override
-    public int tagTextVectorCount() {
+    public int tagTextVectorCount(List<String> candidateTypeNames) {
         count("tagTextVectorCount");
-        return delegate.tagTextVectorCount();
+        return delegate.tagTextVectorCount(candidateTypeNames);
     }
 }

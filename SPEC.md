@@ -240,7 +240,12 @@ vectors** (`@ExternalVector`: a vector JavAI stores, versions, serves and search
 supplied from outside the process in its own embedding model) and **model-scoped aggregates**
 (`vector(modelId)`/`summaryVector(modelId)`, since two models' vectors cannot be combined), both realized
 across all three persistence backends; and `javai-tagging` carries `applyClassification`, the reconciliation
-half of `classify()` reachable without an LLM. Don't assume anything beyond what's in a given module's actual source and
+half of `classify()` reachable without an LLM. As of OMI-460, `VectorIndex` narrows by type (`ofType(...)`,
+returning another `VectorIndex`, so narrowings chain and a search ends the chain) and carries a ranked search
+(`nearestNRanked`); `javai-tagging`'s two tag indexes push that narrowing into each store's own query rather
+than filtering a result, and `javai-persistence` gains `JavAIRepository.count()` and `Windows.of(offset,
+limit)`, a `Pageable` whose offset is independent of its size. `Ranked<T>` moved to `javai-vector` in the
+same ticket, so `javai-collections` could name it. Don't assume anything beyond what's in a given module's actual source and
 tests reflects working code; check that module's README before relying on a claim from this file,
 `doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
 module's real implementation state at a given moment.
