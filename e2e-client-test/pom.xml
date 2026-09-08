@@ -29,7 +29,7 @@
 
     <javai.version>0.1.10-SNAPSHOT</javai.version>
     <junit.version>6.1.2</junit.version>
-    <lombok.version>1.18.46</lombok.version>
+    <lombok.version>1.18.48</lombok.version>
     <!--
       Originally confirmed via `mvn dependency:tree -Dverbose` to fix a real, severe cross-version jackson
       mismatch caused by Testcontainers' own com.github.docker-java:docker-java-api hard-pinning
