@@ -31,12 +31,17 @@ import org.hibernate.boot.MetadataBuilder;
 import org.hibernate.boot.MetadataSources;
 import org.hibernate.boot.model.naming.CamelCaseToUnderscoresNamingStrategy;
 import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
+import org.hibernate.boot.models.JpaAnnotations;
 import org.hibernate.boot.registry.StandardServiceRegistry;
 import org.hibernate.boot.registry.StandardServiceRegistryBuilder;
+import org.hibernate.boot.spi.MetadataBuilderImplementor;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
 import org.hibernate.event.service.spi.EventListenerRegistry;
 import org.hibernate.event.spi.EventType;
+import org.hibernate.models.spi.ClassDetails;
+import org.hibernate.models.spi.ModelsContext;
+import org.hibernate.models.spi.MutableMemberDetails;
 import org.hibernate.query.criteria.HibernateCriteriaBuilder;
 import org.hibernate.query.criteria.JpaCriteriaQuery;
 import org.hibernate.query.criteria.JpaRoot;
@@ -44,11 +49,9 @@ import org.springframework.data.domain.Sort;
 import org.springframework.data.geo.Point;
 import org.springframework.data.repository.query.parser.Part;
 
-import java.io.ByteArrayInputStream;
 import java.lang.reflect.Field;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -144,12 +147,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * shape -- so the field that works on all three is the interface-typed one.
  *
  * <p><b>No manual {@code @Transient} required</b> on a field this backend maps itself. At
- * {@link #buildSessionFactory} time it generates an in-memory JPA {@code orm.xml}-equivalent mapping document
- * marking exactly those fields {@code <transient>} -- fed to Hibernate via
- * {@link MetadataSources#addInputStream}, alongside the ordinary {@code @Entity}-driven annotation scanning.
- * This is a real, spec-defined JPA override mechanism (XML mappings logically override annotations for
- * whatever they explicitly mention, leaving everything else annotation-driven), not a hack, and detection is
- * 100%-confidence from the field's declared type alone -- see {@link #isBackendManagedField}.
+ * {@link #buildSessionFactory} time, {@link #markBackendManagedFieldsTransient} applies {@code @Transient} to
+ * exactly those fields in Hibernate's models layer, on the class that declares each one, so Hibernate reads
+ * them as if the consumer had written it. Detection is 100%-confidence from the field's declared type alone --
+ * see {@link #isBackendManagedField}.
  *
  * <p>Today that means <b>{@code Point} fields only</b>, which live in {@code javai_geo_points}. It used to
  * mean JavAI collection fields as well, when they had storage of their own; since OMI-277 they are ordinary
@@ -568,8 +569,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     /** A field this backend maps itself rather than letting Hibernate map it: a geo {@code Point}, through
-     *  {@code javai_geo_points} + earthdistance, marked {@code <transient>} in the generated override mapping
-     *  so Hibernate's boot-time mapping doesn't choke on a type it cannot map.
+     *  {@code javai_geo_points} + earthdistance, marked {@code @Transient} by
+     *  {@link #markBackendManagedFieldsTransient} so Hibernate's boot-time mapping doesn't choke on a type it
+     *  cannot map.
      *
      *  <p>JavAI collections used to be the other half of this. They are native Hibernate associations now
      *  (OMI-277), so they are mapped rather than hidden. */
@@ -1892,7 +1894,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * Copies the fields this backend maps itself -- {@code Point}s -- from the caller's instance onto the
      * managed copy, over the same graph {@link #syncGeoPoints} just wrote to the database.
      *
-     * <p>Needed because those fields are {@code <transient>} to Hibernate, so {@code merge()} does not carry
+     * <p>Needed because those fields are {@code @Transient} to Hibernate, so {@code merge()} does not carry
      * them: without this, {@code save()} would return an entity whose {@code Point} reads {@code null}
      * immediately after being set, which is the class of "looks wrong right after a save" problem that kept
      * this method returning the caller's own instance for so long (OMI-275).
@@ -4335,11 +4337,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         for (Class<?> entityType : registeredEntityTypes) {
             sources.addAnnotatedClass(entityType);
         }
-        String autoTransientOverrideXml = buildAutoTransientOverrideXml(registeredEntityTypes);
-        if (autoTransientOverrideXml != null) {
-            sources.addInputStream(new ByteArrayInputStream(autoTransientOverrideXml.getBytes(StandardCharsets.UTF_8)));
-        }
         MetadataBuilder metadataBuilder = sources.getMetadataBuilder();
+        markBackendManagedFieldsTransient(metadataBuilder, registeredEntityTypes);
         PhysicalNamingStrategy namingStrategy = resolvePhysicalNamingStrategy();
         if (namingStrategy != null) {
             metadataBuilder.applyPhysicalNamingStrategy(namingStrategy);
@@ -4418,34 +4417,23 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
-    /** Generates an in-memory JPA {@code orm.xml}-equivalent mapping document marking every JavAI collection
-     *  field (see {@link #isJavAICollectionField}) of every registered entity type {@code <transient>} -- see
-     *  this class's own javadoc ("No manual {@code @Transient} required") for the full rationale. Returns
-     *  {@code null} (add nothing) if no registered type has any such field, to avoid feeding Hibernate an
-     *  empty document for the common case where every field is already annotation-mapped correctly. */
-    private static String buildAutoTransientOverrideXml(Set<Class<?>> entityTypes) {
-        StringBuilder entities = new StringBuilder();
+    /** Marks every backend-managed field (see {@link #isBackendManagedField}) {@code @Transient} on the class
+     *  that declares it, in Hibernate's models layer, exactly as a hand-written {@code @Transient} would read.
+     *  Not an {@code orm.xml} override: that re-derives the entity's access type and loses a superclass {@code @Id}
+     *  (OMI-556). */
+    private static void markBackendManagedFieldsTransient(MetadataBuilder metadataBuilder, Set<Class<?>> entityTypes) {
+        ModelsContext models = ((MetadataBuilderImplementor) metadataBuilder).getBootstrapContext().getModelsContext();
         for (Class<?> entityType : entityTypes) {
-            List<Field> transientFields = EntityReflection.allFields(entityType).stream()
-                    .filter(RepositoryBackendHibernatePostgres::isBackendManagedField)
-                    .toList();
-            if (transientFields.isEmpty()) {
-                continue;
+            for (Field field : EntityReflection.allFields(entityType)) {
+                if (!isBackendManagedField(field)) {
+                    continue;
+                }
+                ClassDetails declarer = models.getClassDetailsRegistry()
+                        .resolveClassDetails(field.getDeclaringClass().getName());
+                ((MutableMemberDetails) declarer.findFieldByName(field.getName()))
+                        .applyAnnotationUsage(JpaAnnotations.TRANSIENT, models);
             }
-            entities.append("  <entity class=\"").append(entityType.getName()).append("\">\n")
-                    .append("    <attributes>\n");
-            for (Field field : transientFields) {
-                entities.append("      <transient name=\"").append(field.getName()).append("\"/>\n");
-            }
-            entities.append("    </attributes>\n  </entity>\n");
         }
-        if (entities.isEmpty()) {
-            return null;
-        }
-        return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                + "<entity-mappings xmlns=\"https://jakarta.ee/xml/ns/persistence/orm\" version=\"3.1\">\n"
-                + entities
-                + "</entity-mappings>\n";
     }
 
     /** The pgvector extension, and the geo side table. The per-model vector tables are created lazily, on

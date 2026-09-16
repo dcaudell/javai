@@ -357,7 +357,7 @@ managed, while Hibernate tracked a merged copy. Give that unmanaged root a child
 same unit of work and the result was an unmanaged root holding a managed child.
 
 **So `save()` returns the managed instance now, as Spring Data JPA's does.** It could not before: `merge()`
-leaves `<transient>` fields empty on the managed copy, and JavAI collections used to be transient. OMI-277
+leaves `@Transient` fields empty on the managed copy, and JavAI collections used to be transient. OMI-277
 made them native associations that `merge()` carries across, leaving only `Point` fields, which `save` copies
 across explicitly.
 
