@@ -47,6 +47,11 @@
       <artifactId>hibernate-core</artifactId>
     </dependency>
     <dependency>
+      <!-- Marks geo Point fields @Transient in Hibernate's models layer at boot (OMI-556). -->
+      <groupId>org.hibernate.models</groupId>
+      <artifactId>hibernate-models</artifactId>
+    </dependency>
+    <dependency>
       <!-- Native pgvector column mapping: @JdbcTypeCode(SqlTypes.VECTOR) + @Array(length=n) on a plain
            float[] field. Confirmed on Maven Central at the same version as hibernate-core. -->
       <groupId>org.hibernate.orm</groupId>

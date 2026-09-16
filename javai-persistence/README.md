@@ -301,7 +301,7 @@ deliberate, since naming a setting outright is the more specific instruction. Be
 Both are inert when `Builder.sessionFactory(...)` supplies a factory JavAI didn't build, and inert on Neo4j
 and MongoDB, which classify fields by declared type and have no equivalent of JPA column naming. Note that
 supplying your own `SessionFactory` still skips the two mapping-time hooks (`attachJavAICollectionTypes`,
-`buildAutoTransientOverrideXml`) that JavAI collection fields depend on -- these knobs exist so that needing
+`markBackendManagedFieldsTransient`) that JavAI collection and `Point` fields depend on -- these knobs exist so that needing
 particular Hibernate settings no longer forces that trade-off.
 
 ## Collections: `JavAIList`/`JavAISet`/`JavAIMap` fields
@@ -332,13 +332,16 @@ through one its members were silently never written. It could not be made lazy w
 `final` instance of a `final` class -- so it was withdrawn rather than repaired, and the table went with it.
 `validateCollectionFieldMapping` now throws a message naming the interface to use.
 
-**No manual `@Transient` needed** on a field this backend maps itself. It generates an in-memory JPA
-`orm.xml`-equivalent mapping document marking exactly those fields `<transient>`, fed to Hibernate via
-`MetadataSources.addInputStream` alongside the ordinary annotation scanning -- a real, spec-defined JPA
-override mechanism (XML mappings logically override annotations for whatever they explicitly mention), not a
-hack, confirmed with a real container before being relied on. Since OMI-277 that means **`Point` fields
-only**; JavAI collections were the other user of it, and hiding a native association from Hibernate is the
-last thing wanted.
+**No manual `@Transient` needed** on a field this backend maps itself. At boot it applies `@Transient` to
+exactly those fields in Hibernate's models layer, on the class that declares each one, so Hibernate reads them
+as if the consumer had written it. Since OMI-277 that means **`Point` fields only**; JavAI collections were the
+other user of it, and hiding a native association from Hibernate is the last thing wanted.
+
+Until OMI-556 this was an in-memory `orm.xml` override, which failed boot for any entity with a
+`@MappedSuperclass`. An `<entity>` override with no `access` attribute looks for `@Id` on that class alone,
+falls back to `PROPERTY` access when the `@Id` is inherited, and imposes it, so Hibernate mapped the entity's
+getters and ignored its field annotations. A `<transient>` naming an inherited field could not be resolved
+against the subclass at all. `GeoPointMappedSuperclassTest` pins both.
 
 **Map keys are Hibernate's business on Postgres.** A `Map` field not keyed by `String` used to be refused
 here, because the membership table's key column was a plain `varchar` and a stringified key could never

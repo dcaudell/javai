@@ -102,6 +102,9 @@
          empirically when overriding to the already-proven-working version costs nothing. -->
     <byte-buddy-maven-plugin.version>1.17.5</byte-buddy-maven-plugin.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
+    <!-- Must match the hibernate-models version hibernate-core's own POM declares (runtime scope there);
+         javai-persistence compiles against it directly (OMI-556). -->
+    <hibernate-models.version>1.1.1</hibernate-models.version>
     <neo4j-driver.version>6.2.0</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
@@ -285,6 +288,17 @@
         <groupId>org.hibernate.orm</groupId>
         <artifactId>hibernate-vector</artifactId>
         <version>${hibernate.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.hibernate.models</groupId>
+        <artifactId>hibernate-models</artifactId>
+        <version>${hibernate-models.version}</version>
+        <exclusions>
+          <exclusion>
+            <groupId>xml-apis</groupId>
+            <artifactId>xml-apis</artifactId>
+          </exclusion>
+        </exclusions>
       </dependency>
       <dependency>
         <groupId>org.neo4j.driver</groupId>
