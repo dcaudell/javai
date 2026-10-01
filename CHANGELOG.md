@@ -62,6 +62,15 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **JavAI runs on your connection pool, and a backend can be released (OMI-410).** `javai-persistence` +
+  `javai-tagging`. `JavAIPersistenceConfig.Builder.dataSource(DataSource)` is an alternative to the Postgres
+  URL/username/password: JavAI builds its own `SessionFactory` on the application's pool, so its queries
+  appear in that pool's metrics instead of running on Hibernate's built-in pool. `JavAIPI.release(config)`
+  closes every connection JavAI opened for a config -- including `javai-tagging`'s, whose second backend
+  cache is evicted in the same call -- and forgets the backend, so the next call rebuilds rather than
+  returning a closed one. Repositories realized before a release refuse use instead of reconnecting.
+  Supplied resources (`DataSource`, `SessionFactory`, `Driver`, `MongoTemplate`) are never closed.
+
 - **`CortexMistral` (OMI-598).** `javai-completion`. A `Cortex` for Mistral's hosted chat-completions API,
   sharing `CortexOpenAiCompatibleSupport` with OpenAI, Groq and vLLM since Mistral's API is
   OpenAI-wire-compatible. `providerId()` is `"mistral"`; `ContextWindows` knows `mistral-large-latest`,

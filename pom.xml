@@ -109,6 +109,9 @@
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
     <postgresql-driver.version>42.7.13</postgresql-driver.version>
+    <!-- Test scope only: the application-owned pool JavAI is handed via JavAIPersistenceConfig.dataSource
+         (OMI-410), so a test can read JavAI's connections off the pool's own metrics. -->
+    <hikaricp.version>7.0.2</hikaricp.version>
     <!-- For the reactor's own real-container test suites (javai-persistence/javai-tagging/javai-completion).
          2.x renamed every module artifact with a "testcontainers-" prefix (e.g. "postgresql" ->
          "testcontainers-postgresql"); each module's pom.xml dependency declarations were updated to match,
@@ -308,6 +311,11 @@
         <groupId>org.postgresql</groupId>
         <artifactId>postgresql</artifactId>
         <version>${postgresql-driver.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>com.zaxxer</groupId>
+        <artifactId>HikariCP</artifactId>
+        <version>${hikaricp.version}</version>
       </dependency>
       <dependency>
         <groupId>org.springframework.data</groupId>

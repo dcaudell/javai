@@ -69,6 +69,7 @@ final class TaggingBackendNeo4j implements TaggingBackend {
     private final Set<String> tagTextVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean taggregateIndexesEnsured = new AtomicBoolean();
     private volatile Driver driver;
+    private volatile boolean released;
 
     TaggingBackendNeo4j(JavAIPersistenceConfig config) {
         this.config = config;
@@ -566,13 +567,29 @@ final class TaggingBackendNeo4j implements TaggingBackend {
     }
 
     private Driver driver() {
+        if (released) {
+            throw TaggingBackend.releasedError();
+        }
         if (driver == null) {
             synchronized (this) {
+                if (released) {
+                    throw TaggingBackend.releasedError();
+                }
                 if (driver == null) {
                     driver = GraphDatabase.driver(config.neo4jUri(), AuthTokens.basic(config.neo4jUsername(), config.neo4jPassword()));
                 }
             }
         }
         return driver;
+    }
+
+    @Override
+    public void release() {
+        synchronized (this) {
+            released = true;
+            if (driver != null) {
+                driver.close();
+            }
+        }
     }
 }

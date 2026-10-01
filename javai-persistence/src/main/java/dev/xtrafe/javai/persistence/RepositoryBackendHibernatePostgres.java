@@ -259,6 +259,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private volatile String factoryBuildTrigger;
     private final Object bootstrapLock = new Object();
     private volatile SessionFactory sessionFactory;
+    private volatile boolean released;
 
     RepositoryBackendHibernatePostgres(JavAIPersistenceConfig config) {
         this.config = config;
@@ -3978,11 +3979,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     }
 
     SessionFactory sessionFactory() {
+        if (released) {
+            throw RepositoryBackend.releasedError();
+        }
         SessionFactory factory = sessionFactory;
         if (factory != null) {
             return factory;
         }
         synchronized (bootstrapLock) {
+            if (released) {
+                throw RepositoryBackend.releasedError();
+            }
             if (sessionFactory == null) {
                 // Captured before the build, so a later late-registration failure can name the call that
                 // closed the registration window rather than only the type that arrived after it (OMI-214).
@@ -4325,12 +4332,29 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
+    /** Closing a factory this backend built also closes its connection pool -- Hibernate's built-in one, or
+     *  only JavAI's borrowed connections when it runs on an application {@code DataSource}. */
+    @Override
+    public void release() {
+        synchronized (bootstrapLock) {
+            released = true;
+            if (sessionFactory != null && config.externalSessionFactory() == null) {
+                sessionFactory.close();
+            }
+        }
+    }
+
     private SessionFactory buildSessionFactory() {
-        StandardServiceRegistryBuilder registryBuilder = new StandardServiceRegistryBuilder()
-                .applySetting("jakarta.persistence.jdbc.url", config.postgresUrl())
-                .applySetting("jakarta.persistence.jdbc.user", config.postgresUsername())
-                .applySetting("jakarta.persistence.jdbc.password", config.postgresPassword())
-                .applySetting("hibernate.hbm2ddl.auto", "update");
+        StandardServiceRegistryBuilder registryBuilder = new StandardServiceRegistryBuilder();
+        if (config.dataSource() != null) {
+            registryBuilder.applySetting("hibernate.connection.datasource", config.dataSource());
+        } else {
+            registryBuilder
+                    .applySetting("jakarta.persistence.jdbc.url", config.postgresUrl())
+                    .applySetting("jakarta.persistence.jdbc.user", config.postgresUsername())
+                    .applySetting("jakarta.persistence.jdbc.password", config.postgresPassword());
+        }
+        registryBuilder.applySetting("hibernate.hbm2ddl.auto", "update");
         config.hibernateProperties().forEach(registryBuilder::applySetting);
         StandardServiceRegistry registry = registryBuilder.build();
         MetadataSources sources = new MetadataSources(registry);

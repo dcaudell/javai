@@ -41,6 +41,7 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
     private final JavAIPersistenceConfig config;
     private final Object lock = new Object();
     private Connection connection;
+    private volatile boolean released;
 
     /** See {@link #ambient()} -- resolved on first write, never in the constructor. */
     private volatile TaggregateContainment ambient;
@@ -83,6 +84,9 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
      * @return {@code true} when the work ran on the caller's transaction
      */
     private boolean runOnAmbient(SqlAction action) throws SQLException {
+        if (released) {
+            throw TaggingBackend.releasedError();
+        }
         if (!schemaEnsuredForAmbient) {
             synchronized (lock) {
                 connection();   // opens this backend's own connection purely to run ensureSchema once
@@ -689,11 +693,31 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
     }
 
     private Connection connection() throws SQLException {
+        if (released) {
+            throw TaggingBackend.releasedError();
+        }
         if (connection == null || connection.isClosed()) {
-            connection = DriverManager.getConnection(config.postgresUrl(), config.postgresUsername(), config.postgresPassword());
+            connection = config.dataSource() != null
+                    ? config.dataSource().getConnection()
+                    : DriverManager.getConnection(config.postgresUrl(), config.postgresUsername(), config.postgresPassword());
             ensureSchema(connection);
         }
         return connection;
+    }
+
+    /** With an application {@code DataSource}, closing hands the connection back to its pool. */
+    @Override
+    public void release() {
+        synchronized (lock) {
+            released = true;
+            if (connection != null) {
+                try {
+                    connection.close();
+                } catch (SQLException e) {
+                    throw new IllegalStateException("Closing the tagging connection failed", e);
+                }
+            }
+        }
     }
 
     private void ensureSchema(Connection connection) throws SQLException {

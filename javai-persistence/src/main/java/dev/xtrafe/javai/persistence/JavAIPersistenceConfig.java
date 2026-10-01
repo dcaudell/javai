@@ -5,6 +5,7 @@ import org.hibernate.boot.model.naming.PhysicalNamingStrategy;
 import org.neo4j.driver.Driver;
 import org.springframework.data.mongodb.core.MongoTemplate;
 
+import javax.sql.DataSource;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -20,7 +21,8 @@ import java.util.Set;
  * {@code javai.embedding.*} pattern -- but fully overridable: {@link Builder#sessionFactory(SessionFactory)}
  * / {@link Builder#neo4jDriver(Driver)} / {@link Builder#mongoTemplate(MongoTemplate)} accept a
  * {@code SessionFactory}/{@code Driver}/{@code MongoTemplate} the calling application already built and
- * owns, instead of letting this module bootstrap its own.
+ * owns, instead of letting this module bootstrap its own. {@link Builder#dataSource(DataSource)} is the
+ * Postgres middle ground: JavAI builds its own {@code SessionFactory}, on the application's connection pool.
  *
  * <p>System properties read by {@link #fromSystemProperties()}: {@code javai.persistence.backend}
  * ({@code postgres} [default], {@code neo4j}, or {@code mongodb}),
@@ -39,6 +41,7 @@ public final class JavAIPersistenceConfig {
     private final String postgresUrl;
     private final String postgresUsername;
     private final String postgresPassword;
+    private final DataSource dataSource;
     private final SessionFactory externalSessionFactory;
     private final PhysicalNamingStrategy physicalNamingStrategy;
     private final Map<String, Object> hibernateProperties;
@@ -59,6 +62,7 @@ public final class JavAIPersistenceConfig {
         this.postgresUrl = builder.postgresUrl;
         this.postgresUsername = builder.postgresUsername;
         this.postgresPassword = builder.postgresPassword;
+        this.dataSource = builder.dataSource;
         this.externalSessionFactory = builder.externalSessionFactory;
         this.physicalNamingStrategy = builder.physicalNamingStrategy;
         this.hibernateProperties = Collections.unmodifiableMap(new LinkedHashMap<>(builder.hibernateProperties));
@@ -127,6 +131,12 @@ public final class JavAIPersistenceConfig {
 
     public String postgresPassword() {
         return postgresPassword;
+    }
+
+    /** The application's own Postgres pool, or {@code null} when connecting by URL -- see
+     *  {@link Builder#dataSource(DataSource)}. Public for the same reason as the URL accessors above. */
+    public DataSource dataSource() {
+        return dataSource;
     }
 
     SessionFactory externalSessionFactory() {
@@ -201,6 +211,7 @@ public final class JavAIPersistenceConfig {
         private String postgresUrl;
         private String postgresUsername;
         private String postgresPassword;
+        private DataSource dataSource;
         private SessionFactory externalSessionFactory;
         private PhysicalNamingStrategy physicalNamingStrategy;
         private final Map<String, Object> hibernateProperties = new LinkedHashMap<>();
@@ -239,6 +250,21 @@ public final class JavAIPersistenceConfig {
             return this;
         }
 
+        /**
+         * Connects through the application's own {@code DataSource} -- typically a Spring-managed HikariCP
+         * pool -- instead of {@link #postgresUrl}/{@link #postgresUsername}/{@link #postgresPassword}
+         * (OMI-410). Applied as Hibernate's {@code hibernate.connection.datasource}, so JavAI's queries run
+         * on, and show up in the metrics of, that pool rather than Hibernate's built-in one.
+         *
+         * <p>The application owns the pool: {@link JavAIPI#release(JavAIPersistenceConfig)} returns
+         * JavAI's connections to it and never closes it. Postgres only; mutually exclusive with
+         * {@link #postgresUrl}.
+         */
+        public Builder dataSource(DataSource dataSource) {
+            this.dataSource = dataSource;
+            return this;
+        }
+
         /** Supplies a {@code SessionFactory} the calling app already built -- skips self-contained bootstrap. */
         public Builder sessionFactory(SessionFactory sessionFactory) {
             this.externalSessionFactory = sessionFactory;
@@ -268,7 +294,8 @@ public final class JavAIPersistenceConfig {
          * Applies one arbitrary Hibernate setting to the {@code SessionFactory} this module builds -- the
          * general escape hatch for anything this builder doesn't expose a typed method for. Applied
          * <em>after</em> the settings this module sets itself ({@code jakarta.persistence.jdbc.url}/
-         * {@code .user}/{@code .password} and {@code hibernate.hbm2ddl.auto}), so a key that collides with
+         * {@code .user}/{@code .password} or {@code hibernate.connection.datasource}, and
+         * {@code hibernate.hbm2ddl.auto}), so a key that collides with
          * one of those wins -- deliberate, since the caller naming a setting explicitly is the more specific
          * instruction. Postgres/Hibernate only, and inert when
          * {@link #sessionFactory(SessionFactory)} supplies a factory this module didn't build.
@@ -462,6 +489,14 @@ public final class JavAIPersistenceConfig {
         }
 
         public JavAIPersistenceConfig build() {
+            if (dataSource != null && postgresUrl != null) {
+                throw new IllegalStateException("JavAIPersistenceConfig takes a dataSource or a postgresUrl, "
+                        + "not both -- the DataSource already knows where to connect");
+            }
+            if (dataSource != null && backend != Backend.POSTGRES) {
+                throw new IllegalStateException("dataSource(...) is Postgres-only; this config's backend is "
+                        + backend);
+            }
             return new JavAIPersistenceConfig(this);
         }
     }

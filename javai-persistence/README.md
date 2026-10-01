@@ -294,7 +294,7 @@ JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
 ```
 
 The passthrough is applied **after** the settings this module sets itself (`jakarta.persistence.jdbc.url`/
-`.user`/`.password`, `hibernate.hbm2ddl.auto`), so an explicitly-named key beats JavAI's own default --
+`.user`/`.password` or `hibernate.connection.datasource`, and `hibernate.hbm2ddl.auto`), so an explicitly-named key beats JavAI's own default --
 deliberate, since naming a setting outright is the more specific instruction. Between the two knobs,
 `physicalNamingStrategy(...)` wins over a `hibernate.physical_naming_strategy` passed as a raw property.
 
@@ -303,6 +303,31 @@ and MongoDB, which classify fields by declared type and have no equivalent of JP
 supplying your own `SessionFactory` still skips the two mapping-time hooks (`attachJavAICollectionTypes`,
 `markBackendManagedFieldsTransient`) that JavAI collection and `Point` fields depend on -- these knobs exist so that needing
 particular Hibernate settings no longer forces that trade-off.
+
+## Connections: your own pool, and releasing a backend (OMI-410)
+
+**Your pool.** `Builder.dataSource(DataSource)` replaces the URL/username/password: JavAI still builds its
+own `SessionFactory` (so JavAI collections keep mapping), but every query runs on the application's pool --
+a Spring-managed HikariCP, say -- and shows up in that pool's metrics. `javai-tagging` uses it too. Postgres
+only, and mutually exclusive with `postgresUrl(...)`. Without it, Hibernate's built-in pool serves the URL,
+unchanged.
+
+**Releasing.** `JavAIPI.release(config)` closes every connection JavAI opened for that config -- the
+Postgres factory's, the Neo4j `Driver`, the `MongoClient`, and `javai-tagging`'s own -- and evicts the
+backend, so the next `repository(...)`/`sessionFactory(...)` call for the same config builds a fresh one.
+Repositories realized before the release throw `IllegalStateException` rather than reconnect; realize them
+again. Anything the application supplied (`DataSource`, `SessionFactory`, `Driver`, `MongoTemplate`) is left
+open. Nothing releases a backend implicitly: an application that builds a config per Spring context, or per
+test, calls this when it is done with it.
+
+```java
+JavAIPersistenceConfig config = JavAIPersistenceConfig.builder()
+        .dataSource(dataSource)                 // e.g. Spring Boot's own HikariDataSource
+        .entityPackages("com.example")
+        .build();
+// ... repositories, queries ...
+JavAIPI.release(config);                        // e.g. from the owning bean's @PreDestroy
+```
 
 ## Collections: `JavAIList`/`JavAISet`/`JavAIMap` fields
 

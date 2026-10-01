@@ -519,4 +519,26 @@ class RepositoryBackendNeo4jTest {
         assertEquals(articlesBefore, repository.count(),
                 "another type's rows must not reach this repository's count");
     }
+
+    /** OMI-410: release closes the {@code Driver} this backend opened -- a repository realized before it
+     *  refuses use rather than reconnecting -- and the same config then builds a working backend again. */
+    @Test
+    void releaseRefusesStaleRepositoriesAndTheSameConfigRebuilds() {
+        JavAIPersistenceConfig own = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
+                .build();
+        TestArticleRepository before = JavAIPI.repository(TestArticleRepository.class, own);
+        TestArticle saved = before.save(new TestArticle("release-" + UUID.randomUUID(), "body"));
+
+        JavAIPI.release(own);
+
+        IllegalStateException stale = assertThrows(IllegalStateException.class, before::findAll);
+        assertTrue(stale.getMessage().contains("released"), stale.getMessage());
+        TestArticleRepository after = JavAIPI.repository(TestArticleRepository.class, own);
+        assertTrue(after.findById(saved.getId()).isPresent());
+        JavAIPI.release(own);
+    }
 }

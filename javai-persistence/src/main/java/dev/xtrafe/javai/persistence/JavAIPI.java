@@ -8,8 +8,10 @@ import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Proxy;
 import java.lang.reflect.Type;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
 
 /**
@@ -66,10 +68,17 @@ import java.util.function.Supplier;
  * already registered, directly or because another entity referenced it -- and fails only when it would
  * genuinely add an unknown type, in which case the error names the call that built the factory, since that
  * is the thing to move.
+ *
+ * <p><b>Lifecycle</b>: a backend lives until {@link #release(JavAIPersistenceConfig)} closes its connections
+ * and evicts it (OMI-410). Nothing releases one implicitly -- an application that builds configs per
+ * context, or per test, releases each when it is done with it.
  */
 public final class JavAIPI {
 
     private static final Map<JavAIPersistenceConfig, RepositoryBackend> BACKENDS = new ConcurrentHashMap<>();
+
+    /** Resources other modules opened from a config, closed by {@link #release} -- see {@link #onRelease}. */
+    private static final Map<JavAIPersistenceConfig, List<AutoCloseable>> RELEASE_HOOKS = new ConcurrentHashMap<>();
 
     private JavAIPI() {
     }
@@ -234,7 +243,7 @@ public final class JavAIPI {
      * {@code SessionFactory} is a {@code jakarta.persistence.EntityManagerFactory}, so the JPA manager takes
      * it directly. {@code HibernateTransactionManager}'s {@code (SessionFactory)} constructor eagerly
      * unwraps a {@code javax.sql.DataSource} to share connections with plain JDBC, and a JavAI-built factory
-     * configures Hibernate's own connection provider from raw {@code jakarta.persistence.jdbc.*} settings --
+     * on a URL configures Hibernate's own connection provider from raw {@code jakarta.persistence.jdbc.*} settings --
      * so it throws {@code UnknownUnwrapTypeException}. Confirmed empirically, not inferred.
      *
      * <pre>{@code
@@ -282,6 +291,51 @@ public final class JavAIPI {
      */
     public static TaggregateContainment taggregateContainment(JavAIPersistenceConfig config) {
         return backendFor(config).taggregateContainment();
+    }
+
+    /**
+     * Closes every connection JavAI opened for {@code config} and forgets the backend, so the next
+     * {@code repository(...)}, {@code sessionFactory(...)} or {@code inTransaction(...)} call for the same
+     * config builds a fresh one rather than returning a closed one (OMI-410). Also closes whatever other
+     * modules registered through {@link #onRelease} -- {@code javai-tagging}'s connections among them.
+     *
+     * <p>Repositories realized before the release fail with an {@code IllegalStateException} instead of
+     * reconnecting; realize them again. A {@code SessionFactory}, {@code Driver}, {@code MongoTemplate} or
+     * {@code DataSource} the application supplied is never closed. A no-op for a config with nothing built.
+     */
+    public static void release(JavAIPersistenceConfig config) {
+        RepositoryBackend backend = BACKENDS.remove(config);
+        List<AutoCloseable> hooks = RELEASE_HOOKS.remove(config);
+        RuntimeException failure = null;
+        if (backend != null) {
+            try {
+                backend.release();
+            } catch (RuntimeException e) {
+                failure = e;
+            }
+        }
+        for (AutoCloseable hook : hooks == null ? List.<AutoCloseable>of() : hooks) {
+            try {
+                hook.close();
+            } catch (Exception e) {
+                if (failure == null) {
+                    failure = new IllegalStateException("Releasing a resource opened for this config failed", e);
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /**
+     * Registers {@code resource} to be closed by {@link #release(JavAIPersistenceConfig)} for {@code config}.
+     * For a module that opens its own connections from a config, so one release covers them too.
+     */
+    public static void onRelease(JavAIPersistenceConfig config, AutoCloseable resource) {
+        RELEASE_HOOKS.computeIfAbsent(config, c -> new CopyOnWriteArrayList<>()).add(resource);
     }
 
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {

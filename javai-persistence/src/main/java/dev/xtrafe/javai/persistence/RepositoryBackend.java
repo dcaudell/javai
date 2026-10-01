@@ -457,4 +457,18 @@ interface RepositoryBackend {
      * entity mapper being ready at construction time, and by first use registration is necessarily complete.
      */
     TaggregateContainment taggregateContainment();
+
+    /**
+     * Closes every connection this backend opened itself, and makes any further use fail rather than
+     * reconnect (OMI-410). What the application supplied -- a {@code SessionFactory}, {@code Driver},
+     * {@code MongoTemplate} or {@code DataSource} -- is left open: it is the application's to close.
+     * Reached only through {@link JavAIPI#release(JavAIPersistenceConfig)}, which evicts the backend too.
+     */
+    void release();
+
+    /** What a released backend throws instead of quietly opening a connection nothing would ever close. */
+    static IllegalStateException releasedError() {
+        return new IllegalStateException("This JavAI backend was released by JavAIPI.release(config) -- realize "
+                + "the repository again with JavAIPI.repository(...) to reconnect");
+    }
 }
