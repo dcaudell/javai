@@ -19,7 +19,7 @@ this module consumes from `javai-model` rather than owning — see "RAG integrat
 | `CortexOpenAI` / `CortexAnthropic` / `CortexOllama` / `CortexGroq` / `CortexMistral` / `CortexVLlm` / `CortexReplicate` | `Cortex` implementations | One per provider, each with its own builder — see "Provider coverage" below |
 | `CompletionRequest` | Value type + builder | A `List<String>` of prompt strings + optional `PromptContext` + `promptParams` (a Handlebars template model) + generation parameters + an open-ended `providerOptions` bag for tuning parameters specific to one provider/model |
 | `CompletionRequest.render(int)` | Method | Sizes `context` to fit the calling Cortex's `contextWindowTokens()` before rendering — see "Context-window budgeting" below |
-| `CompletionResult` | Value type | Text result + `providerId`/`modelId`/`completedAt` |
+| `CompletionResult` | Value type | Text result + `providerId`/`modelId`/`completedAt`, plus `as`/`asList`/`asSet`/`completion()` for a typed reply — see "Typed responses" below |
 | `LocalCompletionDefaults` | Static utility | The one place this repo decides which local chat model `CortexOllama` defaults to (`qwen3:8b`) |
 | `ContextWindows` | Static lookup | Best-effort, overridable-per-Cortex token-count table backing `contextWindowTokens()` — see "Context-window budgeting" below |
 | `EndpointRateLimiter` / `RetrySupport` / `TooManyRequestsException` / `RetryAfterParser` | `javai-vector` types, reused here | Shared 429/backoff coordination — see "Rate limiting" below |
@@ -263,6 +263,51 @@ them (see `CompletionRequestTest`'s collision tests):
 A genuinely malformed/unterminated `%%` (not a real placeholder, just a stray token) throws
 `HandlebarsException` (unchecked) rather than silently producing garbled output.
 
+## Typed responses: a schema out, a Gson-unmarshalled object back (OMI-68)
+
+Name the type on the request; read it back off the result. The schema is derived from the type itself, by
+the same field rules Gson uses to read it, so there is nothing to keep in step by hand:
+
+```java
+record Verdict(boolean personA, boolean personB) {}
+
+CompletionResult result = cortex.complete(CompletionRequest.builder()
+        .prompt("Did each person agree?")
+        .responseType(Verdict.class)       // or responseOptional / responseListOf / responseSetOf
+        .withCompletion()                  // optional: prose beside the value
+        .build());
+Verdict verdict = result.as(Verdict.class).orElseThrow();   // asList / asSet for the collection forms
+String reasoning = result.completion();
+```
+
+**Every Cortex whose provider can constrain output to a schema sends it**: OpenAI/Groq/Mistral/vLLM as a
+strict `json_schema` `response_format`, Anthropic as `output_config`'s JSON-schema format, Ollama as
+`format`. Replicate cannot, and sends the prompt alone -- the result is still read the same way, from
+whatever JSON the model wrote. Groq and vLLM accept a schema only on models that support one.
+
+The schema is always an object, since OpenAI and Anthropic require one at the root:
+`{"completion": "...", "response": <value>}`, with `completion` present only under `withCompletion()` and
+`<value>` being the type, the type-or-`null`, or an array of it. `as`/`asList`/`asSet` unwrap it, and read a
+bare value just as well.
+
+**What the reply is held to.** Every field present; a primitive non-null, anything else possibly `null`;
+values of the declared JSON type (no `"7"` for an `int`, no `7.5` either); extra keys ignored. A `Set`
+refuses duplicates. Supported field types: primitives and their boxes, `String`, `char`, `BigDecimal`,
+`BigInteger`, `UUID`, enums (by Gson name), arrays/`List`/`Set`/`Collection` of those, and records or
+concrete classes made of them. A `Map`, an interface or a self-containing type is refused when the request
+is built.
+
+**Finding the JSON**, in order: `` ```json `` fenced blocks; else the whole text, when it is one JSON value;
+else every outermost `{...}` in the prose. Then:
+
+| The text holds | `as` / `asList` / `asSet` |
+|---|---|
+| no JSON, or `{"response": null}` | `Optional.empty()` |
+| one value of the right shape | the value |
+| JSON that does not parse, more than one value, the wrong shape, a duplicate in a `Set` | `CompletionException`, saying which |
+
+`completion()` is the envelope's `completion` field when there is one, else the text with the JSON taken out.
+
 ## Local Docker model
 
 `LocalCompletionDefaults` defaults `CortexOllama` to **`qwen3:8b`** (5.2 GB, 40K context) — deliberately
@@ -312,8 +357,6 @@ implemented against their documented APIs and covered by hermetic tests, but tha
 - `Contextable` on `KnowledgeGraph`/`SubgraphResult`/`VectorIndex` (`javai-collections`) — see "RAG
   integration" above for why (GSON's default marshalling isn't cycle-safe, and those types are
   graph-shaped by design).
-- Structured/schema-typed `CompletionResult` (a second, schema-bound variant, mentioned in the spec's
-  primitives table).
 - Real per-token streaming for `CortexReplicate` (see "Provider coverage" above).
 - Real-endpoint verification for OpenAI/Anthropic/Groq/Replicate (pending API keys) and vLLM (pending a
   GPU-capable host).

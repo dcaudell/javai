@@ -127,6 +127,9 @@ public final class CortexAnthropic implements Cortex {
         if (request.providerOptions().get("thinking_budget_tokens") instanceof Integer budget) {
             builder.thinkingEnabled(budget);
         }
+        if (request.responseSchema() != null) {
+            builder.outputSchema(request.responseSchema()); // sent as output_config's json_schema format
+        }
         return builder.build();
     }
 

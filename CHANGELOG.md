@@ -12,7 +12,27 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-10-01
+
 ### Fixed
+
+- **A `@Point` field on a `@MappedSuperclass` no longer breaks Hibernate boot (OMI-556).** `javai-persistence`.
+  JavAI marked backend-managed fields (`Point`, JavAI collections) transient through a generated `orm.xml`
+  override, and an XML override makes Hibernate re-derive the entity's access type -- losing an `@Id`
+  declared on a superclass, so any entity whose `@Id` and `Point` lived on a mapped superclass failed
+  `SessionFactory` boot. Those fields are now marked `@Transient` in Hibernate's models layer, on the class
+  that declares each one, exactly as a hand-written annotation would read.
+
+- **A blank `@Vectorize` field no longer counts as text (OMI-434), and a concatenated text vector with no
+  summary vector is stored rather than refused (OMI-435).** `javai-model` + `javai-persistence`. An entity
+  whose `@Vectorize` fields were all empty strings assembled `"title: \ncaption: \n"` -- labels with nothing
+  after them -- and embedded it, while every field vector, and so the summary, stayed absent; the Postgres
+  writer declared that pair impossible and threw, rolling back the whole save. Blank text is now absent text,
+  and the entity-grain table's `vector` column is nullable, so a row records a concatenated vector without a
+  summary when that is the truth. ⚠️ **A database created before 0.1.10 keeps its `NOT NULL`**; JavAI never
+  alters an existing table. Run, per model table:
+  `ALTER TABLE javai_summary_vectors__<model> ALTER COLUMN vector DROP NOT NULL;`
+  (see `doc/ai-guidance/persistence-support-matrix.md`).
 
 - **A concatenated-text search from the wrong model is refused rather than answered empty (OMI-458).**
   `javai-persistence`. `concatenatedTextVector()` is a single embedding of assembled text produced by the
@@ -60,7 +80,19 @@ version -- a given release usually changes only one or two of them.
   against Neo4j or MongoDB tag indexes are now cosine and may need lowering; a perfect match still reads 1.0,
   which is exactly why the regression survived (it is a fixed point of the rescaling).
 
+- **Dependency updates.** Spring Framework 7.0.9, Spring Data Commons 4.1.1, Neo4j Java driver 6.2.1, MongoDB
+  sync driver 5.10.0, Byte Buddy 1.18.12 (runtime and Maven plugin), Handlebars 4.5.4, and the
+  `jackson-annotations` pin moves to 2.22 -- see the root `pom.xml` for why that pin exists.
+
 ### Added
+
+- **Typed completion responses (OMI-68).** `javai-completion`. `CompletionRequest.Builder.responseType`/
+  `responseOptional`/`responseListOf`/`responseSetOf` derive a JSON schema from the destination class, and
+  every Cortex that can constrain output to a schema sends it (all but Replicate). `CompletionResult.as`/
+  `asList`/`asSet` find the JSON in the reply and unmarshal it with Gson, holding it to the type: every
+  field present, primitives non-null, no coerced values, no duplicates in a `Set`. No JSON is
+  `Optional.empty()`; anything else wrong is a `CompletionException`. `withCompletion()` adds prose beside
+  the value, read with `completion()`. Verified live against Mistral.
 
 - **JavAI runs on your connection pool, and a backend can be released (OMI-410).** `javai-persistence` +
   `javai-tagging`. `JavAIPersistenceConfig.Builder.dataSource(DataSource)` is an alternative to the Postgres
@@ -1607,7 +1639,8 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/dcaudell/javai/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/dcaudell/javai/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/dcaudell/javai/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dcaudell/javai/compare/v0.1.6...v0.1.7

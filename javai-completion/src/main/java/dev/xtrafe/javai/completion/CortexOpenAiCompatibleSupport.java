@@ -124,6 +124,9 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
         if (request.providerOptions().get("reasoning_effort") instanceof String effort) {
             builder.reasoningEffort(effort);
         }
+        if (request.responseSchema() != null) {
+            builder.outputSchema(request.responseSchema()); // sent as a strict json_schema response_format
+        }
         return builder.build();
     }
 }

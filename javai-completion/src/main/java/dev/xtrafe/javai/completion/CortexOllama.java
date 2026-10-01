@@ -193,6 +193,9 @@ public final class CortexOllama implements Cortex {
         if (request.providerOptions().get(ENABLE_THINKING_KEY) instanceof Boolean enableThinking) {
             builder.think(new ThinkOption.ThinkBoolean(enableThinking));
         }
+        if (request.responseSchema() != null) {
+            builder.format(gson.fromJson(request.responseSchema(), Map.class)); // Ollama's structured outputs
+        }
         return builder.build();
     }
 
