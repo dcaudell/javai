@@ -154,4 +154,21 @@ class CortexOllamaTest {
             executor.awaitTermination(10, TimeUnit.SECONDS);
         }
     }
+
+    /** OMI-68: a typed request is sent as Ollama's {@code format} field, which takes a JSON schema. */
+    @Test
+    void aTypedRequestSendsItsSchemaAsFormat() throws IOException {
+        startFakeServer("""
+                {"message":{"role":"assistant","content":"{\\"response\\":null}"},"done":true}
+                """);
+
+        CompletionResult result = CortexOllama.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+                .model("qwen3:8b").build()
+                .complete(CompletionRequest.builder().prompt("Did they agree?")
+                        .responseOptional(CompletionResultTypedTest.Verdict.class).build());
+
+        assertTrue(capturedRequestBody.contains("\"format\":{"), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"personA\""), capturedRequestBody);
+        assertTrue(result.as(CompletionResultTypedTest.Verdict.class).isEmpty(), "responseOptional allows null");
+    }
 }

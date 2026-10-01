@@ -6,7 +6,7 @@
 
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
   <packaging>pom</packaging>
 
   <name>JavAI Extensions</name>

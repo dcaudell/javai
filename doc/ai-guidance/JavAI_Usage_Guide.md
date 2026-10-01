@@ -720,7 +720,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.10-SNAPSHOT` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.10` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -728,42 +728,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.10-SNAPSHOT</version>
+  <version>0.1.10</version>
 </dependency>
 ```
 
@@ -774,14 +774,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-model:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-substrate:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-supervision:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-collections:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-persistence:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-completion:0.1.10-SNAPSHOT")
-    implementation("io.github.dcaudell:javai-tagging:0.1.10-SNAPSHOT")
+    implementation("io.github.dcaudell:javai-vector:0.1.10")
+    implementation("io.github.dcaudell:javai-model:0.1.10")
+    implementation("io.github.dcaudell:javai-substrate:0.1.10")
+    implementation("io.github.dcaudell:javai-supervision:0.1.10")
+    implementation("io.github.dcaudell:javai-collections:0.1.10")
+    implementation("io.github.dcaudell:javai-persistence:0.1.10")
+    implementation("io.github.dcaudell:javai-completion:0.1.10")
+    implementation("io.github.dcaudell:javai-tagging:0.1.10")
 }
 ```
 
@@ -1378,7 +1378,23 @@ CompletionResult brief = cortex.complete(CompletionRequest.builder()
                 .build())
         .maxTokens(200)
         .build());
+
+// A typed reply (OMI-68): the schema comes from the record; Gson reads the answer back.
+record Concern(String topic, int mentions) {}
+List<Concern> concerns = cortex.complete(CompletionRequest.builder()
+        .prompt("List the distinct concerns readers raise.")
+        .context(PromptContext.builder()
+                .entries(concerned.stream().map(ContextableObject::new).toList())
+                .build())
+        .responseListOf(Concern.class)
+        .build())
+        .asList(Concern.class).orElse(List.of());
 ```
+
+Typed replies -- `responseType`/`responseOptional`/`responseListOf`/`responseSetOf` on the request,
+`as`/`asList`/`asSet`/`completion()` on the result -- and exactly what each outcome is are in
+`javai-completion/README.md`'s "Typed responses". Use Gson's `@SerializedName`, not Jackson annotations, to
+rename a field.
 
 ## Quick reference: where to look next
 

@@ -56,6 +56,12 @@ import java.util.Map;
  * renders as empty string</b>, not an error -- this is Handlebars' own missing-variable behavior, and
  * applies now only to text that actually uses the {@code %%...%%} token, not to arbitrary curly-brace text.
  * A genuinely malformed/unterminated {@code %%} throws {@code HandlebarsException} (unchecked) instead.
+ *
+ * <p><b>{@link #responseSchema()}</b> (OMI-68) is the JSON schema derived from the type named by
+ * {@link Builder#responseType}, {@link Builder#responseOptional}, {@link Builder#responseListOf} or
+ * {@link Builder#responseSetOf}, or {@code null} when none was. Every Cortex whose provider can constrain
+ * its output to a schema sends it -- all but {@link CortexReplicate}, which sends the prompt alone -- and
+ * {@link CompletionResult#as} and its siblings read the result back.
  */
 public record CompletionRequest(
         List<String> prompt,
@@ -63,7 +69,8 @@ public record CompletionRequest(
         Map<String, Object> promptParams,
         Integer maxTokens,
         Double temperature,
-        Map<String, Object> providerOptions) {
+        Map<String, Object> providerOptions,
+        String responseSchema) {
 
     private static final String DELIMITER = "%%";
     private static final Handlebars HANDLEBARS = new Handlebars()
@@ -83,6 +90,12 @@ public record CompletionRequest(
         providerOptions = providerOptions == null
                 ? Map.of()
                 : Map.copyOf(providerOptions);
+    }
+
+    /** The shape before OMI-68 added {@link #responseSchema()}: a request with no typed response. */
+    public CompletionRequest(List<String> prompt, PromptContext context, Map<String, Object> promptParams,
+            Integer maxTokens, Double temperature, Map<String, Object> providerOptions) {
+        this(prompt, context, promptParams, maxTokens, temperature, providerOptions, null);
     }
 
     public static Builder builder() {
@@ -120,7 +133,7 @@ public record CompletionRequest(
         int reservedForOutput = (maxTokens == null ? 0 : maxTokens) * CHARS_PER_TOKEN_ESTIMATE;
         int contextBudget = Math.max(0, totalBudgetChars - promptText.length() - reservedForOutput);
         return new CompletionRequest(prompt, context.withMaxLength(contextBudget), promptParams, maxTokens,
-                temperature, providerOptions)
+                temperature, providerOptions, responseSchema)
                 .render();
     }
 
@@ -131,6 +144,9 @@ public record CompletionRequest(
         private Integer maxTokens;
         private Double temperature;
         private final Map<String, Object> providerOptions = new LinkedHashMap<>();
+        private ResponseSchemas.Kind responseKind;
+        private Class<?> responseType;
+        private boolean withCompletion;
 
         private Builder() {
         }
@@ -185,8 +201,48 @@ public record CompletionRequest(
             return this;
         }
 
+        /** The reply is exactly one {@code type} -- read it with {@link CompletionResult#as}. */
+        public Builder responseType(Class<?> type) {
+            return response(ResponseSchemas.Kind.SINGLE, type);
+        }
+
+        /** The reply is one {@code type} or {@code null} -- {@link CompletionResult#as} is empty for the latter. */
+        public Builder responseOptional(Class<?> type) {
+            return response(ResponseSchemas.Kind.OPTIONAL, type);
+        }
+
+        /** The reply is a list of {@code type} -- read it with {@link CompletionResult#asList}. */
+        public Builder responseListOf(Class<?> type) {
+            return response(ResponseSchemas.Kind.LIST, type);
+        }
+
+        /** The reply is a set of {@code type} -- read it with {@link CompletionResult#asSet}. */
+        public Builder responseSetOf(Class<?> type) {
+            return response(ResponseSchemas.Kind.SET, type);
+        }
+
+        /** The reply also carries prose beside its typed value -- read it with {@link CompletionResult#completion}. */
+        public Builder withCompletion() {
+            this.withCompletion = true;
+            return this;
+        }
+
+        private Builder response(ResponseSchemas.Kind kind, Class<?> type) {
+            ResponseSchemas.requireObjectType(type);
+            this.responseKind = kind;
+            this.responseType = type;
+            return this;
+        }
+
         public CompletionRequest build() {
-            return new CompletionRequest(prompt, context, promptParams, maxTokens, temperature, providerOptions);
+            if (withCompletion && responseType == null) {
+                throw new IllegalStateException("withCompletion() adds prose beside a typed response -- name the "
+                        + "type with responseType/responseOptional/responseListOf/responseSetOf");
+            }
+            String schema = responseType == null ? null
+                    : ResponseSchemas.envelope(responseKind, responseType, withCompletion);
+            return new CompletionRequest(prompt, context, promptParams, maxTokens, temperature, providerOptions,
+                    schema);
         }
     }
 }

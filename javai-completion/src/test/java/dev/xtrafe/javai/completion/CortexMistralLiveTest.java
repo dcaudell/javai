@@ -6,9 +6,11 @@ import org.junit.jupiter.api.condition.EnabledIfEnvironmentVariable;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * Against Mistral's real endpoint -- a paid call, so tagged {@code "requires-model"} (excluded by default,
@@ -48,5 +50,41 @@ class CortexMistralLiveTest {
 
         assertFalse(chunks.isEmpty(), "streaming must deliver at least one chunk");
         assertFalse(String.join("", chunks).isBlank());
+    }
+
+    record Planet(String name, int moons, String note) {
+    }
+
+    /** OMI-68: Mistral honours the strict json_schema envelope -- prose and a typed value side by side. */
+    @Test
+    void aTypedRequestComesBackAsItsTypeWithItsProse() {
+        CompletionResult result = cortex.complete(CompletionRequest.builder()
+                .prompt("How many moons does Mars have? Explain briefly, then answer. Put null in note.")
+                .responseType(Planet.class)
+                .withCompletion()
+                .temperature(0.0)
+                .build());
+
+        Planet mars = result.as(Planet.class).orElseThrow();
+        assertEquals(2, mars.moons(), result.text());
+        assertFalse(result.completion().isBlank(), result.text());
+    }
+
+    @Test
+    void aListAndAnOptionalComeBackAsAskedFor() {
+        Set<Planet> giants = cortex.complete(CompletionRequest.builder()
+                        .prompt("List the four giant planets of the Solar System with their moon counts.")
+                        .responseSetOf(Planet.class)
+                        .temperature(0.0)
+                        .build())
+                .asSet(Planet.class).orElseThrow();
+        assertEquals(4, giants.size(), giants.toString());
+
+        CompletionResult none = cortex.complete(CompletionRequest.builder()
+                .prompt("Name a planet of the Solar System that is made of cheese. If there is none, answer null.")
+                .responseOptional(Planet.class)
+                .temperature(0.0)
+                .build());
+        assertTrue(none.as(Planet.class).isEmpty(), none.text());
     }
 }

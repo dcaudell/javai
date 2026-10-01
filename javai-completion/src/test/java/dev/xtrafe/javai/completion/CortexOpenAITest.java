@@ -16,6 +16,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -142,5 +143,41 @@ class CortexOpenAITest {
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
         }
+    }
+
+    /** OMI-68: a typed request is sent as a strict json_schema response_format, and the reply reads back. */
+    @Test
+    void aTypedRequestSendsItsSchemaAndTheReplyReadsBack() throws IOException {
+        String baseUrl = startFakeServer("""
+                {"id":"chatcmpl-3","object":"chat.completion","created":1,"model":"gpt-4.1",
+                 "choices":[{"index":0,"message":{"role":"assistant",
+                   "content":"{\\"completion\\":\\"Both said yes.\\",\\"response\\":{\\"personA\\":true,\\"personB\\":true}}"},
+                   "finish_reason":"stop"}]}
+                """);
+
+        Cortex cortex = CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build();
+        CompletionResult result = cortex.complete(CompletionRequest.builder().prompt("Did they agree?")
+                .responseType(CompletionResultTypedTest.Verdict.class).withCompletion().build());
+
+        assertTrue(capturedRequestBody.contains("\"response_format\""), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"json_schema\""), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"strict\":true"), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"personB\""), capturedRequestBody);
+        assertEquals(new CompletionResultTypedTest.Verdict(true, true),
+                result.as(CompletionResultTypedTest.Verdict.class).orElseThrow());
+        assertEquals("Both said yes.", result.completion());
+    }
+
+    @Test
+    void anUntypedRequestSendsNoResponseFormat() throws IOException {
+        String baseUrl = startFakeServer("""
+                {"id":"chatcmpl-4","object":"chat.completion","created":1,"model":"gpt-4.1",
+                 "choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}
+                """);
+
+        CortexOpenAI.builder().baseUrl(baseUrl).apiKey("test-key").model("gpt-4.1").build()
+                .complete(CompletionRequest.builder().prompt("hi").build());
+
+        assertFalse(capturedRequestBody.contains("response_format"), capturedRequestBody);
     }
 }
