@@ -123,6 +123,9 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Object bootstrapLock = new Object();
     private volatile MongoTemplate mongoTemplate;
+    /** The client {@link #buildMongoTemplate} opened, kept only so {@link #release} can close it. */
+    private MongoClient ownedClient;
+    private volatile boolean released;
 
     RepositoryBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
@@ -1477,11 +1480,17 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
     private MongoTemplate mongoTemplate() {
+        if (released) {
+            throw RepositoryBackend.releasedError();
+        }
         MongoTemplate template = mongoTemplate;
         if (template != null) {
             return template;
         }
         synchronized (bootstrapLock) {
+            if (released) {
+                throw RepositoryBackend.releasedError();
+            }
             if (mongoTemplate == null) {
                 mongoTemplate = config.externalMongoTemplate() != null
                         ? config.externalMongoTemplate()
@@ -1491,8 +1500,19 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
     }
 
+    @Override
+    public void release() {
+        synchronized (bootstrapLock) {
+            released = true;
+            if (ownedClient != null) {
+                ownedClient.close();
+            }
+        }
+    }
+
     private MongoTemplate buildMongoTemplate() {
         MongoClient client = MongoClients.create(config.mongoUri());
+        ownedClient = client;
         MongoDatabaseFactory factory = new SimpleMongoClientDatabaseFactory(client, config.mongoDatabase());
         return new MongoTemplate(factory);
     }

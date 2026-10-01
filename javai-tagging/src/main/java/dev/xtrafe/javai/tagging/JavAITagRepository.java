@@ -66,7 +66,8 @@ public final class JavAITagRepository {
     // reintroduction of ambient state. Without this, two instances built from the *same* config (e.g.
     // create(config) called twice) would each open an independent physical connection/pool (a raw JDBC
     // Connection, a Neo4j Driver, or a MongoClient -- see each TaggingBackend implementation's own
-    // constructor), a real resource cost with no correctness benefit.
+    // constructor), a real resource cost with no correctness benefit. JavAIPI.release(config) evicts an
+    // entry and closes its backend, through the hook openBackend registers (OMI-410).
     private static final Map<JavAIPersistenceConfig, TaggingBackend> BACKENDS = new ConcurrentHashMap<>();
     private static final Gson GSON = new Gson();
     private static final Type PARSED_TAGS_TYPE = new TypeToken<List<ParsedTag>>() { }.getType();
@@ -97,7 +98,7 @@ public final class JavAITagRepository {
      *  mutator would otherwise raise. */
     public JavAITagRepository(JavAIRepository<Tag> tagRepository, JavAIPersistenceConfig config, Cortex cortex) {
         this.delegate = tagRepository;
-        this.backend = BACKENDS.computeIfAbsent(config, JavAITagRepository::backendFor);
+        this.backend = BACKENDS.computeIfAbsent(config, JavAITagRepository::openBackend);
         this.cortex = cortex;
         this.config = config;
     }
@@ -801,6 +802,17 @@ public final class JavAITagRepository {
     private static TaggableRef refOf(Object instance) {
         Object resolved = PersistentEntities.resolve(instance);
         return new TaggableRef(resolved.getClass().getName(), TaggingReflection.idOf(resolved));
+    }
+
+    /** Opens a backend and registers its release with {@code JavAIPI}, so one {@code JavAIPI.release(config)}
+     *  closes tagging's connections and evicts this cache entry together with persistence's own. */
+    private static TaggingBackend openBackend(JavAIPersistenceConfig config) {
+        TaggingBackend backend = backendFor(config);
+        JavAIPI.onRelease(config, () -> {
+            BACKENDS.remove(config, backend);
+            backend.release();
+        });
+        return backend;
     }
 
     private static TaggingBackend backendFor(JavAIPersistenceConfig config) {

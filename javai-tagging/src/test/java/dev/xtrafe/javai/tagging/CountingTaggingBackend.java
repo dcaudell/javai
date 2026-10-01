@@ -172,4 +172,9 @@ final class CountingTaggingBackend implements TaggingBackend {
         count("tagTextVectorCount");
         return delegate.tagTextVectorCount(candidateTypeNames);
     }
+
+    @Override
+    public void release() {
+        delegate.release();
+    }
 }

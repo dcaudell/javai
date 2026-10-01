@@ -146,4 +146,14 @@ interface TaggingBackend {
      *  {@code candidateTypeNames} (empty = every type) -- backs the tag-text {@code VectorIndex}'s
      *  {@code size()}/{@code filterByMinSimilarity}, mirroring {@link #tagSummaryVectorCount}. */
     int tagTextVectorCount(List<String> candidateTypeNames);
+
+    /** Closes the connection this backend opened and refuses further use (OMI-410). Reached only through
+     *  {@code JavAIPI.release(config)}, which {@link JavAITagRepository} registers it with. */
+    void release();
+
+    /** What a released backend throws instead of quietly opening a connection nothing would ever close. */
+    static IllegalStateException releasedError() {
+        return new IllegalStateException("This tagging backend was released by JavAIPI.release(config) -- "
+                + "construct a new JavAITagRepository to reconnect");
+    }
 }

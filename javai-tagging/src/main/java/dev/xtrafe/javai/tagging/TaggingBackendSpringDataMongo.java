@@ -82,6 +82,8 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     private final AtomicBoolean tagTextVectorsUniqueIndexEnsured = new AtomicBoolean();
     private final AtomicBoolean taggregateIndexesEnsured = new AtomicBoolean();
     private volatile MongoDatabase database;
+    private MongoClient client;
+    private volatile boolean released;
 
     TaggingBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
@@ -655,14 +657,30 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     }
 
     private MongoDatabase database() {
+        if (released) {
+            throw TaggingBackend.releasedError();
+        }
         if (database == null) {
             synchronized (this) {
+                if (released) {
+                    throw TaggingBackend.releasedError();
+                }
                 if (database == null) {
-                    MongoClient client = MongoClients.create(config.mongoUri());
+                    client = MongoClients.create(config.mongoUri());
                     database = client.getDatabase(config.mongoDatabase());
                 }
             }
         }
         return database;
+    }
+
+    @Override
+    public void release() {
+        synchronized (this) {
+            released = true;
+            if (client != null) {
+                client.close();
+            }
+        }
     }
 }

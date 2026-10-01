@@ -104,6 +104,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     /** See {@link #containment()} -- resolved on first use, never in the constructor. */
     private volatile Containment containment;
     private volatile Driver driver;
+    private volatile boolean released;
 
     RepositoryBackendNeo4j(JavAIPersistenceConfig config) {
         this.config = config;
@@ -1591,17 +1592,33 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
     private Driver driver() {
+        if (released) {
+            throw RepositoryBackend.releasedError();
+        }
         Driver current = driver;
         if (current != null) {
             return current;
         }
         synchronized (this) {
+            if (released) {
+                throw RepositoryBackend.releasedError();
+            }
             if (driver == null) {
                 driver = config.externalNeo4jDriver() != null
                         ? config.externalNeo4jDriver()
                         : GraphDatabase.driver(config.neo4jUri(), AuthTokens.basic(config.neo4jUsername(), config.neo4jPassword()));
             }
             return driver;
+        }
+    }
+
+    @Override
+    public void release() {
+        synchronized (this) {
+            released = true;
+            if (driver != null && config.externalNeo4jDriver() == null) {
+                driver.close();
+            }
         }
     }
 }

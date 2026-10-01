@@ -1064,6 +1064,7 @@ run in production — each backend is configured independently:
 |---|---|
 | Embedding provider | `javai-vector`'s `LocalEmbeddingDefaults` picks Ollama or Hugging Face TEI per host platform, or supply your own `JavAIEmbeddingProvider` |
 | Postgres/Neo4j | `javai-persistence/README.md`; connection settings default to `javai.persistence.*` system properties |
+| Postgres connection pool | `JavAIPersistenceConfig.Builder.dataSource(...)` runs JavAI on your own `DataSource`; `JavAIPI.release(config)` closes what JavAI opened for a config and evicts it — see `javai-persistence/README.md` |
 | Postgres schema naming | snake_case by default (`emailVerified` → `email_verified`); override with `JavAIPersistenceConfig.Builder.physicalNamingStrategy(...)` or the general `.hibernateProperty(key, value)` passthrough — see below |
 | Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Mistral/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
 
