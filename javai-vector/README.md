@@ -30,6 +30,7 @@ assumed. See `javai-model`'s own package-info.java for the full trace and
 |---|---|---|
 | `EmbeddingVector` | Record | A versioned vector: `values`, `modelId`, `dims`, `computedAt` — not a bare `float[]` |
 | `VectorMath` | Static utility | `normalize`, `addWeighted`, `cosineSimilarity`, `centroid` — CPU similarity backend |
+| `Ranked<T>` | Record | One search hit paired with the cosine similarity it was ranked on, plus `distance()`. Moved here from `javai-persistence` in OMI-460, when `VectorIndex.nearestNRanked` (in `javai-collections`, which sits below persistence) needed the same shape — what it describes is a similarity, so it belongs to the module every other module depends on. **Adopters update an import** |
 | `JavAIEmbeddingProvider` | SPI interface | Pluggable, versioned embedding-model provider |
 | `JavAIDirtyTracking` | Interface | `addDependent`/`dependents()`, `isFieldDirty`/`markFieldDirty`/`clearFieldDirty`, `isSummaryDirty`/`markSummaryDirty`/`clearSummaryDirty` |
 | `DirtyTrackingSupport` | Concrete implementation | The entire durable per-object dirty-tracking state, as one object — a woven class gets one synthesized field of this type; concrete collections in `javai-model` hold one directly. Also owns one `VectorCacheSlot` per `@Vectorize` field (keyed by field name) plus one for `concatenatedTextVector()`, a per-object `objectLock()` (whole-subgraph persistence flushes *and* `IMMEDIATE_CONSISTENCY`'s read/write exclusion — every setter, every mode, briefly takes it), and a construction-time sequence number giving lock acquisition a fixed global order |
@@ -119,7 +120,7 @@ TEI's `cpu-1.9` image at all (it has no arm64 build).
 
 ## Hosted-vendor providers (mirroring `javai-completion`'s `Cortex` vendor set)
 
-`javai-completion` ships a `Cortex` for six vendors (OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate).
+`javai-completion` ships a `Cortex` for seven vendors (OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate).
 `javai-vector` mirrors that set for embeddings **only where the vendor actually has an embeddings API**:
 
 | Implementation | Backend | Status |
@@ -134,6 +135,9 @@ embeddings partner instead; Groq's own API reference (`console.groq.com/docs/api
 this table was written) lists Chat completions, Responses, Audio, Models, Batches, Files, and Fine Tuning —
 no Embeddings category. Fabricating a client against a nonexistent endpoint would be worse than not having
 one, so this project doesn't.
+
+**No `EmbeddingProviderMistral` exists yet, and that one is a gap, not a decision.** Mistral does have an
+embeddings API (`/v1/embeddings`, `mistral-embed`); OMI-598 added only `CortexMistral`.
 
 **`EmbeddingProviderReplicate` is a genuinely different case from the other four.** Every other provider in
 this family wraps one fixed, vendor-wide contract. Replicate has none — each hosted model defines its own
@@ -157,3 +161,15 @@ gets started":
 
 `e2e-client-test`'s `ArticleGraphEmbeddingE2ETest` is built entirely on top of this — it has no
 platform-specific logic of its own, just asks `LocalEmbeddingDefaults` what to do.
+
+## `DirtyTrackingSupport`: external vector keys (OMI-290)
+
+One addition: a per-name map of the content key each `@ExternalVector` was supplied for. Its whole job is
+answering "does the stored vector still describe this object's current content?".
+
+Deliberately **not** folded into `VectorCacheSlot`. That class is the general lock-free primitive behind
+every vector cache in the system; this is a fact about one kind of vector. And the two answer staleness by
+genuinely different means: a slot tracks it by generation, because a `@Vectorize` field's content *is* the
+field and re-deriving validity would mean re-reading and re-hashing it on every access. An external vector's
+key is a short identifier standing in for content JavAI never touches, so plain comparison is affordable —
+which is also why it needs no woven setter to notice a change.

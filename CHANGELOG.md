@@ -11,6 +11,658 @@ Each entry names the module it affects, because this repository releases all nin
 version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
+
+## [0.1.10] - 2026-10-01
+
+### Fixed
+
+- **A `@Point` field on a `@MappedSuperclass` no longer breaks Hibernate boot (OMI-556).** `javai-persistence`.
+  JavAI marked backend-managed fields (`Point`, JavAI collections) transient through a generated `orm.xml`
+  override, and an XML override makes Hibernate re-derive the entity's access type -- losing an `@Id`
+  declared on a superclass, so any entity whose `@Id` and `Point` lived on a mapped superclass failed
+  `SessionFactory` boot. Those fields are now marked `@Transient` in Hibernate's models layer, on the class
+  that declares each one, exactly as a hand-written annotation would read.
+
+- **A blank `@Vectorize` field no longer counts as text (OMI-434), and a concatenated text vector with no
+  summary vector is stored rather than refused (OMI-435).** `javai-model` + `javai-persistence`. An entity
+  whose `@Vectorize` fields were all empty strings assembled `"title: \ncaption: \n"` -- labels with nothing
+  after them -- and embedded it, while every field vector, and so the summary, stayed absent; the Postgres
+  writer declared that pair impossible and threw, rolling back the whole save. Blank text is now absent text,
+  and the entity-grain table's `vector` column is nullable, so a row records a concatenated vector without a
+  summary when that is the truth. ⚠️ **A database created before 0.1.10 keeps its `NOT NULL`**; JavAI never
+  alters an existing table. Run, per model table:
+  `ALTER TABLE javai_summary_vectors__<model> ALTER COLUMN vector DROP NOT NULL;`
+  (see `doc/ai-guidance/persistence-support-matrix.md`).
+
+- **A concatenated-text search from the wrong model is refused rather than answered empty (OMI-458).**
+  `javai-persistence`. `concatenatedTextVector()` is a single embedding of assembled text produced by the
+  configured provider, so it exists in that model and in no other — for every participating entity, by
+  construction. A reference from anywhere else could match nothing, and used to get back an empty list:
+  exactly what a corpus with no near matches returns, so the query looked answered, and looked answered the
+  same way every time. Unlike a summary search there is nothing to fold, because the value does not exist in
+  that model for anything. All three backends now refuse, through the builder and the
+  `findNearestByConcatenatedTextVector` idiom alike, naming both models and pointing at `nearestBySummary()`
+  — which does serve that model, and is the likely intent. Silent when the provider cannot name its own
+  model: a refusal derived from an unknown is worse than the search it would block.
+
+- **A query no longer creates storage (OMI-458).** `javai-persistence`. `findNearest` resolved its table by
+  calling `ensure*VectorTable(reference.modelId(), reference.dims())`, so a search whose reference named a
+  model nothing had ever been written in **created that model's table** — two HNSW indexes and all — and then
+  returned no rows, because there were none. A failed query left a permanent, empty, indexed table in the
+  schema, and each repetition of a typo'd or mismatched model id minted another. Postgres now resolves the
+  name, finds it absent and answers empty; provisioning belongs to the write path, which knows a vector
+  exists to store. Neo4j and MongoDB had the same shape with worse manners — they created a junk vector index
+  **and blocked the caller** while it came online — but there a read is the *only* thing that ever creates an
+  index, so they cannot simply stop: each now asks one bounded question first (`… IS NOT NULL … LIMIT 1`,
+  `{$exists: true}`) and creates only when something actually carries the property. `QueryTimeSchemaCreationTest`
+  pins the rule rather than the case: it inventories every table and index, runs every shape of read each
+  backend serves against an unwritten model, and requires the inventory unchanged.
+
+  ⚠️ **Adopters may already have junk tables**, one per model id ever passed to a search that matched nothing.
+  They are empty and harmless, and JavAI will not remove them — it provisions what it finds missing and never
+  drops what it finds present. `DROP TABLE javai_vectors__<model>` / `javai_summary_vectors__<model>` for any
+  model you do not recognise, after checking it is empty.
+
+### Changed
+
+- **`Ranked<T>` moved to `dev.xtrafe.javai.vector` (OMI-460).** Was `dev.xtrafe.javai.persistence.Ranked`.
+  `VectorIndex.nearestNRanked` needed the same shape from `javai-collections`, which sits *below*
+  `javai-persistence` and so could not name it; the alternative was a second record meaning exactly the same
+  thing one module down. What the record describes is a cosine similarity, which is `javai-vector`'s own
+  subject. Nothing about its meaning changed — **adopters update an import**.
+
+- **The tag indexes report raw cosine on every backend (OMI-460).** `javai-tagging`. Postgres already did
+  (`1 - distance`); Neo4j and MongoDB passed their own store's score straight through, and both report a
+  cosine index's score rescaled into `(0, 1]` as `(1 + cosine) / 2`. So `filterByMinSimilarity(ref, 0.9)`
+  meant a different thing per backend, and `RankedTaggableRef.similarity` was not the number
+  `JavAIVectorizable.similarityTo` returns in process. Both now undo the rescaling as they read their own
+  result — the conversion `javai-persistence`'s backends have always applied to `Ranked`. Thresholds written
+  against Neo4j or MongoDB tag indexes are now cosine and may need lowering; a perfect match still reads 1.0,
+  which is exactly why the regression survived (it is a fixed point of the rescaling).
+
+- **Dependency updates.** Spring Framework 7.0.9, Spring Data Commons 4.1.1, Neo4j Java driver 6.2.1, MongoDB
+  sync driver 5.10.0, Byte Buddy 1.18.12 (runtime and Maven plugin), Handlebars 4.5.4, and the
+  `jackson-annotations` pin moves to 2.22 -- see the root `pom.xml` for why that pin exists.
+
+### Added
+
+- **Typed completion responses (OMI-68).** `javai-completion`. `CompletionRequest.Builder.responseType`/
+  `responseOptional`/`responseListOf`/`responseSetOf` derive a JSON schema from the destination class, and
+  every Cortex that can constrain output to a schema sends it (all but Replicate). `CompletionResult.as`/
+  `asList`/`asSet` find the JSON in the reply and unmarshal it with Gson, holding it to the type: every
+  field present, primitives non-null, no coerced values, no duplicates in a `Set`. No JSON is
+  `Optional.empty()`; anything else wrong is a `CompletionException`. `withCompletion()` adds prose beside
+  the value, read with `completion()`. Verified live against Mistral.
+
+- **JavAI runs on your connection pool, and a backend can be released (OMI-410).** `javai-persistence` +
+  `javai-tagging`. `JavAIPersistenceConfig.Builder.dataSource(DataSource)` is an alternative to the Postgres
+  URL/username/password: JavAI builds its own `SessionFactory` on the application's pool, so its queries
+  appear in that pool's metrics instead of running on Hibernate's built-in pool. `JavAIPI.release(config)`
+  closes every connection JavAI opened for a config -- including `javai-tagging`'s, whose second backend
+  cache is evicted in the same call -- and forgets the backend, so the next call rebuilds rather than
+  returning a closed one. Repositories realized before a release refuse use instead of reconnecting.
+  Supplied resources (`DataSource`, `SessionFactory`, `Driver`, `MongoTemplate`) are never closed.
+
+- **`CortexMistral` (OMI-598).** `javai-completion`. A `Cortex` for Mistral's hosted chat-completions API,
+  sharing `CortexOpenAiCompatibleSupport` with OpenAI, Groq and vLLM since Mistral's API is
+  OpenAI-wire-compatible. `providerId()` is `"mistral"`; `ContextWindows` knows `mistral-large-latest`,
+  `mistral-medium-latest` and `mistral-small-latest` (262,144 tokens, from Mistral's `/v1/models`).
+  Verified against the live endpoint by `CortexMistralLiveTest`, which is tagged `requires-model` and so
+  excluded from CI.
+
+- **Filter-by-type on a `VectorIndex`, applied by the query rather than to its result (OMI-460).**
+  `javai-collections` + `javai-tagging`. `tagSimilarityIndex()`/`tagTextIndex()` span **every** `@Taggable`
+  type at once — that is what they are for — so "the nearest 20" of one was unanswerable: a caller wanting
+  albums drew `limit × 5` and discarded everything else. Wasteful inside the multiplier and *undetectably
+  wrong* outside it, since an album ranked below the draw is simply absent with nothing in the result to say
+  so. Measured in the field at a 3:2 ratio on a top-5 query. `VectorIndex.ofType(...)` returns **another
+  `VectorIndex`**, so narrowing composes and the search that ends it is an ordinary search over a smaller
+  index — the shape `SubgraphResult extends KnowledgeGraph` already uses one file over:
+
+  ```java
+  JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+          .ofType(Album.class)
+          .nearestN(reference, 20);
+  ```
+
+  The same query written as one call is `nearestN(reference, 20, List.of(Album.class))`, a `default` over
+  `ofType` so the two spellings cannot drift. `JavAITagRepository` also gains
+  **`nearestByTagSimilarity(reference, n, candidateTypes)`** and **`nearestByTagText(...)`**, which take
+  `Class<? extends Taggable>` where the type-agnostic index cannot — the same vocabulary `taggedWith` and
+  `rankedByTags` have taken candidate types in since before this.
+
+  **The types reach the query on every backend, and the ordering contract is the point.** Postgres narrows
+  with `WHERE owner_type IN (…)` ahead of `ORDER BY`/`LIMIT`. MongoDB passes them to `$vectorSearch`'s own
+  `filter`, a genuine pre-filter — which needed `taggableType` declared as a filter field, so an index
+  written by an older JavAI is **dropped and recreated once, automatically**; in-place `updateSearchIndex` is
+  rejected for a `vectorSearch` index (`"mappings" is required`, measured), and leaving it would turn a
+  capability into an upgrade step discovered from a runtime error. Neo4j *cannot* pre-filter a vector index —
+  `db.index.vector.queryNodes` picks its K first — so a narrowed search there abandons the index for an exact
+  `vector.similarity.cosine` scan: exact, filtered in the query, and O(nodes of those types), the same
+  honest-but-linear trade `foldNearestBySummary` already documents. Unnarrowed searches are untouched on all
+  three.
+
+  Matching is on **exact runtime class**, not assignability — `ofType(Animal.class)` does not match a `Dog` —
+  matching `taggedWith`/`rankedByTags`, and the only rule a store holding a fully-qualified name can answer
+  without enumerating loaded subtypes. Naming *no* types matches nothing rather than everything, the same
+  rule `taggedWith(tag, List.of())` already follows. Narrowing an already-narrowed index intersects.
+
+- **`VectorIndex.nearestNRanked(...)` (OMI-460).** `javai-collections`. `nearestN` returned order and
+  nothing else, so a caller could not show a match strength, threshold on one, or tell a strong 50th hit from
+  a weak 5th. The ranked shape already existed twice (`NearestQuery.ranked()`, `rankedByTags`); this was the
+  one search surface without it. Narrowed or not: `nearestNRanked(reference, n, candidateTypes)` is the one
+  signature covering this and the filter above at once.
+
+- **`JavAIRepository.count()` (OMI-460).** `javai-persistence`. A predicate's count already had two routes
+  (a derived `countBy…`, a `@Query`); "how many are there" had none, so it was reached by
+  `findAll().size()` — every row hydrated into an entity, its stored vectors read back into its cache slots,
+  and the lot discarded to learn one number. Each backend answers with the count its own store already does
+  (`count(root)` / `count(n)` / `countDocuments()`); the SPI method is abstract rather than defaulted to
+  `findAll(...).size()`, since that default would silently reintroduce exactly what this removes.
+
+- **`Windows.of(offset, limit[, sort])` (OMI-460).** `javai-persistence`. An offset-based `Pageable`.
+  JavAI's query paths have always read `getOffset()`/`getPageSize()` and never the page *number*, so an
+  arbitrary offset was already supported and merely unsayable: `PageRequest.of(page, size)` derives offset as
+  `page × size`, so every offset it can express is a multiple of the limit. That breaks the standard
+  forever-scroll idiom of asking for one row more than the page holds — page 3 of 20 wants offset 60 with a
+  limit of 21, and `PageRequest.of(60 / 21, 21)` lands on offset **42** and quietly returns the wrong rows.
+  `Pageable` is an interface, so an adopter could always write this; it exists because every adopter doing
+  one-extra-row paging otherwise writes the same class and discovers the need the same way. `getPageNumber()`
+  reports `offset / limit` and `withPage(n)` is page-aligned, both documented — three of `Pageable`'s methods
+  have to answer in pages, and an offset window has no page number of its own.
+
+- **Persisted per-model summary vectors (OMI-458).** `javai-persistence` + `javai-annotations`.
+  `summaryVector(modelId)` has computed a container's per-model summary since OMI-290; nothing stored it. The
+  entity-grain writer asked for `currentModelId()` and the *unscoped* summary, so a model arriving only
+  through `@ExternalVector` — image pixels, an audio waveform — had a computable container summary and no row
+  anywhere, making a corpus ranking O(containers × their members) per query with no index to help.
+  `@Summary(persistModelSummaries = true)` on the container **type** writes one row per model its `@Summary`
+  subtree declares, into the `javai_summary_vectors__<model>` table `ensureSummaryVectorTable` already
+  provisions with an HNSW index. Which models is **derived from declarations**, transitively and expanded to
+  registered subtypes — never from what happens to be in a table, since an un-embedded corpus and a corpus
+  with no such model are indistinguishable there. Concatenated columns are written absent: that vector is one
+  embedding of one assembled string and exists in the configured provider's model alone.
+
+  **The invalidation trigger is `supplyVector`, not `save`, and that is the whole difficulty.** An
+  `@ExternalVector` arrives *after* the save by construction — the model runs elsewhere and answers seconds
+  or minutes later — so every container above it was summarised when there was nothing in that model to
+  summarise. `writeExternalVector` now enqueues on `javai_summary_pending` and drains after commit, reusing
+  OMI-255 rather than adding a second mechanism; the drain's upward walk reaches a tier above the container
+  too, so `Exhibition → Album → Image` works at every level. Gated on some type actually opting in, so an
+  application that never asked pays nothing.
+
+  **The query side needed no new entry point.** Every backend already resolves which storage answers from
+  `reference.modelId()`, so `nearestBySummary().to(pixelSummary)` — and the derived
+  `findNearestBySummaryVector(pixelSummary, n)` — reach the pixel table by the mechanism that was already
+  there. Ranking across two embedding spaces is not a hazard here: the index is *derived from* the reference
+  rather than chosen beside it. The hazard that is real is the caller's, since a container carrying both a
+  `@Vectorize` field and an `@ExternalVector` has *two* coherent summaries and `.to(album.summaryVector())`
+  versus `.to(album.summaryVector(PIXELS))` differ by one token — both valid, both correctly ranked against
+  their own storage, so the wrong one answers the other question with nothing to notice. `NearestQuery` gains
+  **`inModel(String)`** for that: optional, refuses a reference from another model, and refused itself on a
+  field, combined or concatenated-text search, where there is only one model the vector could be in. It is an
+  assertion, not a selector — it buys legibility and a check, never a capability.
+
+  **The search answers whether or not the rows exist** — without the opt-in it folds the candidates in memory,
+  because the alternative is not a slower answer but a wrong one: an empty provisioned table returns nothing,
+  which reads as "nothing is similar" rather than "nothing is stored". Which path runs is decided from the
+  declaration, never from whether the table holds rows. Backfill is `reindex()`. Postgres indexes; Neo4j and
+  MongoDB fold through the shared SPI default.
+
+- **Declared queries, targeted writes, and `@Any` predicates (OMI-398).** `javai-persistence` +
+  `javai-annotations`. A derived name expresses a predicate over an entity's own properties and nothing else,
+  so a **grouped aggregate** — one count per id rather than one total — had no expression at all, leaving N+1
+  counts, counting in memory, or reaching past the repository to `JavAIPI.sessionFactory(config)`. `@Query`
+  (JPQL or `nativeQuery`) puts it on the method, with `@Modifying` for writes. `@Param` is **reused** from
+  `spring-data-commons`; `@Query`/`@Modifying` are JavAI's own, because `spring-data-jpa` is not a dependency
+  and its repository infrastructure is not wanted behind two annotations. `DeclaredQuery` reuses
+  `DerivedFinderQuery`'s shape outright — parse and return-type adaptation there, three primitives per
+  backend, the same `Constraints` record. Returns cover entity/`Optional`/single/`Stream`/scalar/`Object[]`
+  and **records**, the last two needing no projection machinery at all (Hibernate 7 instantiates a record from
+  `select new …`), so `(id, count)` pairs come back typed. `Page` requires an explicit `countQuery` —
+  deliberately not derived by rewriting the select, since a rewriter that misreads one returns a plausible
+  wrong number instead of failing. A dynamic `Sort` is applied through `SelectionSpecification`, never by
+  editing query text, so it is offered on entity-returning JPQL and refused on projections and native SQL.
+  **Postgres only**; Neo4j and MongoDB refuse at repository-creation time, the SPI defaults throwing rather
+  than accepting, as `inTransaction` already does.
+
+  **Validation splits in two, and it is stated rather than discovered.** Every other creation-time check in
+  the module is pure reflection; parsing a query is the first that is not, and building the query engine
+  freezes the entity set — exactly what OMI-214 removed from `repository(...)`. So the signature is validated
+  when the repository is realized and the query *text* as soon as an ORM exists to parse it, which still means
+  before any repository method runs. Native SQL is parsed by the database on first execution; its parameter
+  binding is not.
+
+  **The refusal Spring Data has no equivalent of.** A bulk write fires no woven accessor, so nothing
+  recomputes what it invalidated — and since OMI-187 a stored vector is hydrated straight back on load, so the
+  inconsistency outlives the process rather than the call, exactly as `SPEC.md` warns. Assignments to a
+  `@Vectorize` field, an `@ExternalVector`'s `keyField`, a `@Summary` field or a `@Taggregate` field are
+  refused, resolved against the **statement's own** target entity rather than the repository's type parameter.
+  An ordinary column on a vectorized entity stays writable — a summary is arithmetic over vectors, so a column
+  no vector reads cannot move one. `nativeQuery = true` is refused whenever JavAI owns storage for the type,
+  since SQL has no assignments to inspect. A `@Modifying` delete resolves ids and deletes through
+  `deleteById`'s path, as `deleteBy…` already does: a bulk delete cascades to nothing, detaches from no
+  container, and orphans vector rows. A bulk update does not bump `@Version` unless it says `update versioned`.
+
+  **Two findings changed the design.** `@Column(updatable = false)` already does what the ticket asked for —
+  measured: it protects a column from `save()` while a `@Modifying` query writes past it — so "a column
+  writable only by a dedicated path" needed no new annotation. And an `@Any`, which cannot be *joined*
+  through, turns out to be perfectly *filterable*: `Path.type()` resolves to the discriminator, so
+  `findByTarget(x)`/`…In`/`…IsNull` work through the existing grammar and `findByTargetOfType(Class)` adds the
+  one new keyword (`OfType`, also on the search builder as `.where("target").ofType(...)`). That removes the
+  workaround of mapping an `@Any`'s discriminator and key a second time as read-only columns, which every
+  queryable `@Any` would have repeated with two mappings free to drift. `OfType` is matched to its parsed part
+  by **counting parts** rather than re-tokenizing the method name, so a property whose name contains another's
+  cannot be miscounted; the single ambiguous shape is refused rather than guessed.
+
+  **Proven end to end against real weaving.** `e2e-client-test`'s `DeclaredQueryE2ETest` runs all of it as a
+  client of the published artifacts, on genuinely woven classes -- which `javai-persistence`'s own tests
+  structurally cannot do, since that module has no `javai-substrate` dependency and its fixtures are
+  hand-written stand-ins. Grouped aggregates over the real `Article` -> `JavAIList<Comment>` association, real
+  stored embeddings asserted byte-identical across a targeted write, and the `@Any` half against `AssocHub`'s
+  eager/lazy/`@Summary` polymorphic references. It surfaced a structural consequence worth knowing: **a
+  declared query cannot share a repository interface with a backend that refuses one**, since the refusal
+  happens when the repository is realized -- so an entity served from several backends keeps its declared
+  queries in a second, Postgres-only interface.
+
+### Fixed
+
+- **An `@Any` field whose name is a suffix of another's broke the `OfType` rewrite (found by OMI-398's e2e
+  pass).** `javai-persistence`. `findBySummaryLazyAnyOfType` also ends in `LazyAnyOfType`, so attributing the
+  keyword to the first matching field stripped on behalf of `lazyAny`, flagged a part that did not exist, and
+  rejected a perfectly unambiguous method as ambiguous. Each occurrence now goes to the **longest** `@Any`
+  field name ending where it begins; nothing shorter separates the two, since the preceding character is
+  lowercase in both `findBy|LazyAny` and `Summary|LazyAny`. Invisible to the unit fixtures, which declared a
+  single `@Any` apiece -- a two-`@Any` fixture (`TestPoster`) now reproduces it without needing the container.
+
+- **An `int`-returning `countBy…`/`deleteBy…` threw `ClassCastException` (found by OMI-398).**
+  `javai-persistence`. `cond ? Math.toIntExact(n) : n` reads as if it yields an `Integer`, but binary numeric
+  promotion widens both branches to `long` and boxes to `Long`, so the repository proxy threw on return.
+  Latent because nothing declared an `int`-returning count or delete until now; `DerivedFinderTestSupport`
+  declares one on all three backends so it stays fixed.
+
+- **Taggregate: derived taggings for containers, and the concatenated tag-text vector (OMI-302).**
+  `javai-tagging` + `javai-annotations`. An `Album` of fifty tagged images is itself *about* something;
+  `@Taggregate` says so. The new annotation mirrors `@Summary`'s grammar exactly — on a **field** (a
+  `Taggable` reference or a JavAI collection of them), the target's taggings are absorbed into the declaring
+  object's aggregate: ordinary `Tagging` rows with the new `source = "aggregate"` provenance, per-tag
+  affinity the mean contribution over members (null counting 1.0, absent counting 0 — coverage × strength,
+  bounded [0,1]), diffed with the same never-touch-other-provenances discipline `applyClassification`
+  established. Containers of containers compose one level deep, recursion-free; cycles are tolerated,
+  logged, never repaired. On a **type**, `@Taggregate(concatenate = true)` opts any taggable into the
+  **tag-text vector**: its tags rendered as one deterministic string (display names, affinity-descending
+  then slug, top-50 capped — provider-side truncation is silent, OMI-216) and embedded, so machine tags
+  land in the same text-embedding space as captions and bios (`tagText`/`tagTextVector`/`tagTextIndex()`).
+
+  Staleness is Vector Core's own discipline, repository-side because nothing here is woven: choke-point
+  mutations mark containing aggregates pending (transitively, via the `javai_taggregate_members` snapshot);
+  reads holding the object (`taggingsOf`, `tagText`) recompute on pending marks or membership drift; and
+  `reconcilePendingTaggregates(limit, loader)` sweeps the rest — the loader callback exists because the
+  library cannot materialize adopter entities. Member taggings are read in one batched query per recompute
+  (`associationsOfAll`), pinned structurally, and the tag-summary vector recomputes once per reconcile.
+  `rankedByTags(tags, types, limit)` adds the exact structural counterpart (Σ affinity, one indexed query,
+  spanning `TagSet`s), with `tagQueryVector(tags)` as its fuzzy twin over `tagSimilarityIndex()`. The
+  lineage rule throughout: container and members need only `implements Taggable` + `@Id UUID`, never
+  `@JavAIVectorizable`, and woven/unwoven types mix freely — pinned in both directions by a genuinely
+  build-time-woven test container.
+
+  Covered end to end by `TaggregateE2ETest` (`e2e-client-test`) against all three real backends and real
+  embeddings, on a persisted three-level domain with lazy member collections: nesting composing three
+  levels up from a leaf tag, updates propagating through the sweep alone, a diamond fanning one leaf update
+  out to both containers, same-display-name/different-slug tags staying distinct through aggregation and
+  ranking, and the concatenated tag text's *retrieval quality* — a cooking container ranking nearer a
+  natural-language cooking query than a security one, sharing no vocabulary with either.
+
+- **A vector JavAI never computes: `@ExternalVector` (OMI-290).** An image embedding is produced by a model
+  in its own container behind a queue, from bytes JavAI must not read, arriving minutes later in a different
+  model and dimensionality from every text vector on the same object. Nothing about that fits `@Vectorize`,
+  whose whole shape is "a read of a stale value computes it now" — so this is a separate declaration, made on
+  the type and repeatable, that JavAI stores, versions, serves and searches without ever producing.
+
+  ⚠️ **"Externally-supplied vectors are eventually consistent" is the obvious wrong answer**, and stating why
+  is the clearest way to say what the guarantee actually is. `EVENTUAL_CONSISTENCY` still blocks a slot's
+  *first* read — there being no prior value to serve — and still yields to
+  `runWithSubgraphLockedForPersistence`'s forced-accuracy override. Either would leave a read waiting on a
+  provider that cannot produce this vector, and asking the *text* provider for it. The consistency-mode axis
+  simply does not apply: these reads are unconditionally non-blocking under all three modes and inside a
+  persistence flush.
+
+  ⚠️ **And it is the one kind of vector outside the mutation rule.** Validity is re-derived on every read by
+  comparing a short content key against the field holding it, rather than tracked through an intercepted
+  write — affordable exactly because the key stands in for content JavAI never touches. A key written by
+  reflection or by a framework is caught like one written through a woven setter. A vector for content the
+  object has moved on from reads *absent* rather than stale: it is not out of date, it is a confident
+  description of different content.
+
+  Stored at the usual per-field grain but partitioned by the **declared** model — a new `computed_for` column
+  on Postgres, `ComputedFor` properties on Neo4j and MongoDB. `supplyVector(id, name, vector, computedFor)`
+  is the queue-consumer entry point (one read, one vector written, no merge or summary recomputation);
+  `findPendingVector` is the backlog for backfills and dead-letter re-drives. `reindex` carries them across
+  untouched rather than dropping vectors it cannot recompute. All three backends.
+
+- **Model-scoped aggregates: `vector(modelId)` / `summaryVector(modelId)` (OMI-290).** Two models' vectors
+  cannot be combined — their cosine similarity is not a weaker answer but no answer — so once an object
+  carries an image embedding beside a text one, "this object's vector" is two questions. Purely additive: the
+  unqualified forms are untouched, including their caching, and nothing is computed speculatively (asking for
+  one model's aggregate never embeds another's text in order to discard it).
+
+- **`JavAITagRepository.applyClassification` (OMI-290)** — the reconciliation half of `classify()`, reachable
+  without a `Cortex`, so a classifier that is not an LLM drives the identical diff against `source = "auto"`.
+  One tag-summary recomputation per call rather than one per tag: that path resolves every association through
+  `findById`, so N sequential `addTag` calls cost ~N²/2 id lookups.
+
+### Changed
+
+- ⚠️ **Taggregate's plumbing moved into the library; an adopter no longer writes a reconciler (OMI-304).**
+  OMI-302 shipped Taggregate with three methods an adopter had to orchestrate — `reconcileTaggregate`,
+  `markTaggregateStale`, `reconcilePendingTaggregates(limit, loader)` — plus a `Function<TaggableRef,
+  Object>` loader the library could not supply. The first adopter's cost was a ~190-line reconciler holding
+  a ten-entry type→repository map, a transaction template, a boot-time bootstrap pass and an event
+  listener. That is a kit, not an API: `@Summary`'s bar is "annotate a field, call `save()`", and this now
+  meets it. **`rebuildTaggregates()` is the only public Taggregate method**, documented as the
+  after-a-restore repair — genuinely needed, because promotion, a restored backup and direct SQL write rows
+  the choke points cannot observe.
+
+  **The whole thing is one reuse.** `javai-persistence`'s `Containment` already answered "which containers
+  hold this child" for `@Summary`, resolved against the database rather than whatever object graph happened
+  to be in memory, and its `Edge` already carried a `summary` flag *"because the two consumers want
+  different subsets"*. Taggregate is the third consumer that design anticipated: `Edge` gained a
+  `taggregate` flag, singular references are collected when either annotation is present (a to-one
+  `@Taggregate` is a real adopter shape), and `javai-tagging` reaches it through one narrow
+  `TaggregateContainment` view rather than four newly-public types. There is exactly one implementation of
+  parents-from-child, and the two pre-existing call sites now share its query builder too.
+
+  What that deleted: `javai_taggregate_members` and its Neo4j/Mongo equivalents (the join tables already
+  *are* the membership, so a second copy could only be staler — dropped on first use), the cold-start
+  problem (the snapshot was written *by* reconciliation, so a never-reconciled container was in no snapshot
+  and tagging its members marked nothing), the bootstrap pass that existed only to prime it, the loader,
+  and membership drift as a concept.
+
+  ⚠️ **It also fixes a defect class.** Recompute is now a set-based store operation over members resolved
+  from containment, needing no container instance. The previous design walked the container's
+  `@Taggregate` fields — ordinarily lazy `@ManyToMany` collections — so an entity read outside a session
+  threw `LazyInitializationException`; the adopter's first boot pass failed for 192 assets and every album
+  *while reporting success*, because each failure was caught per object.
+
+  Drain follows `@Summary`'s own precedent exactly: mark inside the write path, recompute after the
+  caller's transaction commits, one callback per transaction. Tagging now joins that transaction for its
+  own reads and writes — resolved lazily at first write, so the deliberate absence of a startup ordering
+  dependency between tagging and the entity mapper survives — which is what makes a rolled-back tag
+  mutation leave no tagging row, no pending row and no aggregate row. `javai_taggregate_pending` stays,
+  insert-only, for the reason `PendingSummaries` documents.
+
+  All three backends: Postgres by HQL, Neo4j by relationship traversal, MongoDB by reference arrays with an
+  index per edge. The declaration is read once by `Containment` for all three; only the traversal differs.
+
+  ⚠️ **One honest consequence, documented rather than hidden:** a membership change with no tag mutation
+  (adding an untagged member dilutes the mean) recomputes at the next tag mutation beneath that container,
+  or at `rebuildTaggregates()`. Recomputing on every `save()` of anything contained was the alternative,
+  and is a cost on a write path most applications never need it on.
+
+### Fixed
+
+- ⚠️ **Model-scoped aggregates went absent once a container was persisted (OMI-303, `javai-persistence`).**
+  `vector(modelId)`/`summaryVector(modelId)` worked over an in-memory JavAI collection and returned
+  `EmbeddingVector.absent()` over the Hibernate-backed one, so an album could be summarized in its images'
+  own model right up until it was saved. `PersistentJavAIList`, `PersistentJavAISet` and
+  `PersistentJavAIMap` never overrode the scoped pair and inherited `JavAIVectorizable`'s `default`, which
+  is `absent()`. The arithmetic they needed already existed and was already model-aware — three missing
+  overrides, not a design gap.
+
+  **What made it invisible is worth more than the fix.** `JavAIRuntime.summaryVector` folds any
+  `JavAIVectorizable` child unconditionally, and a `PersistentJavAISet` is one — so the absent term was not
+  skipped or warned about, it was normalized into an absent result. The unqualified path was untouched
+  throughout, meaning text summaries kept working and only the scoped answers went quiet. A `default` that
+  returns "nothing here" cannot distinguish a type that has nothing from one that forgot to look;
+  doc/spec/vector-core.md now says so where the accessors are specified.
+
+- ⚠️ **OMI-290's own migration could never run (`javai-persistence`).** `ensureFieldVectorTable` ships an
+  `ALTER TABLE ... ADD COLUMN IF NOT EXISTS computed_for` precisely so a `javai_vectors__<model>` table
+  created before OMI-290 gains the column instead of failing on first write — but it called
+  `provisionTable` without naming that column as required. `isAlreadyProvisioned` then answered "yes, this
+  table exists" for a pre-OMI-290 table and skipped the whole DDL block, migration included, so the upgrade
+  path failed with `column "computed_for" does not exist` on the first vector write. The sibling
+  `ensureSummaryVectorTable` had it right all along, passing OMI-191's three added columns — the same
+  mechanism, used correctly one method away.
+
+  Found by accident, which is worth recording: `e2e-client-test`'s deliberately persistent container was,
+  unintentionally, exactly the deployment shape this migration exists for, and the first run after the
+  Taggregate work reproduced the production failure end to end. A stale-schema harness turned out to be the
+  only thing in this repository testing an upgrade at all — accidentally, and about to stop, since the same
+  run's seeder fix (below) gives every run a fresh schema. `PreExistingVectorTableMigrationTest` replaces
+  that accident with the deliberate version: it creates the pre-OMI-290 table by hand and asserts the first
+  write migrates it. Verified to fail with the original `column "computed_for" does not exist` when the
+  one-argument call is restored.
+
+- **`e2e-client-test`: library-provisioned tables are dropped between runs, not truncated (OMI-302).** The
+  reset step discovered every table in the `public` schema and truncated all of them, which is right for
+  Hibernate's own entity tables (created by hbm2ddl before the reset runs) and wrong for every table the
+  library provisions itself. Those are created on demand with `CREATE TABLE IF NOT EXISTS`, so against this
+  module's deliberately persistent container, `IF NOT EXISTS` meant a table created by an *older* library
+  version kept its old columns forever. OMI-290's new `computed_for` column was the one that surfaced it —
+  the first run after that upgrade failed with `column "computed_for" does not exist`, from a schema the
+  reset had faithfully preserved. `javai_*` tables and `taggings` are now dropped so the current library
+  recreates them at first use; entity tables are still truncated.
+
+- ⚠️ **An entity carrying a `static` field broke both reflective backends (OMI-290).**
+  `EntityReflection.allFields` did not exclude them, and Neo4j and MongoDB map an entity by walking that
+  list — so a constant as ordinary as `static final String MODEL = "..."` was written as a node/document
+  property on save and then written *back* on load, failing outright with `Cannot write field static final
+  java.lang.String ...`. Postgres never saw it, because Hibernate does its own mapping and ignores statics,
+  and no entity in this repository had ever declared one. The whole class of failure sat one ordinary
+  constant away from any consumer.
+
+  `JavAIRuntime.allFields` had the same gap and is fixed alongside. That half would not have thrown: it would
+  have followed a static as a graph edge, putting objects nobody referenced into a `query()` result and into a
+  persistence flush's lock set. The loud failure is what made the quiet one findable.
+
+- ⚠️ **Tagging an entity reached through a lazy association silently wrote an unfindable row (OMI-290).**
+  `JavAITagRepository` built a `TaggableRef` from `instance.getClass().getName()` and the `@Id` *field*, and
+  both are wrong for a persistence proxy: the class name is `Target$HibernateProxy$xyz`, and a proxy holds no
+  state of its own so the field reads `null` whether or not it has been initialized. `addTag(parent.getChild(),
+  tag)` therefore succeeded, and every later `hasTag`/`tagsOf`/`taggedWith` answered "no". Proxies are now
+  resolved first, and an instance that still arrives without an id is refused with a message naming the two
+  situations that produce one.
+
+### Changed
+
+- **`@Taggable` is now `@Inherited` (OMI-290).** A subclass of a taggable class is genuinely taggable —
+  tagging state lives in association rows keyed by type name and id, and a subclass has both.
+  `@JavAIVectorizable` cannot say the same, because it commits the weaver to synthesizing per-class bytecode.
+  Note interface inheritance is a separate matter that this does not affect: a hierarchy whose common
+  supertype is an interface expresses participation by having that interface extend the `Taggable` marker
+  interface, which is all the tagging runtime actually requires.
+
+- **Conformance coverage for the fetch/attachment cells that were named but never measured (OMI-279).** The
+  bidirectional `@OneToOne`/`@OneToMany` pairs, `@OneToOne(optional = false)`, `@Any` under `LAZY`, and the
+  `EAGER` variants of both collection mappings. No production code changed — every cell is either conformant
+  or a documented Hibernate behaviour JavAI inherits — but three of them are now written down rather than
+  assumed:
+
+  - ⚠️ **A lazy to-one whose target class is `final` is silently eager.** Hibernate proxies by subclassing,
+    and a `final` class cannot be subclassed. Nothing reports it, `Hibernate.isInitialized` returns `true` on
+    a field declared `LAZY`, and the value is correct — only early. `final` is a keyword people put on
+    entities by habit, so this is the one most likely to be met in the wild.
+  - ⚠️ **The inverse side of a `@OneToOne` (`mappedBy`) ignores `LAZY`.** No foreign key on that side, so
+    Hibernate must look to know whether the other row exists.
+  - **`optional = false` on the *owning* side does *not* force an eager fetch** — the opposite of the widely
+    repeated rule, which holds only for the inverse side. The FK column is itself proof the row exists.
+
+  The middle finding is why the first was found at all: every fixture in the new test was `final`, so *both*
+  to-ones came back eager and finality was very nearly documented as optionality. `TestSeal` and
+  `TestWaxSeal` are now identical targets of identical mappings differing only in the keyword.
+
+- **A `JavAIMap` keyed by something other than `String` is supported on Postgres, and now measured (OMI-279).**
+  OMI-277 deleted the validator that refused one, because it deleted the `varchar` key column that was the
+  reason for it — which left the cell *un-refused but never exercised*, and "we stopped rejecting it" is not
+  the claim a reader hears. `NonStringMapKeyConformanceTest` answers the harm the old rule named rather than
+  settling for a round trip: `Integer`, `UUID` and enum keys come back **as their own types**, out of
+  `integer`/`uuid`/`varchar` columns, with `PersistentJavAIMap` still substituted in and the association
+  lazy. A key stringified on write and parsed on read would pass a naive round-trip assertion and fail both
+  of those. `String` remains the portable choice, but only because Neo4j and MongoDB still refuse the rest —
+  for the reason Postgres no longer has.
+
+### Changed
+
+- **`javai-persistence`: an `@ElementCollection` of basic values no longer breaks `save()` (OMI-275).** The
+  graph walks reflected into every collection element, so a `List<String>` put them on `String.value` and the
+  module system refused to open `java.lang` — `InaccessibleObjectException` on an ordinary JPA mapping the
+  registration validator explicitly accepts. JDK values are leaves now, guarded in the shared walk rather
+  than at each call site.
+
+- **⚠️ `javai-persistence`: `save()` returns the managed instance, as Spring Data JPA's does (OMI-275).**
+  It used to return the caller's own instance, which was never managed. That was deliberate — `merge()` left
+  `@Transient` JavAI collection fields empty on the managed copy — and OMI-277 removed the reason by making
+  JavAI collections native associations `merge()` carries across. Only `Point` fields are still transient,
+  and `save` now copies those onto the managed copy explicitly.
+
+  **What it fixes is not only a difference from Spring Data.** Returning an unmanaged root while the session
+  was open was the *one* way a caller could be handed a graph attached in one place and detached in another:
+  mutate the root and the change was silently discarded, mutate a child reached through it and the change was
+  silently persisted, with nothing about either object saying which was which. Measured, then fixed —
+  `AttachmentConformanceTest`.
+
+  ⚠️ **The returned graph is a different object graph from the one passed in.** That is ordinary `merge`
+  semantics, and it is the part most likely to surprise: after a save, keep using what `save` returned *or*
+  keep using your own instance, but do not mix them and expect the same objects. Mutating an entity you still
+  hold no longer affects what `save` handed back.
+
+
+- **⚠️ `javai-persistence`/`javai-tagging`: a JavAI collection field must be declared by its interface
+  (OMI-277).** `private final JavAIArrayList<X> xs = new JavAIArrayList<>();` is **refused at registration**
+  now, with a message naming the interface to use instead. The supported shape is the one already
+  recommended:
+
+  ```java
+  @OneToMany(cascade = CascadeType.ALL)
+  private JavAIList<Photo> photos = new JavAIArrayList<>();   // interface-typed, non-final, annotated
+  ```
+
+  The concrete form was a second storage mechanism (`javai_collection_members`) and it was **silently
+  root-only in both directions**: reached through an association the collection came back empty, and saved
+  through one its members were never written. It was withdrawn rather than repaired because it cannot be made
+  lazy where it stands — the field holds a `final` instance of a `final` class, and Hibernate manages a
+  collection by substituting its own. See OMI-277 for the options weighed, including the one that was chosen
+  and then withdrawn on contact with the types.
+
+  **This is a breaking API change to `javai-tagging`'s shipped `TagSet`**: `getTags()` returns
+  `JavAIList<Tag>` rather than `JavAIArrayList<Tag>`. A caller that declared the receiver as the concrete
+  type needs a one-word change; every other use is unaffected.
+
+  ⚠️ **Two to-many fields of the same element type now need explicit `@JoinTable(name = …)`.** Hibernate
+  derives the default join-table name from owner + element type, so a list and a map of the same type on one
+  entity silently claim the same table. Ordinary JPA, newly reachable because the map used to avoid the
+  native path entirely.
+
+### Removed
+
+- **`javai-persistence`: the `javai_collection_members` side table and all its machinery (OMI-277).** The
+  mapping that used it was refused in the same release; the table was left in place, unreachable, so the
+  decision could be walked back. Kept that way it would have been an empty table created in every database on
+  every boot, plus read/write/delete/derived-finder/containment code nothing could reach — vestigial by any
+  reading. Gone: the `CREATE TABLE`, the membership read and write paths, the cascade-delete and
+  detach-from-container halves, the map-key validator that only ever fired for the refused shape, and
+  `Containment`'s `JAVAI_COLLECTION` edge kind.
+
+  **Nothing drops an existing table.** A database that already has one keeps it, empty and unread, until
+  somebody drops it by hand; a database built from scratch never gets one.
+
+  One live path had to be rebuilt rather than deleted: a **geo predicate nested through a to-many hop** used
+  the membership table to map member ids back to owner ids. It resolves through an HQL join over the
+  association now, which is what the hop always was once the collection was native.
+
+### Fixed
+
+- **Docs: `doc/ai-guidance/persistence-support-matrix.md` described the storage this release deleted.** The
+  consumer-facing support matrix still had JavAI collections living in a side table, `@Transient` being
+  auto-added for them, a to-many finder hop costing a query per hop, `String`-keyed maps as a rule on all
+  three backends, and — worst of the set, because someone would have followed it — a *Rules of thumb* line
+  reading "*Many* related entities → a **JavAI collection**, never `@OneToMany`", which 0.1.10 inverts. Also
+  corrected: the `save()`-returns-managed note was dated to 0.1.11, a version that does not exist.
+
+  The same OMI-277 vestiges are gone from `RepositoryBackendHibernatePostgres`'s own javadoc, which claimed
+  "both shapes are fully supported and can coexist" two paragraphs after explaining that one of them was
+  withdrawn, and from the `IllegalArgumentException` thrown at an unmapped collection field, which advised
+  reaching for a concrete JavAI collection — the shape that is now refused, so following the message led
+  straight into a second failure.
+
+- **`javai-persistence`: a `Point` reached through an association is no longer silently `null` (OMI-276).**
+  A 0.1.10 regression, and a silent one: nothing threw and nothing logged, so an entity simply appeared to
+  have no location. `Point` fields live out-of-band in `javai_geo_points` and were read by a recursive walk
+  of the loaded graph. OMI-271 correctly stopped that walk at uninitialized associations, and the walk runs
+  before the caller can initialize anything -- so a `Point` on any entity the caller initialized afterwards
+  was never read. On 0.1.9 the walk force-initialized the whole graph and always got there; the over-fetch
+  was carrying it.
+
+  `Point` fields now come from the same `POST_LOAD` event that already serves vectors -- once per entity
+  Hibernate actually loads, whenever it loads it -- which is the one place that can also cover an entity
+  initialized later. The recursive geo walk is gone, and with it the last graph walk on the load path.
+
+- **`javai-persistence`: an entity's out-of-band state is read in one statement (OMI-276).** Restoring the
+  `Point` could have meant a third query per entity on top of the two the post-load listener already issued
+  for vectors, plus a JDBC metadata call per table per entity, plus **one query per `Point` field**. Instead
+  the three reads are one: a single `UNION` over the tables that apply to that entity and actually exist,
+  with existence memoised so the metadata round trip is paid once per table rather than once per entity.
+  Measured, per OMI-275's standing criterion: an entity with two `Point` fields costs **one** geo read, and
+  a load costs **one** field-vector read per entity.
+
+
+### Fixed
+
+- **`javai-persistence`: a read no longer loads the whole reachable object graph (OMI-271).**
+  `reachableRelated` -- the walk both post-load steps traversed -- called `addAll` on every collection-valued
+  field, and iterating an uninitialized Hibernate `PersistentCollection` *is* initializing it. So every
+  `findById`/`findAll`/derived finder/vector search loaded the root's entire reachable collection graph,
+  recursively, and paid a side-table SELECT per entity in it, whatever the caller had asked for.
+
+  Measured with Hibernate's own load counters against a real pgvector container: reading one string off a
+  root with five children loaded **6** entities, now **1**; off a three-level graph of sixteen, loaded
+  **16**, now **1**.
+
+  Laziness was already enforced on *singular* associations -- but by accident, not design: an uninitialized
+  proxy is a generated subclass, `@Entity` is not `@Inherited`, so the walk's `isAnnotationPresent` test
+  happened to reject it. A lazy `@OneToMany`/`@ManyToMany` had no such accident protecting it.
+
+  ⚠️ **This changes what a consumer gets back.** A repository now returns a genuinely detached entity, so
+  traversing an association the caller never touched raises `LazyInitializationException` -- ordinary JPA,
+  and what `AssociationGraphE2ETest` already asserted for singular associations. Read inside
+  `JavAIPI.inTransaction` (or a Spring `@Transactional` unit of work) when the graph is genuinely wanted:
+
+  ```java
+  Library library = JavAIPI.inTransaction(config, () -> {
+      Library loaded = libraries.findById(id).orElseThrow();
+      Hibernate.initialize(loaded.getShelves());   // pay for the hop you actually want
+      return loaded;
+  });
+  ```
+
+  Fixing the walk exposed the same defect in four more graph walks that had only ever worked *because* the
+  read path pre-initialized everything for them -- `JavAIRuntime.collectReachableVectorizables`,
+  `ensureIdsAssigned`, `writeVectorsForRelatedEntities`, and the `@Summary` child handling -- so `save()` of
+  a detached entity threw from inside JavAI once the crutch was gone. All four now skip what they cannot see
+  without loading it.
+
+  This left one deliberate exception — a JavAI collection field carrying **no** association annotation stayed
+  eagerly hydrated, since it was mapped out-of-band and had no Hibernate laziness to lean on, and declining to
+  fill it would have handed back a silently-empty collection rather than a lazy one. **OMI-277, later in this
+  same release, removed that mapping and with it the exception.** As shipped, no collection shape ignores its
+  declared `FetchType`.
+
+### Added
+
+- **`javai-persistence`: stored vectors are served from Hibernate's load event (OMI-271).** The walk removed
+  above existed to serve loaded entities their stored vectors, so that re-saving unchanged content does not
+  re-embed it (OMI-256). `JavAIPostLoadVectorListener` does that from `POST_LOAD` instead -- one SELECT per
+  entity *actually loaded*, and strictly more complete than any walk could be: a member the caller
+  initializes later, after any load-time walk has finished, is served as it arrives. `save()` suspends it for
+  its own unit of work, because `merge()` loads the row before copying the caller's values onto it and
+  hydrating there would pair the old vector with the new value.
+
+- **`javai-model`: `JavAIRuntime.configureInitializationCheck(Predicate<Object>)` (OMI-271).** Vector Core's
+  graph walks must not touch a value whose resolution would perform I/O, and cannot recognise one without
+  depending on an ORM -- which it deliberately does not. The Hibernate backend installs
+  `Hibernate::isInitialized`; the default answers `true` for everything, which is exactly right for a plain
+  object graph with no persistence layer under it.
 --
 ## [0.1.9] - 2026-08-07
 
@@ -987,7 +1639,8 @@ version -- a given release usually changes only one or two of them.
   `buildAutoTransientOverrideXml`) that JavAI collection fields depend on — so correct naming and collection
   support were mutually exclusive.
 
-[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.9...HEAD
+[Unreleased]: https://github.com/dcaudell/javai/compare/v0.1.10...HEAD
+[0.1.10]: https://github.com/dcaudell/javai/compare/v0.1.9...v0.1.10
 [0.1.9]: https://github.com/dcaudell/javai/compare/v0.1.8...v0.1.9
 [0.1.8]: https://github.com/dcaudell/javai/compare/v0.1.7...v0.1.8
 [0.1.7]: https://github.com/dcaudell/javai/compare/v0.1.6...v0.1.7

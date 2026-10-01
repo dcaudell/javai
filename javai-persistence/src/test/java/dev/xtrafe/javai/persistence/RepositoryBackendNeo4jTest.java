@@ -496,4 +496,49 @@ class RepositoryBackendNeo4jTest {
             return result;
         }
     }
+
+    @Test
+    void countAnswersTheSameNumberAsFindAllWithoutMaterializingIt() {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before, "count() and findAll().size() are the same "
+                + "question -- one of them just does not hydrate every row to answer it");
+
+        repository.save(new TestArticle("Counted one", "First of two rows added for the count."));
+        repository.save(new TestArticle("Counted two", "Second of two rows added for the count."));
+
+        assertEquals(before + 2, repository.count());
+        assertEquals(repository.findAll().size(), repository.count());
+    }
+
+    @Test
+    void countIsScopedToThisRepositorysOwnType() {
+        long articlesBefore = repository.count();
+
+        accountRepository.save(new TestAccount("counting-user", "counting@example.com", 30, true, null));
+
+        assertEquals(articlesBefore, repository.count(),
+                "another type's rows must not reach this repository's count");
+    }
+
+    /** OMI-410: release closes the {@code Driver} this backend opened -- a repository realized before it
+     *  refuses use rather than reconnecting -- and the same config then builds a working backend again. */
+    @Test
+    void releaseRefusesStaleRepositoriesAndTheSameConfigRebuilds() {
+        JavAIPersistenceConfig own = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
+                .build();
+        TestArticleRepository before = JavAIPI.repository(TestArticleRepository.class, own);
+        TestArticle saved = before.save(new TestArticle("release-" + UUID.randomUUID(), "body"));
+
+        JavAIPI.release(own);
+
+        IllegalStateException stale = assertThrows(IllegalStateException.class, before::findAll);
+        assertTrue(stale.getMessage().contains("released"), stale.getMessage());
+        TestArticleRepository after = JavAIPI.repository(TestArticleRepository.class, own);
+        assertTrue(after.findById(saved.getId()).isPresent());
+        JavAIPI.release(own);
+    }
 }

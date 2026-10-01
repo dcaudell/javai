@@ -4,8 +4,11 @@ import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.model.JavAIArrayList;
+import dev.xtrafe.javai.model.JavAIList;
 import jakarta.persistence.Entity;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Id;
+import jakarta.persistence.OneToMany;
 
 import java.util.Collections;
 import java.util.Map;
@@ -41,8 +44,16 @@ public class TagSet {
     /** See {@link LocalizedNames}'s own javadoc for why this is a JSON string, not a {@code Map} field. */
     private String localizedNamesJson;
 
+    /**
+     * Declared by the interface and non-final, which is now the only supported shape for a JavAI collection
+     * on an entity (OMI-277): Hibernate substitutes its own instance into a mapped collection field, and it
+     * cannot substitute anything for a final concrete class. The annotation makes this a native association
+     * on Postgres -- FK/join table, cascade, laziness -- and is inert on Neo4j and MongoDB, which classify a
+     * field by its declared type and store references either way.
+     */
     @Summary
-    private final JavAIArrayList<Tag> tags = new JavAIArrayList<>();
+    @OneToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    private JavAIList<Tag> tags = new JavAIArrayList<>();
 
     /** Reflective-hydration only -- application code should use a real constructor. */
     public TagSet() {
@@ -123,7 +134,12 @@ public class TagSet {
         applyLocalization(LocalizedNames.mergeJson(currentLocalization(), localizedNamesJson, describe()));
     }
 
-    public JavAIArrayList<Tag> getTags() {
+    /**
+     * ⚠️ Returns the {@code JavAIList} interface as of OMI-277, not {@code JavAIArrayList}. A caller that
+     * declared the receiver as the concrete type needs a one-word change; every other use is unaffected,
+     * since the interface carries the full {@code List} contract plus JavAI's own.
+     */
+    public JavAIList<Tag> getTags() {
         return tags;
     }
 

@@ -3,14 +3,23 @@ package dev.xtrafe.javai.e2e.environment;
 import java.time.Duration;
 import dev.xtrafe.javai.completion.Cortex;
 import dev.xtrafe.javai.completion.LocalCompletionDefaults;
+import dev.xtrafe.javai.e2e.domain.AnthologyRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleClusterRepository;
+import dev.xtrafe.javai.e2e.domain.ArticleQueryRepository;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.AttachmentRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoAlbumRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoAssetRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoCollageRepository;
+import dev.xtrafe.javai.e2e.domain.PhotoExhibitionRepository;
 import dev.xtrafe.javai.e2e.domain.CommentRepository;
+import dev.xtrafe.javai.e2e.domain.LibraryRepository;
 import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
 import dev.xtrafe.javai.e2e.domain.PlaceRepository;
+import dev.xtrafe.javai.e2e.domain.ShelfRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocBiParentRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocChainTopRepository;
+import dev.xtrafe.javai.e2e.domain.assoc.AssocHubQueryRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocHubRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocLeafRepository;
 import dev.xtrafe.javai.e2e.domain.assoc.AssocSelfNodeRepository;
@@ -95,6 +104,28 @@ public final class JavAIEnvironment {
     private static final AssocSelfNodeRepository POSTGRES_ASSOC_SELF_NODE_REPOSITORY;
     private static final AssocBiParentRepository POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
 
+    // OMI-458's fixture: a three-tier @Summary chain whose leaves carry an @ExternalVector, plus the
+    // same middle tier without the persistModelSummaries opt-in so both paths can be exercised.
+    private static final PhotoAssetRepository POSTGRES_PHOTO_ASSET_REPOSITORY;
+    private static final PhotoAlbumRepository POSTGRES_PHOTO_ALBUM_REPOSITORY;
+    private static final PhotoExhibitionRepository POSTGRES_PHOTO_EXHIBITION_REPOSITORY;
+    private static final PhotoCollageRepository POSTGRES_PHOTO_COLLAGE_REPOSITORY;
+
+    private static final AnthologyRepository POSTGRES_ANTHOLOGY_REPOSITORY;
+    private static final ShelfRepository POSTGRES_SHELF_REPOSITORY;
+    private static final LibraryRepository POSTGRES_LIBRARY_REPOSITORY;
+    private static final AnthologyRepository NEO4J_ANTHOLOGY_REPOSITORY;
+    private static final AnthologyRepository MONGO_ANTHOLOGY_REPOSITORY;
+
+    /** Exposed so a test can compose several repository calls into one unit of work -- which a test that
+     *  traverses a lazy association must, since a repository returns a detached entity (OMI-271). */
+    /** Declared queries (OMI-398) and `@Any` predicates (OMI-407) -- Postgres-only interfaces, deliberately
+     *  separate from the repositories realized against all three backends. */
+    private static final ArticleQueryRepository POSTGRES_ARTICLE_QUERY_REPOSITORY;
+    private static final AssocHubQueryRepository POSTGRES_ASSOC_HUB_QUERY_REPOSITORY;
+
+    private static final JavAIPersistenceConfig POSTGRES_CONFIG;
+
     private static final Cortex CORTEX;
 
     private static final JavAITagRepository POSTGRES_TAGGING;
@@ -116,6 +147,7 @@ public final class JavAIEnvironment {
                 .postgresUsername(MonolithicContainer.POSTGRES_USERNAME)
                 .postgresPassword(MonolithicContainer.POSTGRES_PASSWORD)
                 .build();
+        POSTGRES_CONFIG = postgresConfig;
         POSTGRES_ARTICLE_REPOSITORY = JavAIPI.repository(ArticleRepository.class, postgresConfig);
         POSTGRES_PLACE_REPOSITORY = JavAIPI.repository(PlaceRepository.class, postgresConfig);
         POSTGRES_MEDIA_NOTE_REPOSITORY = JavAIPI.repository(MediaNoteRepository.class, postgresConfig);
@@ -124,7 +156,20 @@ public final class JavAIEnvironment {
         POSTGRES_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, postgresConfig);
         // AssocLeaf/AssocChainMiddle/AssocBiChild are auto-registered as related types, but each root that
         // tests query independently still needs its own proxy.
+        POSTGRES_PHOTO_ASSET_REPOSITORY = JavAIPI.repository(PhotoAssetRepository.class, postgresConfig);
+        POSTGRES_PHOTO_ALBUM_REPOSITORY = JavAIPI.repository(PhotoAlbumRepository.class, postgresConfig);
+        POSTGRES_PHOTO_EXHIBITION_REPOSITORY =
+                JavAIPI.repository(PhotoExhibitionRepository.class, postgresConfig);
+        POSTGRES_PHOTO_COLLAGE_REPOSITORY = JavAIPI.repository(PhotoCollageRepository.class, postgresConfig);
+        POSTGRES_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, postgresConfig);
+        POSTGRES_SHELF_REPOSITORY = JavAIPI.repository(ShelfRepository.class, postgresConfig);
+        POSTGRES_LIBRARY_REPOSITORY = JavAIPI.repository(LibraryRepository.class, postgresConfig);
         POSTGRES_ASSOC_HUB_REPOSITORY = JavAIPI.repository(AssocHubRepository.class, postgresConfig);
+        // A @Query is refused when the repository is REALIZED, and only Postgres serves one -- so these two
+        // interfaces exist solely to keep declared queries off ArticleRepository/AssocHubRepository, which
+        // are (or could be) realized against the other two backends. See ArticleQueryRepository's javadoc.
+        POSTGRES_ARTICLE_QUERY_REPOSITORY = JavAIPI.repository(ArticleQueryRepository.class, postgresConfig);
+        POSTGRES_ASSOC_HUB_QUERY_REPOSITORY = JavAIPI.repository(AssocHubQueryRepository.class, postgresConfig);
         POSTGRES_ASSOC_LEAF_REPOSITORY = JavAIPI.repository(AssocLeafRepository.class, postgresConfig);
         POSTGRES_PLAIN_LEAF_REPOSITORY = JavAIPI.repository(PlainLeafRepository.class, postgresConfig);
         POSTGRES_ASSOC_CHAIN_TOP_REPOSITORY = JavAIPI.repository(AssocChainTopRepository.class, postgresConfig);
@@ -148,6 +193,8 @@ public final class JavAIEnvironment {
         NEO4J_ARTICLE_CLUSTER_REPOSITORY = JavAIPI.repository(ArticleClusterRepository.class, neo4jConfig);
         NEO4J_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, neo4jConfig);
         NEO4J_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, neo4jConfig);
+        // Article/Comment are already registered above -- Anthology's own member fields reach both.
+        NEO4J_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, neo4jConfig);
 
         // No CommentRepository/AttachmentRepository pre-registration here either: RepositoryBackendSpringDataMongo
         // recursively auto-registers related types too, matching Postgres's convenience rather than Neo4j's
@@ -163,6 +210,7 @@ public final class JavAIEnvironment {
         MONGO_COMMENT_REPOSITORY = JavAIPI.repository(CommentRepository.class, mongoConfig);
         MONGO_TAG_REPOSITORY = JavAIPI.repository(TagRepository.class, mongoConfig);
         MONGO_TAG_SET_REPOSITORY = JavAIPI.repository(TagSetRepository.class, mongoConfig);
+        MONGO_ANTHOLOGY_REPOSITORY = JavAIPI.repository(AnthologyRepository.class, mongoConfig);
 
         // Willing to wait, because in this harness a slow answer is real work rather than a stall: the model
         // runs on CPU inside the test container, and a long classification prompt legitimately takes minutes
@@ -194,6 +242,19 @@ public final class JavAIEnvironment {
 
     public static ArticleRepository postgresArticleRepository() {
         return POSTGRES_ARTICLE_REPOSITORY;
+    }
+
+    /** The Postgres configuration, for {@link JavAIPI#inTransaction} -- see {@link #POSTGRES_CONFIG}. */
+    public static ArticleQueryRepository postgresArticleQueryRepository() {
+        return POSTGRES_ARTICLE_QUERY_REPOSITORY;
+    }
+
+    public static AssocHubQueryRepository postgresAssocHubQueryRepository() {
+        return POSTGRES_ASSOC_HUB_QUERY_REPOSITORY;
+    }
+
+    public static JavAIPersistenceConfig postgresConfig() {
+        return POSTGRES_CONFIG;
     }
 
     public static ArticleRepository neo4jArticleRepository() {
@@ -288,6 +349,44 @@ public final class JavAIEnvironment {
 
     public static AssocBiParentRepository postgresAssocBiParentRepository() {
         return POSTGRES_ASSOC_BI_PARENT_REPOSITORY;
+    }
+
+    public static AnthologyRepository postgresAnthologyRepository() {
+        return POSTGRES_ANTHOLOGY_REPOSITORY;
+    }
+
+    public static ShelfRepository postgresShelfRepository() {
+        return POSTGRES_SHELF_REPOSITORY;
+    }
+
+    public static LibraryRepository postgresLibraryRepository() {
+        return POSTGRES_LIBRARY_REPOSITORY;
+    }
+
+    // ---- OMI-458: persisted per-model summaries ------------------------------------------------
+
+    public static PhotoAssetRepository postgresPhotoAssetRepository() {
+        return POSTGRES_PHOTO_ASSET_REPOSITORY;
+    }
+
+    public static PhotoAlbumRepository postgresPhotoAlbumRepository() {
+        return POSTGRES_PHOTO_ALBUM_REPOSITORY;
+    }
+
+    public static PhotoExhibitionRepository postgresPhotoExhibitionRepository() {
+        return POSTGRES_PHOTO_EXHIBITION_REPOSITORY;
+    }
+
+    public static PhotoCollageRepository postgresPhotoCollageRepository() {
+        return POSTGRES_PHOTO_COLLAGE_REPOSITORY;
+    }
+
+    public static AnthologyRepository neo4jAnthologyRepository() {
+        return NEO4J_ANTHOLOGY_REPOSITORY;
+    }
+
+    public static AnthologyRepository mongoAnthologyRepository() {
+        return MONGO_ANTHOLOGY_REPOSITORY;
     }
 
     public static Cortex cortex() {

@@ -1,0 +1,16 @@
+# Keeps this repository usable as a Docker build context, which it now is: omiai-platform builds JavAI
+# from source in a named additional build context (`javai-src`) while it depends on a -SNAPSHOT that lives
+# only in a local Maven repository. Without this, `docker/data` alone sends 562 MB of local container state
+# into the build for a build that wants source and poms.
+#
+# Mirrors xtrafe-swtch's own .dockerignore, which exists for exactly the same reason, plus the two entries
+# specific to this repository.
+**/target/
+.git/
+*.iml
+
+# Local Postgres/Neo4j/Mongo/Ollama state written by docker/docker-compose.yml -- by far the largest thing
+# here, and of no use to any build.
+docker/data/
+
+.idea/

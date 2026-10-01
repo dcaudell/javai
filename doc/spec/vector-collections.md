@@ -145,6 +145,78 @@ SubgraphResult<Article, RelatesTo> narrowed =
 JavAIList<Article> ranked = narrowed.sortByCosineDistance(queryVector);
 ```
 
+## `VectorIndex<T>`, in full
+
+The bare similarity-search container — no graph semantics, no `JavAIVectorizable` of its own, no dirty
+tracking. What distinguishes it from `JavAIList`/`JavAISet` is that it is a lookup structure rather than a
+node in the object graph, and that a realization of it may be *persistence-backed* rather than in memory
+(`javai-tagging`'s two tag indexes are, and are the reason the interface earns its keep).
+
+```java
+public interface VectorIndex<T> extends JavAISortable<T> {
+
+    void add(T item);
+    boolean remove(T item);
+    int size();
+
+    JavAIList<T> nearestN(EmbeddingVector reference, int n);
+    JavAIList<T> filterByMinSimilarity(EmbeddingVector reference, double threshold);
+
+    // -- the similarity each hit was ranked on, not just the order (OMI-460) --
+    List<Ranked<T>> nearestNRanked(EmbeddingVector reference, int n);
+
+    // -- narrowing, which returns another VectorIndex and therefore chains (OMI-460) --
+    VectorIndex<T> ofType(Collection<? extends Class<?>> candidateTypes);
+    VectorIndex<T> ofType(Class<?>... candidateTypes);              // default over the above
+
+    // -- the same query written as one call; defaults, so they cannot drift --
+    JavAIList<T> nearestN(EmbeddingVector, int n, Collection<? extends Class<?>>);
+    List<Ranked<T>> nearestNRanked(EmbeddingVector, int n, Collection<? extends Class<?>>);
+}
+```
+
+### Narrowing chains; searching ends the chain
+
+`ofType` returns a `VectorIndex`, not a result — the same design point `SubgraphResult extends
+KnowledgeGraph` makes above. A narrowed index is still an index, so it narrows again and answers every
+query the original did; a `JavAIList` appears only when a search is actually run:
+
+```java
+JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+        .ofType(Album.class)
+        .nearestN(reference, 20);
+```
+
+**Narrowing is not filtering the result, and this is the whole of why it exists.** Every realization applies
+the candidate types *before* the top-N is chosen: "the nearest N of these types", never "those of the
+nearest N that happen to be of these types". The second is what a caller is forced to approximate when an
+index cannot be narrowed — draw some multiple and discard — and it is silently wrong past the edge of
+whatever multiplier they guessed. It is the same ordering rule `NearestSpec` states for repository vector
+search, in the collection that has no repository.
+
+Three further rules, each stated because the alternative reading is plausible:
+
+- **Exact runtime class, not assignability.** `ofType(Animal.class)` does not match a `Dog`. This matches
+  `JavAITagRepository.taggedWith`/`rankedByTags`, which have taken candidate types on these terms since
+  before narrowing existed, and it is the only rule a persistence-backed realization can answer without
+  enumerating every loaded subtype of the class it was handed. Where an index holds *references* to
+  instances rather than the instances themselves (`VectorIndex<TaggableRef>`), the type is the referenced
+  instance's.
+- **Naming no types matches nothing**, rather than meaning "don't narrow" — the same rule
+  `taggedWith(tag, List.of())` already follows. Call the unnarrowed query to say "everything".
+- **Narrowing an already-narrowed index intersects.** `ofType(A, B).ofType(A)` is `ofType(A)`;
+  `ofType(A).ofType(B)` matches nothing.
+
+A narrowed view is read-only (`add`/`remove` refuse): an item added through a filter it does not satisfy
+would have to either vanish or falsify the filter.
+
+**Narrowing by anything other than type is not in this phase (OMI-461).** A general
+`matching(Predicate<? super T>)` would be exact for the in-memory realization and unanswerable for the
+persistence-backed ones, which can only push a type list into a query — honouring it there would mean
+fetching the whole index and filtering in the caller, which is the over-fetch this feature exists to remove,
+moved inside the library where nobody can see it. So it would have to refuse on two of the three
+realizations. Deferred rather than half-delivered.
+
 ## Related interfaces and annotations
 
 | Element | Kind | Purpose |

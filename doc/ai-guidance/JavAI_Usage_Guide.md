@@ -28,10 +28,10 @@ mutating it. JavAI Extensions makes that a property of the object model itself:
 | **Native knowledge-graph structure** | `KnowledgeGraph<N, E>` — nodes/edges plus hybrid pattern-match + similarity queries (`nearestSubgraph`) in one call, re-queryable on the result itself | `javai-collections` (Vector Collections) |
 | **Vector-aware standard collections** | `JavAIList`/`JavAISet`/`JavAIMap` — drop-in `java.util` replacements that are themselves `JavAIVectorizable` (a collection has its own `vector()`/`summaryVector()`) | `javai-model` |
 | **Persisted, searchable object graphs** | `JavAIPI.repository(YourRepository.class)` — CRUD plus `findNearestBy<Field>Vector`-style derived queries, against Postgres+pgvector or Neo4j, model-versioned automatically | `javai-persistence` (Persistence Bridge) |
-| **Provider-agnostic RAG completions** | `Cortex` (six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
+| **Provider-agnostic RAG completions** | `Cortex` (seven providers: OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
 | **Grounding a completion in real object-graph data** | `PromptContext`/`Contextable`/`ContextableObject` — a `query()` result, or any `JavAIList`/`Set`/`Map`, renders directly as prompt material, no manual serialization | `javai-model` (lives here, not `javai-completion` — see "Module layout" below) |
 | **Agentic Supervision** | `@SyncSupervision`/`@AsyncSupervision` on a method or constructor — a registered `SupervisionListener` can veto/rewrite a call (blocking) and/or react to it (fire-and-forget), at PRE/POST/EXCEPTION | `javai-supervision` |
-| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), and cross-type tag-similarity search (`tagSimilarityIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
+| **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggingsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`/`rankedByTags`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), cross-type tag-similarity search (`tagSimilarityIndex()`, narrowable to one type via `ofType(...)`/`nearestByTagSimilarity(...)`), and Taggregate — `@Taggregate` fields make a container's tags a derived aggregate of its members', and `@Taggregate(concatenate = true)` renders any taggable's tags as an embedded, searchable string (`tagTextIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
 | **Codegen Guidance** | A *different* annotation family (`@Requires`/`@Intent`/`@AgentWritable`/`@Nondeterministic`/`@Provenance`) that constrains what an AI agent may read/generate/modify in annotated code | `javai-annotations`; see `JavAI_Codegen_Guidance.md` |
 
 **The hard interop rule that shapes all of the above:** every class this library produces — woven or
@@ -54,7 +54,7 @@ below is for understanding what each module actually contributes, not for decidi
 | `javai-collections` | Vector Collections | `KnowledgeGraph`, `SubgraphResult`, `VectorIndex` |
 | `javai-persistence` | Persistence Bridge | `JavAIPI.repository(Class, JavAIPersistenceConfig)` against Postgres, Neo4j, or MongoDB |
 | `javai-completion` | Completion Fabric | `Cortex`/`CompletionRequest` |
-| `javai-tagging` | Tagging | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`, `JavAITagRepository` (tag-based queries, similarity search, LLM classification) |
+| `javai-tagging` | Tagging | `@Taggable`/`@TagIgnore`/`@Taggregate`, `Tag`/`TagSet`, `JavAITagRepository` (tag-based queries, similarity search, LLM classification, Taggregate + tag text) |
 
 `javai-model` is a *physical*, not conceptual, module — it exists because `JavAIVectorizable.query()`
 returns `JavAIList<T>` and `JavAIList` implements `JavAIVectorizable` right back, so those types (plus the
@@ -103,6 +103,10 @@ have to live together upstream of everything else. Don't be surprised to find `P
 | `<T> JavAIList<T> query(EmbeddingVector reference, Class<T> type, int maxDepth)` | `JavAIVectorizable` | Yes | Same, with an explicit traversal-depth limit. |
 | `EmbeddingVector fieldVector(String fieldName)` | `JavAIVectorizable` | Yes | Dynamic (string-keyed) counterpart to the per-field accessors below. |
 | `<field>Vector()` — e.g. `titleVector()` for a field named `title` | Synthesized, one per `@Vectorize` field | Yes | Named accessor for that one field's own contribution — real method, real name, not reflection-only. |
+| `EmbeddingVector vector(String modelId)` | `JavAIVectorizable` | Yes | The same aggregate **restricted to one embedding model** — `@Vectorize` fields and `@ExternalVector`s alike. Absent when this object carries nothing from that model. Only matters once an object has more than one model on it; see "@ExternalVector" below. |
+| `EmbeddingVector summaryVector(String modelId)` | `JavAIVectorizable` | Yes | `summaryVector()` restricted to one model — same decay-weighted formula, admitting only that model's vectors. Uncached (it recombines vectors that are themselves cached). Persist it with `@Summary(persistModelSummaries = true)` when you rank a corpus by it rather than asking one object. |
+| `EmbeddingVector externalVector(String vectorName)` | `JavAIVectorizable` | Yes | An `@ExternalVector`'s current value, or absent. **Never computes, never blocks, never calls a provider.** Throws if the class declares no such name. |
+| `<name>Vector()` — e.g. `pixelsVector()` for `@ExternalVector(name = "pixels")` | Synthesized, one per `@ExternalVector` | Yes | Named accessor for that external vector, exactly like the `@Vectorize` one above. |
 | `addDependent(Object)` / `dependents()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Registers/lists what to mark dirty when this object changes. `JavAIRuntime` calls this for you via the woven setter. |
 | `isFieldDirty()` / `markFieldDirty()` / `clearFieldDirty()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Tracks whether this object's own `vector()` is stale. |
 | `isSummaryDirty()` / `markSummaryDirty()` / `clearSummaryDirty()` | `JavAIDirtyTracking` | **No** — internal bookkeeping | Tracks whether this object's `summaryVector()` is stale (a descendant changed). |
@@ -128,8 +132,10 @@ see "Collection fields on a persisted `@Entity`" below before choosing one.
 | `@VectorizeIgnore` | field | Explicitly excludes a field from the local embedding. Wins over `@Vectorize` if a field somehow carries both. |
 | `@Summary` | field or class | This field (a single reference or a `JavAIList`/`Set`/`Map`) folds into the container's `summaryVector()`, decay-weighted, cycle-safe. **When persisted, this makes the container a write-coordination point** — see the note below. |
 | `@Summary(concatenate = true)` | field or class | Additionally opts into **concatenated text vectoring**. On a *class*: embed my own `@Vectorize` fields as text. On a *field*: absorb that child's (or collection's members') text into mine. Defaults to `false`; adds to `@Summary`'s meaning rather than replacing it. |
+| `@Summary(persistModelSummaries = true)` | **class only** | Persists this container's per-model summary vectors, so a non-ambient `nearestBySummary()` is an indexed lookup instead of an in-memory fold. Which models is derived from the `@ExternalVector`s its `@Summary` subtree declares, transitively. Postgres. Refused on a field. See "Ranking containers by a non-text model" below. |
 | `@SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field or class | Search-semantic visibility, independent of Java access modifiers. `PRIVATE` on a *field* blocks `query()` from traversing through it at all. `PRIVATE` on a *class* blocks instances from being returned as a match (but traversal still passes through them, so their own descendants stay reachable). `PUBLIC`/`PROTECTED` currently behave identically. |
-| `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. |
+| `@ExternalVector(name, keyField, model)` | class, **repeatable** | Declares a vector JavAI **stores but never computes** — supplied from outside the process, in its own model. Gains a `<name>Vector()` accessor and a `findNearestBy<Name>Vector` query. See the section below. |
+| `@EmbeddingModel("model-id")` | class, field, method, or parameter | Overrides which embedding model computes this element's vector, instead of the default. ⚠️ Defined but **not yet read by anything** — declaring it changes no behaviour today. |
 | `@JavAIGraphNode` / `@JavAIEdge` | class | **Documentation/intent-signaling only — not woven, no runtime behavior.** To actually make a class a `KnowledgeGraph` participant, hand-declare `implements JavAIGraphNode` / `implements JavAIEdge` directly (both are empty marker interfaces in `javai-collections` — there are no method bodies to weave, so annotating alone does nothing). Using the annotation *and* the `implements` together is the documented, correct pattern; the annotation alone is not enough. |
 
 ### ⚠️ What `@Summary` implies once the container is persisted
@@ -157,13 +163,11 @@ Three consequences worth knowing before you annotate:
 Full contract, including what happens when a recomputation fails, is in `persistence-support-matrix.md`'s
 "Concurrency" section. On Neo4j/MongoDB summaries are still written inline.
 
-### Collection fields on a persisted `@Entity` — two shapes, decided by the declared type
+### Collection fields on a persisted `@Entity` — declare them by the interface
 
 When a class is both `@JavAIVectorizable` and a JPA `@Entity` persisted through `JavAIRepository` on
-**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides how it is
-stored. Both shapes are fully supported, and one entity can carry both.
-
-**1. Interface-typed + an ordinary JPA association → a native Hibernate association.** The recommended shape:
+**Postgres**, how you *declare* a collection field — not which annotation you put on it — decides whether it
+can be mapped at all. **Since 0.1.10 there is one shape:**
 
 ```java
 @OneToMany(cascade = CascadeType.ALL)
@@ -177,25 +181,29 @@ field is a `PersistentJavAIList`/`PersistentJavAISet`/`PersistentJavAIMap`, i.e.
 collection, so vectors and dirty-tracking survive the load. You write **nothing** JavAI-specific to get
 this — no `@CollectionType`; the backend attaches it at mapping time. Two requirements, both mechanical:
 declare the field by the JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), and don't make it `final`,
-since Hibernate assigns the field its own instance.
+since Hibernate assigns the field its own instance. A `Map` also wants `@MapKeyColumn`.
 
-**2. Concrete-typed with no association annotation → JavAI's own side-table storage.**
+**⚠️ Breaking change in 0.1.10 (OMI-277): the concrete-typed field is now refused.**
 
 ```java
 private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 ```
 
-Stored in `javai_collection_members`, a shared side table the persistence backend owns, and hydrated
-reflectively back into the instance your own constructor created — so `final` is fine here. No join table and
-no FK integrity; `Map` keys must be `String` in this phase.
+That used to be a second supported shape, stored in a side table the backend owned. It is rejected at
+repository-registration time now, with an `IllegalArgumentException` naming the interface to use — and the
+table is gone. It was withdrawn rather than repaired because it was **silently root-only in both
+directions**: reached through an association the collection came back empty, and saved through one its
+members were never written. It could not be made lazy where it stood either, since the field holds a `final`
+instance of a `final` class and Hibernate manages a collection by substituting its own.
 
-**The one combination that fails fast:** a *concrete*-typed field carrying `@OneToMany`/`@ManyToMany` is
-rejected with an `IllegalArgumentException` at repository-registration time, naming the interface-typed fix.
-It can't be honored — you'd silently get JavAI's own "owner owns its members" cascade instead of the JPA
-semantics you asked for, which is actively unsafe for `@ManyToMany`.
+**Migrating:** change the declared type to the interface, drop `final`, and add the JPA annotation you would
+have written for a plain collection. The initializer stays exactly as it is. Any *caller* that declared its
+receiver as the concrete type (`JavAIArrayList<Comment> cs = article.getComments();`) needs the same one-word
+change.
 
 **Backend caveat:** native associations are **Postgres-only**. Neo4j and MongoDB classify collection fields by
-declared type and store both shapes their own way, so an interface-typed field buys you nothing there. Check
+declared type, accept either declaration, and store both their own way — so the interface-typed field buys
+you nothing there, but it is what makes one entity portable across all three. Check
 [`persistence-support-matrix.md`](persistence-support-matrix.md) — it has the per-backend tables for JPA
 annotations, derived-finder capabilities, and collection types — before relying on any of this.
 
@@ -221,8 +229,9 @@ annotations, derived-finder capabilities, and collection types — before relyin
 |---|---|---|
 | `@Taggable` | class | Unwoven marker — same shape as `@JavAIGraphNode`, not the fully-woven shape of `@JavAIVectorizable`. Declares that instances of this class can carry Tags, but synthesizes no methods and no interface implementation; independent of `@JavAIVectorizable`/`@JavAIGraphNode` (a class can carry any subset of all three). Always pair it with hand-implementing the *interface* `Taggable` (empty, marker-only) — the annotation alone doesn't give you that interface, and generic tagging APIs (`taggedWith`'s `candidateTypes` parameter) are bounded by it. **Shares its simple name with that interface** (`dev.xtrafe.javai.annotations.Taggable` the annotation vs. `dev.xtrafe.javai.tagging.Taggable` the interface) — different packages, so `@Taggable class Foo implements Taggable` compiles with one `import` covering both simple names, but write the interface fully-qualified (`implements dev.xtrafe.javai.tagging.Taggable`) if your file already imports something else named `Taggable`, or if you're generating code without import statements at all. |
 | `@TagIgnore` | field | Excludes an otherwise-`@dev.xtrafe.javai.annotations.PromptContext` field from the text a classification prompt sees, without affecting what that field renders as for ordinary RAG completions. A field with no `@PromptContext` to begin with needs no `@TagIgnore` — it was never classifier-visible either way. |
+| `@Taggregate` | field, class | Mirrors `@Summary`'s grammar exactly, in the tagging lineage. On a **field** holding a `Taggable` reference or a JavAI collection of them: absorb that target's taggings into the declaring object's aggregate — the container gains derived `Tagging` rows (`source = "aggregate"`, mean-contribution affinities), maintained by `JavAITagRepository`. On a **class**, `@Taggregate(concatenate = true)`: this type's tags render as one deterministic string and embed as a **tag-text vector**, searchable via `tagTextIndex()`; `concatenate` is meaningful only at this placement. Requires exactly what `Taggable` requires — the marker interface and an `@Id UUID` — on container and members alike; never `@JavAIVectorizable`, on either. Nothing is woven: the aggregate and the tag text live repository-side. See "Taggregate" below. |
 
-See "Tagging" below for the full instance-based API (`JavAITagRepository`) these two annotations feed into.
+See "Tagging" below for the full instance-based API (`JavAITagRepository`) these annotations feed into.
 
 ### Codegen Guidance — a distinct feature, see the sibling file
 
@@ -230,6 +239,173 @@ See "Tagging" below for the full instance-based API (`JavAITagRepository`) these
 `@Nondeterministic`/`@Costly`, `@Provenance` — these don't affect runtime behavior at all. They constrain
 what *you*, the AI agent, may read, generate, or modify in code that carries them. Full rules in
 `JavAI_Codegen_Guidance.md`.
+
+## Vectors JavAI cannot compute: `@ExternalVector`
+
+Everything above assumes JavAI can produce a vector on demand — a read of a stale value calls the configured
+provider and waits. Some vectors do not work that way. An image embedding is produced by a different model,
+in a different process, from bytes JavAI must never read, and it arrives seconds or minutes later. Declaring
+that field `@Vectorize` would be wrong in every particular: it would embed the *filename*, block a read on a
+provider that cannot answer, and land a 1152-dimension vector in the middle of 1024-dimension text ones.
+
+```java
+@Entity
+@JavAIVectorizable
+@ExternalVector(name = "pixels", keyField = "contentHash", model = "siglip2-so400m-p14-384/pp1")
+public class Image extends Asset {
+
+    @Vectorize private String caption;   // JavAI computes this one, as usual
+    private String contentHash;          // identifies the bytes; JavAI never reads them
+}
+```
+
+**Declare it on the type, not the field.** The field identifying the content is usually inherited from a
+shared base, while only some subclasses have a vector of that kind — and an annotation on a field applies to
+everything inheriting it and cannot be overridden on one subclass. Type-level also lets one class declare
+several (`@ExternalVector` is repeatable): a video with both a keyframe vector and an audio vector, naming
+the same key field with two different models.
+
+### Reading one
+
+```java
+EmbeddingVector pixels = image.pixelsVector();   // or image.externalVector("pixels")
+if (pixels.isAbsent()) {
+    // Either nothing has been supplied yet, or the bytes changed since it was.
+}
+```
+
+| | |
+|---|---|
+| Before anything is supplied | `EmbeddingVector.absent()` |
+| After `contentHash` changes | `absent()` again — the stored vector describes *different content* |
+| Provider calls | **none, ever** |
+| Blocking | **none, ever** — under every `EmbeddingConsistencyMode`, and inside a save |
+
+⚠️ **Do not reach for `EVENTUAL_CONSISTENCY` to get this.** That mode still blocks a vector's *first* read
+(there is no prior value to serve) and still yields to the accuracy a save forces — so both would end up
+waiting on a provider that cannot produce this vector, and asking the *text* provider for it. The
+consistency-mode setting simply does not apply to external vectors; you need no configuration at all.
+
+### Supplying one
+
+From whatever consumes your pipeline's output — it needs only an id, a vector, and the key the model
+actually embedded:
+
+```java
+images.supplyVector(event.assetId(), "pixels",
+        new EmbeddingVector(event.values(), "siglip2-so400m-p14-384/pp1", event.dims(), event.computedAt()),
+        event.contentHash());
+```
+
+**`computedFor` is what makes this safe under at-least-once delivery**, and it is not optional ceremony. If
+the asset has moved on to different content since the model ran, the vector is discarded and `supplyVector`
+returns `false` — a normal outcome of a slow producer racing an edit, not a failure to handle. Redelivering
+the same event simply stores the same vector again.
+
+If you already hold the object rather than just its id, `JavAIRuntime.supplyVector(image, "pixels", vector,
+hash)` does the same thing in memory; save as usual afterwards.
+
+**Fold every dimension of the model's identity into `model`** — name, weights version, preprocessing version
+(`siglip2-so400m-p14-384/pp1`). Storage is partitioned by that string, so changing it makes the new vectors a
+separate, additively-migratable set rather than an in-place overwrite. This is the difference between a model
+upgrade you can run and one you cannot.
+
+### Finding what is still owed
+
+```java
+List<Image> backlog = images.findPendingVector("pixels", 500);
+```
+
+Covers both causes at once, because they mean the same thing to a producer: never supplied, and supplied for
+content since replaced. Intended for backfills and for re-driving after a dead-letter drain. ⚠️ It is a scan
+of the type — right for those two jobs, wrong for polling per upload. For "is *this* upload processed yet",
+keep your own status row.
+
+### Searching one
+
+Nothing new to learn — the ordinary convention, with the external vector's name:
+
+```java
+public interface ImageRepository extends JavAIRepository<Image> {
+    List<Image> findNearestByPixelsVector(EmbeddingVector reference, int limit);
+}
+
+images.nearestBy("pixels").to(siglipQuery).limit(20).ranked();   // or the builder
+```
+
+⚠️ **The reference vector must come from the same model.** A query embedding produced by your text provider
+cannot search an image index — not less well, but not at all. Embedding a text query into image space needs
+that model's own text tower, which is your pipeline's job to expose, not JavAI's.
+
+### Two models on one object
+
+Once an object carries both, "this object's vector" is two questions, and each aggregate names which:
+
+```java
+image.vector();                                    // the text model, exactly as before
+image.vector("siglip2-so400m-p14-384/pp1");        // the image one
+album.summaryVector("siglip2-so400m-p14-384/pp1"); // what this album *looks* like
+album.summaryVector();                             // what it reads like
+```
+
+They are separate on purpose. Two models' vectors cannot be combined — their cosine similarity is not a
+weaker answer but no answer — and JavAI refuses rather than producing a meaningless number. Combining two
+models' *rankings* (reciprocal rank fusion and friends) is a real technique, but the weighting is specific to
+your domain, so it is your code, not the library's.
+
+### Ranking containers by a non-text model
+
+`album.summaryVector(imageModel)` answers for *one* album. Ranking a corpus by it is a different cost: every
+candidate has to be folded, per query. Persist the summaries and it becomes an indexed lookup:
+
+```java
+@Entity
+@JavAIVectorizable
+@Summary(persistModelSummaries = true)             // ← opt in, on the container type
+public class Album {
+    @Summary
+    private JavAISet<Image> images;                // Image declares @ExternalVector(model = "siglip2…")
+}
+
+// then, either way:
+albums.nearestBySummary().to(reference).limit(10).ranked();
+```
+
+**You never name the model, and you never had to.** JavAI picks the storage from `reference.modelId()`, so
+the same call searches the text summary or the pixel summary depending on the vector you hand it — including
+through the method-name idiom, `findNearestBySummaryVector(reference, 10)`.
+
+**When that is worth saying out loud, say it:**
+
+```java
+albums.nearestBySummary().inModel("siglip2-so400m-p14-384/pp1")
+      .to(reference).limit(10).ranked();
+```
+
+An album has *two* coherent summaries, and `.to(album.summaryVector())` versus
+`.to(album.summaryVector(PIXELS))` differ by one token — both valid, both ranked correctly against their own
+storage, so the wrong one answers the *other* question with nothing to notice. `inModel(...)` names which you
+meant and refuses a reference from anywhere else. ⚠️ It is an assertion, not a selector: it buys legibility
+and a check, never a capability, and it is refused on a field, combined or concatenated-text search, where
+there is only ever one model the vector could be in.
+
+**The search answers with or without the flag.** Without it, JavAI folds the candidates in memory — the same
+value and the same ranking, at a cost proportional to your corpus, logged once so it is not invisible. The
+flag buys the index, not the answer. Nested containers work at every tier (`Exhibition → Album → Image`), and
+the models are read from your declarations rather than from what happens to be stored, so turning the flag on
+mid-project is a `reindex()` and nothing more.
+
+⚠️ **What it costs:** one extra row written per model on every recomputation of the container, and a queue row
+each time an external vector is supplied anywhere beneath it — because that, not `save`, is when a container's
+per-model summary actually goes stale. A container nobody ranks this way should leave the flag off.
+
+### The one rule it is exempt from
+
+Elsewhere in JavAI, a `@Vectorize` field mutated by anything other than its woven setter goes silently stale
+forever. An `@ExternalVector` has no such exposure: its validity is re-derived on every read by comparing the
+key field's current value, so a `contentHash` written by reflection, by a framework, or by any other route is
+caught exactly like one written through a setter. That is affordable here precisely because the key is a
+short identifier standing in for content JavAI never touches.
 
 ## Tagging: `JavAITagRepository`, an instance, not a woven mechanism
 
@@ -360,18 +536,32 @@ association on top of it.
 | Method | What it does |
 |---|---|
 | `JavAIList<Tag> tagsOf(Object instance)` | Every tag currently applied to `instance`. |
+| `List<Tagging> taggingsOf(Object instance)` | Every tagging on `instance`, carrying what a bare `Tag` cannot: `affinity` (how strongly) and `source` (`"manual"`/`"auto"`/`"aggregate"` — who applied it). On a `@Taggregate` container this read also trues the aggregate up first (see "Taggregate" below). |
+| `List<RankedTaggableRef> rankedByTags(List<Tag> tags, List<Class<? extends Taggable>> candidateTypes, int limit)` | Exact multi-tag ranking: every instance carrying at least one query tag, scored `Σ` of its affinity for each (`null` counting 1.0), descending — one indexed query, freely spanning `TagSet`s. The structural counterpart to querying `tagSimilarityIndex()` with `tagQueryVector(tags)`. |
 | `JavAIList<TaggableRef> taggedWith(Tag tag, List<Class<? extends Taggable>> candidateTypes)` | Every instance, across the given `@Taggable` types, carrying `tag` — genuinely heterogeneous, one query per backend regardless of how many `candidateTypes` you pass. |
 | `void addTag(Object instance, Tag tag)` / `addTag(Object instance, Tag tag, double affinity)` | Applies `tag` to `instance` (`source = "manual"`), optionally with an affinity/match-strength score. Idempotent — a given `(tag, instance)` pair has zero or one association by construction. |
 | `void removeTag(Object instance, Tag tag)` | Removes the association, if present. |
 | `boolean hasTag(Object instance, Tag tag)` | Structural presence check. |
 | `ClassificationResult classify(Object instance, TagSet tagSet)` | One LLM call via the constructor-supplied `Cortex`: marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones), shows the model only `tagSet`'s candidate **slugs**, and diffs the result against `instance`'s existing `source = "auto"` taggings *for this `TagSet` specifically* — adds/updates/removes as needed, never touching `source = "manual"` taggings even for tags in the same set. Client-invoked only; never triggered automatically by a `TagSet` edit. |
 | `List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet)` | Convenience batch form — still one LLM call per instance internally, not a fan-out you hand-loop yourself. |
-| `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. |
+| `ClassificationResult applyClassification(Object instance, TagSet tagSet, List<AppliedTag> results)` | The same reconciliation as `classify`, for a classifier that **is not an LLM** — an image tagger, a rules engine, anything returning `(tag, confidence)` of its own. Needs no `Cortex`. ⚠️ A tag from another `TagSet` throws here, where `classify` silently discards a hallucinated slug: a model inventing a slug is expected noise, but a caller passing the wrong set creates an automatic tagging no later run could ever retract. |
+| `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. Narrowable to one type with `ofType(...)`. |
+| `JavAIList<TaggableRef> nearestByTagSimilarity(EmbeddingVector reference, int n, List<Class<? extends Taggable>> candidateTypes)` | The nearest `n` instances **of one of `candidateTypes`** by tag-summary vector — the type restriction goes into the store's query, applied before the top-`n` is chosen. Exactly `tagSimilarityIndex().ofType(candidateTypes).nearestN(reference, n)`. |
+| `JavAIList<TaggableRef> nearestByTagText(EmbeddingVector reference, int n, List<Class<? extends Taggable>> candidateTypes)` | The same, over the tag-**text** index. |
 
 `ClassificationResult` is `record ClassificationResult(TaggableRef instance, TagSet tagSet, List<AppliedTag>
 appliedTags)`, where `AppliedTag` is `record AppliedTag(Tag tag, Double affinity, String reasoning)` —
 `affinity`/`reasoning` are nullable, since a classifier is free to say "this applies" without a strength
 score or explanation.
+
+⚠️ **Prefer `applyClassification` to a loop of `addTag`** when a classifier hands you several tags at once.
+The tag-summary index is recomputed once per call there and once per tag in a loop, and each recomputation
+resolves every association the instance already has — so twenty tags applied one at a time cost on the order
+of two hundred id lookups instead of twenty.
+
+⚠️ **Tag an instance you loaded, not one you reached through a lazy association.** JavAI resolves a
+persistence proxy before recording a tag, so both work — but resolving forces the load, which on a detached
+graph raises `LazyInitializationException`. If you hold an id, load it and tag that.
 
 **Homogeneous vs. heterogeneous `taggedWith`** — the same method either way; the shape of `candidateTypes`
 is what decides which you get, continuing the `breach`/`recipe`/`reply` example above:
@@ -405,10 +595,10 @@ EmbeddingVector adHoc = VectorMath.centroid(tags.stream().map(Tag::vector).toLis
 JavAIList<TaggableRef> similarByTags = index.nearestN(adHoc, 20);
 ```
 
-**Heterogeneous by default, homogeneous by client-side filter** — `tagSimilarityIndex()` takes no type
-parameter (the underlying vector is a property of the *tagging*, not of the tagged type), so a plain
-`nearestN`/`filterByMinSimilarity` call naturally returns a mix of every `@Taggable` type that happens to
-rank close to the reference:
+**Heterogeneous by default, narrowed on request** — the index spans every `@Taggable` type at once (the
+underlying vector is a property of the *tagging*, not of the tagged type), so a plain `nearestN` returns a
+mix of whatever ranks close to the reference. Ask for one type and the type restriction goes into the
+store's own query, before the top-N is chosen:
 
 ```java
 EmbeddingVector securityVector = ((JavAIVectorizable) security).summaryVector();
@@ -417,13 +607,27 @@ EmbeddingVector securityVector = ((JavAIVectorizable) security).summaryVector();
 // by how similar each one's whole tag collection is to the reference -- no type restriction at all.
 JavAIList<TaggableRef> similarOfAnyType = index.nearestN(securityVector, 10);
 
-// Homogeneous: filter the same result down to one @Taggable type yourself -- there's no "candidateTypes"
-// parameter here the way taggedWith has one, since ranking is over the aggregate tag vector, not a
-// per-type index.
-List<TaggableRef> similarArticlesOnly = similarOfAnyType.stream()
-        .filter(ref -> ref.taggableType().equals(Article.class.getName()))
-        .toList();
+// Narrowed: ofType(...) returns another VectorIndex, so it chains; the search ends the chain.
+JavAIList<TaggableRef> similarArticles = index.ofType(Article.class).nearestN(securityVector, 10);
+
+// Or in this module's own vocabulary, the same shape taggedWith/rankedByTags use:
+JavAIList<TaggableRef> same = tagging.nearestByTagSimilarity(securityVector, 10, List.of(Article.class));
+
+// With the score each hit was ranked on -- plain cosine in [-1, 1], on every backend:
+List<Ranked<TaggableRef>> withScores = index.ofType(Article.class).nearestNRanked(securityVector, 10);
 ```
+
+⚠️ **Do not filter the result instead.** Drawing `limit × some multiple` and discarding the wrong types is
+wasteful inside the multiplier and *silently wrong* outside it: an instance ranked below the draw is simply
+absent, and nothing in the result says so. `ofType(...)` narrows before the limit is applied, so `n` hits
+means `n` hits of that type.
+
+Three rules worth knowing:
+
+- **Exact runtime class, not assignability.** `ofType(Animal.class)` does not match a `Dog` — the stored
+  discriminator is `instance.getClass().getName()`. Same rule `taggedWith`/`rankedByTags` have always used.
+- **Naming no types matches nothing**, not everything. Call the unnarrowed query to say "everything".
+- **Narrowing intersects.** `ofType(A, B).ofType(A)` is `ofType(A)`; `ofType(A).ofType(B)` matches nothing.
 
 `TaggableRef` is `record TaggableRef(String taggableType, UUID taggableId)`, where `taggableType` is the
 tagged instance's **fully-qualified** class name (`instance.getClass().getName()`) — deliberately not the
@@ -436,6 +640,72 @@ The underlying vector is a decay-weighted, affinity-scaled sum over `Tag.summary
 applied to an instance (so a tag's own recursive tags — a `Tag` can itself be `@Taggable` — contribute too),
 recomputed eagerly on every `addTag`/`removeTag`/`classify` call rather than lazily, since combining
 already-cached tag vectors is pure arithmetic with nothing to defer.
+
+For an ad hoc collection of tags, `tagging.tagQueryVector(List.of(tagA, tagB))` builds a query vector with
+the same weighted-sum construction the index itself uses — the fuzzy counterpart of `rankedByTags` over the
+same tags.
+
+### Taggregate — a container's tags, derived from its members'
+
+An `Album` of fifty tagged images is itself *about* something; `@Taggregate` fields make that explicit. Mark
+the fields whose targets contribute (a single `Taggable` reference, or a JavAI collection of them — the
+owning field decides, never the member), and the container gains ordinary `Tagging` rows with
+`source = "aggregate"`: per tag, the **mean contribution over members** (a member's affinity, `null`
+counting 1.0, absent counting 0) — so a tag on every member at 0.99 aggregates to 0.99, on one member of
+ten to 0.099, and an untagged member dilutes everything. Every tag query (`taggedWith`, `taggingsOf`,
+`rankedByTags`, the vector indexes) then works on containers with no new query shape, and containers of
+containers compose — a member's own aggregate rows are inputs too, one level deep, recursion-free.
+
+```java
+public class Album implements dev.xtrafe.javai.tagging.Taggable {
+    @Id private UUID id;
+    @Taggregate private JavAISet<MediaImage> mediaImages;   // members' tags flow up
+}
+```
+
+**The lineage rule**: container and members need exactly what tagging always needs — the `Taggable` marker
+interface and an `@Id UUID` — never `@JavAIVectorizable`, on either side. Woven and unwoven types mix
+freely in one graph; nothing about the aggregate is woven; a `@MappedSuperclass` field declaration applies
+to every subclass.
+
+**The container must be a persisted entity with ordinary mapped associations** — a `@OneToMany`,
+`@ManyToMany` or a to-one reference. That is not an extra requirement so much as where membership now
+lives: JavAI reads it from the join tables Hibernate already maintains, rather than keeping a copy.
+
+**Staleness needs nothing from you.** Tagging a member (`addTag`/`removeTag`/`applyClassification`) marks
+every container holding it and recomputes them after your transaction commits — including containers of
+containers, and including a container this process never loaded. There is no reconciler to write, no
+loader callback to supply, no bootstrap pass to run, and no cold start: a container saved a moment ago and
+never touched since is correct the first time one of its members is tagged.
+
+| Method | What it does |
+|---|---|
+| *(automatic)* | Everything above. Tag a member; the containers are right. |
+| `int rebuildTaggregates()` | ⚠️ **The after-a-restore repair, not a routine call.** Rebuilds every container from its members. Needed because promotion, a restored backup and direct SQL write rows the tagging calls never observe, and after those the aggregates are wrong with nothing to notice. Cost is proportional to your whole world — a maintenance path, never a request one. |
+
+⚠️ **One honest consequence.** Adding or removing a *member* changes what the aggregate should say (the
+mean dilutes) without any tag being mutated, so nothing recomputes at that instant. The next tag mutation
+beneath that container corrects it, and `rebuildTaggregates()` corrects it without one. The alternative —
+recomputing on every `save()` of anything that happens to be contained — is a cost on a write path most
+applications would never need it on.
+
+### Concatenated tag text — tags as searchable language
+
+Independent of aggregation, any taggable type can opt in with `@Taggregate(concatenate = true)` at class
+level: its tags render as one deterministic string — display names (`en`, slug fallback), strongest first
+(affinity descending, then slug), `", "`-joined, capped at the top 50 — embedded and stored beside the
+text, recomputed at the same trigger points as the tag-summary vector.
+
+| Method | What it does |
+|---|---|
+| `String tagText(Object instance)` | The stored rendered string, or `null` if none. |
+| `EmbeddingVector tagTextVector(Object instance)` | Its stored embedding, or absent. |
+| `VectorIndex<TaggableRef> tagTextIndex()` | The cross-type index over every stored tag-text vector — embed a statement, `nearestN` it, get back the instances whose *tags read most like it*. Like `tagSimilarityIndex()`, its own `add`/`remove` refuse, and it narrows the same way (`ofType(...)`, or `nearestByTagText(...)`). |
+
+Because the text embeds through the same model as any other text in your system, pixel-derived machine
+tags rendered as words land in the same embedding space as captions and bios — "albums about lakes" is one
+`tagTextIndex().nearestN(...)` call, no cross-model fusion. Containers that aggregate get this for free;
+a non-aggregating class uses the class-level placement alone.
 
 ## Installing the library
 
@@ -450,7 +720,7 @@ mvn install   # builds and installs all 9 modules to the local ~/.m2, in depende
 ```
 
 Then add the **full module set** to your own project's `pom.xml`, at the version declared in this
-repository's root `pom.xml` (currently `0.1.9` — check there directly rather than assuming it
+repository's root `pom.xml` (currently `0.1.10` — check there directly rather than assuming it
 hasn't changed). Install everything rather than picking a subset — the modules are small and designed to
 interoperate, and not reasoning about which subset a given task needs is one less decision to make:
 
@@ -458,42 +728,42 @@ interoperate, and not reasoning about which subset a given task needs is one les
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-vector</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-model</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-substrate</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-supervision</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-collections</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-persistence</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-completion</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 <dependency>
   <groupId>io.github.dcaudell</groupId>
   <artifactId>javai-tagging</artifactId>
-  <version>0.1.9</version>
+  <version>0.1.10</version>
 </dependency>
 ```
 
@@ -504,14 +774,14 @@ For a Gradle project, the equivalent `build.gradle.kts` dependency block is:
 
 ```kotlin
 dependencies {
-    implementation("io.github.dcaudell:javai-vector:0.1.9")
-    implementation("io.github.dcaudell:javai-model:0.1.9")
-    implementation("io.github.dcaudell:javai-substrate:0.1.9")
-    implementation("io.github.dcaudell:javai-supervision:0.1.9")
-    implementation("io.github.dcaudell:javai-collections:0.1.9")
-    implementation("io.github.dcaudell:javai-persistence:0.1.9")
-    implementation("io.github.dcaudell:javai-completion:0.1.9")
-    implementation("io.github.dcaudell:javai-tagging:0.1.9")
+    implementation("io.github.dcaudell:javai-vector:0.1.10")
+    implementation("io.github.dcaudell:javai-model:0.1.10")
+    implementation("io.github.dcaudell:javai-substrate:0.1.10")
+    implementation("io.github.dcaudell:javai-supervision:0.1.10")
+    implementation("io.github.dcaudell:javai-collections:0.1.10")
+    implementation("io.github.dcaudell:javai-persistence:0.1.10")
+    implementation("io.github.dcaudell:javai-completion:0.1.10")
+    implementation("io.github.dcaudell:javai-tagging:0.1.10")
 }
 ```
 
@@ -609,11 +879,127 @@ runtime, or the shape isn't worth a method.
   results and paging *do* work on Neo4j.
 - **`Ranked.similarity()` is plain cosine in `[-1, 1]`** on every backend — the same number `similarityTo`
   gives you in process, so a threshold means the same thing whichever store answered. (`Ranked.distance()` is
-  `1 - similarity` if you would rather think in distances.)
+  `1 - similarity` if you would rather think in distances.) `Ranked` is
+  `dev.xtrafe.javai.vector.Ranked` — it moved out of `dev.xtrafe.javai.persistence` when
+  `VectorIndex.nearestNRanked` needed the same type, so an older import needs updating and nothing else.
+
+## Counting, and paging from an arbitrary offset
+
+```java
+long total = albums.count();                                  // no rows hydrated
+
+// page 3 of 20, asking for one row more than the page holds so you learn whether page 4 exists
+List<Album> window = albums.browse(ownerId, Windows.of(60, 21, Sort.by("title")));
+boolean hasMore = window.size() > 20;
+```
+
+- **`count()`** is the unconditional count, scoped to the repository's own entity type. A predicate's count
+  already had `countBy…` and `@Query`; this is "how many are there". Do not reach for `findAll().size()` —
+  that hydrates every row, and its stored vectors, to produce one number.
+- **`Windows.of(offset, limit)`** is a `Pageable` whose offset is independent of its size.
+  `PageRequest.of(page, size)` derives offset as `page × size`, so it cannot express offset 60 with a limit
+  of 21 — `PageRequest.of(60 / 21, 21)` is offset **42** and returns different rows with no error. Use
+  `Windows` wherever the offset is not a multiple of the limit, which is every forever-scroll that probes
+  for a next page. `getPageNumber()` reports `offset / limit` and `withPage(n)` is page-aligned, so the two
+  do not round-trip; `next()`/`previousOrFirst()` move by the limit from where the window actually starts.
 
 ⚠️ **MongoDB only:** a vector search index created before this feature existed lacks the `_id` filter path
 narrowing needs, and index definitions are not amended in place. If a narrowed search fails on an index an
 older version created, drop it and let JavAI recreate it.
+
+## Writing a query out: `@Query`, and targeted writes with `@Modifying`
+
+A derived name can express a predicate over an entity's own properties and nothing else. When you need a
+**grouped aggregate** — one count per id rather than one total — a projection, or a write that touches one
+column, put the query on the method.
+
+```java
+public interface LikeRepository extends JavAIRepository<Like> {
+
+    // a grouped aggregate: countByTargetIdIn(...) would give you one number, not one per target
+    @Query("select new com.example.LikeCount(l.targetId, count(l)) from Like l "
+            + "where l.targetId in :ids group by l.targetId")
+    List<LikeCount> countsByTarget(@Param("ids") Collection<UUID> ids);
+
+    // an atomic single-column write
+    @Modifying
+    @Query("update MediaSocialDetails d set d.likeCount = d.likeCount + 1 where d.id = :id")
+    int incrementLikeCount(@Param("id") UUID id);
+}
+```
+
+**Import `dev.xtrafe.javai.annotations.Query` and `…Modifying`** — not Spring Data JPA's. `@Param` *is*
+Spring Data's (`org.springframework.data.repository.query.Param`), reused rather than reinvented. If your
+project also uses Spring Data JPA, qualify wherever the two meet.
+
+- **Postgres only.** Neo4j and MongoDB refuse a declared query when the repository is created rather than
+  silently never running it. A JPQL string has no meaning in Cypher or an aggregation pipeline.
+- **Returns**: entity, `Optional`, single, `Stream`, a scalar, `Object[]`, or a **record** via an ordinary
+  `select new …` constructor expression — which is how a grouped aggregate comes back typed. A `Page` return
+  needs `countQuery = "…"`; a `Slice` does not.
+- **A dynamic `Sort`** works on an entity-returning JPQL query. It is refused on a projection (nothing to
+  order by) and on a native query (it would mean rewriting your SQL). A `Pageable`'s window works on both.
+- **Entities come back with their vectors already loaded**, exactly as `findById` does.
+- **Name your entity types on the config.** Mentioning an entity in query text does not register it — use
+  `entityType(...)`/`entityPackages(...)`, as with everything else.
+
+⚠️ **Don't put a `@Query` on a repository interface you also use with Neo4j or MongoDB.** The refusal happens
+when the repository is *realized*, not when the method is called, so the whole repository fails on those
+backends -- including the methods that would have worked. If an entity is served from more than one backend,
+put its declared queries in a second, Postgres-only interface over the same entity. Both proxies are
+independent and the same rows are reachable through either.
+
+### What a `@Modifying` write may not touch
+
+`save(entity)` writes the whole row, which is why a column maintained *outside* the entity's editing path is
+easy to clobber: load a row before the counter moved, edit a caption, save, and the stale counter goes back
+with it. Two things address that, and the first needs nothing from JavAI:
+
+**Declare the column `@Column(updatable = false)`.** JPA's own flag stops ordinary `save()` traffic writing
+it, while a `@Modifying` query writes it anyway. That combination is the mechanism; there is no JavAI
+annotation for it.
+
+**And know what is refused.** A bulk write fires none of the woven accessors, so JavAI is never told the
+value moved — and because vectors are stored and read back on every load, that staleness would outlive the
+process rather than the call. So a statement assigning to any of these is refused *when the repository is
+created*:
+
+| Assigned to | Why |
+|---|---|
+| a `@Vectorize` field | its embedding would keep the old value's meaning, permanently |
+| an `@ExternalVector`'s `keyField` | the vector supplied for the old content would go on being served |
+| a `@Summary` field | both containers' summary vectors would be wrong, with nothing queued to fix them |
+| a `@Taggregate` field | aggregate taggings would drift with nothing to notice |
+
+An **ordinary column on a vectorized entity is fine** — a summary is arithmetic over vectors, so a column no
+vector reads cannot move one. Change a `@Vectorize` field through `save(entity)`, which re-embeds it in the
+same flush.
+
+`nativeQuery = true` is refused for a `@Modifying` method whenever JavAI stores anything for that entity
+(vectors, or a `Point`): a SQL string gives nothing to check, so the repository is the only signal available.
+Write it in JPQL, where each assignment is inspected.
+
+Two more things worth knowing: a `@Modifying` **delete** resolves the matching rows and deletes each properly
+(cascades, container membership, vector rows) rather than issuing one bulk statement — the same thing
+`deleteBy…` does, and for the same reasons. And a bulk update **does not** increment `@Version` unless the
+query says `update versioned`.
+
+### Filtering on an `@Any` association
+
+An `@Any` cannot be joined *through*, but it can be filtered *on* — so you no longer need to map its
+discriminator and foreign key a second time as read-only columns just to query them:
+
+```java
+List<Like> findByTarget(Likeable target);            // this exact target
+List<Like> findByTargetIn(Collection<Likeable> targets);
+List<Like> findByTargetOfType(Class<?> targetType);  // any target of this type
+List<Like> findByTargetOfTypeIn(Collection<Class<?>> targetTypes);
+```
+
+`OfType` also works in a narrowed vector search (`findNearestByCaptionVectorAndTargetOfType(...)`) and on the
+builder (`.where("target").ofType(MediaAsset.class)`). Postgres only — the other two backends refuse `@Any`
+fields entirely. Traversing into one (`findByTargetLabel`) or sorting by one is still refused: the key points
+into several tables, so there is no join and no column to order by.
 
 ## Registering entity types
 
@@ -678,8 +1064,9 @@ run in production — each backend is configured independently:
 |---|---|
 | Embedding provider | `javai-vector`'s `LocalEmbeddingDefaults` picks Ollama or Hugging Face TEI per host platform, or supply your own `JavAIEmbeddingProvider` |
 | Postgres/Neo4j | `javai-persistence/README.md`; connection settings default to `javai.persistence.*` system properties |
+| Postgres connection pool | `JavAIPersistenceConfig.Builder.dataSource(...)` runs JavAI on your own `DataSource`; `JavAIPI.release(config)` closes what JavAI opened for a config and evicts it — see `javai-persistence/README.md` |
 | Postgres schema naming | snake_case by default (`emailVerified` → `email_verified`); override with `JavAIPersistenceConfig.Builder.physicalNamingStrategy(...)` or the general `.hibernateProperty(key, value)` passthrough — see below |
-| Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
+| Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Mistral/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
 
 **Embedding provider, in detail** — registered once, globally, before anything calls `vector()`:
 
@@ -731,7 +1118,8 @@ public class Chapter {
     private Chapter continuation;
 
     @Summary(concatenate = true)           // 3. aggregate these members' text into mine
-    private final JavAIArrayList<Footnote> footnotes = new JavAIArrayList<>();
+    @OneToMany(cascade = CascadeType.ALL)  //    (interface-typed + annotated: see "Collection fields" above)
+    private JavAIList<Footnote> footnotes = new JavAIArrayList<>();
 }
 ```
 
@@ -905,7 +1293,7 @@ you use it:
 
 ```java
 Cortex cortex = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
-// or CortexAnthropic / CortexGroq / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
+// or CortexAnthropic / CortexGroq / CortexMistral / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
 ```
 
 Constructing several `Cortex`es side by side, local and remote, is normal — each is a plain object, not
@@ -923,6 +1311,7 @@ import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
+import dev.xtrafe.javai.model.JavAIMap;
 import jakarta.persistence.*;
 import java.util.UUID;
 
@@ -941,15 +1330,18 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
     @PromptContext
     private String body;
 
-    // Shape 1: interface-typed + @OneToMany -> a native Hibernate association (Postgres).
-    // Non-final, because Hibernate substitutes its own PersistentJavAIList into the field.
+    // Interface-typed + @OneToMany -> a native Hibernate association. Non-final, because Hibernate
+    // substitutes its own PersistentJavAIList into the field.
     @OneToMany(cascade = CascadeType.ALL)
     @Summary
     private JavAIList<Comment> comments = new JavAIArrayList<>();
 
-    // Shape 2: concrete-typed, unannotated -> JavAI's own javai_collection_members side table.
-    // final is fine here: this instance is hydrated into, never replaced.
-    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+    // A second to-many of the SAME element type, so it needs its own join table named explicitly --
+    // Hibernate would otherwise derive `article_comment` for both. A map also wants @MapKeyColumn.
+    @OneToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    @JoinTable(name = "article_related_comment")
+    @MapKeyColumn(name = "related_key")
+    private JavAIMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     public void setTitle(String title) { this.title = title; }   // re-vectorizes lazily on next vector() read
     public void setBody(String body) { this.body = body; }
@@ -957,10 +1349,10 @@ public class Article implements JavAIGraphNode {   // implements is required -- 
 }
 ```
 
-Both collection shapes appear here deliberately — see "Collection fields on a persisted `@Entity`" above.
-Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments` can just as well be a plain
-`final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()` don't depend on persistence
-at all.
+Both collection fields are interface-typed, because since 0.1.10 that is the only shape Postgres maps — see
+"Collection fields on a persisted `@Entity`" above. Drop the `@Entity`/`@Id`/`@OneToMany` lines and `comments`
+can just as well be a plain `final JavAIArrayList<Comment>`; vectors, `@Summary` propagation and `query()`
+don't depend on persistence at all, and the concrete type is only a problem when Hibernate has to map it.
 
 Using it — every call below is a woven method, not something declared in `Article.java`
 (imports for `EmbeddingVector`/`JavAIList`/`Cortex`/`CompletionRequest`/`CompletionResult`/`PromptContext`/
@@ -986,7 +1378,23 @@ CompletionResult brief = cortex.complete(CompletionRequest.builder()
                 .build())
         .maxTokens(200)
         .build());
+
+// A typed reply (OMI-68): the schema comes from the record; Gson reads the answer back.
+record Concern(String topic, int mentions) {}
+List<Concern> concerns = cortex.complete(CompletionRequest.builder()
+        .prompt("List the distinct concerns readers raise.")
+        .context(PromptContext.builder()
+                .entries(concerned.stream().map(ContextableObject::new).toList())
+                .build())
+        .responseListOf(Concern.class)
+        .build())
+        .asList(Concern.class).orElse(List.of());
 ```
+
+Typed replies -- `responseType`/`responseOptional`/`responseListOf`/`responseSetOf` on the request,
+`as`/`asList`/`asSet`/`completion()` on the result -- and exactly what each outcome is are in
+`javai-completion/README.md`'s "Typed responses". Use Gson's `@SerializedName`, not Jackson annotations, to
+rename a field.
 
 ## Quick reference: where to look next
 

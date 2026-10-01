@@ -97,22 +97,44 @@ public final class SampleDataSeeder {
     private static final int READINESS_RETRY_ATTEMPTS = 20;
     private static final long READINESS_RETRY_DELAY_MILLIS = 1000;
 
-    /** Discovers every table in the {@code public} schema (rather than hardcoding names) so this doesn't
-     *  quietly break if the per-model vector table names change (see {@code RepositoryBackendHibernatePostgres}'s
-     *  own table-per-model scheme). */
+    /**
+     * Discovers every table in the {@code public} schema (rather than hardcoding names) so this doesn't
+     * quietly break if the per-model vector table names change (see {@code RepositoryBackendHibernatePostgres}'s
+     * own table-per-model scheme).
+     *
+     * <p><b>Library-provisioned tables are dropped, not truncated.</b> Entity tables are Hibernate's --
+     * created by hbm2ddl when the SessionFactory boots (before this reset runs), so they must survive with
+     * their rows cleared. But every {@code javai_*} table and {@code taggings} is provisioned by the
+     * library itself, on demand, with {@code CREATE TABLE IF NOT EXISTS} -- and against a persistent
+     * container, {@code IF NOT EXISTS} means a table created by an <em>older</em> library version keeps its
+     * old columns forever. Confirmed empirically, not hypothetical: OMI-290 added {@code computed_for} to
+     * the per-model vector tables, and the first run after upgrading failed with
+     * {@code column "computed_for" does not exist} because the truncate-only reset had preserved the
+     * pre-upgrade schema. Dropping lets the current library recreate each table at first use, so the schema
+     * is always the one the code shipping with this run expects.
+     */
     private static void resetPostgres(String postgresUrl) {
         try (Connection connection = connectToPostgresWithRetry(postgresUrl)) {
-            List<String> tableNames = new ArrayList<>();
+            List<String> entityTables = new ArrayList<>();
+            List<String> libraryTables = new ArrayList<>();
             try (Statement listTables = connection.createStatement();
                     ResultSet tables = listTables.executeQuery(
                             "SELECT tablename FROM pg_tables WHERE schemaname = 'public'")) {
                 while (tables.next()) {
-                    tableNames.add(tables.getString("tablename"));
+                    String name = tables.getString("tablename");
+                    if (name.startsWith("javai_") || name.equals("taggings")) {
+                        libraryTables.add(name);
+                    } else {
+                        entityTables.add(name);
+                    }
                 }
             }
-            if (!tableNames.isEmpty()) {
-                try (Statement truncate = connection.createStatement()) {
-                    truncate.execute("TRUNCATE TABLE " + String.join(", ", tableNames) + " CASCADE");
+            try (Statement reset = connection.createStatement()) {
+                for (String table : libraryTables) {
+                    reset.execute("DROP TABLE IF EXISTS " + table + " CASCADE");
+                }
+                if (!entityTables.isEmpty()) {
+                    reset.execute("TRUNCATE TABLE " + String.join(", ", entityTables) + " CASCADE");
                 }
             }
         } catch (SQLException e) {

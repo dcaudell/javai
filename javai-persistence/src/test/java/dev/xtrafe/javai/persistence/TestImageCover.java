@@ -30,4 +30,9 @@ final class TestImageCover implements TestCover {
     public String label() {
         return label;
     }
+
+    @Override
+    public String getLabel() {
+        return label;
+    }
 }

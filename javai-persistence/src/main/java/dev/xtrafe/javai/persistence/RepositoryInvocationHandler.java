@@ -1,5 +1,8 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.vector.EmbeddingVector;
+
+import dev.xtrafe.javai.vector.Ranked;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
@@ -23,6 +26,7 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     private final Class<?> entityType;
     private final Map<Method, DerivedQueryMethods.ParsedQuery> parsedQueries = new ConcurrentHashMap<>();
     private final Map<Method, DerivedFinderQuery> derivedFinders = new ConcurrentHashMap<>();
+    private final Map<Method, DeclaredQuery> declaredQueries = new ConcurrentHashMap<>();
 
     RepositoryInvocationHandler(RepositoryBackend backend, Class<?> entityType) {
         this.backend = backend;
@@ -46,6 +50,8 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 return backend.findById(entityType, (UUID) args[0]);
             case "findAll":
                 return backend.findAll(entityType);
+            case "count":
+                return backend.count(entityType);
             case "deleteById":
                 backend.deleteById(entityType, (UUID) args[0]);
                 return null;
@@ -55,6 +61,11 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "reindex":
                 backend.reindex(entityType);
                 return null;
+            case "supplyVector":
+                return backend.supplyVector(entityType, (UUID) args[0], (String) args[1],
+                        (EmbeddingVector) args[2], (String) args[3]);
+            case "findPendingVector":
+                return backend.findPendingVector(entityType, (String) args[0], (Integer) args[1]);
             // The builder idiom (OMI-230). Declared on JavAIRepository itself, so these names are matched
             // here before the findNearestBy* convention below ever sees them -- and are deliberately not
             // spelled findNearestBy*, so the two idioms cannot collide on a name in the first place.
@@ -65,6 +76,9 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                         DerivedQueryMethods.Kind.FIELD, DerivedQueryMethods.requireVectorizeField(
                                 entityType, (String) args[0]));
             case "nearestBySummary":
+                // No model arity here: the model is asserted mid-chain with NearestQuery.inModel(...), not
+                // selected at the entry point, because the reference vector already selects the storage
+                // (OMI-458).
                 return newNearestQuery(DerivedQueryMethods.Kind.SUMMARY, null);
             case "nearestByConcatenatedText":
                 DerivedQueryMethods.requireConcatenationParticipant(entityType);
@@ -77,6 +91,13 @@ final class RepositoryInvocationHandler implements InvocationHandler {
                 return proxy == args[0];
             default:
                 break;
+        }
+        // Checked before either derived-name grammar (OMI-398): a declared query says what it is, so the
+        // method may be named anything at all -- including something that would otherwise parse as a finder.
+        if (DeclaredQuery.isDeclaredQuery(method)) {
+            DeclaredQuery declared =
+                    declaredQueries.computeIfAbsent(method, m -> DeclaredQuery.parse(m, entityType));
+            return declared.execute(backend, entityType, args);
         }
         if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
             DerivedQueryMethods.ParsedQuery parsed =

@@ -70,6 +70,21 @@ public final class JavAILinkedHashMap<K, V> extends LinkedHashMap<K, V> implemen
         return CollectionVectorSupport.summaryVector($javai$state, values());
     }
 
+    /** This collection's centroid restricted to one embedding model -- see
+     *  {@link JavAIVectorizable#vector(String)}. Uncached; the members' own vectors are not. */
+    @Override
+    public EmbeddingVector vector(String modelId) {
+        return CollectionVectorSupport.vector($javai$state, values(), modelId);
+    }
+
+    /** This collection's decay-weighted summary restricted to one embedding model -- what makes a
+     *  container of images summarizable by what its members look like, in a model no text field on any of
+     *  them was ever embedded under. See {@link JavAIVectorizable#summaryVector(String)}. */
+    @Override
+    public EmbeddingVector summaryVector(String modelId) {
+        return CollectionVectorSupport.summaryVector($javai$state, values(), modelId);
+    }
+
     @Override
     public double similarityTo(JavAIVectorizable other) {
         return VectorMath.cosineSimilarity(vector(), other.vector());

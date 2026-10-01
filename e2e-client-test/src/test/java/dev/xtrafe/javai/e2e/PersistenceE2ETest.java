@@ -4,10 +4,12 @@ import dev.xtrafe.javai.e2e.domain.Article;
 import dev.xtrafe.javai.e2e.domain.ArticleRepository;
 import dev.xtrafe.javai.e2e.domain.Attachment;
 import dev.xtrafe.javai.e2e.domain.Comment;
+import dev.xtrafe.javai.persistence.JavAIPI;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.e2e.environment.MonolithicContainer;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.neo4j.driver.AuthTokens;
@@ -90,6 +92,29 @@ class PersistenceE2ETest {
         return article;
     }
 
+    /**
+     * {@code count()} against a real, already-populated store (OMI-460).
+     *
+     * <p>Asserted relatively rather than absolutely, deliberately: these stores are not reset between runs
+     * (see {@code postgresFindNearestByFieldVectorRanksByRealSimilarity}'s own note), so the invariant worth
+     * pinning is not "there are N articles" but "count() is the number {@code findAll()} would have had to
+     * hydrate every row to produce, and it tracks writes exactly."
+     */
+    private static void assertCountTracksTheStore(ArticleRepository repository, String backend) {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before,
+                backend + ": count() and findAll().size() are the same question");
+
+        repository.save(newArticle("Counted article one " + UUID.randomUUID(),
+                "One of two articles saved to prove count() tracks writes on " + backend + "."));
+        repository.save(newArticle("Counted article two " + UUID.randomUUID(),
+                "Two of two articles saved to prove count() tracks writes on " + backend + "."));
+
+        assertEquals(before + 2, repository.count(), backend + ": two saves, two more rows");
+        assertEquals(repository.findAll().size(), repository.count(),
+                backend + ": still the same question after the writes");
+    }
+
     // ---- Postgres ---------------------------------------------------------------------------
 
     @Test
@@ -135,6 +160,11 @@ class PersistenceE2ETest {
 
         List<Article> bySummary = postgresRepository.findNearestBySummaryVector(vectorizable.summaryVector(), 5);
         assertTrue(bySummary.stream().anyMatch(a -> a.getId().equals(article.getId())));
+    }
+
+    @Test
+    void postgresCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(postgresRepository, "Postgres");
     }
 
     // ---- Neo4j --------------------------------------------------------------------------------
@@ -199,7 +229,15 @@ class PersistenceE2ETest {
         Article article = fullArticle("Full graph test (Postgres)");
         Article saved = postgresRepository.save(article);
 
-        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+        // Read inside a unit of work: `comments` is a lazy Hibernate-owned collection (OMI-142), and a
+        // repository hands back a detached entity, so it is only traversable while the loading session is
+        // open. It used to arrive initialized because the load path walked and loaded the whole reachable
+        // graph of everything anyone read -- the over-fetch OMI-271 removed.
+        Article reloaded = JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article loaded = postgresRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getComments());
+            return loaded;
+        });
         assertEquals("first take: Full graph test (Postgres)", reloaded.getFeaturedComment().getText());
         assertEquals(2, reloaded.getComments().size());
         assertTrue(reloaded.getComments().stream().anyMatch(c -> c.getText().equals("first listed comment")));
@@ -212,8 +250,12 @@ class PersistenceE2ETest {
 
     /**
      * {@code relatedComments} (a {@code JavAILinkedHashMap<String, Comment>}, not {@code @Summary} -- see
-     * {@code Article}'s own javadoc) round-trips through the same {@code javai_collection_members} table as
-     * {@code comments}, this time with {@code member_key} populated.
+     * {@code Article}'s own javadoc) round-trips as a native Hibernate map, keyed by {@code @MapKeyColumn}.
+     *
+     * <p>It used to go through {@code javai_collection_members} with {@code member_key} populated. OMI-277
+     * refused that mapping, so this is now an ordinary lazy association and has to be read inside a unit of
+     * work like any other -- which is the whole point of the change: one collection mechanism, one set of
+     * rules.
      */
     @Test
     void postgresJavAILinkedHashMapFieldRoundTrips() {
@@ -222,11 +264,14 @@ class PersistenceE2ETest {
         article.getRelatedComments().put("second", new Comment("frank", "second related comment"));
 
         Article saved = postgresRepository.save(article);
-        Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
 
-        assertEquals(2, reloaded.getRelatedComments().size());
-        assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
-        assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+        JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article reloaded = postgresRepository.findById(saved.getId()).orElseThrow();
+            assertEquals(2, reloaded.getRelatedComments().size());
+            assertEquals("first related comment", reloaded.getRelatedComments().get("first").getText());
+            assertEquals("second related comment", reloaded.getRelatedComments().get("second").getText());
+            return null;
+        });
     }
 
     /**
@@ -285,7 +330,11 @@ class PersistenceE2ETest {
         assertEquals(postgresManaged.getId(), neo4jManaged.getId(), "all three saves share the same identity");
         assertEquals(postgresManaged.getId(), mongoManaged.getId(), "all three saves share the same identity");
 
-        Article fromPostgres = postgresRepository.findById(article.getId()).orElseThrow();
+        Article fromPostgres = JavAIPI.inTransaction(JavAIEnvironment.postgresConfig(), () -> {
+            Article loaded = postgresRepository.findById(article.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getComments());
+            return loaded;
+        });
         Article fromNeo4j = neo4jRepository.findById(article.getId()).orElseThrow();
         Article fromMongo = mongoRepository.findById(article.getId()).orElseThrow();
 
@@ -297,6 +346,11 @@ class PersistenceE2ETest {
         assertEquals(2, fromMongo.getComments().size());
         assertEquals(fromPostgres.getFeaturedComment().getText(), fromNeo4j.getFeaturedComment().getText());
         assertEquals(fromPostgres.getFeaturedComment().getText(), fromMongo.getFeaturedComment().getText());
+    }
+
+    @Test
+    void neo4jCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(neo4jRepository, "Neo4j");
     }
 
     // ---- MongoDB ------------------------------------------------------------------------------
@@ -397,5 +451,10 @@ class PersistenceE2ETest {
             assertEquals(1, relationshipCount,
                     "featuredComment must be persisted as a real :FEATURED_COMMENT relationship to its own Comment node");
         }
+    }
+
+    @Test
+    void mongoCountAnswersWithoutMaterializingEveryArticle() {
+        assertCountTracksTheStore(mongoRepository, "MongoDB");
     }
 }

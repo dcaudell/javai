@@ -68,6 +68,23 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
      *  {@code @Vectorize} field, kept as its own slot separate from any individual field's. */
     private final VectorCacheSlot concatenatedTextSlot = new VectorCacheSlot();
 
+    /**
+     * For each {@code @ExternalVector} that has been supplied, the {@code keyField} value it was computed
+     * for -- keyed by the vector's name, sharing {@link #fieldSlots}' namespace (OMI-290).
+     *
+     * <p>Its whole job is answering "does the stored vector still describe this object's current content?".
+     * A {@code @Vectorize} field cannot ask that question, because the content <em>is</em> the field and
+     * re-deriving validity would mean re-reading and re-hashing it on every access -- which is exactly why
+     * {@link VectorCacheSlot}'s generation counter exists, and why the mutation must be observed through a
+     * woven setter for it to be bumped. An external vector is the case where the question is cheap: the key
+     * is a short identifier standing in for content JavAI never touches, so validity can be re-derived on
+     * every read by plain comparison, and does not depend on the mutation having been intercepted at all.
+     *
+     * <p>Deliberately not folded into {@link VectorCacheSlot}: that class is the general lock-free
+     * primitive behind every vector cache in the system, and this is a fact about one kind of vector.
+     */
+    private final Map<String, String> externalVectorKeys = new ConcurrentHashMap<>();
+
     /** Assigned once, at construction, purely to give whole-subgraph lock acquisition (persistence flushes)
      *  a stable, deadlock-free global order -- never used for anything else. */
     private final long sequenceNumber = SEQUENCE_GENERATOR.incrementAndGet();
@@ -120,6 +137,22 @@ public final class DirtyTrackingSupport implements JavAIDirtyTracking {
 
     public VectorCacheSlot concatenatedTextSlot() {
         return concatenatedTextSlot;
+    }
+
+    /** The {@code keyField} value {@code vectorName}'s currently-held external vector was computed for, or
+     *  {@code null} if none has ever been supplied -- see {@link #externalVectorKeys}. */
+    public String externalVectorKey(String vectorName) {
+        return externalVectorKeys.get(vectorName);
+    }
+
+    /** Records which content {@code vectorName}'s newly-supplied vector describes. A {@code null} key clears
+     *  the record, which is how a vector that no longer applies stops being served. */
+    public void recordExternalVectorKey(String vectorName, String key) {
+        if (key == null) {
+            externalVectorKeys.remove(vectorName);
+        } else {
+            externalVectorKeys.put(vectorName, key);
+        }
     }
 
     public long sequenceNumber() {

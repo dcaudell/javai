@@ -34,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -234,8 +235,18 @@ class AssociationGraphE2ETest {
         assertEquals(1, vectorRowCount(lazyManyToOneLeaf.getId(), AssocLeaf.class, "label"));
     }
 
-    /** {@code @Summary} through a <em>lazy</em> association: mutating the target must still move the
-     *  owner's summary vector, which means the summary walk resolves the proxy too. */
+    /**
+     * {@code @Summary} through a <em>lazy</em> association: mutating the target must still move the owner's
+     * summary vector, which means the summary walk resolves the proxy too.
+     *
+     * <p>⚠️ Asserted on the caller's own {@code hub}, not on what {@code save} returned, and the difference
+     * is the point. Since OMI-275 {@code save} returns Hibernate's <b>managed</b> instance, as Spring Data
+     * JPA's does -- so the returned graph is a different object graph from the one passed in, and mutating
+     * the {@code target} the caller still holds does not reach it. That is ordinary {@code merge} semantics
+     * rather than anything JavAI invented, and it is why the rule for callers is: after a save, keep using
+     * what save returned, or keep using your own instance, but do not mix the two and expect them to be the
+     * same objects.
+     */
     @Test
     void summaryVectorStillPropagatesThroughALazyAssociation() {
         AssocLeaf target = JavAIEnvironment.postgresAssocLeafRepository().save(new AssocLeaf("summary before"));
@@ -243,9 +254,11 @@ class AssociationGraphE2ETest {
         hub.setSummaryLazyManyToOne(target);
         AssocHub saved = JavAIEnvironment.postgresAssocHubRepository().save(hub);
 
-        float[] before = ((JavAIVectorizable) saved).summaryVector().values();
+        assertNotSame(hub, saved, "save returns the managed instance, not the one it was given");
+
+        float[] before = ((JavAIVectorizable) hub).summaryVector().values();
         target.setLabel("summary after, wholly different subject matter");
-        float[] after = ((JavAIVectorizable) saved).summaryVector().values();
+        float[] after = ((JavAIVectorizable) hub).summaryVector().values();
 
         assertNotEquals(java.util.Arrays.toString(before), java.util.Arrays.toString(after),
                 "mutating a @Summary child reached through a lazy association must move the owner's summary");

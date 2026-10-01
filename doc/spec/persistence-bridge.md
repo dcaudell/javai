@@ -12,8 +12,12 @@ asking the developer to hand-manage a parallel vector index alongside their ORM.
 |---|---|---|
 | `JavAIPI` | Internal contract | The save/query/re-index contract JavAI objects speak internally; `repository(Class, JavAIPersistenceConfig)` takes its backend config as an explicit argument, no ambient "current config" |
 | `JavAIRepository<T>` | Interface | Spring-Data-style repository base; delegates to existing derived-query-method machinery |
+| `count()` | Method on `JavAIRepository<T>` | How many rows this type has, unconditionally — the count a predicate already had two routes to and "how many are there" had none. See "`count()`" below |
+| `Windows.of(offset, limit[, sort])` | `Pageable` factory | A page window whose offset is independent of its size, which `PageRequest` cannot express. See "Offset windows" below |
 | `findNearestBy<Field>(EmbeddingVector, int limit)` | Derived query method convention | E.g. `findNearestByBodyVector` — repository-level nearest-neighbor search |
 | `findBy<Field>`/`existsBy…`/`countBy…`/`deleteBy…` | Ordinary derived finders | Full Spring-Data-style relational finders (parsed via `PartTree`), resolved against the entity's own mapped columns — so one repository serves both an entity's relational access and its vector search. See "Ordinary relational derived finders" below |
+| `@Query` / `@Modifying` (+ `@Param`) | Declared query on a method | JPQL or native SQL a method carries itself, for what a derived name cannot ask — grouped aggregates, projections, and targeted single-column writes. Postgres only; see "Declared queries" below |
+| `findBy<AnyField>OfType(Class)` | `@Any` discriminator predicate | Filters on a polymorphic to-one's target *type* without mapping its discriminator a second time as a shadow column. Postgres only; see "`@Any` predicates" below |
 | Hibernate-based enhancement shim | Mechanism | ByteBuddy enhancement via Hibernate's `EnhancementContext`-style SPI |
 | `hibernate-vector` module | Dependency | Native pgvector column mapping (`@JdbcTypeCode(SqlTypes.VECTOR)`) |
 | Neo4j-facing shim | Mechanism | Parallel graph-native persistence backend, same `JavAIPI` contract |
@@ -259,8 +263,9 @@ back-edge walk is correct for a single process holding the whole graph, and insu
 deployment is multi-pod: a pod that loaded a `Shelf` through its own repository holds no `Library`, so there
 is no back-edge to walk and the library's summary silently keeps whatever some other pod last left. The
 drain instead asks which containers *currently* hold the entity, from the declared `@Summary` fields of
-registered types plus the stored relationships -- covering both natively-mapped associations (HQL) and this
-backend's own `javai_collection_members` (SQL) -- and walks up transitively.
+registered types plus the stored relationships -- resolved by HQL over the mapped association, singular or
+to-many -- and walks up transitively. (It used to cover a second storage shape by SQL as well; that shape and
+its table went in OMI-277, and this lookup lost the half that served it.)
 
 Two costs are accepted deliberately. A summary row is **stale within the caller's own transaction**, since
 the write happens after commit. And a drain that fails leaves the recomputation queued rather than
@@ -335,6 +340,162 @@ deferring every vector write to commit time — across three backends, and throu
 queue above. `saveAll` is the answer for that shape. The cost of not doing it is pinned by a test rather than
 left as a footnote.
 
+## Attachment: one graph, one state (OMI-275)
+
+A repository call returns a graph that is uniformly attached or uniformly detached, never mixed. Outside a
+unit of work everything is detached; inside one, the root and every node reached through it are managed --
+through a lazy hop, an eager one, `@OneToOne`, `@ManyToOne`, `@OneToMany`, `@ManyToMany`, `@Any`, and a
+self-reference alike.
+
+**A mixed graph is the outcome worth designing against**, which is why it is stated as a property rather than
+left to fall out. Nothing about an object tells a caller which kind of node they hold, so in a mixed graph the
+same traversal works or throws depending on where they landed, and mutations are silently persisted in one
+place and silently discarded in another. No rule a caller could learn covers it.
+
+There was exactly one route to one: `save()` used to return the caller's own instance, which is never
+managed, while Hibernate tracked a merged copy. Give that unmanaged root a child the caller had loaded in the
+same unit of work and the result was an unmanaged root holding a managed child.
+
+**So `save()` returns the managed instance now, as Spring Data JPA's does.** It could not before: `merge()`
+leaves `@Transient` fields empty on the managed copy, and JavAI collections used to be transient. OMI-277
+made them native associations that `merge()` carries across, leaving only `Point` fields, which `save` copies
+across explicitly.
+
+Two consequences to know:
+
+- **Inside a transaction, mutating what `save` returned is dirty-checked.** Before, it was not.
+- **The returned graph is a different object graph from the one passed in** -- ordinary `merge` semantics.
+  After a save, use what `save` returned *or* your own instance, but do not mix them and expect the same
+  objects.
+
+**An uninitialized proxy answers its `@Id` without a round trip only if the identifier getter is `public`.**
+Hibernate serves it by overriding that getter and cannot override a package-private one, so the call falls
+through to the uninitialized instance and triggers a load -- which on a detached entity turns a free read into
+`LazyInitializationException`. Nothing warns about it.
+
+## A read loads what was read, not what is reachable from it (OMI-271)
+
+The section above is about not re-embedding what a load already knows. It says nothing about how much the
+load itself costs, and the answer used to be *everything reachable*: both post-load steps walked the loaded
+root's graph reflectively, and that walk called `addAll` on every collection-valued field. **Iterating an
+uninitialized `PersistentCollection` is initializing it**, so reading one scalar off one entity loaded its
+whole reachable collection graph, recursively, plus a side-table SELECT per entity in it.
+
+| Read | Entities loaded, before | After |
+|---|---|---|
+| a root with five children, one string asked for | 6 | **1** |
+| a three-level graph of sixteen, one string asked for | 16 | **1** |
+
+Laziness *was* enforced for **singular** associations, and this is worth stating because it is why the gap
+survived: an uninitialized proxy is a generated subclass, `@Entity` is not `@Inherited`, so the walk's
+`isAnnotationPresent` test rejected it — by accident rather than by design. A lazy `@OneToMany`/`@ManyToMany`
+had no such accident protecting it.
+
+**A repository therefore returns a genuinely detached entity now**, and traversing an association nobody
+touched raises `LazyInitializationException` like any other lazy dereference — the behaviour
+`doc/spec/vector-core.md`'s persistence rules and this project's own e2e tests already describe for singular
+associations. Read inside a unit of work when the graph is genuinely wanted, and pay for the hops taken:
+
+```java
+Library library = JavAIPI.inTransaction(config, () -> {
+    Library loaded = libraries.findById(id).orElseThrow();
+    Hibernate.initialize(loaded.getShelves());
+    return loaded;
+});
+```
+
+**Every piece of out-of-band state is served from Hibernate's `POST_LOAD` event, in one read (OMI-276).**
+Three things live outside an entity's own table -- each `@Vectorize` field's vector, the entity-grain
+concatenated text vector, and any `Point` field -- and they were originally fetched by different mechanisms
+at different times. Geo kept its own recursive walk, which is what made it the one that broke: the walk ran
+before a caller could initialize anything, so a `Point` on an entity reached through an association was
+silently never read. All three now come from one `UNION` per entity, over the tables that apply to it and
+exist, with existence memoised. One statement per entity, and the count does not scale with how many
+`@Vectorize` or `Point` fields that entity has.
+
+**Stored vectors are served from Hibernate's `POST_LOAD` event instead of from a walk.** That is what makes
+the removal free rather than a trade: the cost becomes one SELECT per entity *actually loaded*, and it covers
+a case no walk at load time could — a member the caller initializes afterwards, which arrives long after any
+walk has finished. `save()` suspends it for its own unit of work, since `merge()` loads the row *before*
+copying the caller's values onto it, and hydrating there would pair the old vector with the new value.
+
+Vector Core has the same hazard one layer up — its own walks must not touch a value whose resolution would
+perform I/O — and cannot recognise one without depending on an ORM. `JavAIRuntime.configureInitializationCheck`
+is the seam: the Hibernate backend installs `Hibernate::isInitialized`, and the default answers `true` for
+everything, which is right for a plain object graph with no persistence layer under it.
+
+**There is now exactly one JavAI collection mapping (OMI-277).** A JavAI collection field must be declared by
+the *interface* (`JavAIList`/`JavAISet`/`JavAIMap`), non-final, with the ordinary JPA annotation; Hibernate
+then substitutes `PersistentJavAIList`/`Set`/`Map`, and the field is an ordinary lazy association with vectors
+and dirty-tracking intact (see OMI-142 for how that substitution works).
+
+A *concrete*-typed field (`private final JavAIArrayList<X>`) is refused at registration. It used to be a
+second, out-of-band mapping through `javai_collection_members`, and it was withdrawn rather than repaired
+because that storage was only ever read and written for the entity a repository call **returned**: reached
+through an association the collection came back silently empty, and saved through one its members were
+silently never written. Neither failure announced itself.
+
+It could not be made lazy where it stood, and the reason is worth recording because it is the whole argument.
+The field holds a `final` instance of a `final` class that the entity's own constructor created; Hibernate
+manages a collection by substituting its own instance, which a final class forbids. Laziness would therefore
+have had to live *inside* `JavAIArrayList`/`JavAILinkedHashSet`/`JavAILinkedHashMap`, as a pending load
+triggered from every read — and `ArrayList`'s read surface has no single funnel, so a missed override returns
+an empty collection, which is precisely the defect being fixed. Doing it properly would have required an
+interface-typed, non-final field: exactly what the native mapping already requires, at which point the second
+mapping has no reason to exist.
+
+The membership table and every path that touched it have been **removed**: an unclaimed table created in
+every database on every boot, plus code nothing could reach, is vestigial rather than reversible. Nothing
+drops an existing one — a database that has it keeps it, empty, until somebody drops it by hand.
+
+One live path was rebuilt rather than deleted. A geo predicate nested through a to-many hop used the
+membership table to map member ids back to owner ids; it resolves through an HQL join over the association
+now, which is what that hop always was once the collection became native.
+
+## `count()` (OMI-460)
+
+```java
+long total = albums.count();
+```
+
+The unconditional count. A *predicate's* count already had two routes — a derived `countBy…` finder and a
+declared `@Query` — and "how many are there" had none, so it was reached by `findAll().size()`: every row
+hydrated into an entity, its stored vectors read back into its cache slots (`hydrateFieldVector`), and the
+whole lot discarded to learn one number. Spring Data's `CrudRepository.count()` is the precedent.
+
+Each backend answers with the count its own store already knows how to do — `count(root)` through the same
+criteria API `findAll` uses, `MATCH (n:Label) RETURN count(n)`, `countDocuments()`. The `RepositoryBackend`
+method is **abstract rather than defaulted** to `findAll(entityType).size()`: that default would silently
+reintroduce exactly what this exists to remove, and would leave a backend looking as though it had
+implemented the method.
+
+Scoped to the repository's own entity type, like every other read on it — not to the store.
+
+## Offset windows: `Windows.of(offset, limit)` (OMI-460)
+
+```java
+// page 3 of 20, asking for one row more than the page holds
+List<Album> window = albums.browse(ownerId, Windows.of(60, 21, Sort.by("title")));
+boolean hasMore = window.size() > 20;
+```
+
+JavAI's query paths have always read `pageable.getOffset()` and `pageable.getPageSize()` and never the page
+*number* (`DeclaredQuery.resolveConstraints`, `DerivedFinderQuery.resolveConstraints`), so an arbitrary
+offset was already supported and merely unsayable. `PageRequest.of(page, size)` derives its offset as
+`page × size`, so every offset it can express is a multiple of the limit — which breaks the standard
+forever-scroll idiom of asking for one row more than the page holds. Page 3 of 20 wants offset 60 with a
+limit of 21, and `PageRequest.of(60 / 21, 21)` lands on offset **42** and quietly returns the wrong rows.
+
+`Pageable` is an interface, so an adopter can always implement one; this exists because every adopter doing
+one-extra-row paging otherwise writes the same ~70-line class, and discovers the need the same way — from
+rows that are subtly not the ones they asked for.
+
+Three of `Pageable`'s methods have to answer in pages, and an offset window has no page number of its own,
+so they are defined rather than left to be discovered: `getPageNumber()` reports `offset / limit` (floor),
+and `withPage(n)` returns a page-aligned window at `n × limit` — so `withPage(getPageNumber())` does **not**
+round-trip, by construction. `next()`/`previousOrFirst()` do stay exact, moving by the limit from wherever
+the window actually starts.
+
 ## Ordinary relational derived finders
 
 A `JavAIRepository` interface may declare ordinary Spring-Data-style derived finders alongside the
@@ -370,15 +531,16 @@ query language (Postgres → JPA Criteria, Neo4j → Cypher, MongoDB → a drive
 paths** are supported through *both* singular associations *and* to-many/collection relationships
 (`findByReviewsReviewer` — an entity by a field of its collection members). Each backend uses the mechanism
 that fits its storage: Neo4j composes a self-contained `EXISTS { MATCH (n)-[:REL]->(x) WHERE … }` subquery
-(correct through any cardinality and under `And`/`Or`); Postgres and MongoDB, whose related entities live
-out-of-band (Postgres `javai_collection_members`; Mongo `{type, id}` reference pointers, not embedded),
-resolve the matching related ids first and then match owners referencing them, expressed as `root.id IN (…)`.
-Pure single-or-nested-*singular* scalar predicates stay a native Criteria join on Postgres. **Collection
-emptiness** (`findByReviewsIsEmpty`) rides the same side tables/relationships. *Sort* is still limited to a
-singular scalar path (a to-many sort is ambiguous). The id-set resolution materializes intermediate id sets
-and issues a query per hop — fine for the Phase-0 goal of proving the design space; a single-statement
-rewrite (a mapped membership entity for Criteria subqueries; `$lookup` for Mongo) is a natural later
-optimization.
+(correct through any cardinality and under `And`/`Or`); MongoDB, whose related entities live out-of-band as
+`{type, id}` reference pointers rather than embedded, resolves the matching related ids first and then matches
+owners referencing them, expressed as `root.id IN (…)`. **Postgres is a native Criteria join throughout** —
+singular or to-many, since OMI-277 left it one collection shape and that shape is a mapped association. The
+id-set-per-hop path it used to need for the other shape is gone with it; the one Postgres predicate still
+resolved that way is **geo**, whose `javai_geo_points` is not a table Hibernate can join. **Collection
+emptiness** (`findByReviewsIsEmpty`) rides the same mechanisms. *Sort* is still limited to a singular scalar
+path (a to-many sort is ambiguous). Where id-set resolution survives it materializes an id set and issues a
+query per hop — fine for the Phase-0 goal of proving the design space; `$lookup` is the natural later
+optimization for Mongo.
 
 **Geo (`Near`/`Within`).** A `Point` field (Spring Data's `org.springframework.data.geo.Point`) round-trips
 per backend — a Neo4j native `point`, a MongoDB GeoJSON `Point`, and (Postgres) two columns in a
@@ -399,6 +561,159 @@ silently match nothing. The Postgres backend needs no such step — Hibernate bi
 is why the note is specific to the two reflective backends. (Range comparisons on a value stored as an
 ISO-8601 string, e.g. an `Instant`, remain correct because ISO-8601 sorts lexicographically; comparisons that
 are meaningless on a converted value, e.g. `>` on a UUID string, are permitted but not meaningful.)
+
+## Declared queries: `@Query` and `@Modifying` (OMI-398)
+
+A derived name can express a predicate over an entity's own properties, and nothing else. A **grouped
+aggregate** is the plainest thing it cannot: "how many rows does each of these thirty ids have" is one
+`GROUP BY`, while `countBy…In` returns a single total. That left N+1 counts, counting in memory, or reaching
+past the repository to `JavAIPI.sessionFactory(config)` — and it is the last one this exists to stop being
+the answer.
+
+```java
+public interface LikeRepository extends JavAIRepository<Like> {
+
+    @Query("select new com.example.LikeCount(l.targetId, count(l)) from Like l "
+            + "where l.targetId in :ids group by l.targetId")
+    List<LikeCount> countsByTarget(@Param("ids") Collection<UUID> ids);
+
+    @Modifying
+    @Query("update MediaSocialDetails d set d.likeCount = d.likeCount + 1 where d.id = :id")
+    int incrementLikeCount(@Param("id") UUID id);
+}
+```
+
+`@Query`/`@Modifying` are JavAI's own (`javai-annotations`); **`@Param` is reused** from
+`spring-data-commons`, already a dependency, the same reuse-not-reinvent choice `@Id` makes. `spring-data-jpa`
+is not a dependency, and taking on a whole repository framework to borrow one annotation is not worth it.
+`DeclaredQuery` sits beside `DerivedFinderQuery` and reuses its shape — parse, signature analysis,
+return-type adaptation, binding here; three primitives in each backend — including its `Constraints` record,
+so ordering and windowing mean the same thing whichever path produced them.
+
+**Postgres only.** Neo4j and MongoDB refuse at repository-creation time, and the SPI defaults *throw* rather
+than accept, following `inTransaction`'s precedent: a JPQL string means nothing to either store, and
+translating one would be a query engine rather than a shim.
+
+**Returns**: entity, `Optional`, single, `Stream`, scalar, `Object[]`, and a record. The last two needed no
+projection machinery — Hibernate 7 instantiates a record from an ordinary `select new …` constructor
+expression and hands back a tuple as `Object[]`. `Page` requires `countQuery = "…"`, which is **not** derived
+by rewriting the query: counting an arbitrary select means understanding its projection, joins and grouping,
+and a rewriter that gets that wrong returns a plausible wrong number instead of failing. `Slice` needs none,
+since it fetches one extra row.
+
+**A dynamic `Sort` is applied through Hibernate's `SelectionSpecification`, never by editing the query text.**
+It therefore works only on an entity-returning JPQL query — there is no attribute to order a projection by —
+and a native query refuses one outright, since applying it there could only mean rewriting SQL. A `Pageable`'s
+*window* needs no rewriting and is honoured on both.
+
+**Vector hydration is free.** Hibernate's `POST_LOAD` fires for HQL and native entity queries alike, so an
+entity a declared query returns arrives with its stored vectors already in its slots, exactly as `findById`
+does. Measured at the embedding provider, not inferred.
+
+**A declared query cannot share an interface with a backend that refuses one.** The refusal happens when the
+repository is *realized*, not when the method is called, so a `@Query` on an interface that is also handed to
+`JavAIPI.repository(..., neo4jConfig)` fails that whole repository -- including the methods that would have
+worked. If an entity is served from more than one backend, keep its declared queries in their own
+Postgres-only interface; both proxies are independent, and the same entity is reachable through either. This
+is what `ArticleQueryRepository` beside `ArticleRepository` looks like in `e2e-client-test`.
+
+### When a declared query is validated
+
+Every other creation-time check in this module is pure reflection. Parsing a query is the first that is not:
+it needs Hibernate's query engine, and building that engine freezes the entity set — precisely what OMI-214
+arranged should *not* happen when a repository is realized. So validation splits, and this is a property to
+know rather than an accident:
+
+- **Signature, at repository-creation time** — `@Param` names against the query's own, parameter counts,
+  return-type feasibility, trailing-parameter placement, `Page` without a `countQuery`.
+- **Query text, as early as the ORM allows** — immediately when the `SessionFactory` already exists,
+  otherwise queued and translated the moment it is built. Either way it fails before any repository method
+  runs, never on the first call of the annotated one.
+
+Native SQL is the exception, stated plainly: there is no SQL grammar in this module, so a native statement is
+parsed by the database on first execution. Its *parameter binding* is still checked at creation time.
+
+**A query is not a registration.** Naming an entity in query text does not map it; a type reachable no other
+way must be named on the configuration (`entityType(...)`/`entityPackages(...)`). The error says so.
+
+### `@Modifying`, and what it is not allowed to touch
+
+`save(entity)` persists the whole row, which makes a single-column write inexpressible and any column
+maintained *outside* the entity's own editing path clobberable — load a row before some counter moved, edit
+something unrelated, save, and the stale counter goes back with it. A repository handing out detached entities
+is exactly the shape that goes stale. It is also the only way to get an atomic `SET c = c + 1`.
+
+**Point 5 of the ticket needed no new annotation.** Measured: JPA's own `@Column(updatable = false)` already
+protects a column from `save()` (7 stays 7 through a save of a mutated detached entity) while a `@Modifying`
+query writes straight past it (7 → 8). Declare the column with the JPA annotation and write it through a
+targeted method; JavAI adds no marker of its own.
+
+**A bulk write that would break Vector Core's mutation rule is refused, not documented.** It fires no woven
+accessor, so nothing recomputes what it invalidated — and since OMI-187 a stored vector is hydrated straight
+back into a loaded object's slots, so the inconsistency is served on every later load rather than lasting one
+process. `SqmUpdateStatement`'s set clause is readable without a session, so the check is static and happens
+when the repository is realized. Refused assignments, resolved against **the statement's own target entity**
+rather than the repository's type parameter — so a repository over a plain entity is not a way around it:
+
+| Assigned to | Why it cannot be allowed |
+|---|---|
+| `@Vectorize` field | its embedding keeps the value the field had before the write |
+| `@ExternalVector`'s `keyField` | the vector supplied for the old content goes on being served for the new |
+| `@Summary` field | reassigning it moves containment; both containers' summary vectors are wrong, nothing enqueued |
+| `@Taggregate` field | the same drift one layer up, invisible to tagging's own reconciliation |
+
+An **ordinary column on a vectorized entity stays writable**, and that half matters as much: a summary is
+arithmetic over vectors, so a column no vector reads cannot move one. A guard that refused these too would
+have blocked the feature on any entity carrying an embedding.
+
+**`nativeQuery = true` is refused outright when JavAI owns storage for the type** (it is `@JavAIVectorizable`,
+or declares a `Point`). The check above reads a parsed statement's assignments and SQL has none to read, so
+the repository is the only signal there is — coarse on purpose, and better than a rule that lives in a
+document and is therefore never enforced. Native writes on a type JavAI keeps nothing for are ordinary.
+
+**A `@Modifying` delete resolves the matching ids and deletes each through `deleteById`'s path**, for the same
+three reasons `deleteBy…` already does: a bulk `delete` cascades to nothing, detaches from no container (so a
+join table's foreign key refuses it), and leaves `javai_vectors__*`/`javai_geo_points` rows orphaned — and a
+stale vector row is worse than an orphan, since it keeps matching similarity searches for an entity that no
+longer exists. One extra statement buys a deletion path that is already correct and already tested.
+
+**A bulk update does not increment `@Version`** unless the query says `update versioned`. Both spellings are
+pinned by tests.
+
+## `@Any` predicates, without shadow columns (OMI-407)
+
+An `@Any` cannot be *joined* through, and that had been taken to mean it could not be *filtered* on either —
+so the discriminator and the foreign key were mapped a second time as plain read-only columns purely to give a
+derived finder something to see, duplication every queryable `@Any` would repeat and two mappings free to
+drift. Measured on Hibernate 7, the premise is false for predicates: `Path.type()` resolves straight to the
+discriminator column, and ordinary equality straight to the pair.
+
+```java
+List<Like> findByTarget(Likeable target);            // by instance -- no new grammar; @Any is a real field
+List<Like> findByTargetIn(Collection<Likeable> targets);
+List<Like> findByTargetIsNull();
+
+List<Like> findByTargetOfType(Class<?> targetType);  // by discriminator alone -- one new keyword
+List<Like> findByTargetOfTypeIn(Collection<Class<?>> targetTypes);
+
+likes.nearestBy("caption").to(reference).where("target").ofType(MediaAsset.class).limit(20).ranked();
+```
+
+`OfType` is the one keyword added to `PartTree`'s closed vocabulary. It is stripped before the tree is built
+and re-attached to the matching part afterwards, and the match is made **by counting parts**, not by
+re-tokenizing the name — so a property whose name contains another's cannot be miscounted. Each occurrence is
+attributed to the **longest** `@Any` field name ending where it begins, which is load-bearing rather than
+defensive: one `@Any` field's name is frequently a suffix of another's (`lazyAny` inside `summaryLazyAny`),
+and the character before the token is lowercase in both `findBy|LazyAny` and `Summary|LazyAny`, so nothing
+short of longest-match separates them. The single
+ambiguous shape (one `@Any` property named twice with the keyword on only some) is refused rather than
+guessed. The same stripping runs on the vector convention's narrowing tail, so the two grammars cannot mean
+different things by it.
+
+Refusals stay refusals, with messages that now name `@Any` rather than "not a singular @Entity": traversing
+*into* one (`findByTargetLabel`), sorting by one, and any operator beyond equality/`In`/`IsNull` — there is no
+text in a discriminator-and-key pair to match. **Postgres-only for free**, since Neo4j and MongoDB already
+refuse `@Any` fields at registration.
 
 ## Vector search combined with a relational predicate (OMI-230)
 
@@ -466,7 +781,7 @@ row but one, with an arbitrary convention for which row carries it.
 ```sql
 -- javai_summary_vectors__<model>
 owner_type, owner_id, model_id, dims,
-vector                        vector(N) NOT NULL,   -- summary vector, unchanged
+vector                        vector(N)   NULL,     -- summary vector; NULL-able since OMI-435
 concatenated_text             text        NULL,     -- new
 concatenated_text_vector      vector(N)   NULL,     -- new
 concatenated_text_computed_at timestamptz NULL,     -- new
@@ -491,11 +806,51 @@ table's per-field grain.
   exists — a pre-OMI-191 deployment would keep a three-column-short table and fail on first write. The three
   `ALTER TABLE … ADD COLUMN IF NOT EXISTS` statements alongside it are the migration, and are idempotent.
 
-`vector NOT NULL` means a row cannot hold concatenated text without a summary vector. Reasoning says the two
-always co-occur (text implies content, content implies a non-absent summary contribution), but that is
-inference, so the write path **refuses loudly** if it ever meets the combination rather than silently
-dropping the text or tripping a bare constraint violation. If it ever fires, the fix is to make `vector`
-nullable, not to skip the write.
+### ⚠️ `vector` is NULL-able, and the reasoning that said it need not be was wrong (OMI-435)
+
+This column was `NOT NULL`, on the inference that the two values always co-occur: text implies content,
+content implies a non-absent summary contribution. The write path **refused loudly** when it met the
+combination, and the note here said that if it ever fired, the fix was to make the column nullable rather
+than to skip the write.
+
+It fired, and that was the fix. **A concatenated text vector with no summary vector is a real state**: an
+entity that loses its last `@Vectorize` content has an absent summary immediately, while a concatenated
+vector computed earlier is still on file and is served back by hydration on the drain path. The pair reaches
+the writer through no fault of the entity.
+
+Refusing it cost far more than it caught. On the inline path the whole save rolled back — an owner's edit
+lost to a vector-bookkeeping constraint — and on the drain path the recomputation requeued forever, leaving
+the container's summaries stale. The row now records what is true: this text, and no summary. `rankIds`
+already skips NULL vectors, so a half-populated row is invisible to a summary search and findable by a
+concatenated-text one.
+
+⚠️ **A database created before this keeps its `NOT NULL`, and that is the adopter's to fix.** JavAI has no
+concept of a migration — it provisions a table it finds missing rather than altering one it finds present,
+and an `ALTER` issued from the write path would need an `ACCESS EXCLUSIVE` lock on a table the calling
+transaction already holds a lock on, which deadlocks the request that triggered it. One statement per
+existing summary table:
+
+```sql
+ALTER TABLE javai_summary_vectors__<model> ALTER COLUMN vector DROP NOT NULL;
+```
+
+### ⚠️ A reference from another model is refused, not answered empty (OMI-458)
+
+The concatenated text vector is **one embedding of one assembled string, produced by the configured
+provider** — so it exists in that provider's model and in no other, for every participating entity, by
+construction. A search whose reference comes from anywhere else is asking for something nothing can hold.
+
+That case used to return an empty list. Empty is a lie here, and a consistent one: it is exactly what a
+corpus with no near matches returns, so the query looks answered, and looks answered the same way every time
+it is run. It is the one place a wrong model produces a plausible non-answer rather than a missing table,
+which is why it is the one place that has to say so out loud. All three backends refuse it, through both the
+builder and the `findNearestByConcatenatedTextVector` idiom, and the message points at `nearestBySummary()` —
+which *does* serve that model, and is the likely intent when someone reaches here with an image vector.
+
+**There is no fold to fall back to**, unlike a summary search: folding needs a value that exists to be
+folded, and this one does not exist in that model for anything. Silent when the provider cannot name its own
+model — there is nothing to compare against, and a refusal derived from an unknown is worse than the search
+it would block.
 
 **Neo4j and MongoDB need no special handling.** Both already store `summaryVector__<model>` as a per-entity
 property/field; `concatenatedText__<model>` and `concatenatedTextVector__<model>` are the same shape, and
@@ -506,3 +861,206 @@ over field vectors hydration already restored, so recomputing costs nothing; the
 a real embedding, so not restoring it would mean a live model call on every load of every participating
 entity. All three backends read it back into the entity's slot under the same pristine-slot rule that governs
 field hydration.
+
+## Externally-supplied vectors (OMI-290)
+
+`@ExternalVector` (see `doc/spec/vector-core.md`) is stored at the **same per-field grain** as a
+`@Vectorize` field, and partitioned by the model the type *declares* rather than the one currently
+configured — the two have nothing to do with each other. That is the whole of the storage design; no new
+table, no new grain, no new keying rule.
+
+| Backend | Realization |
+|---|---|
+| Postgres | `javai_vectors__<model>`, with a new `computed_for text NULL` column holding the content key. `ALTER TABLE … ADD COLUMN IF NOT EXISTS` alongside `ensureFieldVectorTable` is the migration for a table created earlier — idempotent, same pattern as OMI-191's three columns |
+| Neo4j | `<name>Vector__<model>` node property, plus `…ComputedAt` and `…ComputedFor` siblings — the same shape as `summaryVector__<model>` |
+| MongoDB | `<name>Vector__<model>` document field, plus the same two siblings |
+
+**`computed_for` earns its place on the load path, not the query path.** After hydration the vector sits in
+its cache slot, and every read compares the key it was written for against the entity's current content
+before serving it. Without the stored key, a hydrated vector would be held and never served — which from
+outside is indistinguishable from a pipeline that never ran. The backlog query is a bonus, not the reason.
+
+**Reads hydrate it before the `currentModelId()` guard**, deliberately: an external vector's model is
+declared on the type, so it is readable whether or not a text provider is configured or can name itself.
+
+**A save deletes the row when the vector reads absent** — nothing supplied yet, or superseded by a content
+change — for the same reason `AbsentVectorRemovalTest` gives for a `@Vectorize` field that loses its content.
+A stale row in an ANN index is worse than a missing one: the entity goes on matching searches for content it
+no longer has.
+
+**`reindex` carries them across untouched.** A re-index re-embeds under the currently configured model, and
+this vector is neither in that model nor computable by this process — so it is neither recomputed nor
+dropped.
+
+### The repository surface
+
+```java
+boolean supplyVector(UUID id, String vectorName, EmbeddingVector vector, String computedFor);
+List<T>  findPendingVector(String vectorName, int limit);
+```
+
+`supplyVector` reads the entity — the content-key comparison is against the entity's own field, so there is
+nothing to compare without it — and then writes exactly one vector: no merge, no summary recomputation, no
+walk of the reachable graph, because a consumer storing a vector has not touched the entity. It returns
+`false` rather than throwing when the entity has moved on, which under at-least-once delivery is ordinary.
+
+`findPendingVector` is a **scan**, stated plainly: it needs no store-specific code, is correct on all three
+backends, and is the right shape for the two jobs it exists for — a backfill and a re-drive after a
+dead-letter drain — both of which sweep the whole type anyway. A backend can override it with an anti-join
+against its own vector storage if that stops being true.
+
+### Searching one
+
+`findNearestBy<Name>Vector(reference, limit)` and `nearestBy("<name>")` accept an `@ExternalVector`'s name
+exactly as they accept a `@Vectorize` field's. Nothing in the query machinery had to learn a new concept:
+every backend already resolves *which* storage answers from `reference.modelId()`, so a reference from the
+image model selects the image model's table/property by the mechanism that was already there.
+
+## ⚠️ A read never provisions storage (OMI-458)
+
+**Reading is not a reason to create anything.** `findNearest` used to resolve its table by calling
+`ensure*VectorTable(reference.modelId(), reference.dims())`, so a search whose reference named a model
+nothing had ever been written in *created that model's table* — two HNSW indexes and all — and then returned
+no rows, because there were none to return. A failed query left a permanent, empty, indexed table in the
+adopter's schema, and every repetition of a typo'd or mismatched model id minted another.
+
+The rule now, on all three backends:
+
+| | Who provisions | What a read does when it is absent |
+|---|---|---|
+| Postgres | the write path, which knows a vector exists to store | resolves the table name, finds it absent, answers empty |
+| Neo4j | ⚠️ the read — it is the only trigger, since writes set properties and never create indexes | creates the index **only if some node actually carries the property**; otherwise answers empty |
+| MongoDB | ⚠️ the read, same reason | creates the search index **only if some document actually carries the field**; otherwise answers empty |
+
+Neo4j and MongoDB could not simply stop creating — nothing else ever would, and vector search would break
+outright. So they ask one bounded question first (`… IS NOT NULL … LIMIT 1`, `{$exists: true}` limit 1) and
+create when there is something to create it for. That also removes a second cost those two carried: both
+*block the caller* while a newly created index comes online, so a junk index was a junk wait as well.
+
+`QueryTimeSchemaCreationTest` pins the rule rather than the bug: it inventories every table and index,
+runs every shape of read each backend can serve against an unwritten model, and requires the inventory to be
+unchanged. A future read path that provisions anything fails there without anyone having predicted it.
+
+## Persisted per-model summary vectors (OMI-458)
+
+`summaryVector(String modelId)` computes a container's summary restricted to one embedding model — what its
+subtree *looks* like, as against what it *reads* like. Storing it was the missing half: the entity-grain
+writer asked for `currentModelId()` and the unscoped `summaryVector()`, so a model arriving only through
+`@ExternalVector` — image pixels, an audio waveform — had a computable container summary and no row anywhere.
+Ranking a corpus by it therefore meant folding **every** candidate in memory, at O(containers × their
+members) per query.
+
+Opt in on the container **type**:
+
+```java
+@Entity
+@JavAIVectorizable
+@Summary(persistModelSummaries = true)     // ← the whole opt-in
+public class Album {
+    @Summary
+    private JavAISet<Image> images;        // Image declares @ExternalVector(model = "siglip2…")
+}
+```
+
+```java
+albums.nearestBySummary().to(reference).limit(10).ranked();                        // reference names the model
+albums.nearestBySummary().inModel(Image.PIXELS_MODEL).to(reference).limit(10);     // …and says so out loud
+```
+
+**Which models is derived, never configured.** Every `@ExternalVector(model = …)` reachable from the
+container through `@Summary` fields, **transitively**, minus the ambient one (which the ordinary path already
+writes). Read from declarations rather than from what happens to be in a table: an un-embedded corpus and a
+corpus with no such model are indistinguishable in storage, so the second would silently and permanently stop
+writing rows the first is merely waiting for. The declared element type is expanded to its registered
+subtypes, since a `@Summary` collection typed to a `@MappedSuperclass` whose subclass carries the declaration
+is the ordinary adopter shape.
+
+**Transitive, because containment is.** `Exhibition → Album → Image` is one `@Summary` chain, and the
+exhibition's pixel summary is a real vector — `summaryVector(modelId)` recurses and `VectorMath` skips the
+absent terms at each tier that carries nothing of its own. A walk stopping at the first hop would store the
+album's row and leave the exhibition doing the in-memory fold this exists to remove.
+
+**Storage is the table that was already there.** `javai_summary_vectors__<model>`, keyed
+`(owner_type, owner_id)`, provisioned by `ensureSummaryVectorTable` with its `hnsw (vector vector_cosine_ops)`
+index — so a new model's table arrives fully indexed with no migration. The concatenated columns are written
+**absent**: concatenated text is one embedding of one assembled string, so it exists in the configured
+provider's model and no other, and carrying it across would file a text embedding under an image model. They
+are assigned rather than skipped, per the writer's standing rule, so nothing a previous configuration left
+there survives.
+
+**Nothing here can trigger an embedding.** `summaryVector(modelId)` skips a `@Vectorize` field *without
+reading it* when `modelId` is not the configured provider's, and every model this writes is by definition not
+that. The added cost is arithmetic over vectors already in hand plus one upsert per model.
+
+### ⚠️ Invalidation happens at `supplyVector`, not at `save`
+
+This is the part that is easy to get wrong, and getting it wrong produces a row that is correct exactly when
+it is empty. **An `@ExternalVector` arrives after the save, by construction** — the model runs in its own
+container behind a queue and answers seconds or minutes later — so every container above the entity was
+summarised at a moment when there was nothing in that model to summarise. A writer that only ran on `save`
+would never see the data arrive.
+
+So `writeExternalVector` enqueues the entity on `javai_summary_pending` and drains after commit, reusing
+OMI-255's mechanism rather than adding a second. The drain's own upward walk does the rest: it skips the
+entity (not a container, nothing of its own to recompute) and walks one hop at a time against *committed*
+state, so a tier above the container is reached too. Duplicates are expected and collapse by owner, which is
+what makes a burst of thousands of supplied vectors cost one recomputation per container.
+
+The enqueue is **gated on some registered type actually opting in**. Without that gate every `supplyVector` in
+an application that never asked for this would pay a queue row and a drain for a row nothing would read.
+
+### The query answers whether or not the rows exist
+
+**Nothing new is needed to search one.** Every backend already resolves *which* storage answers from
+`reference.modelId()`, so `nearestBySummary().to(pixelSummary)` reaches the pixel table by the mechanism that
+was already there, and so does the derived `findNearestBySummaryVector(pixelSummary, 10)` — model ids are not
+Java identifiers, and the method-name idiom needs none. Ranking across two embedding spaces is therefore not
+a hazard here: the index is *derived from* the reference rather than chosen beside it, so the two cannot
+disagree.
+
+`NearestQuery.inModel(String)` exists for the hazard that is real, which is the caller's:
+
+```java
+albums.nearestBySummary().to(album.summaryVector());          // the text one
+albums.nearestBySummary().to(album.summaryVector(PIXELS));    // the pixel one
+```
+
+A container carrying both a `@Vectorize` field and an `@ExternalVector` has *two* coherent summaries, and
+those two lines differ by one token. Both compile, both run, both return sensible hits against their own
+storage — so passing the wrong one answers the **other** of the container's two questions with nothing to
+notice. `inModel(...)` names which was meant and refuses a reference from anywhere else.
+
+⚠️ **It is an assertion, not a selector**, and that is why it is optional and why it is refused on every other
+grain. A field-grain search names the vector, and an `@ExternalVector`'s model is fixed by its own
+declaration; the combined vector and the concatenated text vector exist in the configured provider's model
+and no other. On those there is no second answer for a qualifier to give, so accepting one would invite the
+belief that it does something.
+
+When the type has **not** opted in, the same question is answered by folding the candidates in memory: the
+same value, the same ranking, at a cost proportional to the corpus. That fallback exists because the
+alternative is not a slower answer but a wrong one — `ensureSummaryVectorTable` would provision an empty table
+and the search would return nothing, which reads as *"nothing is similar"* rather than *"nothing is stored"*,
+and a caller cannot tell those apart. ⚠️ **Which path runs is decided from the declaration, never from whether
+the table holds rows**, so a deployment mid-backfill does not silently change both its cost and its answer
+partway through. The fold logs once per `(type, model)`: a fallback nobody can see is indistinguishable from
+an index, right up to the corpus size where it is not.
+
+| | Opted in | Not opted in |
+|---|---|---|
+| `save` / drain | one upsert per declared non-ambient model | nothing extra |
+| `supplyVector` | queue row + drain | nothing extra |
+| `nearestBySummary()` in that model | indexed lookup, HNSW | in-memory fold, O(corpus) |
+| Answer | identical | identical |
+
+**Backfill is `reindex()`**, which already runs `QUEUE_ONLY` then drains — the drain recomputes each container
+from committed state and writes every model's row, so turning the flag on needs no separate migration.
+
+⚠️ **Turning the flag back off, or removing a model from a subtree, leaves the rows behind.** JavAI provisions
+what it finds missing rather than altering what it finds present, and it has no record of models a container
+*used to* declare. Deleting the entity still clears every table, since `deleteById` sweeps the catalog rather
+than a remembered list.
+
+**Neo4j and MongoDB** store `summaryVector__<model>` as a per-entity property/field already, so the shape
+generalizes — but their writers remain single-model in this phase. Both answer a non-ambient summary search by
+folding, through the same shared SPI default, rather than returning the empty result an unwritten property
+would give.

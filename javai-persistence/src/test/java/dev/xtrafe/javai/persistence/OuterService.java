@@ -14,20 +14,33 @@ import java.sql.Connection;
  */
 class OuterService {
 
-    private final SpringTransactionalIntegrationTest.SpringTxRecordRepository repository;
+    private final SpringTxRecordRepository repository;
     private final InnerService inner;
     private final SessionFactory sessionFactory;
+    private final JavAIPersistenceConfig config;
 
-    OuterService(SpringTransactionalIntegrationTest.SpringTxRecordRepository repository, InnerService inner,
-            SessionFactory sessionFactory) {
+    OuterService(SpringTxRecordRepository repository, InnerService inner,
+            SessionFactory sessionFactory, JavAIPersistenceConfig config) {
         this.repository = repository;
         this.inner = inner;
         this.sessionFactory = sessionFactory;
+        this.config = config;
     }
 
     /** The proxied inner bean, for tests that need to call it with no surrounding transaction. */
     InnerService inner() {
         return inner;
+    }
+
+    /** A JavAI-owned transaction block opened inside a Spring-owned one (OMI-275): it must join rather than
+     *  nest, so the failure below rolls the repository write back rather than leaving it committed. */
+    @Transactional
+    void springThenJavAiInTransactionThenFail(String label) {
+        JavAIPI.inTransaction(config, () -> {
+            repository.save(new TestTxRecord(label));
+            return null;
+        });
+        throw new IllegalStateException("deliberate failure after the inner JavAI block returned");
     }
 
     @Transactional

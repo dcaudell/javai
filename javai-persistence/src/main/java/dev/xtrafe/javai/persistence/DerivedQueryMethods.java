@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.Ranked;
 import org.springframework.data.core.PropertyReferenceException;
 import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.Pageable;
@@ -76,7 +77,8 @@ final class DerivedQueryMethods {
      * @param ranked            whether the method returns {@code List<Ranked<T>>} rather than {@code List<T>}
      */
     record ParsedQuery(Kind kind, String fieldName, PartTree predicate, int limitParamIndex, int firstBindable,
-            int bindableCount, int pageableIndex, int limitObjectIndex, boolean ranked) {
+            int bindableCount, int pageableIndex, int limitObjectIndex, boolean ranked,
+            boolean[] anyDiscriminatorFlags) {
 
         boolean isNarrowed() {
             return predicate != null;
@@ -94,12 +96,30 @@ final class DerivedQueryMethods {
      *  idiom's {@code nearestBy(String)} entry point -- the runtime counterpart of what {@link #parse}
      *  checks at repository-creation time, sharing the check so the two idioms cannot disagree. */
     static String requireVectorizeField(Class<?> entityType, String fieldName) {
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
-        if (fieldName == null || !vectorizeFields.contains(fieldName)) {
-            throw new IllegalArgumentException("'" + fieldName + "' is not a @Vectorize field on "
-                    + entityType.getName() + " -- known @Vectorize fields: " + vectorizeFields);
+        Set<String> searchable = fieldGrainVectorNames(entityType);
+        if (fieldName == null || !searchable.contains(fieldName)) {
+            throw new IllegalArgumentException("'" + fieldName + "' is not a @Vectorize field or"
+                    + " @ExternalVector on " + entityType.getName() + " -- known: " + searchable);
         }
         return fieldName;
+    }
+
+    /**
+     * Every name with a vector of its own at <b>field grain</b> -- {@code @Vectorize} fields and
+     * {@code @ExternalVector}s alike (OMI-290).
+     *
+     * <p>They are one namespace to a query for the same reason they are one namespace to the cache: an
+     * external vector is stored under its own name in exactly the per-field shape a {@code @Vectorize} field
+     * uses, so {@code findNearestByPixelsVector} needs nothing from a backend that
+     * {@code findNearestByCaptionVector} did not already need. What makes the two resolve to different
+     * storage is the reference vector's own model, which every backend already keys on -- so the only thing
+     * that had to change to make an external vector searchable was this check, which was refusing the name
+     * before any of that machinery got a chance to work.
+     */
+    static Set<String> fieldGrainVectorNames(Class<?> entityType) {
+        Set<String> names = new java.util.LinkedHashSet<>(EntityReflection.vectorizeFieldNames(entityType));
+        names.addAll(JavAIRuntime.externalVectorNames(entityType));
+        return names;
     }
 
     /** @see #requireVectorizeField -- the same shared check, for the concatenated-text kind. */
@@ -134,8 +154,21 @@ final class DerivedQueryMethods {
                 throw new IllegalArgumentException(method + " needs " + e.getMessage(), e);
             }
         }
-        PartTree predicate = parsePredicateTail(method, entityType, split.tail());
-        return resolveSignature(method, entityType, kind, split.fieldName(), predicate);
+        // The OfType keyword (OMI-407) is stripped from the narrowing tail exactly as DerivedFinderQuery
+        // strips it from a whole method name -- the two grammars share the machinery so an @Any discriminator
+        // predicate cannot mean one thing in a findBy… and another in a findNearestBy…VectorAnd… .
+        DerivedFinderQuery.AnyTypeRewrite rewrite =
+                DerivedFinderQuery.stripAnyTypeKeyword(split.tail(), entityType);
+        PartTree predicate = parsePredicateTail(method, entityType, rewrite.cleanName());
+        boolean[] anyFlags = predicate == null
+                ? new boolean[0]
+                : DerivedFinderQuery.anyDiscriminatorFlags(predicate, rewrite, method);
+        if (predicate == null && !rewrite.isEmpty()) {
+            throw new IllegalArgumentException(method + " uses '" + DerivedFinderQuery.ANY_TYPE_KEYWORD
+                    + "' outside a narrowing predicate -- it belongs after And, as in "
+                    + "findNearestByCaptionVectorAndTargetOfType(reference, limit, MediaAsset.class).");
+        }
+        return resolveSignature(method, entityType, kind, split.fieldName(), predicate, anyFlags);
     }
 
     private record Split(Kind kind, String fieldName, String tail) {
@@ -155,7 +188,7 @@ final class DerivedQueryMethods {
      * {@code NameContaining}, which has no lead-in, so the scan keeps going and lands on the right one.
      */
     private static Split splitAtVectorKeyword(Method method, Class<?> entityType, String afterPrefix) {
-        Set<String> vectorizeFields = EntityReflection.vectorizeFieldNames(entityType);
+        Set<String> vectorizeFields = fieldGrainVectorNames(entityType);
         for (int at = afterPrefix.lastIndexOf(SUFFIX); at >= 0; at = afterPrefix.lastIndexOf(SUFFIX, at - 1)) {
             String middle = afterPrefix.substring(0, at);
             String tail = afterPrefix.substring(at + SUFFIX.length());
@@ -177,8 +210,8 @@ final class DerivedQueryMethods {
             }
         }
         if (afterPrefix.contains(SUFFIX)) {
-            throw new IllegalArgumentException(method + " does not match a @Vectorize field on "
-                    + entityType.getName() + " -- known @Vectorize fields: " + vectorizeFields
+            throw new IllegalArgumentException(method + " does not match a @Vectorize field or"
+                    + " @ExternalVector on " + entityType.getName() + " -- known: " + vectorizeFields
                     + ". The name must be findNearestBy<Field>Vector, optionally followed by And<Predicate>.");
         }
         throw unsupported(method, entityType);
@@ -213,7 +246,7 @@ final class DerivedQueryMethods {
      * search with no bound at all is never what a caller means.
      */
     private static ParsedQuery resolveSignature(Method method, Class<?> entityType, Kind kind, String fieldName,
-            PartTree predicate) {
+            PartTree predicate, boolean[] anyDiscriminatorFlags) {
         Class<?>[] params = method.getParameterTypes();
         if (params.length == 0 || params[0] != EmbeddingVector.class) {
             throw badShape(method, entityType);
@@ -271,8 +304,25 @@ final class DerivedQueryMethods {
         if (!List.class.isAssignableFrom(method.getReturnType())) {
             throw badShape(method, entityType);
         }
+        // Checked against the parameters the atoms will actually bind, which start after the reference vector
+        // and the optional int limit rather than at zero -- the one way this differs from the relational half.
+        int ordinal = 0;
+        int cursor = firstBindable;
+        if (predicate != null) {
+            for (PartTree.OrPart orPart : predicate) {
+                for (Part part : orPart) {
+                    int arity = part.getNumberOfArguments();
+                    if (anyDiscriminatorFlags[ordinal]) {
+                        DerivedFinderQuery.validateAnyDiscriminatorPart(part, entityType,
+                                java.util.Arrays.copyOfRange(params, cursor, cursor + arity), method);
+                    }
+                    cursor += arity;
+                    ordinal++;
+                }
+            }
+        }
         return new ParsedQuery(kind, fieldName, predicate, limitParamIndex, firstBindable, bindableCount,
-                pageableIndex, limitObjectIndex, returnsRanked(method));
+                pageableIndex, limitObjectIndex, returnsRanked(method), anyDiscriminatorFlags);
     }
 
     /** Whether the declared return type is {@code List<Ranked<…>>} rather than {@code List<T>}. */
@@ -302,8 +352,10 @@ final class DerivedQueryMethods {
                 && explicit.isLimited()) {
             limit = explicit.max();
         }
+        // No model named: the findNearestBy...Vector convention has no room for one, so it means the
+        // reference's own -- which is what it has always meant (OMI-458).
         return new NearestSpec(parsed.kind(), parsed.fieldName(), reference, limit, offset,
-                bindPredicate(parsed, args));
+                bindPredicate(parsed, args), null);
     }
 
     /**
@@ -318,17 +370,18 @@ final class DerivedQueryMethods {
      */
     static NearestSpec shapeOnly(ParsedQuery parsed) {
         List<List<DerivedFinderQuery.BoundPart>> groups = new ArrayList<>();
+        int ordinal = 0;
         if (parsed.isNarrowed()) {
             for (PartTree.OrPart orPart : parsed.predicate()) {
                 List<DerivedFinderQuery.BoundPart> group = new ArrayList<>();
                 for (Part part : orPart) {
-                    group.add(new DerivedFinderQuery.BoundPart(
-                            part.getProperty(), part.getType(), false, List.of()));
+                    group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), false,
+                            List.of(), parsed.anyDiscriminatorFlags()[ordinal++]));
                 }
                 groups.add(List.copyOf(group));
             }
         }
-        return new NearestSpec(parsed.kind(), parsed.fieldName(), null, 1, 0, List.copyOf(groups));
+        return new NearestSpec(parsed.kind(), parsed.fieldName(), null, 1, 0, List.copyOf(groups), null);
     }
 
     /** The narrowing tail's atoms with this call's arguments sliced in, in method-name order -- the same
@@ -339,6 +392,7 @@ final class DerivedQueryMethods {
         }
         List<List<DerivedFinderQuery.BoundPart>> groups = new ArrayList<>();
         int cursor = parsed.firstBindable();
+        int ordinal = 0;
         for (PartTree.OrPart orPart : parsed.predicate()) {
             List<DerivedFinderQuery.BoundPart> group = new ArrayList<>();
             for (Part part : orPart) {
@@ -348,7 +402,8 @@ final class DerivedQueryMethods {
                     partArgs.add(args[cursor++]);
                 }
                 boolean ignoreCase = part.shouldIgnoreCase() != Part.IgnoreCaseType.NEVER;
-                group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), ignoreCase, partArgs));
+                group.add(new DerivedFinderQuery.BoundPart(part.getProperty(), part.getType(), ignoreCase,
+                        partArgs, parsed.anyDiscriminatorFlags()[ordinal++]));
             }
             groups.add(List.copyOf(group));
         }

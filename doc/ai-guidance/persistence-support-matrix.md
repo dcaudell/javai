@@ -12,16 +12,26 @@ configured. Companion to `JavAI_Usage_Guide.md`; the authoritative, always-curre
 below:
 
 - **`POSTGRES` (`RepositoryBackendHibernatePostgres`)** — a *real Hibernate/JPA* backend. Your entity is an
-  ordinary `@Entity`, mapped by Hibernate, so **standard JPA mapping annotations apply**. Vectors and JavAI
-  collections live in side tables this backend owns; derived finders become JPA Criteria queries.
+  ordinary `@Entity`, mapped by Hibernate, so **standard JPA mapping annotations apply**. Only **vectors and
+  geo points** live in side tables this backend owns (`javai_vectors__*`, `javai_summary_vectors__*`,
+  `javai_geo_points`); everything else — **including JavAI collections, since 0.1.10** — is an ordinary
+  Hibernate mapping. Derived finders become JPA Criteria queries.
 - **`NEO4J` (`RepositoryBackendNeo4j`)** and **`MONGODB` (`RepositoryBackendSpringDataMongo`)** — *reflective*
   backends. There is no ORM. The backend reflects over your object's **declared field types** to decide what
   is a scalar property, a relationship/reference, or a vector. They consult **only `@Id`** from JPA; every
   other JPA mapping annotation is **ignored** (harmless, just not load-bearing).
 
 **Invariants across all three:** identity is a single `@Id`-annotated `UUID` field, **application-assigned**
-(no `@GeneratedValue`); a `Map`-typed relationship field must be **`String`-keyed**; and a repository method
-that a backend can't serve is rejected **at repository-creation time**, never on first call.
+(no `@GeneratedValue`); and a repository method that a backend can't serve is rejected **at
+repository-creation time**, never on first call.
+
+**Not an invariant any more:** the `String`-keyed-`Map` rule. **Neo4j and MongoDB** still refuse any
+`Map`-typed field keyed by anything else, at registration, JavAI-typed or plain. **On Postgres a non-`String`
+key is supported** — the validator went with the storage it protected (OMI-277), and a map is now mapped by
+Hibernate the way JPA specifies (`@MapKeyColumn`, `@MapKeyEnumerated`, …). Measured, not merely un-refused:
+`Integer`, `UUID` and enum keys round-trip **as their own types**, in `integer`/`uuid`/`varchar` columns
+(`NonStringMapKeyConformanceTest`). `String` is still the **portable** choice, but only because of the other
+two backends.
 
 Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupported / rejected · **N/A** not applicable.
 
@@ -34,15 +44,15 @@ Legend: ✅ supported · ⚠️ accepted but inert (no effect) · ❌ unsupporte
 | `@Id` | ✅ | ✅ | ✅ | **Required.** Must be `UUID`. Application-assigned (the backend sets a random `UUID` if null on save). |
 | `@Entity` | ✅ (required) | ⚠️ | ⚠️ | Postgres needs it (it *is* a Hibernate entity; also drives recursive related-type registration). Neo4j/Mongo key off the declared class/field type instead — the annotation is conventional, not consulted. |
 | `@GeneratedValue` | ❌ | ❌ | ❌ | Identity is always an app-assigned `UUID`. Don't use it. |
-| `@MappedSuperclass` | ✅ | ⚠️ | ⚠️ | Postgres needs it for an inherited field to be mapped. Neo4j/Mongo walk the full class hierarchy regardless, so inherited fields round-trip either way. |
-| `@OneToOne` / `@ManyToOne` | ✅ | ⚠️ | ⚠️ | Postgres maps a **singular** association through Hibernate (use `cascade = CascadeType.ALL` so it saves with the owner). Neo4j/Mongo infer a singular relationship/reference from the field's declared type (a `JavAIVectorizable`-typed field) — the annotation is inert. |
-| `@OneToMany` / `@ManyToMany` | ✅ on a plain JDK collection **and** on an interface-typed JavAI collection<br>❌ on a *concrete*-typed JavAI collection | ⚠️ | ⚠️ | **Postgres:** a normal Hibernate association — FK/join table, cascade, `orphanRemoval`, `mappedBy`, lazy loading — whether the field is a plain JDK collection **or** declared by a JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`). In both cases `@JavAIVectorizable` members get their vectors persisted automatically; for the JavAI-interface case the instance Hibernate substitutes is still a real JavAI collection (vectors + dirty-tracking intact), with **no `@CollectionType` or other JavAI-specific annotation required**. A *concrete*-typed field (`JavAIArrayList<X>`) is rejected at registration, because Hibernate must be able to substitute its own instance — declare it by the interface and make it non-final. Neo4j/Mongo: inert, to-many works by declared type. |
-| `@Transient` | ✅ | ⚠️ | ⚠️ | Postgres honors it (and auto-adds it for JavAI-collection and `Point` fields). Neo4j/Mongo don't skip `@Transient` fields — a simple-typed one would still be persisted. |
+| `@MappedSuperclass` | ✅ | ⚠️ | ⚠️ | Postgres needs it for an inherited field to be mapped. A geo `Point` may be declared on the `@MappedSuperclass` or on its subclass (since 0.1.10, OMI-556; before that either one failed `SessionFactory` boot). Neo4j/Mongo walk the full class hierarchy regardless, so inherited fields round-trip either way. |
+| `@OneToOne` / `@ManyToOne` | ✅ | ⚠️ | ⚠️ | Postgres maps a **singular** association through Hibernate (use `cascade = CascadeType.ALL` so it saves with the owner). Neo4j/Mongo infer a singular relationship/reference from the field's declared type (a `JavAIVectorizable`-typed field) — the annotation is inert. ⚠️ **Two ways `fetch = LAZY` is quietly ignored on Postgres**, both inherited from Hibernate and both documented below: a **`final` target class**, and the **inverse side of a `@OneToOne`**. |
+| `@OneToMany` / `@ManyToMany` | ✅ on a plain JDK collection **and** on an interface-typed JavAI collection (`JavAIList`/`JavAISet`/`JavAIMap`, non-final)<br>❌ on a *concrete*-typed JavAI collection, annotated or not (OMI-277) | ⚠️ | ⚠️ | **Postgres:** a normal Hibernate association — FK/join table, cascade, `orphanRemoval`, `mappedBy`, lazy loading — whether the field is a plain JDK collection **or** declared by a JavAI *interface* (`JavAIList`/`JavAISet`/`JavAIMap`). In both cases `@JavAIVectorizable` members get their vectors persisted automatically; for the JavAI-interface case the instance Hibernate substitutes is still a real JavAI collection (vectors + dirty-tracking intact), with **no `@CollectionType` or other JavAI-specific annotation required**. A *concrete*-typed field (`JavAIArrayList<X>`) is rejected at registration, because Hibernate must be able to substitute its own instance — declare it by the interface and make it non-final. Neo4j/Mongo: inert, to-many works by declared type. |
+| `@Transient` | ✅ | ⚠️ | ⚠️ | Postgres honors it, and auto-adds it for **`Point` fields**, which it maps itself in `javai_geo_points`. (Up to 0.1.9 it auto-added it for JavAI collection fields too; since 0.1.10 those are ordinary Hibernate associations and are mapped, not hidden.) Neo4j/Mongo don't skip `@Transient` fields — a simple-typed one would still be persisted. |
 | `@Column`, `@Table`, `@Basic`, `@Enumerated`, `@Temporal`, `@Lob` | ✅ | ⚠️ | ⚠️ | Postgres: honored by Hibernate as usual. Neo4j/Mongo: ignored — scalar conversion is fixed (`enum`→`name()`, `Instant`/`UUID`→string, etc.), column/table names don't apply. |
-| `@Version` | ✅ | ⚠️ | ⚠️ | **Postgres:** optimistic locking works, and works through a detached-entity repository. Concurrent writers to one entity produce one winner and one `OptimisticLockException`; and **since 0.1.8 (OMI-254) the instance `save()` returns carries the version the write assigned**, so the object you get back is safe to mutate and save again — the ordinary load-mutate-save-mutate-save shape, on the root and on cascaded members alike. Up to and including 0.1.7 it did not: detection was correct but `save()` handed back the *pre-write* version, so a second save of the same instance threw with no concurrency involved at all, which made the annotation effectively unusable. On ≤0.1.7, re-read between writes. **Neo4j/Mongo:** inert, and inert in a way worth stating plainly — the field is persisted as an ordinary scalar and never checked or incremented, so it looks like protection and provides none. Use `@Transactional(isolation = …)`, not `@Version`, on those backends. |
+| `@Version` | ✅ | ⚠️ | ⚠️ | **Postgres:** optimistic locking works, and works through a detached-entity repository. Concurrent writers to one entity produce one winner and one `OptimisticLockException`; and **since 0.1.8 (OMI-254) the instance `save()` returns carries the version the write assigned**, so the object you get back is safe to mutate and save again — the ordinary load-mutate-save-mutate-save shape, on the root and on cascaded members alike. (Since 0.1.10 that instance is Hibernate's own *managed* one rather than the one you passed — see *`save()` returns the managed instance* below.) Up to and including 0.1.7 it did not: detection was correct but `save()` handed back the *pre-write* version, so a second save of the same instance threw with no concurrency involved at all, which made the annotation effectively unusable. On ≤0.1.7, re-read between writes. **Neo4j/Mongo:** inert, and inert in a way worth stating plainly — the field is persisted as an ordinary scalar and never checked or incremented, so it looks like protection and provides none. Use `@Transactional(isolation = …)`, not `@Version`, on those backends. |
 | *Implicit* column/table naming (no `@Column`/`@Table`) | ✅ snake_case | n/a | n/a | **Postgres, since 0.1.5 (OMI-145):** `CamelCaseToUnderscoresNamingStrategy` is the default — `emailVerified` → `email_verified`, entity `TestCrew` → table `test_crew` — matching Spring Boot's default. Up to 0.1.4 the bare Hibernate default applied (`emailverified`), so **an existing pre-0.1.5 schema with multi-word names needs migrating or pinning**: `JavAIPersistenceConfig.Builder.physicalNamingStrategy(new PhysicalNamingStrategyStandardImpl())` restores the old naming, and `.hibernateProperty(k, v)`/`.hibernateProperties(map)` passes through any other Hibernate setting. Neo4j/Mongo have no JPA column naming at all, so both knobs are inert there. |
 | `@Embedded` / `@Embeddable` | ✅ | ❌ | ❌ | Postgres maps an embeddable's columns (and Criteria can navigate into them). Neo4j/Mongo have no embeddable concept — such a field is skipped. |
-| `@Any` (+ `@AnyDiscriminator`, `@AnyDiscriminatorValue`, `@AnyKeyJavaClass`) | ✅ | ❌ | ❌ | A **polymorphic to-one** whose target may be any of several *unrelated* entities, resolved by a discriminator column. **Postgres:** ordinary Hibernate mapping; the concrete types named in `@AnyDiscriminatorValue(entity = …)` are registered automatically, so you don't need a repository for each one. Add `@Cascade` if the owner should save its target — `@Any` doesn't cascade by default. **Two things to know before choosing it:** the target's id column points into several tables, so `@Any` **cannot carry a foreign key** — you trade referential integrity for the polymorphism, and nothing at the database level will stop a dangling reference. And the discriminator values are strings in your data, so renaming or moving a target class is a data migration, not a refactor. **Neo4j/Mongo:** rejected at registration with a clear error. Their mapping has no discriminator concept, and reference detection keys off the declared field type — which for `@Any` is deliberately a plain interface, so the field previously fell into the "silently skipped" boundary and the association came back `null` after a successful save. Refusing it loudly is better than losing it quietly. |
+| `@Any` (+ `@AnyDiscriminator`, `@AnyDiscriminatorValue`, `@AnyKeyJavaClass`) | ✅ | ❌ | ❌ | A **polymorphic to-one** whose target may be any of several *unrelated* entities, resolved by a discriminator column. **Postgres:** ordinary Hibernate mapping; the concrete types named in `@AnyDiscriminatorValue(entity = …)` are registered automatically, so you don't need a repository for each one. Add `@Cascade` if the owner should save its target — `@Any` doesn't cascade by default. **Queryable since 0.1.10 (OMI-407)** — `findByTarget(x)`/`…In`/`…IsNull` by instance and `findByTargetOfType(Class)` by discriminator, with no shadow read-only column mappings; see Table 2. Traversing *into* one, and sorting by one, remain refused. Under `fetch = LAZY` it behaves like any other to-one: uniformly attached with its owner, and resolving to the concrete target type (measured in `RemainingFetchCellsConformanceTest`). **Two things to know before choosing it:** the target's id column points into several tables, so `@Any` **cannot carry a foreign key** — you trade referential integrity for the polymorphism, and nothing at the database level will stop a dangling reference. And the discriminator values are strings in your data, so renaming or moving a target class is a data migration, not a refactor. **Neo4j/Mongo:** rejected at registration with a clear error. Their mapping has no discriminator concept, and reference detection keys off the declared field type — which for `@Any` is deliberately a plain interface, so the field previously fell into the "silently skipped" boundary and the association came back `null` after a successful save. Refusing it loudly is better than losing it quietly. |
 
 > The JavAI vector/graph annotations (`@Vectorize`, `@Summary`, `@SearchVisibility`, `@JavAIVectorizable`,
 > `@JavAIGraphNode`/`@JavAIEdge`, `@Taggable`) are orthogonal to this table and behave the same on all three
@@ -74,10 +84,23 @@ hand-implemented.
 | `Exists` (property present) | ✅ | ✅ | ✅ | Scalar → not-null; collection → non-empty; Mongo → `$exists`. |
 | **Geo** `Near(Point, Distance)` / `Within(Circle)` (on a `Point` field) | ✅ | ✅ | ✅ | Requires an `org.springframework.data.geo.Point` field. PG `earth_distance`/`earthdistance` · Neo4j `point.distance` · Mongo `$geoWithin`+`$centerSphere`. Great-circle point-distance (not full PostGIS/GeoJSON polygon geometry). |
 | **Nested path — singular** (`findByProfileHandle`) | ✅ | ✅ | ✅ | PG: native Criteria join. Neo4j: `EXISTS {}` traversal. Mongo: resolve referenced ids, match `field.id IN (…)`. |
-| **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | Same mechanisms; the to-many hop uses the collection's storage (Table 3). **Postgres:** a natively-mapped collection (plain JDK or interface-typed JavAI) resolves as a single **Criteria JOIN**; only a *concrete*-typed JavAI collection still uses id-set materialization (a query per hop). Mongo still uses id-set (references are `{type, id}` pointers); Neo4j composes `EXISTS {}` subqueries. |
+| **Nested path — to-many** (`findByReviewsReviewer`) | ✅ | ✅ | ✅ | **Postgres, since 0.1.10:** every to-many hop is a single **Criteria JOIN**. There is only one collection storage shape left (OMI-277), so the id-set-per-hop walk went with the side table it existed for — **with one exception**: a **geo** predicate at the leaf still materializes an id set per hop, because `javai_geo_points` is not a table Hibernate can join. Mongo still uses id-set throughout (references are `{type, id}` pointers); Neo4j composes `EXISTS {}` subqueries. |
 | `countBy…` / `existsBy…` | ✅ | ✅ | ✅ | Return `long`/`int` and `boolean` respectively. |
+| **Declared query** — `@Query("…")` on the method (JPQL) | ✅ | ❌ | ❌ | **Since 0.1.10 (OMI-398).** For what a derived name cannot ask: grouped aggregates (`GROUP BY` — `countBy…In` gives one total, not one per id), projections, and any query worth writing out. `@Param` is Spring Data's own (`org.springframework.data.repository.query.Param`); `@Query`/`@Modifying` are JavAI's (`dev.xtrafe.javai.annotations`), because `spring-data-jpa` is not a dependency. **Neo4j/Mongo refuse at repository-creation time** rather than never running it — a JPQL string means nothing to either store. Signature is validated when the repository is realized; the query *text* as soon as an ORM exists to parse it (immediately, or when the `SessionFactory` is built) — always before any repository method runs. **An entity named only inside query text is not thereby registered**: name it with `entityType(...)`/`entityPackages(...)`. ⚠️ **The refusal is at realization, so a `@Query` cannot share an interface with a backend that refuses one** — serve a multi-backend entity by putting its declared queries in a second, Postgres-only repository interface. |
+| **Declared query** — `@Query(nativeQuery = true)` (SQL) | ✅ | ❌ | ❌ | Same, for what JPQL cannot reach. The SQL itself is parsed by the database on first execution — there is no SQL grammar in JavAI — though parameter binding is still checked at creation time. |
+| Declared-query returns: entity / `Optional` / single / `Stream` / scalar / `Object[]` / **record** | ✅ | ❌ | ❌ | `Object[]` and records needed no projection machinery: Hibernate 7 hands back a tuple and instantiates a record from an ordinary `select new …` constructor expression, so `(id, count)` pairs come back typed. |
+| Declared-query `Page` / `Slice` | ✅ | ❌ | ❌ | `Page` **requires** `countQuery = "…"`, deliberately not derived by rewriting the query — counting an arbitrary select means understanding its projection, joins and grouping, and a wrong rewriter returns a plausible wrong number rather than failing. `Slice` needs none (it fetches one extra row). |
+| Declared-query dynamic `Sort` | ✅ JPQL, entity-returning only · ❌ native | ❌ | ❌ | Applied through Hibernate's `SelectionSpecification`, never by editing query text. A projection has no attribute to order by, and a native query would need SQL rewriting — both refused, at creation time. A `Pageable`'s *window* needs no rewriting and works on both. |
+| **`@Modifying`** targeted write (`set c = c + 1`) | ✅ | ❌ | ❌ | The only way to write one column and touch nothing else, and the only way to get an *atomic* read-modify-write. Joins the caller's transaction like any other write. Does **not** bump `@Version` unless the query says `update versioned`. `flushAutomatically`/`clearAutomatically` are opt-in and default `false`. |
+| `@Modifying` **write to a column JavAI derives from** | ❌ **refused at creation** | n/a | n/a | A bulk write fires no woven accessor, so nothing recomputes what it invalidated — and a stored vector is hydrated back on every later load, so the inconsistency outlives the process. Refused for a `@Vectorize` field, an `@ExternalVector`'s `keyField`, a `@Summary` field, or a `@Taggregate` field, resolved against **the statement's own target entity**, not the repository's type parameter. An *ordinary* column on a vectorized entity stays writable — a summary is arithmetic over vectors, so a column no vector reads cannot move one. |
+| `@Modifying` + `nativeQuery = true` on a type JavAI stores for | ❌ **refused at creation** | n/a | n/a | The check above reads a parsed statement's assignments; SQL has none to read, so the repository is the only signal. Refused when the entity is `@JavAIVectorizable` or declares a `Point`. Native writes on a type JavAI keeps nothing for are ordinary. |
+| `@Modifying` delete | ✅ | ❌ | ❌ | Resolves the matching ids and deletes each through `deleteById`'s path, exactly as `deleteBy…` does — a bulk `delete` cascades to nothing, detaches from no container (join-table FK refuses it), and orphans `javai_vectors__*`/`javai_geo_points` rows. One extra statement for a deletion path that is already correct. |
+| **Keeping a column off `save()`'s path** | ✅ `@Column(updatable = false)` | n/a | n/a | Needs no JavAI annotation, and this was **measured**: JPA's own flag already stops an ordinary `save()` writing the column (a stale detached value does not clobber it) while a `@Modifying` query writes it anyway. That is the whole mechanism for a counter maintained outside its entity's editing path. |
+| **`@Any` predicate — by target instance** (`findByTarget(x)`, `…In`, `…IsNull`) | ✅ | ❌ | ❌ | **Since 0.1.10 (OMI-407).** Needs no new grammar: the `@Any` field is a real property, and Hibernate resolves equality straight to the discriminator + key pair. |
+| **`@Any` predicate — by target type** (`findByTargetOfType(Class)`, `…OfTypeIn`) | ✅ | ❌ | ❌ | The one keyword added to `PartTree`'s closed vocabulary, translating to `Path.type()`. Removes the workaround of mapping an `@Any`'s discriminator and key a *second* time as read-only columns just so a finder could see them — duplication every queryable `@Any` repeated, with two mappings free to drift. Also available on the vector-search builder as `.where("target").ofType(X.class)`. |
+| Traversing *into* an `@Any` (`findByTargetLabel`), or sorting by one | ❌ | ❌ | ❌ | Genuinely impossible rather than unimplemented: the key column points into several tables, so there is no join to make and no single column to order by. Refused at creation time, with a message naming `@Any`. |
 | **Joining a caller's transaction** (Spring `@Transactional`, or `JavAIPI.inTransaction`) | ✅ | ❌ | ❌ | **Postgres, since 0.1.5 (OMI-146):** a repository call runs on the caller's session when one is active — a Spring `@Transactional` method or a `JavAIPI.inTransaction(config, body)` block — and opens its own session only when there is none. `@Transactional` needs Spring's transaction manager and JavAI to hold the *same* `SessionFactory` (matched by identity), which since **0.1.6 (OMI-160)** you can get either way round: let JavAI own the factory and ask for it with `JavAIPI.sessionFactory(config)` (**preferred** — keeps the mapping hooks that make an interface-typed `@OneToMany JavAIList<T>` a real JavAI collection; wire it to `JpaTransactionManager`, *not* `HibernateTransactionManager`, which can't unwrap a `DataSource` from it), or let Spring own it and hand it over with `Builder.sessionFactory(...)` (works with either manager, but loses those hooks). Vector rows commit/roll back with the caller. Neo4j/Mongo: every call is still its own unit of work, and `inTransaction` throws rather than pretending; design multi-call flows there to be idempotent. |
-| `deleteBy…` / `deleteById` | ✅ | ✅ | ✅ | PG deletes per-id (cascades vectors + collection members) · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). **Postgres, since OMI-255:** an entity held in another entity's `@Summary` or ordinary to-many is **detached from those containers first**, so deleting it succeeds instead of tripping the join table's foreign key. Membership only — no other entity is deleted. A **singular** reference (`@ManyToOne`/`@OneToOne`) at the entity is still refused by the foreign key, deliberately: nulling someone else's field is a data change, not a cleanup. |
+| `deleteBy…` / `deleteById` | ✅ | ✅ | ✅ | PG deletes per-id, taking the entity's own vector/geo rows with it — and those of any member Hibernate cascade-deletes alongside it (`cascade = REMOVE`/`ALL`, or `orphanRemoval`), so no side-table row is left orphaned · Neo4j `DETACH DELETE` · Mongo `deleteMany` (does **not** cascade to referenced docs). **Postgres, since OMI-255:** an entity held in another entity's `@Summary` or ordinary to-many is **detached from those containers first**, so deleting it succeeds instead of tripping the join table's foreign key. Membership only — no other entity is deleted. A **singular** reference (`@ManyToOne`/`@OneToOne`) at the entity is still refused by the foreign key, deliberately: nulling someone else's field is a data change, not a cleanup. |
 | `OrderBy…` / dynamic `Sort` — **root scalar** | ✅ | ✅ | ✅ | |
 | `OrderBy…` / `Sort` — **nested singular path** | ✅ | ❌ | ❌ | Neo4j/Mongo sort only by a root scalar; a nested/to-many sort is rejected at creation. |
 | `Top`/`First` limiting | ✅ | ✅ | ✅ | |
@@ -90,22 +113,107 @@ hand-implemented.
 
 ---
 
+## Table 2b — Externally-supplied vectors (`@ExternalVector`, OMI-290)
+
+| Capability | Postgres | Neo4j | MongoDB | Notes |
+|---|---|---|---|---|
+| Store / hydrate an `@ExternalVector` | ✅ | ✅ | ✅ | Per-field grain, partitioned by the **declared** model, not the configured one |
+| Content key round-trips (`computed_for`) | ✅ | ✅ | ✅ | Postgres column; `…ComputedFor` property/field on the other two. Without it a hydrated vector is held and never served |
+| Row/property removed when the content changes | ✅ | ✅ | ✅ | Same rule as an absent `@Vectorize` field — a stale entry keeps matching searches |
+| `supplyVector(id, name, vector, computedFor)` | ✅ | ✅ | ✅ | Reads the entity, writes one vector. No merge, no summary recomputation |
+| `findPendingVector(name, limit)` | ✅ | ✅ | ✅ | A scan, deliberately — for backfills and dead-letter re-drives, not per-item polling |
+| `findNearestBy<Name>Vector` / `nearestBy("<name>")` | ✅ | ✅ | ✅ | Same convention as a `@Vectorize` field; the reference vector's own model selects the storage |
+| Narrowing a search of one (`…AndKindIs`) | ✅ | ❌ | ✅ | Inherits Table 2's rule exactly — Neo4j cannot narrow *any* vector search, for its own structural reason |
+| Reads never call a provider or block | ✅ | ✅ | ✅ | Including inside a save's forced-accuracy pass, under every `EmbeddingConsistencyMode` |
+| `reindex` preserves it | ✅ | ✅ | ✅ | Neither recomputed nor dropped — there is no provider that could produce it |
+
+## ⚠️ One manual migration, if your database predates 0.1.10 (OMI-435)
+
+`javai_summary_vectors__<model>.vector` was `NOT NULL` and is now NULL-able: an entity can legitimately hold
+a concatenated text vector and no summary vector, and refusing that pair rolled back whole saves inline and
+requeued forever on the drain. **A table JavAI created before this keeps its old constraint.** JavAI
+provisions a table it finds missing rather than altering one it finds present, and an `ALTER` from the write
+path would need an `ACCESS EXCLUSIVE` lock on a table the calling transaction already holds — a deadlock on
+the request that triggered it. So it is one statement, run once per existing summary table, by you:
+
+```sql
+ALTER TABLE javai_summary_vectors__<model> ALTER COLUMN vector DROP NOT NULL;
+```
+
+A database created by 0.1.10 or later needs nothing. Nothing else in this document requires a manual step.
+
+## Table 2c — Persisted per-model summary vectors (`@Summary(persistModelSummaries = true)`, OMI-458)
+
+Opt-in, on the container **type**. Off, everything below is exactly the pre-OMI-458 behaviour: nothing extra
+written, nothing enqueued, no table provisioned.
+
+| Capability | Postgres | Neo4j | MongoDB | Notes |
+|---|---|---|---|---|
+| One summary row per declared non-ambient model | ✅ | ❌ | ❌ | `javai_summary_vectors__<model>`, already HNSW-indexed by `ensureSummaryVectorTable`. The other two store `summaryVector__<model>` per node/document but their writers stay single-model this phase |
+| Models derived from the `@Summary` subtree | ✅ | ✅ | ✅ | Transitively, and expanded to registered subtypes — a `@Summary` collection typed to a `@MappedSuperclass` whose subclass declares the `@ExternalVector` is found. Read from *declarations*, never from what a table holds |
+| Nested containers (`Exhibition → Album → Image`) | ✅ | n/a | n/a | Every tier gets its own row, including tiers contributing nothing of their own to that model |
+| Row updated when a member's vector is **supplied** | ✅ | ❌ | ❌ | ⚠️ The load-bearing one: an `@ExternalVector` arrives *after* the save, so a writer that only ran on `save` would keep a row that is correct exactly when it is empty. `writeExternalVector` enqueues on `javai_summary_pending`; OMI-255's drain walks upward from there |
+| Row deleted when the last such member goes | ✅ | n/a | n/a | Same rule as an absent `@Vectorize` field — a stale ANN row keeps matching searches |
+| `nearestBySummary()` in a non-ambient model — indexed | ✅ | ❌ | ❌ | Requires the opt-in; otherwise the fold below. **No model is named at the call** — the reference vector selects the storage, as it always has |
+| `nearestBySummary()` — **answers regardless** | ✅ | ✅ | ✅ | Without the opt-in, folds candidates in memory: same value, same ranking, O(corpus). Which path runs is decided from the declaration, never from whether the table holds rows. Logged once per (type, model) |
+| `findNearestBySummaryVector(ref, n)` in a non-ambient model | ✅ | ✅ | ✅ | The method-name idiom needs no model either, and could not carry one — model ids are not Java identifiers |
+| `NearestQuery.inModel(modelId)` — assert the model | ✅ | ✅ | ✅ | Optional. Buys legibility and a checked assumption, never a capability: it refuses a reference from another model, which catches asking for one of a container's two summaries and passing the other |
+| `nearestByConcatenatedText()` with a reference from another model | ❌ refused | ❌ refused | ❌ refused | That vector is one embedding produced by the configured provider, so it exists in that model and no other — nothing could match. Refused rather than answered empty, since empty is what a corpus with no near matches returns and the query would look answered. Both idioms; the message points at `nearestBySummary()`, which does serve that model |
+| A read provisions a table or index | ❌ never | ❌ never | ❌ never | Postgres resolves the name and answers empty when absent; Neo4j/MongoDB create an index only when something actually carries the property, since there a read is the only creator. Pinned by `QueryTimeSchemaCreationTest` |
+| `inModel(...)` on any other grain | ❌ refused | ❌ refused | ❌ refused | A field names its vector, an `@ExternalVector`'s model is fixed by its declaration, and combined/concatenated exist in the configured model alone — no second answer for a qualifier to give |
+| Backfill after turning the flag on | ✅ | n/a | n/a | `reindex()` — it already queues then drains, and the drain writes every model's row |
+| `@Summary(persistModelSummaries = true)` on a **field** | ❌ refused at registration | ❌ | ❌ | A summary row is the container's, keyed `(owner_type, owner_id)`; there is no half of one for a field to opt in. Refused rather than ignored |
+
+⚠️ **Turning the flag off, or removing a model from a subtree, leaves the rows behind.** JavAI provisions what
+it finds missing rather than altering what it finds present, and keeps no record of models a container *used
+to* declare. Deleting the entity still clears every table — `deleteById` sweeps the catalog.
+
+⚠️ **The cost is at write time, and it is real.** One upsert per model on every recomputation of the
+container, plus a queue row per external vector supplied anywhere beneath it. That is the trade: a ranking
+that was O(containers × their members) per query becomes an indexed lookup. A container nobody ranks this way
+should leave the flag off — the fold still answers.
+
+⚠️ **Searching an external vector needs a reference from the same model.** A query embedding from your text
+provider cannot search an image index — not less well, but not at all. Producing one is your pipeline's job.
+
 ## Table 3 — JavAI collection field types
 
 How each **JavAI collection type**, declared as an `@Entity` field, persists and what derived-finder queries
-can reach *through* or *about* it. A `Map` field must be **`String`-keyed** on every backend (validated at
-registration).
+can reach *through* or *about* it.
+
+⚠️ **The `Persist: Postgres` column is where the backends stopped agreeing in 0.1.10.** A JavAI collection is
+declared **by its interface** there — the concrete types are refused at registration (OMI-277). Neo4j and
+MongoDB classify collections by declared type and accept either, so the *same field* that works on all three
+is the interface-typed one.
 
 | Collection type | Persist: Postgres | Persist: Neo4j | Persist: MongoDB | Nested-traversal finder | `IsEmpty`/`IsNotEmpty` finder |
 |---|:--:|:--:|:--:|:--:|:--:|
-| `JavAIArrayList<E>` | ✅ `javai_collection_members` | ✅ relationship (ordered) | ✅ `{type,id}` reference array | ✅ P·N·M | ✅ P·N·M |
-| `JavAILinkedHashSet<E>` | ✅ `javai_collection_members` | ✅ relationship | ✅ reference array | ✅ P·N·M | ✅ P·N·M |
-| `JavAILinkedHashMap<String,V>` | ✅ (String key only) | ✅ key on the relationship | ✅ reference array + key | ✅ P·N·M (by the value's field; key-agnostic) | ✅ P·N·M |
+| **interface-typed** `JavAIList`/`JavAISet`/`JavAIMap` + `@OneToMany`/`@ManyToMany` | ✅ **native Hibernate association** (own join table/FK), JavAI collection instance preserved; a `JavAIMap` takes **any key JPA can map**, not just `String` | ✅ relationship (`String` key only) | ✅ reference array (`String` key only) | ✅ P·N·M | ✅ P·N·M |
+| *plain* `List`/`Set`/`Map` (not a JavAI type) | ✅ native Hibernate association — **requires** `@OneToMany`/`@ManyToMany`/`@ManyToAny`/`@ElementCollection` | ✅ relationship (annotation inert) | ✅ reference array (annotation inert) | ✅ P·N·M | ✅ P·N·M |
+| *concrete-typed* `JavAIArrayList<E>` | ❌ **refused at registration** (OMI-277) — declare it `JavAIList<E>` | ✅ relationship (ordered) | ✅ `{type,id}` reference array | ✅ N·M | ✅ N·M |
+| *concrete-typed* `JavAILinkedHashSet<E>` | ❌ **refused at registration** — declare it `JavAISet<E>` | ✅ relationship | ✅ reference array | ✅ N·M | ✅ N·M |
+| *concrete-typed* `JavAILinkedHashMap<K,V>` | ❌ **refused at registration** — declare it `JavAIMap<K,V>` | ✅ key on the relationship (`String` key only) | ✅ reference array + key (`String` key only) | ✅ N·M (by the value's field; key-agnostic) | ✅ N·M |
 | `KnowledgeGraph<N,E>` | ❌ rejected at registration | ✅ **Neo4j-only** (two rel. types) | ❌ rejected at registration | ❌ (not a derived-finder path) | ❌ |
-| *plain* `List`/`Set`/`Map` (not a JavAI type) | ✅ native Hibernate association — **requires** `@OneToMany`/`@ManyToMany`/`@ElementCollection` | ✅ relationship (annotation inert) | ✅ reference array (annotation inert) | ✅ P·N·M | ✅ P·N·M |
-| **interface-typed** `JavAIList`/`JavAISet`/`JavAIMap` + `@OneToMany`/`@ManyToMany` | ✅ **native Hibernate association** (own join table/FK), JavAI collection instance preserved | ✅ relationship | ✅ reference array | ✅ P·N·M | ✅ P·N·M |
 
-**Which JavAI collection shape should I use on Postgres?** Declare the field by the **interface**, non-final, with the ordinary JPA annotation — `@OneToMany(cascade = ALL) private JavAIList<Comment> comments = new JavAIArrayList<>();`. You get real JPA semantics *and* a real JavAI collection. Declaring it by the **concrete** class (`private final JavAIArrayList<Comment> …`, no annotation) keeps JavAI's own side-table storage instead — still supported, but without FK/join-table/lazy-loading semantics. Hibernate substitutes its own instance into a mapped collection field, which is why the native path needs an interface type and a non-final field.
+**Which JavAI collection shape should I use on Postgres?** There is exactly one. Declare the field by the
+**interface**, **non-final**, with the ordinary JPA annotation:
+
+```java
+@OneToMany(cascade = CascadeType.ALL)
+private JavAIList<Comment> comments = new JavAIArrayList<>();   // interface-typed, non-final, annotated
+```
+
+You get real JPA semantics *and* a real JavAI collection — vectors and dirty-tracking survive, with **no
+`@CollectionType` or other JavAI-specific annotation**. A **map** additionally needs `@MapKeyColumn`, and may
+be keyed by anything JPA can map — add `@MapKeyEnumerated` for an enum key, as you would on a plain `Map`.
+
+Declaring it by the **concrete** class (`private final JavAIArrayList<Comment> …`) is **refused at
+registration** as of 0.1.10, with a message naming the interface to use. It used to be a second storage
+mechanism, and it was withdrawn rather than repaired: it was silently root-only in both directions — reached
+*through* an association the collection came back empty, and saved *through* one its members were never
+written. It also could not be made lazy where it stood, since the field holds a `final` instance of a `final`
+class and Hibernate manages a collection by substituting its own. That is the same reason the supported shape
+needs an interface type and a non-final field.
 
 Notes:
 - **Element/value type** of the collection must itself be a persistable entity (its own `@Id`), and it keeps
@@ -125,11 +233,17 @@ Notes:
   it works everywhere. Reaching *through* a relationship, or using geo/emptiness, also works everywhere now —
   just mind the sort restriction on Neo4j/Mongo (root scalar only).
 - **Adding a field?** Scalar → fine on all three. A *single* related entity → `@OneToOne`/`@ManyToOne`
-  (Postgres) or just the declared type (Neo4j/Mongo). *Many* related entities → a **JavAI collection**, never
-  `@OneToMany`. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
+  (Postgres) or just the declared type (Neo4j/Mongo). *Many* related entities → **`@OneToMany`/`@ManyToMany`
+  on a field declared by its interface** — `JavAIList`/`JavAISet`/`JavAIMap` if you want vectors and
+  dirty-tracking on the collection itself, a plain `List`/`Set`/`Map` if you don't. ⚠️ *This advice inverted
+  in 0.1.10:* up to 0.1.9 it read "a JavAI collection, never `@OneToMany`", and the storage that made that
+  true is gone. A **geo point** → `org.springframework.data.geo.Point`. A **`KnowledgeGraph`** → Neo4j only.
   A **polymorphic to-one** (the target may be any of several unrelated entities) → `@Any`, Postgres only.
 - **Portability:** target the intersection (avoid `KnowledgeGraph`, `@Any`, `@Embedded`, and nested/to-many
-  *sort*) if the same entity must run on more than one backend. Note that `KnowledgeGraph` and `@Any` pull in
+  *sort*) if the same entity must run on more than one backend. Two more since 0.1.10, both pointing *away*
+  from Postgres: declare a JavAI collection by its **interface** (the concrete type still works on
+  Neo4j/Mongo, but Postgres refuses it), and key any `Map` by **`String`** (Postgres takes any key JPA can
+  map, but it is the only one that does). Note that `KnowledgeGraph` and `@Any` pull in
   opposite directions — one is Neo4j-only, the other Postgres-only — so an entity declaring both cannot be
   persisted on any single backend at all.
 
@@ -160,20 +274,23 @@ maintained. In Spring, that means repository `@Bean`s need no `@DependsOn` on th
 
 Scanning reads class metadata rather than loading classes, so a broad package is cheap and initializes
 nothing. It does **validate everything it finds**, and registration fails naming both the type and the
-package it came from. Only three things are refused, all about JavAI-owned field types rather than about
-vectors:
+package it came from. What gets refused is backend-specific, and it is a short list — all about how a field
+is *declared*, none of it about vectors.
 
-1. a **JavAI collection field keyed by something other than `String`** (`JavAIMap<UUID, X>`); a plain
-   `Map<UUID, X>` is unaffected;
-2. a **`KnowledgeGraph`-typed field**, which is Neo4j-only and already refused on Postgres/Mongo however the
-   type was registered;
-3. a **collection field that is unmapped** (no `@OneToMany`/`@ManyToMany`/`@ManyToAny`/`@ElementCollection`/
-   `@Transient`), or a **concrete-typed** JavAI collection (`JavAIArrayList<X>`) carrying an association
-   annotation Hibernate cannot honour.
+**On Postgres**, two validators run:
 
-An entity has to be using JavAI's own collection types, or a Neo4j-only feature, to be refused at all. This
-is deliberate rather than lenient: an entity Hibernate maps but JavAI cannot is worse than one that is
-refused, because the failure surfaces later and far from its cause.
+1. a **`KnowledgeGraph`-typed field** — Neo4j-only, and refused however the type was registered;
+2. a **collection field Hibernate cannot manage**, which is either a **concrete-typed JavAI collection**
+   (`JavAIArrayList<X>`, annotated or not — see Table 3), or a **plain collection with no mapping
+   annotation** (no `@OneToMany`/`@ManyToMany`/`@ManyToAny`/`@ElementCollection`/`@Transient`). Both would
+   otherwise fail deep inside Hibernate's boot, with a message pointing nowhere near the field.
+
+**On Neo4j and MongoDB**, one: a **`Map`-typed field keyed by anything but `String`**, JavAI-typed or plain —
+the key is a string property on the relationship / a string in the reference array, and a stringified key of
+another type could not round-trip back. (Plus `KnowledgeGraph` on Mongo, and `@Any` on both — see Table 1.)
+
+This is deliberately narrow rather than lenient: an entity Hibernate maps but JavAI cannot is worse than one
+that is refused, because the failure surfaces later and far from its cause.
 
 **Excluding something from a scan.** Occasionally an `@Entity` sits inside a scanned package but belongs to a
 *different* persistence unit or `SessionFactory`. Three ways to keep it out, all scanning-only:
@@ -270,7 +387,11 @@ characterised.
 
 ---
 
-## Two traps that look like JavAI bugs and aren't
+## Traps that look like JavAI bugs and aren't
+
+Most of what follows is **Hibernate behaving as Hibernate does**, surfacing through a JavAI repository and
+therefore looking like JavAI's. Where a claim below was established by measurement rather than by reasoning,
+the test is named — so you can re-check it instead of believing it.
 
 ### A convenience getter can break a nested finder (OMI-161)
 
@@ -299,6 +420,116 @@ The getter that "helps" is what breaks it. **Fix:** rename the getter (`identity
 `resolveIdentityId()`), or drop it and let the nested path resolve naturally. Nested paths need no accessor —
 JavAI reads fields.
 
+### Inheritance: a subclass must be registered, the root is not enough
+
+JavAI discovers related types by walking an entity's **fields**, and a subclass is not reachable that way —
+nor discoverable by reflection at all without scanning. So registering a repository for an inheritance root
+does **not** bring its subclasses in, and saving one fails with Hibernate's `Unknown entity type`, which does
+not point at the fix. Name them with `entityPackages(...)` for a whole package, or `entityType(Subclass.class)`
+one at a time. `JOINED` hierarchies otherwise behave normally: a subclass round-trips as itself and a
+polymorphic `findAll` over the root sees it.
+
+### ⚠️ Two to-many fields of the same element type collide on their join table
+
+Hibernate derives a default join-table name from the owner and the element type, so two to-many fields on one
+entity holding the *same* type silently claim the **same table** — and the second field's rows land in the
+first field's collection.
+
+```java
+@OneToMany private JavAIList<Photo> gallery = new JavAIArrayList<>();
+@OneToMany private JavAIMap<String, Photo> byCaption = new JavAILinkedHashMap<>();   // same table!
+```
+
+Ordinary JPA, and the fix is the ordinary one — name the table explicitly, `@JoinTable(name = "…")`, on at
+least one of them. It is worth stating here because it is **newly reachable in 0.1.10**: a JavAI-typed map
+used to avoid the native path entirely, so it could not collide with anything.
+
+### ⚠️ A `static` field on an entity used to break Neo4j and MongoDB (fixed in 0.1.10, OMI-290)
+
+Both reflective backends map an entity by walking its declared fields, and that walk did not exclude
+statics — so a constant as ordinary as `static final String MODEL = "…"` was written as a node/document
+property on save and then written *back* on load, failing with `Cannot write field static final
+java.lang.String …`. Postgres never saw it, because Hibernate does its own mapping and ignores statics.
+
+Fixed, and recorded here because the shape is worth recognising: a defect that only one of three backends
+can express will look like a backend bug when it is really a shared-helper one.
+
+### `@MapsId`, `@ElementCollection`, `@Basic(fetch = LAZY)`
+
+- **`@MapsId` ✅** — the derived id wins over JavAI's own assignment, which is the outcome you want and not
+  the obvious one: JavAI assigns a random `UUID` to any null `@Id` before Hibernate sees the graph, and if
+  that had won, the child would be written under an id unrelated to its parent and the shared primary key
+  would be silently broken.
+- **`@ElementCollection` ✅** — round-trips, and is lazy like any other collection. ⚠️ **Only since 0.1.10 (OMI-275).**
+  Before that a `List<String>` made `save()` throw `InaccessibleObjectException` — the graph walk reflected
+  into every collection element, and the module system refused to open `java.lang`. JDK values are leaves in
+  that walk now.
+- **⚠️ `@Basic(fetch = LAZY)` degrades to eager.** A lazy basic has no proxy to stand in for it; Hibernate
+  defers it only by rewriting field access, which needs bytecode enhancement that a JavAI-built
+  `SessionFactory` does not apply. The value is correct, just fetched sooner than asked — safe, unlike a
+  missing value. For a genuinely large column, split it into its own entity behind a lazy `@OneToOne`.
+
+### `save()` returns the managed instance, not the one you passed (changed in 0.1.10, OMI-275)
+
+`repo.save(x)` returns Hibernate's **managed** instance, exactly as Spring Data JPA's `save` does. Up to
+0.1.9 it returned `x` itself, which was never managed.
+
+Three consequences, and the second is the one that bites:
+
+1. **Inside a transaction, mutating the result is dirty-checked.** Before, it silently was not.
+2. ⚠️ **The returned graph is a different object graph from the one you passed in.** Ordinary `merge`
+   semantics: `save(x) != x`, and mutating `x` afterwards does not affect what you got back. **After a save,
+   keep using what `save` returned, or keep using your own instance — do not mix them.**
+3. **The graph you get back has one attachment state throughout.** Returning an unmanaged root while the
+   session was open used to be the one way a caller could hold a graph attached in one place and detached in
+   another — mutate the root and the change was silently discarded, mutate a child reached through it and the
+   change was silently persisted, with nothing about either object saying which was which. Root and
+   everything reachable from it now agree, in a transaction and out of one (`AttachmentConformanceTest`).
+
+### ⚠️ A lazy to-one whose target class is `final` is silently eager (OMI-279)
+
+Hibernate makes a lazy to-one by handing you a **proxy — a generated subclass of the target entity**. A
+`final` class cannot be subclassed, so there is no proxy to hand over and the association is fetched with its
+owner instead.
+
+```java
+@Entity final class Seal { … }                    // ← the whole cause
+
+@OneToOne(fetch = FetchType.LAZY)
+private Seal seal;                                 // asks for lazy, gets eager
+```
+
+**Nothing tells you.** Not the mapping, not the annotation, not the log. The value is correct — merely
+fetched sooner than you asked — so this is a cost, never a wrong answer. But it is a cost that scales with
+the graph, and `final` is a keyword people put on entities by habit.
+
+The same applies to the entity a lazy `@ManyToOne`, `@OneToOne` or `@Any` points at, and to
+`Hibernate.isInitialized`, which will report `true` on a field you declared `LAZY`. If a to-one you expected
+to be lazy is not, **check the target class for `final` before looking anywhere else** — measured in
+`RemainingFetchCellsConformanceTest`, where `TestSeal` and `TestWaxSeal` are identical targets of identical
+mappings and differ only in that keyword.
+
+### `@OneToOne`: the two sides do not behave alike (OMI-279)
+
+| Side | `fetch = LAZY` | Why |
+|---|---|---|
+| **Owning** (holds the FK), optional **or** `optional = false` | ✅ honoured | The FK column is itself proof of whether the row exists, so a proxy promises nothing it cannot keep |
+| **Inverse** (`mappedBy`) | ❌ **fetched eagerly** | There is no FK on this side. Hibernate has to look to know whether the other row exists at all, so it looks |
+
+⚠️ **`optional = false` does *not* force an eager fetch on the owning side**, which is worth stating because
+the opposite is widely repeated. That folklore is true of the inverse side and false here; measured, not
+assumed. As with the `final` rule above, the inverse-side fetch is early rather than wrong.
+
+### An uninitialized proxy answers its `@Id` for free, *if* the getter is public
+
+A lazy singular association comes back as an uninitialized proxy whose `@Id` you can read without a database
+round trip — which is what lets you wire associations by identity on a detached entity.
+
+⚠️ **This requires a `public` identifier getter.** Hibernate serves the id by overriding that getter, and it
+cannot override a package-private one: the call falls through to the uninitialized instance and triggers a
+load, so on a detached entity what looks like a free read raises `LazyInitializationException`. Nothing warns
+you; the fix is one keyword.
+
 ### `@Summary` on a `FetchType.LAZY` association only summarizes inside a session
 
 `summaryVector()` has to read each `@Summary` child's own summary. If that child is a still-uninitialized
@@ -309,3 +540,37 @@ This is deliberate, not an oversight: silently treating an unloadable child as c
 make `summaryVector()` depend on session state, so the identical object graph would summarize differently
 depending on how it happened to be loaded. **Fix:** fetch that association eagerly, or read the summary while
 the entity is still managed. Saving is unaffected — only reading a summary off a detached instance.
+
+### A repository returns a genuinely detached entity (changed in 0.1.10, OMI-271)
+
+Up to and including 0.1.9, an entity from `findById`/`findAll`/a derived finder/a vector search came back
+with its **whole reachable collection graph already loaded** — a read of one entity loaded everything
+reachable from it, recursively, and paid a side-table SELECT per entity in it. That was a defect, not a
+feature: the post-load walk that served stored vectors iterated every collection field, and iterating an
+uninitialized Hibernate collection is initializing it.
+
+Since 0.1.10 nothing is loaded that the caller did not ask for, which means **traversing an untouched lazy
+association on a returned entity now throws `LazyInitializationException`** — ordinary JPA, and the same rule
+the `@Summary` section above already described for singular associations. Code that relied on the graph
+arriving pre-loaded will break, visibly and at the point of traversal.
+
+**Fix:** read inside a unit of work and initialize the hops you actually want, so the cost is yours to choose:
+
+```java
+Identity identity = JavAIPI.inTransaction(config, () -> {
+    Identity loaded = identities.findById(id).orElseThrow();
+    Hibernate.initialize(loaded.getGallery());
+    return loaded;
+});
+```
+
+A Spring `@Transactional` method works the same way (see OMI-146's Spring-managed sessions). For a GraphQL or
+REST surface, the durable answer is to resolve each hop from its own repository call driven by the selection
+set, rather than loading a graph and projecting it.
+
+**Every collection obeys its own mapping now.** 0.1.10 briefly carved out an exception here — a JavAI
+collection field with no association annotation was stored out-of-band and had no Hibernate laziness to lean
+on, so it stayed eager. That mapping was withdrawn later in the same release (OMI-277), and with it the
+exception: there is no collection shape left that ignores its declared `FetchType`. The fetches that are
+still eager despite asking otherwise are the four inherited-from-Hibernate ones documented above — a `final`
+target class, the inverse side of a `@OneToOne`, `@Basic(fetch = LAZY)`, and whatever you mapped `EAGER`.

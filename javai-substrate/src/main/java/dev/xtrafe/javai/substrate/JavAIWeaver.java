@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.substrate;
 
+import dev.xtrafe.javai.annotations.ExternalVector;
 import dev.xtrafe.javai.annotations.JavAIVectorizable;
 import dev.xtrafe.javai.annotations.Summary;
 import dev.xtrafe.javai.annotations.Vectorize;
@@ -12,6 +13,8 @@ import dev.xtrafe.javai.vector.JavAIDirtyTracking;
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.agent.builder.ResettableClassFileTransformer;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.description.annotation.AnnotationDescription;
+import net.bytebuddy.description.annotation.AnnotationList;
 import net.bytebuddy.description.field.FieldDescription;
 import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.modifier.FieldPersistence;
@@ -76,7 +79,7 @@ public final class JavAIWeaver {
     private static final Set<String> RESERVED_METHOD_NAMES = Set.of(
             "markFieldDirty", "isFieldDirty", "clearFieldDirty", "markSummaryDirty", "isSummaryDirty",
             "clearSummaryDirty", "addDependent", "dependents", "vector", "concatenatedTextVector", "fieldVector",
-            "summaryVector", "similarityTo", "query", "concatenatedText");
+            "summaryVector", "similarityTo", "query", "concatenatedText", "externalVector");
 
     private static final Method MARK_FIELD_DIRTY = runtimeMethod("markFieldDirty", Object.class);
     private static final Method IS_FIELD_DIRTY = runtimeMethod("isFieldDirty", Object.class);
@@ -90,8 +93,13 @@ public final class JavAIWeaver {
     private static final Method CONCATENATED_TEXT_VECTOR = runtimeMethod("concatenatedTextVector", Object.class, String.class);
     private static final Method CONCATENATED_TEXT = runtimeMethod("concatenatedText", Object.class, String.class);
     private static final Method FIELD_VECTOR = runtimeMethod("fieldVector", Object.class, String.class);
+    private static final Method EXTERNAL_VECTOR = runtimeMethod("externalVector", Object.class, String.class);
     private static final Method SUMMARY_VECTOR =
             runtimeMethod("summaryVector", Object.class, String.class, String.class);
+    private static final Method VECTOR_FOR_MODEL =
+            runtimeMethod("vector", Object.class, String.class, String.class);
+    private static final Method SUMMARY_VECTOR_FOR_MODEL =
+            runtimeMethod("summaryVector", Object.class, String.class, String.class, String.class);
     private static final Method SIMILARITY_TO_VECTORIZABLE = runtimeMethod(
             "similarityToVectorizable", Object.class, String.class, dev.xtrafe.javai.model.JavAIVectorizable.class);
     private static final Method SIMILARITY_TO_REFERENCE =
@@ -165,8 +173,27 @@ public final class JavAIWeaver {
                 .defineMethod("fieldVector", EmbeddingVector.class, Visibility.PUBLIC)
                 .withParameters(String.class)
                 .intercept(MethodCall.invoke(FIELD_VECTOR).withThis().withArgument(0))
+                // Overrides JavAIVectorizable's throwing default. Deliberately wired even on a class that
+                // declares no @ExternalVector: JavAIRuntime.externalVector raises the same "declares no
+                // @ExternalVector named ..." error the default would, naming the ones that do exist, so
+                // there is one message for the mistake rather than two that differ by whether the class
+                // happened to declare any at all.
+                .defineMethod("externalVector", EmbeddingVector.class, Visibility.PUBLIC)
+                .withParameters(String.class)
+                .intercept(MethodCall.invoke(EXTERNAL_VECTOR).withThis().withArgument(0))
                 .defineMethod("summaryVector", EmbeddingVector.class, Visibility.PUBLIC)
                 .intercept(MethodCall.invoke(SUMMARY_VECTOR).withThis().with(summaryFieldsCsv).with(vectorizeFieldsCsv))
+                // The model-scoped forms (OMI-290). Both override JavAIVectorizable's absent-returning
+                // defaults, and both are wired on every woven class rather than only on ones declaring an
+                // @ExternalVector: a class with a single model still has one model to name, and a caller
+                // asking for it should get an answer rather than silently getting absent.
+                .defineMethod("vector", EmbeddingVector.class, Visibility.PUBLIC)
+                .withParameters(String.class)
+                .intercept(MethodCall.invoke(VECTOR_FOR_MODEL).withThis().with(vectorizeFieldsCsv).withArgument(0))
+                .defineMethod("summaryVector", EmbeddingVector.class, Visibility.PUBLIC)
+                .withParameters(String.class)
+                .intercept(MethodCall.invoke(SUMMARY_VECTOR_FOR_MODEL).withThis()
+                        .with(summaryFieldsCsv).with(vectorizeFieldsCsv).withArgument(0))
                 .defineMethod("similarityTo", double.class, Visibility.PUBLIC)
                 .withParameters(dev.xtrafe.javai.model.JavAIVectorizable.class)
                 .intercept(MethodCall.invoke(SIMILARITY_TO_VECTORIZABLE).withThis().with(vectorizeFieldsCsv).withArgument(0))
@@ -179,6 +206,31 @@ public final class JavAIWeaver {
                 .defineMethod("query", JavAIList.class, Visibility.PUBLIC)
                 .withParameters(EmbeddingVector.class, Class.class, int.class)
                 .intercept(MethodCall.invoke(QUERY).withThis().withArgument(0).withArgument(1).withArgument(2));
+
+        // Every @ExternalVector gets the same per-name accessor a @Vectorize field does -- pixelsVector() --
+        // routed to JavAIRuntime.externalVector rather than fieldVector, since the two resolve completely
+        // differently (one is never computed). Validated first, because both checks are about names that
+        // would otherwise produce a class that misbehaves silently.
+        Set<String> externalVectorNames = externalVectorNames(typeDescription);
+        for (String vectorName : externalVectorNames) {
+            if (vectorizeFields.contains(vectorName)) {
+                // They share one cache-slot namespace (an external vector's slot is an ordinary field slot
+                // keyed by its name), so a collision would have the two silently overwrite each other's
+                // vectors -- one of them computed, one of them not.
+                throw new IllegalStateException("@ExternalVector(name = \"" + vectorName + "\") on "
+                        + typeDescription.getName() + " collides with a @Vectorize field of the same name."
+                        + " An external vector's name shares the per-field cache namespace, so the two would"
+                        + " overwrite one another -- rename one of them.");
+            }
+            String accessorName = vectorName + "Vector";
+            if (RESERVED_METHOD_NAMES.contains(accessorName)) {
+                throw new IllegalStateException("@ExternalVector(name = \"" + vectorName + "\") on "
+                        + typeDescription.getName() + " produces an accessor (" + accessorName
+                        + ") that collides with a reserved JavAIVectorizable method name -- rename it.");
+            }
+            result = result.defineMethod(accessorName, EmbeddingVector.class, Visibility.PUBLIC)
+                    .intercept(MethodCall.invoke(EXTERNAL_VECTOR).withThis().with(vectorName));
+        }
 
         for (String fieldName : vectorizeFields) {
             String accessorName = fieldName + "Vector";
@@ -238,6 +290,38 @@ public final class JavAIWeaver {
         }
 
         return result;
+    }
+
+    /**
+     * Every {@code @ExternalVector} name declared on this type or inherited, nearest declaration first.
+     *
+     * <p>Read off the {@link TypeDescription} rather than a loaded {@code Class}, because at build time (and
+     * at load time, during the transform) there is no loaded class to reflect on -- which is the same reason
+     * {@link #fieldNamesAnnotatedWith} walks descriptions rather than calling into {@code JavAIRuntime}'s own
+     * equivalent. The two must agree on what a class declares; the runtime's version is the one that decides
+     * behaviour, this one only decides which accessors exist.
+     *
+     * <p>A repeatable annotation is present either directly (exactly one) or inside its generated container
+     * (two or more), never both, so both shapes are read.
+     */
+    private static Set<String> externalVectorNames(TypeDescription typeDescription) {
+        Set<String> names = new LinkedHashSet<>();
+        for (TypeDescription current = typeDescription; current != null && !current.represents(Object.class);
+                current = current.getSuperClass() == null ? null : current.getSuperClass().asErasure()) {
+            AnnotationList annotations = current.getDeclaredAnnotations();
+            AnnotationDescription.Loadable<ExternalVector> single = annotations.ofType(ExternalVector.class);
+            if (single != null) {
+                names.add(single.load().name());
+            }
+            AnnotationDescription.Loadable<ExternalVector.List> repeated =
+                    annotations.ofType(ExternalVector.List.class);
+            if (repeated != null) {
+                for (ExternalVector each : repeated.load().value()) {
+                    names.add(each.name());
+                }
+            }
+        }
+        return names;
     }
 
     private static Set<String> fieldNamesAnnotatedWith(TypeDescription typeDescription, Class<? extends Annotation> annotationType) {

@@ -52,6 +52,35 @@ time) can cost several minutes on the *first* real completion in a run; once war
 complete in a few seconds combined. `forkedProcessTimeoutInSeconds` is set generously (3600s) to absorb the
 cold case without a spurious fork-timeout failure.
 
+`TaggregateE2ETest` proves Taggregate (OMI-302) on a real, persisted, three-level container domain --
+`Library` of `Shelf` of `Anthology` of `Article`/`Comment` (`src/main/java/.../domain/`) with lazy
+Hibernate-owned member collections. What `javai-tagging`'s own module tests structurally cannot: an
+aggregate composing three levels up from a tag applied to a leaf; every mutation choke point propagating
+through those levels via the pending sweep alone (proven by a search-only read, which never recomputes on
+its own); a diamond (one article in two containers) fanning one leaf update out to both; heterogeneous
+container/member lineage in both directions, since `Shelf` is genuinely load-time woven while its
+neighbours are plain; two tags with identical *display names* but different slugs (one authored in French,
+localized into English afterward) staying distinct rows through aggregation, ranking, and rendered text;
+and -- the reason real embeddings matter here -- **actual tag-text retrieval quality**, where a container
+whose members' tags are about cooking must rank nearer a natural-language cooking query than a security
+one, in both directions, with no vocabulary shared between the query and the tag names.
+
+`DeclaredQueryE2ETest` proves declared queries (OMI-398) and `@Any` predicates (OMI-407) against genuinely
+woven classes -- which is the part `javai-persistence`'s own tests structurally cannot do, since that module
+has no `javai-substrate` dependency and its fixtures are hand-written stand-ins for woven ones. Grouped
+aggregates over the real `Article` -> `JavAIList<Comment>` association (as `Object[]` and as a record), a
+projection to bare ids, entity returns whose **real** stored vectors must come back rather than be recomputed,
+native queries, `Page`/`Slice`/dynamic `Sort`, and targeted `@Modifying` writes to counters on a woven
+`@JavAIVectorizable` `Article` -- with the embedding asserted byte-identical afterwards, and
+`@Column(updatable = false)` proven to stop an unrelated `save()` clobbering a count its own path maintains.
+The `@Any` half runs against `AssocHub`, whose polymorphic references are eager, lazy, `@Summary`-bearing, and
+may resolve per row to a vectorizable or non-vectorizable target. Two things it caught that no unit fixture
+could: **a declared query cannot share a repository interface with a backend that refuses one** (the refusal
+happens when the repository is *realized*, and `ArticleRepository` is realized against all three backends --
+hence `ArticleQueryRepository` beside it, which is the pattern an adopter should copy), and an `@Any` field
+whose name is a *suffix* of another's (`lazyAny` inside `summaryLazyAny`) broke the first version of the
+`OfType` keyword's name rewrite.
+
 `LombokInteropE2ETest` proves Lombok and `javai-substrate`'s load-time weaver genuinely coexist on the same
 class -- see "Lombok interop" below.
 

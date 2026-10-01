@@ -7,7 +7,7 @@
   <parent>
     <groupId>io.github.dcaudell</groupId>
     <artifactId>javai</artifactId>
-    <version>0.1.9</version>
+    <version>0.1.10</version>
   </parent>
 
   <artifactId>javai-tagging</artifactId>
@@ -97,6 +97,11 @@
       <artifactId>testcontainers-junit-jupiter</artifactId>
       <scope>test</scope>
     </dependency>
+    <dependency>
+      <groupId>com.zaxxer</groupId>
+      <artifactId>HikariCP</artifactId>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -138,6 +143,15 @@
           <execution>
             <goals>
               <goal>transform</goal>
+            </goals>
+          </execution>
+          <execution>
+            <!-- Test-fixture weaving (OMI-302): TestWovenAlbum is a genuinely woven @JavAIVectorizable
+                 container, pinning that Taggregate works on woven and unwoven containers alike. Same
+                 plugin, same transform, applied to target/test-classes at process-test-classes. -->
+            <id>weave-test-fixtures</id>
+            <goals>
+              <goal>transform-test</goal>
             </goals>
           </execution>
         </executions>

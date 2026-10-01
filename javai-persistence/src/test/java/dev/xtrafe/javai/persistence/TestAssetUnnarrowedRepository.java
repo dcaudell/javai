@@ -1,6 +1,7 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.Ranked;
 import org.springframework.data.domain.Pageable;
 
 import java.util.List;

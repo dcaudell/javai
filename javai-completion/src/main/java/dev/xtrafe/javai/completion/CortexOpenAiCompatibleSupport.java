@@ -15,13 +15,13 @@ import java.time.Instant;
 import java.util.concurrent.Flow;
 
 /**
- * Shared implementation behind {@link CortexOpenAI}, {@link CortexGroq}, and {@link CortexVLlm} -- all
- * three speak the same OpenAI-compatible chat-completions wire format (native for OpenAI itself, and by
- * explicit design for Groq/vLLM, both of which expose an OpenAI-compatible endpoint specifically so
- * existing OpenAI clients work against them unmodified with just a different {@code base-url}). One real
- * implementation, three distinct public classes -- the user asked for three separately-named connector
- * types, and that vocabulary should show up in code, even though underneath all three just configure a
- * repointed {@code OpenAiChatModel}.
+ * Shared implementation behind {@link CortexOpenAI}, {@link CortexGroq}, {@link CortexMistral}, and
+ * {@link CortexVLlm} -- all four speak the same OpenAI-compatible chat-completions wire format (native for
+ * OpenAI itself, and by explicit design for Groq/Mistral/vLLM, each of which exposes an OpenAI-compatible
+ * endpoint so existing OpenAI clients work against them unmodified with just a different
+ * {@code base-url}). One real implementation, four distinct public classes -- separately-named connector
+ * types were asked for, and that vocabulary should show up in code, even though underneath all four just
+ * configure a repointed {@code OpenAiChatModel}.
  *
  * <p><b>429 detection, since Spring AI 2.0</b>: {@code OpenAiChatModel} now wraps OpenAI's own official
  * Java SDK (a {@code com.openai.client.OpenAIClient}, constructed internally from {@code apiKey}/
@@ -123,6 +123,9 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
         }
         if (request.providerOptions().get("reasoning_effort") instanceof String effort) {
             builder.reasoningEffort(effort);
+        }
+        if (request.responseSchema() != null) {
+            builder.outputSchema(request.responseSchema()); // sent as a strict json_schema response_format
         }
         return builder.build();
     }

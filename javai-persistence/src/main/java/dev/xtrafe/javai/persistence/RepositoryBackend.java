@@ -1,9 +1,13 @@
 package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
+import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.vector.EmbeddingVector;
+import dev.xtrafe.javai.vector.Ranked;
+import dev.xtrafe.javai.vector.VectorMath;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -139,9 +143,197 @@ interface RepositoryBackend {
                 + "the store's own driver/template transaction API directly for this sequence.");
     }
 
+    /**
+     * Stores an externally-computed vector against one entity (OMI-290).
+     *
+     * <p>Backend-agnostic by construction, and deliberately so: the decision this has to make -- does the
+     * entity still reference the content this vector was computed for? -- lives in Vector Core, and the
+     * write it then performs is one the backend already knows how to do. So the default is the whole
+     * implementation on every backend, and a backend overrides it only if it can do the write more
+     * narrowly.
+     *
+     * <p><b>It loads the entity, and cannot not.</b> The content-key comparison is against the entity's own
+     * field, so there is nothing to compare without reading it. What it avoids is the rest of a
+     * {@code save()}: no merge, no summary recomputation, no walk of the reachable graph.
+     *
+     * @return {@code true} if stored; {@code false} if the vector described content the entity has since
+     *         moved on from -- the ordinary outcome of a slow producer racing an edit, not an error
+     * @throws IllegalArgumentException if no such entity exists, or if the vector's model disagrees with
+     *                                  what the type declares
+     */
+    default boolean supplyVector(Class<?> entityType, UUID id, String vectorName, EmbeddingVector vector,
+            String computedFor) {
+        Object entity = findById(entityType, id).orElseThrow(() -> new IllegalArgumentException(
+                "No " + entityType.getName() + " with id " + id + " -- cannot store an external vector"
+                        + " against an entity that does not exist"));
+        if (!JavAIRuntime.supplyVector(entity, vectorName, vector, computedFor)) {
+            return false;
+        }
+        writeExternalVector(entityType, entity, vectorName);
+        return true;
+    }
+
+    /** Persists one already-supplied {@code @ExternalVector} on {@code entity}, without touching anything
+     *  else about it -- the narrow write behind {@link #supplyVector}. */
+    void writeExternalVector(Class<?> entityType, Object entity, String vectorName);
+
+    /**
+     * Refuses a concatenated-text search whose reference is from a model that vector cannot exist in
+     * (OMI-458).
+     *
+     * <p>{@code concatenatedTextVector()} is <b>one real embedding of one assembled string</b>, produced by
+     * the configured provider. So it exists in that provider's model and in no other -- not "rarely", but by
+     * construction, for every entity that ever participates. A reference from anywhere else is therefore
+     * asking for something no row, node or document can hold.
+     *
+     * <p>⚠️ <b>Refused rather than answered empty, because empty is a lie here.</b> An empty result is what a
+     * caller also gets from a corpus that genuinely has no near matches, and nothing distinguishes the two --
+     * so the query looks answered. Worse, it looks answered <em>consistently</em>: every repetition returns
+     * the same nothing. This is the one place a wrong model produces a plausible non-answer instead of a
+     * missing table, which is why it is the one place that has to say so out loud.
+     *
+     * <p>Unlike a summary search, there is no fold to fall back to: folding needs a value that exists to be
+     * folded, and this one does not exist in that model for anything.
+     *
+     * <p>Silent when the provider cannot name its own model -- there is nothing to compare against, and a
+     * refusal derived from an unknown is worse than the search it would block.
+     */
+    default void requireConcatenatedTextInConfiguredModel(NearestSpec spec) {
+        if (spec.kind() != DerivedQueryMethods.Kind.CONCATENATED_TEXT) {
+            return;
+        }
+        String configured = JavAIRuntime.currentModelId();
+        String referenceModel = spec.reference().modelId();
+        if (configured == null || configured.equals(referenceModel)) {
+            return;
+        }
+        throw new IllegalArgumentException("A concatenated-text search needs a reference from '" + configured
+                + "', but this one is from '" + referenceModel + "'. The concatenated text vector is a single"
+                + " embedding of assembled text, produced by the configured provider -- so it exists in that"
+                + " model and in no other, for every entity, and nothing could match this reference. Answering"
+                + " an empty list would be indistinguishable from a corpus with no near matches. Either embed"
+                + " your query with the configured provider, or -- if you wanted the model-scoped aggregate"
+                + " over a subtree's vectors rather than an embedding of its text -- use nearestBySummary(),"
+                + " which does serve '" + referenceModel + "'.");
+    }
+
+    // ---- model-scoped summary search without an index (OMI-458) ------------------------------------
+
+    /**
+     * Whether a summary search must be answered by folding candidates in memory rather than by ranking a
+     * stored vector -- <b>one rule, shared by every backend</b>, so the three cannot disagree about when a
+     * query has an index.
+     *
+     * <p>True in exactly one situation: the search names a model that this entity's {@code @Summary} subtree
+     * declares through an {@code @ExternalVector}, and the type has not opted into persisting that model's
+     * summaries with {@code @Summary(persistModelSummaries = true)}. The value is real and computable and
+     * nothing stored it.
+     *
+     * <p>⚠️ <b>Decided from the declaration, never from whether a table or property happens to hold
+     * anything.</b> An un-backfilled corpus and a corpus with no such model are indistinguishable in
+     * storage, so a "is anything there?" test would fold for a deployment merely mid-backfill and then stop
+     * folding partway through it -- the cost and the answer both changing under a caller while nothing about
+     * their code did.
+     *
+     * <p>⚠️ <b>The ambient model is never folded.</b> Its row is written by the ordinary entity-grain path
+     * and always has been, so an {@code @ExternalVector} that happens to declare the configured provider's
+     * own model must not drag a working indexed search onto this path.
+     */
+    default boolean foldsSummaryInMemory(Containment containment, Class<?> entityType, NearestSpec spec) {
+        if (spec.kind() != DerivedQueryMethods.Kind.SUMMARY) {
+            return false;
+        }
+        String modelId = spec.resolvedModelId();
+        if (modelId == null || modelId.equals(JavAIRuntime.currentModelId())) {
+            return false;
+        }
+        return containment.declaredSubtreeModels(entityType).contains(modelId)
+                && !containment.perModelSummaryModels(entityType).contains(modelId);
+    }
+
+    /**
+     * Ranks by {@code summaryVector(modelId)} computed on the spot -- the honest answer to a summary search
+     * with no index, for a backend that has no narrowing to apply on top of it.
+     *
+     * <p>Backend-agnostic for the same reason {@link #supplyVector} is: the decision lives in Vector Core
+     * and the only store operation involved is {@link #findAll}, which every backend implements and which
+     * serves each entity its stored vectors as it loads. The Postgres backend overrides this with a version
+     * that also honours a relational predicate; Neo4j and MongoDB refuse a narrowed vector search outright,
+     * so for them this is the whole of it.
+     *
+     * <p>A candidate whose summary is absent in this model is skipped rather than ranked last -- a
+     * content-free vector has no direction and must never occupy a slot in someone's top N, which is the
+     * same rule the indexed paths apply by ignoring null vectors.
+     *
+     * <p>⚠️ <b>Cost is proportional to the corpus</b>, not to the result. That is the argument for the flag,
+     * not a reason to treat this as equivalent to having one.
+     */
+    default List<Ranked<Object>> foldNearestBySummary(Class<?> entityType, NearestSpec spec) {
+        String modelId = spec.resolvedModelId();
+        List<Ranked<Object>> scored = new ArrayList<>();
+        for (Object candidate : findAll(entityType)) {
+            if (!(candidate instanceof JavAIVectorizable vectorizable)) {
+                continue;
+            }
+            EmbeddingVector summary = vectorizable.summaryVector(modelId);
+            if (summary.isAbsent()) {
+                continue;
+            }
+            scored.add(new Ranked<>(candidate, VectorMath.cosineSimilarity(spec.reference(), summary)));
+        }
+        scored.sort(Comparator.comparingDouble(Ranked<Object>::similarity).reversed());
+        int from = Math.min(spec.offset(), scored.size());
+        int to = Math.min(Math.addExact(from, spec.limit()), scored.size());
+        return List.copyOf(scored.subList(from, to));
+    }
+
+    /**
+     * Every entity of {@code entityType} whose {@code vectorName} has not been supplied for the content it
+     * currently references -- the backlog a producer works through (OMI-290).
+     *
+     * <p>Necessary because the vector lives outside the entity's own table/label/collection, so a caller
+     * cannot express this as an ordinary derived finder without reaching into storage JavAI owns. Per-item
+     * "is this one done yet" is a different question, and belongs in whatever status the application already
+     * keeps; this is for backfills and for re-driving after a dead-letter drain.
+     *
+     * <p><b>A scan, and honestly so.</b> It reads the type and keeps those whose vector reads absent, which
+     * is exactly the question being asked and is correct on every backend without a line of store-specific
+     * code. It is also O(rows), which is the right shape for the two jobs it exists for -- both of which
+     * sweep the whole type anyway -- and the wrong shape for polling it per upload. A backend can override
+     * with an anti-join against its own vector storage if that ever stops being true.
+     *
+     * <p>Note "absent" already covers both causes: never supplied, and supplied for content since replaced.
+     * They need no separate handling because a save writes the new content key and deletes the superseded
+     * row in the same flush, so the two states are indistinguishable at rest -- as they should be, since
+     * both mean the same thing to a producer.
+     */
+    default List<Object> findPendingVector(Class<?> entityType, String vectorName, int limit) {
+        List<Object> pending = new ArrayList<>();
+        for (Object entity : findAll(entityType)) {
+            if (entity instanceof dev.xtrafe.javai.model.JavAIVectorizable vectorizable
+                    && vectorizable.externalVector(vectorName).isAbsent()) {
+                pending.add(entity);
+                if (pending.size() >= limit) {
+                    break;
+                }
+            }
+        }
+        return pending;
+    }
+
     Optional<Object> findById(Class<?> entityType, UUID id);
 
     List<Object> findAll(Class<?> entityType);
+
+    /**
+     * How many entities of {@code entityType} the store holds (OMI-460).
+     *
+     * <p>Abstract rather than a {@code findAll(entityType).size()} default on purpose: that default is
+     * exactly the waste {@code JavAIRepository.count()} exists to remove, and inheriting it silently would
+     * leave a backend looking like it had implemented the method. Every store this project targets counts
+     * natively.
+     */
+    long count(Class<?> entityType);
 
     void deleteById(Class<?> entityType, UUID id);
 
@@ -210,4 +402,73 @@ interface RepositoryBackend {
 
     /** Deletes every entity matching the derived finder's predicate, returning how many were removed. */
     long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args);
+
+    // ---- declared queries: @Query / @Modifying (OMI-398) -------------------------------------------
+    // Three primitives, mirroring the four above: DeclaredQuery owns the annotation, the parameter binding,
+    // the return-type adaptation and Pageable/Sort/Limit; a backend runs a query and hands back rows, a
+    // count, or an affected-row count.
+    //
+    // The defaults REFUSE rather than accept, unlike validateDerivedQuery's. That follows inTransaction's
+    // precedent, and for the same reason: this is a capability one backend has and the others structurally
+    // do not, so a new backend must answer it deliberately instead of inheriting a silent no-op. A JPQL or
+    // SQL string means nothing to Neo4j or MongoDB, and translating one would be a query engine, not a shim.
+
+    /**
+     * Rejects, at repository-creation time, a declared query this backend cannot serve -- and on the two
+     * backends that serve none, rejects every one of them.
+     *
+     * <p>{@link DeclaredQuery#parse} has already validated everything reflection can see. What is left is
+     * store-specific: on Postgres, whether the query text parses at all and whether a write touches state
+     * JavAI maintains out of band.
+     */
+    default void validateDeclaredQuery(Class<?> entityType, DeclaredQuery query) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs a declared select under {@code constraints}, hydrating entity results exactly as {@link #findAll}
+     *  hydrates them. */
+    default List<Object> runDeclaredQuery(Class<?> entityType, DeclaredQuery query, Object[] args,
+            DerivedFinderQuery.Constraints constraints) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs the {@code countQuery} of a {@code Page}-returning declared query. */
+    default long runDeclaredCount(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    /** Runs a {@code @Modifying} declared query, returning how many rows it affected. */
+    default long runDeclaredUpdate(Class<?> entityType, DeclaredQuery query, Object[] args) {
+        throw new UnsupportedOperationException(declaredQueriesUnsupported(query));
+    }
+
+    private String declaredQueriesUnsupported(DeclaredQuery query) {
+        return "@Query is supported on the Postgres backend only -- " + getClass().getSimpleName()
+                + " has no query language JPQL or SQL could be translated into, and " + query.method()
+                + " declares one. Express it as a derived finder (findBy…/findNearestBy…Vector), as a runtime "
+                + "predicate through nearestBy(...), or use the store's own driver for this one query.";
+    }
+
+    /**
+     * This backend's answer to "which containers hold this member, and which members does this container
+     * hold", for {@code @Taggregate} (OMI-304) -- what {@code javai-tagging} consumes through
+     * {@link JavAIPI#taggregateContainment(JavAIPersistenceConfig)} in place of the membership snapshot it
+     * used to keep. Resolved lazily, never in a constructor: tagging deliberately does not depend on the
+     * entity mapper being ready at construction time, and by first use registration is necessarily complete.
+     */
+    TaggregateContainment taggregateContainment();
+
+    /**
+     * Closes every connection this backend opened itself, and makes any further use fail rather than
+     * reconnect (OMI-410). What the application supplied -- a {@code SessionFactory}, {@code Driver},
+     * {@code MongoTemplate} or {@code DataSource} -- is left open: it is the application's to close.
+     * Reached only through {@link JavAIPI#release(JavAIPersistenceConfig)}, which evicts the backend too.
+     */
+    void release();
+
+    /** What a released backend throws instead of quietly opening a connection nothing would ever close. */
+    static IllegalStateException releasedError() {
+        return new IllegalStateException("This JavAI backend was released by JavAIPI.release(config) -- realize "
+                + "the repository again with JavAIPI.repository(...) to reconnect");
+    }
 }

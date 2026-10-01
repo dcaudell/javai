@@ -4,7 +4,7 @@ import dev.xtrafe.javai.e2e.domain.MediaNote;
 import dev.xtrafe.javai.e2e.domain.MediaNoteRepository;
 import dev.xtrafe.javai.e2e.environment.JavAIEnvironment;
 import dev.xtrafe.javai.model.JavAIVectorizable;
-import dev.xtrafe.javai.persistence.Ranked;
+import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;

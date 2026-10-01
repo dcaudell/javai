@@ -113,3 +113,23 @@ Byte Buddy was bumped from the `1.15.10` scaffolding placeholder to `1.18.11` wh
 spike: `1.15.10` cannot parse class files compiled by this repo's JDK 26 toolchain ("Java 26 (70) is not
 supported"). `ByteBuddyAgent.install()` also needs `-Djdk.attach.allowAttachSelf=true` to self-attach on
 modern JDKs — wired into this module's `maven-surefire-plugin` configuration.
+
+## `@ExternalVector` and model-scoped accessors (OMI-290)
+
+`JavAIWeaver` now also synthesizes, on every woven class:
+
+- `externalVector(String)`, and a `<name>Vector()` accessor per `@ExternalVector` — read off the
+  `TypeDescription` rather than a loaded `Class`, since at weave time there is none. The annotation is
+  `@Repeatable`, so both shapes are read: one declaration sits directly on the type, two or more sit inside
+  the generated container.
+- `vector(String modelId)` and `summaryVector(String modelId)`, wired on every class rather than only those
+  declaring an external vector — a class with a single model still has one model to name.
+
+Two collisions are refused at weave time, both because they would otherwise produce a class that misbehaves
+silently: an external vector named after a `@Vectorize` field (they share one cache-slot namespace, so the
+two would overwrite each other — one computed, one not), and one whose accessor name is reserved. This
+extends the same check the `text`/`textVector()` collision established.
+
+⚠️ Weave-time throws are visible from the **build-time** plugin and swallowed by `AgentBuilder`'s default
+listener at load time, which is why `VectorizationWeavingTest` drives the collision case through
+`JavAIWeaver.weave(...)` directly.

@@ -129,42 +129,42 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-vector</artifactId>
-     <version>0.1.9</version> <!-- match the current release -->
+     <version>0.1.10</version> <!-- match the current release -->
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-model</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-substrate</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-supervision</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-collections</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-persistence</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-completion</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    <dependency>
      <groupId>io.github.dcaudell</groupId>
      <artifactId>javai-tagging</artifactId>
-     <version>0.1.9</version>
+     <version>0.1.10</version>
    </dependency>
    ```
 
@@ -174,14 +174,14 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
    ```kotlin
    dependencies {
-       implementation("io.github.dcaudell:javai-vector:0.1.9")
-       implementation("io.github.dcaudell:javai-model:0.1.9")
-       implementation("io.github.dcaudell:javai-substrate:0.1.9")
-       implementation("io.github.dcaudell:javai-supervision:0.1.9")
-       implementation("io.github.dcaudell:javai-collections:0.1.9")
-       implementation("io.github.dcaudell:javai-persistence:0.1.9")
-       implementation("io.github.dcaudell:javai-completion:0.1.9")
-       implementation("io.github.dcaudell:javai-tagging:0.1.9")
+       implementation("io.github.dcaudell:javai-vector:0.1.10")
+       implementation("io.github.dcaudell:javai-model:0.1.10")
+       implementation("io.github.dcaudell:javai-substrate:0.1.10")
+       implementation("io.github.dcaudell:javai-supervision:0.1.10")
+       implementation("io.github.dcaudell:javai-collections:0.1.10")
+       implementation("io.github.dcaudell:javai-persistence:0.1.10")
+       implementation("io.github.dcaudell:javai-completion:0.1.10")
+       implementation("io.github.dcaudell:javai-tagging:0.1.10")
    }
    ```
 
@@ -250,7 +250,7 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
      ```java
      Cortex cortex = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
-     // or CortexAnthropic / CortexGroq / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
+     // or CortexAnthropic / CortexGroq / CortexMistral / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
      ```
 
      Constructing several `Cortex`es side by side, local and remote, is normal — each is a plain object, not
@@ -293,14 +293,16 @@ smoke tests:
 - **`javai-substrate`** (Acceleration Substrate) — a full ByteBuddy weaver: multi-field `vector()`,
   `summaryVector()` propagation through both single references and collections, `query()`, cycle safety,
   `@SearchVisibility`/`@VectorizeIgnore`, and inherited-field support via synthesized setter overrides.
-- **`javai-collections`** (Vector Collections) — `VectorIndex` and `KnowledgeGraph`/`SubgraphResult`
-  (hybrid similarity + structural queries), both hand-written and reflection-based, not woven.
+- **`javai-collections`** (Vector Collections) — `VectorIndex` (narrowable by type with `ofType(...)`,
+  which returns another `VectorIndex` so narrowings chain, plus a ranked search) and
+  `KnowledgeGraph`/`SubgraphResult` (hybrid similarity + structural queries), both hand-written and
+  reflection-based, not woven.
 - **`javai-persistence`** (Persistence Bridge) — both backends real: Postgres+pgvector (one table per
   embedding model, so a provider swap needs no schema migration) and Neo4j (native vector index, one
   model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
   for re-embedding an existing store after a provider swap, reverting non-destructively.
-- **`javai-completion`** (Completion Fabric) — real and tested: six `Cortex` providers (OpenAI, Anthropic,
-  Groq, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
+- **`javai-completion`** (Completion Fabric) — real and tested: seven `Cortex` providers (OpenAI, Anthropic,
+  Groq, Mistral, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
   parameters, Handlebars-based prompt templating (`CompletionRequest.render()`), and the RAG-integration
   half grounding a completion in `PromptContext`.
 - **`javai-supervision`** (Agentic Supervision) — a full, independent ByteBuddy weaver (`SupervisionWeaver`)
@@ -310,7 +312,8 @@ smoke tests:
   exception propagated from a called method, not just a literal `throw`). See that module's README for two
   JVM-imposed method/constructor asymmetries discovered while building it.
 - **`javai-tagging`** (Tagging) — `@Taggable`/`@TagIgnore` unwoven markers, recursive `Tag`/`TagSet`
-  structures, tag-collection similarity search over a tag-summary-vector `VectorIndex<TaggableRef>`, and
+  structures, tag-collection similarity search over a tag-summary-vector `VectorIndex<TaggableRef>` —
+  narrowable to one `@Taggable` type, with the restriction pushed into each store's own query — and
   LLM-based auto-classification via `javai-completion`'s `Cortex`, tested against all three persistence
   backends. Tagging operations are scoped to a `JavAITagRepository` instance wrapping an already-realized
   `TagRepository`, not a static facade — see `doc/spec/tagging.md` and `SPEC.md`'s "Coding standard:

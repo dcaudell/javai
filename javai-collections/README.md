@@ -21,7 +21,7 @@ not the reverse. See `javai-model/README.md` for where the collection-supertype 
 |---|---|---|
 | `JavAIList<T>` / `JavAISet<T>` / `JavAIMap<K,V>` | Cosine-similarity-aware standard-collection replacements | `javai-model` (see note above) |
 | `KnowledgeGraph<N, E>` | Native graph type: nodes and edges plus hybrid pattern-match + similarity queries in one call | here |
-| `VectorIndex<T>` | Bare similarity-search container for cases that don't need full graph semantics | here |
+| `VectorIndex<T>` | Bare similarity-search container for cases that don't need full graph semantics -- narrowable by type, and with a ranked search, since OMI-460 | here |
 
 ## `KnowledgeGraph<N, E>`, in full
 
@@ -113,6 +113,37 @@ Two independent reasons, either one sufficient on its own:
    `JavAIGraphNode`/`JavAIEdge` into `javai-model`, mirroring `JavAIList`/`Set`/`Map`'s own placement
    precedent above -- pure churn for annotations that don't need it.
 
+## `VectorIndex<T>`: narrowing chains, searching ends the chain (OMI-460)
+
+```java
+JavAIList<TaggableRef> albums = tagging.tagSimilarityIndex()
+        .ofType(Album.class)          // -> another VectorIndex, so it composes
+        .nearestN(reference, 20);     // -> a JavAIList, so the chain ends
+
+List<Ranked<TaggableRef>> withScores = tagging.tagSimilarityIndex()
+        .ofType(Album.class)
+        .nearestNRanked(reference, 20);
+```
+
+`ofType` returns a `VectorIndex` rather than a result -- the same design point `SubgraphResult extends
+KnowledgeGraph` makes in this module already. `nearestN(reference, n, candidateTypes)` and
+`nearestNRanked(reference, n, candidateTypes)` are `default`s over it, so the one-call and chained spellings
+are the same query and cannot drift.
+
+**Narrowing is not filtering the result.** Every realization applies the candidate types *before* the top-N
+is chosen. The alternative -- draw some multiple of N and discard -- is what a caller is forced into when an
+index cannot be narrowed, and it is undetectably wrong past the edge of whatever multiplier they guessed.
+`javai-tagging`'s persistence-backed realizations push the types into the store's own query for exactly this
+reason; see that module's README.
+
+Matching is on **exact runtime class**, not assignability, and where an index holds references rather than
+instances (`VectorIndex<TaggableRef>`) it is the referenced instance's type. Naming no types matches
+nothing; narrowing an already-narrowed index intersects; a narrowed view is read-only. Full contract:
+`doc/spec/vector-collections.md`'s "`VectorIndex<T>`, in full".
+
+`JavAIVectorIndex`'s narrowed views share the backing list rather than copying it, so a chain of narrowings
+costs nothing per step and a later `add` is visible through every view that admits it.
+
 ## Which one do I reach for?
 
 See whitepaper §6.7 for the full comparison table (`JavAIList` vs. `VectorIndex` vs. `KnowledgeGraph` vs. a
@@ -121,7 +152,10 @@ JPA-style repository query).
 ## What's actually implemented
 
 `JavAIGraphNode`/`JavAIEdge` (empty marker interfaces, declared directly, never woven -- see above).
-`VectorIndex`/`JavAIVectorIndex` (hand-written, reuses `javai-model`'s `CollectionVectorSupport`).
+`VectorIndex`/`JavAIVectorIndex` (hand-written, reuses `javai-model`'s `CollectionVectorSupport`),
+including OMI-460's `ofType` narrowing and `nearestNRanked` -- both covered by `NarrowedVectorIndexTest`,
+whose fixture places every instance of the unwanted type nearer the reference than every instance of the
+wanted one, so a rank-then-filter implementation returns nothing rather than merely something different.
 `KnowledgeGraph`/`SubgraphResult` via `JavAIKnowledgeGraph`/`JavAIKnowledgeSubgraphResult` (hand-written,
 not woven -- concrete, user-instantiated containers like `javai-model`'s `JavAIArrayList`): `addNode`/
 `addEdge`/`nodes`/`edges`/`neighbors`/`match` for construction and pattern-match traversal,

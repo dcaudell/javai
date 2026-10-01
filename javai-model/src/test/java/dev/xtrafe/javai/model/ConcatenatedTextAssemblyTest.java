@@ -53,6 +53,72 @@ class ConcatenatedTextAssemblyTest {
     }
 
     /**
+     * <b>An empty value is no content, in both aggregates or in neither.</b>
+     *
+     * <p>⚠️ This fired in production as an {@code IllegalStateException} out of
+     * {@code RepositoryBackendHibernatePostgres.writeEntityGrainRow}, on an entity whose only
+     * {@code @Vectorize} fields were empty strings: <em>"has a concatenated text vector but an absent summary
+     * vector … This combination was believed impossible"</em>. It was not impossible, and the two halves of
+     * this class disagreed about why.
+     *
+     * <p>{@code embedText} treats blank text as <b>absent</b> -- a deliberate rule, so "this field lost its
+     * content" is representable at rest and a backend can delete the row rather than store the embedding of a
+     * space. But {@code concatenatedFieldText} tested only {@code != null}, so an empty title still emitted
+     * its label -- {@code "title: \n"} -- which is not blank, and got a real embedding. Present concatenated
+     * vector, absent summary vector, and a NOT NULL column that cannot hold the pair.
+     *
+     * <p>The label is the whole of the text in that case: it says a field exists and nothing about what it
+     * holds, which is not content by any reading.
+     */
+    @Test
+    void anEmptyFieldContributesNoTextAndNoVector() {
+        Node node = new Node("");
+
+        assertNull(node.concatenatedText(), "a label with nothing after it is not text");
+        assertTrue(node.concatenatedTextVector().isAbsent());
+        assertTrue(node.summaryVector().isAbsent(),
+                "the summary was always absent here -- it is the other half that has to agree");
+    }
+
+    /** Whitespace is the same case: {@code embedText} calls it blank, so this must not call it text. */
+    @Test
+    void aWhitespaceOnlyFieldContributesNothingEither() {
+        Node node = new Node("   ");
+
+        assertNull(node.concatenatedText());
+        assertTrue(node.concatenatedTextVector().isAbsent());
+        assertTrue(node.summaryVector().isAbsent());
+    }
+
+    /**
+     * ⚠️ The pair that must never occur again, asserted as a pair rather than as two separate facts -- it is
+     * their <em>combination</em> the entity-grain table cannot represent, and either one alone is fine.
+     */
+    @Test
+    void neverConcatenatedTextWithoutASummaryVector() {
+        for (String value : new String[] {null, "", " ", "\n", "real content"}) {
+            Node node = new Node(value);
+            if (!node.concatenatedTextVector().isAbsent()) {
+                assertFalse(node.summaryVector().isAbsent(),
+                        "value " + (value == null ? "null" : "'" + value + "'")
+                                + " produced concatenated text with no summary vector -- the shape"
+                                + " writeEntityGrainRow refuses");
+            }
+        }
+    }
+
+    /** An empty field beside a full one drops only its own label, and the rest is unchanged. */
+    @Test
+    void anEmptyFieldIsSkippedRatherThanEmptyingTheWholeAssembly() {
+        Node parent = new Node("");
+        parent.setChild(new Node("alpha"));
+
+        assertEquals("text: alpha\n", parent.concatenatedText(),
+                "the parent contributes nothing of its own, and the child is untouched");
+        assertFalse(parent.summaryVector().isAbsent());
+    }
+
+    /**
      * The opt-out has to be genuinely free, not merely correct: before this ticket, every vectorizable
      * computed one of these on demand at the price of a real model call, and stored it nowhere any query
      * could reach.

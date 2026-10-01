@@ -39,7 +39,7 @@ stop — that breaks the one constraint everything else is built around.
 | 5 | **Codegen Guidance** | Annotations governing what an LLM coding agent may read, generate, or modify | `doc/spec/codegen-guidance.md` |
 | 6 | **Acceleration Substrate** | The compiler/weaver/dispatch mechanism beneath Vector Core, Vector Collections, and Codegen Guidance | `doc/spec/acceleration-substrate.md` |
 | 7 | **Agentic Supervision** | AoP-style method/constructor interception (sync, read-write + async, observation-only) enabling an LLM-backed listener to observe or intervene on execution | `doc/spec/agentic-supervision.md` |
-| 8 | **Tagging** | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, and tag-collection similarity search — independent of Vector Core, composable with it | `doc/spec/tagging.md` |
+| 8 | **Tagging** | `@Taggable` objects, recursive Tags/TagSets, LLM-based classification, tag-collection similarity search, and Taggregate — derived taggings for containers plus the concatenated tag-text vector — independent of Vector Core, composable with it | `doc/spec/tagging.md` |
 
 ## Dependency graph between the areas
 
@@ -129,7 +129,7 @@ see above), each a plain library, each independently buildable in the order belo
 | `javai-collections` (Vector Collections) | Pure Java library, backed by `javai-vector` + `javai-model` | `VectorIndex`, `KnowledgeGraph` + `SubgraphResult` |
 | `javai-persistence` (Persistence Bridge) | Hibernate-based shim + Neo4j shim + Spring Data MongoDB shim | All three persistence backends real in Phase 0, not aspirational |
 | `javai-completion` (Completion Fabric) | Wraps Spring AI `ChatModel` | Full RAG API — `PromptContext`, `CompletionRequest`/`Result`, `toContext()`, `complete()`/`completeStreaming()` |
-| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagRepository`, the tag-summary-vector `VectorIndex<TaggableRef>` |
+| `javai-tagging` (Tagging) | Pure Java library, backed by `javai-vector`/`javai-model`/`javai-collections`/`javai-persistence`/`javai-completion`; ships its own pre-woven `Tag`/`TagSet` (see `doc/spec/tagging.md`'s "this module weaves itself") | `@Taggable`/`@TagIgnore`/`@Taggregate`, `Tag`/`TagSet`/`Tagging`, LLM-based classification via `JavAITagRepository`, the tag-summary-vector and tag-text `VectorIndex<TaggableRef>`s, derived container taggings with `rankedByTags` |
 
 Nothing past Phase 0 (a real `javaic` compiler, `invokedynamic` dispatch, GPU acceleration, an optional
 JavAIVM) adds a capability a Phase 0 developer doesn't already have — each replaces an internal mechanism
@@ -170,6 +170,12 @@ database and, since OMI-187, read straight back into a loaded object's cache slo
 no longer stale merely for that object's lifetime — it is stored, served on every subsequent load, and
 outlives the process that produced it. The rule is the same rule; persistence just makes breaking it durable.
 
+**An `@ExternalVector` is outside this rule entirely** (OMI-290), and is the one kind of vector that is. Its
+validity is re-derived on every read by comparing a short content key against the field that holds it, rather
+than tracked through an intercepted write — affordable precisely because the key stands in for content JavAI
+never reads. A key written by reflection, by a framework, or by any other route that bypasses a woven setter
+is therefore caught exactly like one written through it. See `doc/spec/vector-core.md`'s own section.
+
 Two things that are explicitly *not* violations, because JavAI handles them itself:
 - **`merge()` handing back a different instance.** Hibernate copies mapped field values onto a managed copy
   but not the woven `$javai$state` the caches live in. `javai-persistence` carries the vectors across
@@ -201,12 +207,14 @@ split across the two — see above — with `javai-model` also including the `Co
 RAG-integration primitives and the `JavAIList`/`Set`/`Map` Vector Collections interfaces), `javai-substrate`
 (Acceleration Substrate's weaving, including the full lifecycle state machine and summary-vector
 propagation), `javai-collections` (Vector Collections' `KnowledgeGraph`/`SubgraphResult`/`VectorIndex`), and
-`javai-persistence` (Persistence Bridge, all three backends, including model-versioning/reindex/revert, and
+`javai-persistence` (Persistence Bridge, all three backends, including model-versioning/reindex/revert,
 `KnowledgeGraph`-typed field persistence -- Neo4j-only, since it's the one backend with a native equivalent
 to `nearestSubgraph()`'s hybrid traversal-plus-similarity query; Postgres/MongoDB reject such a field with a
-clear error at registration time instead) all have real, tested implementations — see each module's own
+clear error at registration time instead -- and, as of OMI-398, declared queries: `@Query`/`@Modifying` on a
+repository method for what a derived name cannot ask, plus `@Any` predicates including the `OfType`
+target-type keyword, both Postgres-only) all have real, tested implementations — see each module's own
 README for exactly what's covered and what's still deliberately out of scope. `javai-completion` (Completion Fabric) has both its connector layer (`Cortex`,
-six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
+seven providers: OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
 provider-specific tuning parameters, Handlebars-based prompt templating via `CompletionRequest.render()`)
 and its RAG-integration half real and tested: grounding a completion in a `JavAIList`/`Set`/`Map` via
 `PromptContext` (`Contextable`, `ContextableObject`) — these primitives live in `javai-model`, not
@@ -227,7 +235,17 @@ against all three persistence backends, LLM-based classification via `JavAITagRe
 weaving to `javai-substrate` as a prerequisite (see that module's own README). `JavAITagRepository` is an
 instance wrapper, not a static facade — see "Coding standard: static/global scope is the exception" below,
 which this module (alongside `javai-persistence`'s own `JavAIPI.repository(Class, JavAIPersistenceConfig)`)
-is the reference example for. Don't assume anything beyond what's in a given module's actual source and
+is the reference example for. As of OMI-290 Vector Core also carries **externally-supplied
+vectors** (`@ExternalVector`: a vector JavAI stores, versions, serves and searches but never computes,
+supplied from outside the process in its own embedding model) and **model-scoped aggregates**
+(`vector(modelId)`/`summaryVector(modelId)`, since two models' vectors cannot be combined), both realized
+across all three persistence backends; and `javai-tagging` carries `applyClassification`, the reconciliation
+half of `classify()` reachable without an LLM. As of OMI-460, `VectorIndex` narrows by type (`ofType(...)`,
+returning another `VectorIndex`, so narrowings chain and a search ends the chain) and carries a ranked search
+(`nearestNRanked`); `javai-tagging`'s two tag indexes push that narrowing into each store's own query rather
+than filtering a result, and `javai-persistence` gains `JavAIRepository.count()` and `Windows.of(offset,
+limit)`, a `Pageable` whose offset is independent of its size. `Ranked<T>` moved to `javai-vector` in the
+same ticket, so `javai-collections` could name it. Don't assume anything beyond what's in a given module's actual source and
 tests reflects working code; check that module's README before relying on a claim from this file,
 `doc/spec/`, or the whitepaper, all three of which describe the design and may be ahead of or behind any one
 module's real implementation state at a given moment.

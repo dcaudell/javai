@@ -12,9 +12,9 @@ import org.springframework.transaction.annotation.Transactional;
 @Transactional
 class ClassLevelService {
 
-    private final SpringTransactionalIntegrationTest.SpringTxRecordRepository repository;
+    private final SpringTxRecordRepository repository;
 
-    ClassLevelService(SpringTransactionalIntegrationTest.SpringTxRecordRepository repository) {
+    ClassLevelService(SpringTxRecordRepository repository) {
         this.repository = repository;
     }
 

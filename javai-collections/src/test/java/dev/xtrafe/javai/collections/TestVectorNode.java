@@ -12,8 +12,13 @@ import dev.xtrafe.javai.model.JavAIVectorizable;
  * pattern as {@code javai-model}'s own {@code TestNode}, reimplemented here since that one is
  * package-private in a different module. Delegates everything to {@link JavAIRuntime}, exactly like real
  * woven bytecode would.
+ *
+ * <p>Not {@code final}: {@link TestAlbumNode}/{@link TestImageNode} extend it to give
+ * {@link NarrowedVectorIndexTest} two distinct runtime classes to narrow between without a second copy of
+ * this boilerplate. {@code JavAIRuntime.findField} walks superclasses, so an inherited {@code text} field
+ * vectorizes exactly as it does here.
  */
-final class TestVectorNode implements JavAIVectorizable, JavAIDirtyTracking {
+class TestVectorNode implements JavAIVectorizable, JavAIDirtyTracking {
 
     @SuppressWarnings("unused") // reflectively accessed via JavAIRuntime.STATE_FIELD
     private DirtyTrackingSupport $javai$state;

@@ -8,12 +8,14 @@ import com.mongodb.client.MongoCollection;
 import com.mongodb.client.model.Collation;
 import com.mongodb.client.model.CollationStrength;
 import com.mongodb.client.model.Filters;
+import com.mongodb.client.model.Indexes;
 import com.mongodb.client.model.UpdateOptions;
 import com.mongodb.client.model.Updates;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.Ranked;
 import org.bson.Document;
 import org.bson.conversions.Bson;
 import org.springframework.data.domain.Sort;
@@ -40,6 +42,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 
@@ -111,9 +114,18 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     private final JavAIPersistenceConfig config;
     private final Set<Class<?>> registeredEntityTypes = ConcurrentHashMap.newKeySet();
+
+    /** See {@link #containment()} -- resolved on first use, never in the constructor. */
+    private volatile Containment containment;
+
+    /** One-time index creation per {@code @Taggregate} edge; see {@link #ensureTaggregateIndex}. */
+    private final Set<String> taggregateIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Object bootstrapLock = new Object();
     private volatile MongoTemplate mongoTemplate;
+    /** The client {@link #buildMongoTemplate} opened, kept only so {@link #release} can close it. */
+    private MongoClient ownedClient;
+    private volatile boolean released;
 
     RepositoryBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
@@ -279,6 +291,11 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     }
 
     @Override
+    public long count(Class<?> entityType) {
+        return collectionFor(entityType).countDocuments();
+    }
+
+    @Override
     public List<Object> findAll(Class<?> entityType) {
         Map<UUID, Object> hydrated = new HashMap<>();
         List<Object> results = new ArrayList<>();
@@ -295,6 +312,14 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
 
     @Override
     public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
+        // A summary search in a model this backend never wrote a property for still has an answer, and
+        // returning nothing would be indistinguishable from "nothing is similar" (OMI-458). Folding is that
+        // answer; the flag that makes it an indexed lookup is Postgres-only for now.
+        spec.requireModelAgreement();
+        requireConcatenatedTextInConfiguredModel(spec);
+        if (foldsSummaryInMemory(containment(), entityType, spec)) {
+            return foldNearestBySummary(entityType, spec);
+        }
         return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
@@ -330,6 +355,15 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         String collectionName = collectionName(entityType);
         String qualifiedField = qualify(basePropertyName, reference.modelId());
         String indexName = vectorIndexName(collectionName, qualifiedField);
+        // ⚠️ **No document carries this field, so there is nothing to index and nothing to find.** Creating
+        // the search index anyway -- which this did -- left a permanent, empty Atlas search index behind for
+        // every query whose reference named a model nothing had been written in, and blocked the caller
+        // while waiting for that junk index to become queryable. As on Neo4j, a query is the only thing that
+        // ever creates an index here, so it creates when there is something to create it for.
+        if (collectionFor(entityType).find(new Document(qualifiedField, new Document("$exists", true)))
+                .limit(1).first() == null) {
+            return List.of();
+        }
         ensureVectorIndex(collectionName, indexName, qualifiedField, reference.dims());
 
         Document search = new Document()
@@ -940,6 +974,29 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                     updates.put(qualifiedText, text);
                 }
             }
+
+            // @ExternalVector fields (OMI-290). Per-document, like summaryVector above, with two
+            // differences: the qualifier is the *declared* model rather than the configured one -- these
+            // have nothing to do with whichever text provider is running -- and the content key the vector
+            // was computed for is stored beside it. Without that key a hydrated vector is held and never
+            // served, since every read compares it against the document's current content.
+            for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+                String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+                EmbeddingVector external = vectorizable.externalVector(vectorName);
+                if (external.isAbsent()) {
+                    // Nothing supplied yet, or superseded. $unset rather than left behind: the stored vector
+                    // confidently describes content this document no longer references, and a stale entry in
+                    // a $vectorSearch index goes on matching forever.
+                    clearVectorField(removals, vectorName + "Vector", declaredModel);
+                    removals.add(qualify(vectorName + "Vector", declaredModel) + "ComputedFor");
+                    continue;
+                }
+                String qualifiedExternal = qualify(vectorName + "Vector", external.modelId());
+                updates.put(qualifiedExternal, toDoubleList(external.values()));
+                updates.put(qualifiedExternal + "ComputedAt", external.computedAt().toString());
+                updates.put(qualifiedExternal + "ComputedFor",
+                        JavAIRuntime.externalVectorKey(entity, vectorName));
+            }
         }
 
         // $set-based upsert, deliberately never a whole-document replaceOne -- see this class's own javadoc
@@ -1051,11 +1108,67 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         removals.add(qualified + "ComputedAt");
     }
 
+    /**
+     * Writes one {@code @ExternalVector}'s document fields and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290). Not a {@code save()}: the consumer storing a vector has not touched
+     * the entity itself.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        List<Bson> ops = new ArrayList<>();
+        if (vector.isAbsent()) {
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            ops.add(Updates.unset(qualified));
+            ops.add(Updates.unset(qualified + "ComputedAt"));
+            ops.add(Updates.unset(qualified + "ComputedFor"));
+        } else {
+            String qualified = qualify(vectorName + "Vector", vector.modelId());
+            ops.add(Updates.set(qualified, toDoubleList(vector.values())));
+            ops.add(Updates.set(qualified + "ComputedAt", vector.computedAt().toString()));
+            ops.add(Updates.set(qualified + "ComputedFor",
+                    JavAIRuntime.externalVectorKey(entity, vectorName)));
+        }
+        collectionFor(entityType).updateOne(Filters.eq("_id", id.toString()), Updates.combine(ops));
+    }
+
+    /**
+     * Restores each {@code @ExternalVector} from its declared model's document fields, together with the
+     * content key it was written for (OMI-290).
+     *
+     * <p>The key is what makes the restored vector answerable: {@code externalVector()} compares it against
+     * the entity's current content on every read, so a vector hydrated without one is held and never served
+     * -- which from outside looks exactly like a pipeline that never ran.
+     */
+    private void hydrateExternalVectors(Class<?> entityType, Object entity, Document doc) {
+        for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+            String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            if (!(doc.get(qualified) instanceof List<?> stored)) {
+                continue;
+            }
+            float[] values = new float[stored.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) stored.get(i)).floatValue();
+            }
+            String computedAt = doc.getString(qualified + "ComputedAt");
+            JavAIRuntime.hydrateExternalVector(entity, vectorName,
+                    new EmbeddingVector(values, declaredModel, values.length,
+                            computedAt == null ? Instant.now() : Instant.parse(computedAt)),
+                    doc.getString(qualified + "ComputedFor"));
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private void hydrateVectors(Class<?> entityType, Object entity, Document doc) {
         if (!(entity instanceof JavAIVectorizable)) {
             return;
         }
+        // Read before the currentModelId() guard: an @ExternalVector's model is declared on the type, so it
+        // is readable whether or not a text provider is configured or can name itself (OMI-290).
+        hydrateExternalVectors(entityType, entity, doc);
         String modelId = JavAIRuntime.currentModelId();
         if (modelId == null) {
             return;
@@ -1235,14 +1348,149 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         return mongoTemplate().getCollection(collectionName(entityType));
     }
 
+    /**
+     * The {@code @Taggregate} containment of the registered model, over this backend's reference-pointer
+     * arrays (OMI-304).
+     *
+     * <p>The <em>declaration</em> comes from {@link Containment}, exactly as on the other two backends; only
+     * the traversal is native. A reference field is stored as {@code {type, id}} -- one such document for a
+     * singular reference, an array of them for a collection -- and MongoDB's dot notation matches both
+     * shapes with one filter, so {@code field.id} finds a container whether the field holds one member or
+     * fifty. That is what makes this a query rather than two.
+     */
+    @Override
+    public TaggregateContainment taggregateContainment() {
+        return new TaggregateContainment() {
+            @Override
+            public boolean isEmpty() {
+                return containment().hasNoTaggregates();
+            }
+
+            @Override
+            public void containersOf(String childTypeName, UUID childId, BiConsumer<String, UUID> sink) {
+                Class<?> childType = typeOrNull(childTypeName);
+                for (Containment.Edge edge : containment().taggregateEdges()) {
+                    // By name first, so a member type that was never registered as a repository of its own
+                    // is still found through the edge that declares it; by assignability second, for a
+                    // subclass held in a field declared as its supertype.
+                    boolean holdsThisChild = edge.childType().getName().equals(childTypeName)
+                            || (childType != null && edge.childType().isAssignableFrom(childType));
+                    if (!holdsThisChild) {
+                        continue;
+                    }
+                    ensureTaggregateIndex(edge);
+                    for (Document doc : collectionFor(edge.parentType()).find(Filters.and(
+                            Filters.eq(edge.fieldName() + ".type", childTypeName),
+                            Filters.eq(edge.fieldName() + ".id", childId.toString())))) {
+                        sink.accept(edge.parentType().getName(), UUID.fromString(doc.getString("_id")));
+                    }
+                }
+            }
+
+            @Override
+            public void membersOf(String containerTypeName, UUID containerId, BiConsumer<String, UUID> sink) {
+                Class<?> containerType = typeOrNull(containerTypeName);
+                if (containerType == null) {
+                    return;
+                }
+                Document container = collectionFor(containerType)
+                        .find(Filters.eq("_id", containerId.toString())).first();
+                if (container == null) {
+                    return;
+                }
+                for (Containment.Edge edge : containment().taggregateEdges()) {
+                    if (!edge.parentType().isAssignableFrom(containerType)) {
+                        continue;
+                    }
+                    Object value = container.get(edge.fieldName());
+                    if (value instanceof List<?> references) {
+                        for (Object reference : references) {
+                            acceptReference(reference, sink);
+                        }
+                    } else {
+                        acceptReference(value, sink);
+                    }
+                }
+            }
+
+            @Override
+            public void allContainers(BiConsumer<String, UUID> sink) {
+                for (Class<?> containerType : containment().taggregateContainerTypes()) {
+                    for (Document doc : collectionFor(containerType).find()) {
+                        sink.accept(containerType.getName(), UUID.fromString(doc.getString("_id")));
+                    }
+                }
+            }
+
+            /** No ambient JDBC transaction on this backend -- see the Neo4j implementation's own note. */
+            @Override
+            public boolean inAmbientTransaction(ConnectionWork work) {
+                return false;
+            }
+
+            /** No ambient transaction to hang a commit callback on either -- the caller drains inline. */
+            @Override
+            public boolean afterCommit(Runnable drain) {
+                return false;
+            }
+
+            private void acceptReference(Object reference, BiConsumer<String, UUID> sink) {
+                if (reference instanceof Document document
+                        && document.getString("type") != null && document.getString("id") != null) {
+                    sink.accept(document.getString("type"), UUID.fromString(document.getString("id")));
+                }
+            }
+        };
+    }
+
+    /** One index per {@code @Taggregate} edge, on the reference id the container lookup filters by --
+     *  without it, finding a member's containers is a collection scan per edge on every tag mutation. */
+    private void ensureTaggregateIndex(Containment.Edge edge) {
+        String key = edge.parentType().getName() + "#" + edge.fieldName();
+        if (taggregateIndexesEnsured.add(key)) {
+            collectionFor(edge.parentType())
+                    .createIndex(Indexes.ascending(edge.fieldName() + ".type", edge.fieldName() + ".id"));
+        }
+    }
+
+    private Class<?> typeOrNull(String typeName) {
+        for (Class<?> registered : registeredEntityTypes) {
+            if (registered.getName().equals(typeName)) {
+                return registered;
+            }
+        }
+        return null;
+    }
+
+    /** See the Postgres backend's own {@code containment()} for why this resolves lazily. */
+    private Containment containment() {
+        Containment resolved = containment;
+        if (resolved == null) {
+            synchronized (this) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = Containment.of(registeredEntityTypes);
+                    containment = resolved;
+                }
+            }
+        }
+        return resolved;
+    }
+
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
     private MongoTemplate mongoTemplate() {
+        if (released) {
+            throw RepositoryBackend.releasedError();
+        }
         MongoTemplate template = mongoTemplate;
         if (template != null) {
             return template;
         }
         synchronized (bootstrapLock) {
+            if (released) {
+                throw RepositoryBackend.releasedError();
+            }
             if (mongoTemplate == null) {
                 mongoTemplate = config.externalMongoTemplate() != null
                         ? config.externalMongoTemplate()
@@ -1252,8 +1500,19 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
     }
 
+    @Override
+    public void release() {
+        synchronized (bootstrapLock) {
+            released = true;
+            if (ownedClient != null) {
+                ownedClient.close();
+            }
+        }
+    }
+
     private MongoTemplate buildMongoTemplate() {
         MongoClient client = MongoClients.create(config.mongoUri());
+        ownedClient = client;
         MongoDatabaseFactory factory = new SimpleMongoClientDatabaseFactory(client, config.mongoDatabase());
         return new MongoTemplate(factory);
     }

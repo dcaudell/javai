@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -163,7 +164,7 @@ class SummaryPropagationConcurrencyTest {
         Map<String, Long> before = vectorRowVersions(TestShelf.class.getName(), shelf.getId());
         Instant summaryBefore = summaryComputedAt(TestShelf.class.getName(), shelf.getId());
 
-        TestShelf reloaded = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf reloaded = shelfWithBooks(shelf.getId());
         reloaded.getBooks().add(new TestBook("a new arrival"));
         shelves.save(reloaded);
 
@@ -219,7 +220,7 @@ class SummaryPropagationConcurrencyTest {
         assertNotNull(libraryBefore, "the library must have a summary to begin with");
 
         // Reached through the shelf's own repository: this caller never loads, mentions, or holds a library.
-        TestShelf held = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf held = shelfWithBooks(shelf.getId());
         held.getBooks().add(new TestBook("two levels down"));
         shelves.save(held);
 
@@ -239,7 +240,11 @@ class SummaryPropagationConcurrencyTest {
         TestVault vault = vaults.save(new TestVault("oddly keyed"));
         Instant before = summaryComputedAt(TestVault.class.getName(), vault.getVaultKey());
 
-        TestVault held = vaults.findById(vault.getVaultKey()).orElseThrow();
+        TestVault held = JavAIPI.inTransaction(config, () -> {
+            TestVault loaded = vaults.findById(vault.getVaultKey()).orElseThrow();
+            Hibernate.initialize(loaded.getBooks());
+            return loaded;
+        });
         held.getBooks().add(new TestBook("filed in a vault"));
         vaults.save(held);
 
@@ -260,13 +265,13 @@ class SummaryPropagationConcurrencyTest {
     @DisplayName("removing a child recomputes the container that held it")
     void removingAChildRecomputesItsContainer() {
         TestShelf shelf = shelves.save(new TestShelf("losing a book"));
-        TestShelf held = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf held = shelfWithBooks(shelf.getId());
         held.getBooks().add(new TestBook("about to be removed"));
         held.getBooks().add(new TestBook("staying put"));
         shelves.save(held);
         Instant withBothBooks = summaryComputedAt(TestShelf.class.getName(), shelf.getId());
 
-        TestShelf reloaded = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf reloaded = shelfWithBooks(shelf.getId());
         reloaded.getBooks().removeIf(book -> book.getTitle().startsWith("about to be"));
         shelves.save(reloaded);
 
@@ -290,7 +295,7 @@ class SummaryPropagationConcurrencyTest {
     @DisplayName("deleting an entity a container still holds detaches it first, and recomputes the container")
     void deletingAnEntityStillHeldByAContainerSucceeds() {
         TestShelf shelf = shelves.save(new TestShelf("holding a doomed book"));
-        TestShelf held = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf held = shelfWithBooks(shelf.getId());
         TestBook doomed = new TestBook("about to be deleted outright");
         held.getBooks().add(doomed);
         held.getBooks().add(new TestBook("surviving"));
@@ -319,7 +324,7 @@ class SummaryPropagationConcurrencyTest {
         TestShelf shelf = shelves.save(new TestShelf("deferred"));
         Instant before = summaryComputedAt(TestShelf.class.getName(), shelf.getId());
 
-        TestShelf held = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf held = shelfWithBooks(shelf.getId());
         held.getBooks().add(new TestBook("queued, not yet folded in"));
         shelves.save(held, SummaryPolicy.QUEUE_ONLY);
 
@@ -339,7 +344,7 @@ class SummaryPropagationConcurrencyTest {
     @DisplayName("a plain save() leaves nothing queued")
     void aPlainSaveLeavesNothingQueued() {
         TestShelf shelf = shelves.save(new TestShelf("default policy"));
-        TestShelf held = shelves.findById(shelf.getId()).orElseThrow();
+        TestShelf held = shelfWithBooks(shelf.getId());
         held.getBooks().add(new TestBook("folded in before save returns"));
         shelves.save(held);
 
@@ -437,7 +442,9 @@ class SummaryPropagationConcurrencyTest {
      * believed at the time.
      */
     private static void assertSummaryMatchesCommittedGraph(UUID shelfId) {
-        TestShelf reloaded = shelves.findById(shelfId).orElseThrow();
+        // summaryVector() is defined over the container's @Summary children, so this one genuinely needs
+        // them -- loaded deliberately (see shelfWithBooks) rather than arriving for free (OMI-271).
+        TestShelf reloaded = shelfWithBooks(shelfId);
         float[] expected = reloaded.summaryVector().values();
         float[] stored = storedSummaryVector(TestShelf.class.getName(), shelfId);
         assertNotNull(stored, "the container must have a stored summary");
@@ -495,7 +502,24 @@ class SummaryPropagationConcurrencyTest {
     /** Read back through the repository rather than against a guessed join-table name: Hibernate owns that
      *  mapping and its naming is not this test's business. What matters is that both adds survived. */
     private static int membershipCount(UUID shelfId) {
-        return shelves.findById(shelfId).orElseThrow().getBooks().size();
+        return shelfWithBooks(shelfId).getBooks().size();
+    }
+
+    /**
+     * A shelf loaded with its {@code books} already initialized.
+     *
+     * <p>A repository returns a <em>detached</em> entity, so a lazy collection can only be initialized inside
+     * the unit of work that loaded it -- ordinary JPA, and what every test here needs before it can add to
+     * the collection. It used to come back initialized for free, because the load path walked and
+     * initialized the whole reachable graph of everything anyone read; that is the over-fetch OMI-271
+     * removed, and this is what these tests pay for the graph they actually want.
+     */
+    private static TestShelf shelfWithBooks(UUID shelfId) {
+        return JavAIPI.inTransaction(config, () -> {
+            TestShelf shelf = shelves.findById(shelfId).orElseThrow();
+            Hibernate.initialize(shelf.getBooks());
+            return shelf;
+        });
     }
 
     private interface RowReader<T> {

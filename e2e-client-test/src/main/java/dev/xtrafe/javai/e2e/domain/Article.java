@@ -9,10 +9,14 @@ import dev.xtrafe.javai.annotations.Vectorize;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.model.JavAIArrayList;
 import dev.xtrafe.javai.model.JavAIList;
+import dev.xtrafe.javai.model.JavAIMap;
 import dev.xtrafe.javai.model.JavAILinkedHashMap;
 import jakarta.persistence.CascadeType;
+import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
+import jakarta.persistence.JoinTable;
+import jakarta.persistence.MapKeyColumn;
 import jakarta.persistence.OneToMany;
 import jakarta.persistence.OneToOne;
 
@@ -53,22 +57,21 @@ import static dev.xtrafe.javai.annotations.SearchVisibility.Visibility.PRIVATE;
  * across both the Postgres and Neo4j backends. {@code featuredComment}/{@code draftComment}/
  * {@code attachment} are real {@code @OneToOne(cascade = CascadeType.ALL)} associations -- ordinary
  * Hibernate relational mapping, since a *singular* reference field never collides with Hibernate's own
- * collection-proxy substitution. The two collection fields deliberately carry <em>one shape each</em>, so
- * this one class exercises both halves of OMI-142 side by side:
+ * collection-proxy substitution.
  *
- * <p>{@code comments} is declared by the JavAI <em>interface</em> ({@code JavAIList}) and non-final, with an
- * ordinary {@code @OneToMany} -- a genuine, natively Hibernate-managed association (its own join table,
- * cascade, lazy loading), with a {@code PersistentJavAIList} substituted into the field so vectors and
- * dirty-tracking survive. {@code relatedComments} is declared by the <em>concrete</em> class
- * ({@code JavAILinkedHashMap}) and unannotated, which can never be a natively mapped collection field
- * (confirmed empirically -- a {@code ClassCastException} the moment Hibernate tries to substitute its own
- * {@code PersistentMap} into a field statically typed as the concrete JavAI class), so it keeps JavAI's own
- * {@code javai_collection_members} side-table storage, hydrated reflectively rather than by proxy, exactly
- * like Neo4j's own relationship mapping already does. Note there's no {@code @Transient} on it, though, and
- * no manual repository pre-registration for {@code Comment} either: {@code RepositoryBackendHibernatePostgres}
- * auto-detects the side-table field reflectively and excludes it from Hibernate's own mapping itself, and
- * auto-registers {@code Comment} as reachable through either field -- see that class's javadoc ("No manual
- * {@code @Transient} required" / "Related entity types are auto-registered too").
+ * <p>Both collection fields are declared by a JavAI <em>interface</em> ({@code JavAIList}/{@code JavAIMap}),
+ * non-final, with an ordinary JPA annotation -- genuine, natively Hibernate-managed associations (their own
+ * join tables, cascade, lazy loading), with a {@code PersistentJavAIList}/{@code PersistentJavAIMap}
+ * substituted into the field so vectors and dirty-tracking survive. This class used to carry <em>one shape
+ * each</em>, {@code relatedComments} being concrete-typed and unannotated so it exercised the membership
+ * table alongside the native mapping; OMI-277 withdrew that shape and deleted the table, and this fixture
+ * migrated with it. The two fields now differ in cardinality ({@code List} vs. {@code Map}) and cascade
+ * rather than in storage.
+ *
+ * <p>Note there is no {@code @Transient} anywhere here, and no manual repository pre-registration for
+ * {@code Comment} either: {@code RepositoryBackendHibernatePostgres} auto-registers {@code Comment} as
+ * reachable through either field -- see that class's javadoc ("Related entity types are auto-registered
+ * too").
  */
 @Entity
 @JavAIVectorizable
@@ -95,17 +98,20 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
      * {@code @OneToMany} -- so Hibernate owns this association natively (its own join table, cascade, lazy
      * loading) while the instance it substitutes into the field is still a real JavAI collection with
      * vectors and dirty-tracking. Nothing JavAI-specific is written here: the collection type is attached by
-     * {@code RepositoryBackendHibernatePostgres} at mapping time. Contrast {@link #relatedComments} below,
-     * which stays on JavAI's own side-table storage -- the two shapes coexist deliberately.
+     * {@code RepositoryBackendHibernatePostgres} at mapping time.
      */
     @OneToMany(cascade = CascadeType.ALL)
     @Summary
     private JavAIList<Comment> comments = new JavAIArrayList<>();
 
-    // Not @Summary -- purely exercises JavAILinkedHashMap persistence (String-keyed, per
-    // RepositoryBackendHibernatePostgres's own documented Phase 0 limitation) alongside comments'
-    // JavAIArrayList, without changing what already-passing tests assert about summaryVector().
-    private final JavAILinkedHashMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
+    // Not @Summary -- purely exercises JavAIMap persistence alongside comments' JavAIList, without changing
+    // what already-passing tests assert about summaryVector().
+    // Its own join table, explicitly: `comments` above is also a to-many of Comment, and Hibernate derives
+    // the default join-table name from owner + element type, so both would claim `article_comment`.
+    @OneToMany(cascade = { CascadeType.PERSIST, CascadeType.MERGE })
+    @JoinTable(name = "article_related_comment")
+    @MapKeyColumn(name = "related_key")
+    private JavAIMap<String, Comment> relatedComments = new JavAILinkedHashMap<>();
 
     @OneToOne(cascade = CascadeType.ALL)
     @SearchVisibility(PRIVATE)
@@ -113,6 +119,25 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
 
     @OneToOne(cascade = CascadeType.ALL)
     private Attachment attachment;
+
+    // ---- counters maintained outside this entity's own editing path (OMI-398) --------------------
+    //
+    // Neither is @Vectorize, and that is the point: they sit on a genuinely woven @JavAIVectorizable class,
+    // so a targeted write to one has to be allowed while a write to title/body is refused. The two differ in
+    // the one dimension the ticket cared about.
+
+    /** Ordinary: writable by save() and by a targeted @Modifying query alike. */
+    private long viewCount;
+
+    /**
+     * Read-only to save(), writable only through a targeted @Modifying query -- the ticket's motivating
+     * shape. A count moved by its own path (a like, a settled charge) is otherwise clobberable by any
+     * unrelated edit: load the article before the count moved, fix a typo in the title, save, and the stale
+     * count goes back with it. This repository hands out detached entities, which is exactly the shape that
+     * goes stale. JPA's own flag is the whole mechanism; JavAI adds no annotation for it.
+     */
+    @Column(updatable = false)
+    private long likeCount;
 
     public Article() {
     }
@@ -142,6 +167,22 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
         this.body = body;
     }
 
+    public long getViewCount() {
+        return viewCount;
+    }
+
+    public void setViewCount(long viewCount) {
+        this.viewCount = viewCount;
+    }
+
+    public long getLikeCount() {
+        return likeCount;
+    }
+
+    public void setLikeCount(long likeCount) {
+        this.likeCount = likeCount;
+    }
+
     public Comment getFeaturedComment() {
         return featuredComment;
     }
@@ -154,7 +195,7 @@ public class Article implements JavAIGraphNode, dev.xtrafe.javai.tagging.Taggabl
         return comments;
     }
 
-    public JavAILinkedHashMap<String, Comment> getRelatedComments() {
+    public JavAIMap<String, Comment> getRelatedComments() {
         return relatedComments;
     }
 

@@ -16,6 +16,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -178,5 +179,35 @@ class CortexReplicateTest {
             executor.shutdown();
             executor.awaitTermination(10, TimeUnit.SECONDS);
         }
+    }
+
+    /** OMI-68: Replicate has no way to constrain output to a schema, so a typed request sends the prompt
+     *  alone and the reply is still read with {@code as}. */
+    @Test
+    void aTypedRequestSendsThePromptAloneAndTheReplyStillReadsBack() throws IOException {
+        StringBuilder capturedRequestBody = new StringBuilder();
+        server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+        server.createContext("/v1/models/test/model/predictions", exchange -> {
+            capturedRequestBody.append(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] body = """
+                    {"id":"pred-9","status":"succeeded",
+                     "output":["Sure: {\\"personA\\": false, ", "\\"personB\\": true}"],
+                     "urls":{"get":"http://unused/should-not-be-polled"}}
+                    """.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, body.length);
+            exchange.getResponseBody().write(body);
+            exchange.close();
+        });
+        server.start();
+
+        CompletionResult result = CortexReplicate.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+                .apiToken("test-token").model("test/model").build()
+                .complete(CompletionRequest.builder().prompt("Did they agree?")
+                        .responseType(CompletionResultTypedTest.Verdict.class).build());
+
+        assertFalse(capturedRequestBody.toString().contains("additionalProperties"), capturedRequestBody.toString());
+        assertEquals(new CompletionResultTypedTest.Verdict(false, true),
+                result.as(CompletionResultTypedTest.Verdict.class).orElseThrow());
     }
 }

@@ -7,6 +7,7 @@ import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
+import dev.xtrafe.javai.vector.Ranked;
 import org.neo4j.driver.AuthTokens;
 import org.neo4j.driver.Driver;
 import org.neo4j.driver.GraphDatabase;
@@ -37,6 +38,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.BiConsumer;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -98,7 +100,11 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     private final JavAIPersistenceConfig config;
     private final Set<String> vectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final Map<String, Class<?>> typesByLabel = new ConcurrentHashMap<>();
+
+    /** See {@link #containment()} -- resolved on first use, never in the constructor. */
+    private volatile Containment containment;
     private volatile Driver driver;
+    private volatile boolean released;
 
     RepositoryBackendNeo4j(JavAIPersistenceConfig config) {
         this.config = config;
@@ -229,6 +235,15 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     @Override
+    public long count(Class<?> entityType) {
+        try (Session session = driver().session()) {
+            return session.executeRead(tx -> tx
+                    .run("MATCH (n:`" + label(entityType) + "`) RETURN count(n) AS c")
+                    .single().get("c").asLong());
+        }
+    }
+
+    @Override
     public List<Object> findAll(Class<?> entityType) {
         try (Session session = driver().session()) {
             List<Node> nodes = session.executeRead(tx -> {
@@ -262,6 +277,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     @Override
     public List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec) {
         validateNearestQuery(entityType, spec); // the builder idiom reaches here without a creation-time check
+        // A summary search in a model this backend never wrote a property for still has an answer, and
+        // returning nothing would be indistinguishable from "nothing is similar" (OMI-458). Folding is that
+        // answer; the flag that makes it an indexed lookup is Postgres-only for now.
+        spec.requireModelAgreement();
+        requireConcatenatedTextInConfiguredModel(spec);
+        if (foldsSummaryInMemory(containment(), entityType, spec)) {
+            return foldNearestBySummary(entityType, spec);
+        }
         return findNearest(entityType, vectorPropertyName(spec), spec);
     }
 
@@ -312,6 +335,15 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         EmbeddingVector reference = spec.reference();
         String label = label(entityType);
         String property = qualify(basePropertyName, reference.modelId());
+        // ⚠️ **Nothing carries this property, so there is nothing to index and nothing to find.** Creating a
+        // vector index here anyway -- which this did -- left a permanent, empty index behind for every
+        // search whose reference named a model no node had ever been written in, and blocked the caller
+        // while waiting for that junk index to come online. Unlike Postgres, whose write path provisions
+        // its own tables, a query is the only thing that ever creates an index here, so this cannot simply
+        // stop creating: it creates when there is something to create it for.
+        if (!anyNodeCarries(label, property)) {
+            return List.of();
+        }
         ensureVectorIndex(label, property, reference.dims());
         String indexName = vectorIndexName(label, property);
         try (Session session = driver().session()) {
@@ -342,6 +374,16 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     private record Scored(Node node, double score) {
+    }
+
+    /** Whether a single node of {@code label} carries {@code property} at all -- one indexed-free lookup
+     *  bounded by {@code LIMIT 1}, which is all "is there anything to index" needs to ask. */
+    private boolean anyNodeCarries(String label, String property) {
+        try (Session session = driver().session()) {
+            return session.executeRead(tx -> tx.run(
+                    "MATCH (n:`" + label + "`) WHERE n.`" + property + "` IS NOT NULL RETURN n LIMIT 1")
+                    .hasNext());
+        }
     }
 
     private void ensureVectorIndex(String label, String property, int dims) {
@@ -850,6 +892,29 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 properties.put(qualify("concatenatedText", concatenated.modelId()),
                         vectorizable.concatenatedText());
             }
+
+            // @ExternalVector properties (OMI-290). Same per-entity shape as summaryVector above, with two
+            // differences: the qualifier is the *declared* model rather than the configured one -- these
+            // vectors have nothing to do with whichever text provider is running -- and the content key the
+            // vector was computed for travels alongside it. Without that key a hydrated vector is held and
+            // never served, since every read compares it against the entity's current content.
+            for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+                String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+                EmbeddingVector external = vectorizable.externalVector(vectorName);
+                if (external.isAbsent()) {
+                    // Nothing supplied yet, or superseded. Removing rather than leaving it is the same rule
+                    // an absent @Vectorize field follows, and matters more: the stored vector confidently
+                    // describes content this node no longer references.
+                    clearVectorProperty(properties, vectorName + "Vector", declaredModel);
+                    properties.put(qualify(vectorName + "Vector", declaredModel) + "ComputedFor", null);
+                    continue;
+                }
+                String qualifiedExternal = qualify(vectorName + "Vector", external.modelId());
+                properties.put(qualifiedExternal, external.values());
+                properties.put(qualifiedExternal + "ComputedAt", external.computedAt().toString());
+                properties.put(qualifiedExternal + "ComputedFor",
+                        JavAIRuntime.externalVectorKey(entity, vectorName));
+            }
         }
 
         tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
@@ -1050,6 +1115,10 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (!(entity instanceof JavAIVectorizable)) {
             return;
         }
+        // Read before the currentModelId() guard below, deliberately: an @ExternalVector's model is declared
+        // on the type, so it is readable whether or not a text provider is configured or can name itself
+        // (OMI-290).
+        hydrateExternalVectors(entityType, entity, node);
         String modelId = JavAIRuntime.currentModelId();
         if (modelId == null) {
             return;
@@ -1086,6 +1155,66 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                     : Instant.now();
             JavAIRuntime.hydrateConcatenatedTextVector(entity,
                     new EmbeddingVector(values, modelId, values.length, computedAt));
+        }
+    }
+
+    /**
+     * Writes one {@code @ExternalVector}'s node properties and nothing else -- the narrow write behind
+     * {@code supplyVector} (OMI-290). Not a {@code save()}: the consumer storing a vector has not touched
+     * the entity itself.
+     */
+    @Override
+    public void writeExternalVector(Class<?> entityType, Object entity, String vectorName) {
+        UUID id = EntityReflection.readId(entity);
+        String label = label(entityType);
+        EmbeddingVector vector = ((JavAIVectorizable) entity).externalVector(vectorName);
+        String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+        Map<String, Object> properties = new HashMap<>();
+        if (vector.isAbsent()) {
+            clearVectorProperty(properties, vectorName + "Vector", declaredModel);
+            properties.put(qualify(vectorName + "Vector", declaredModel) + "ComputedFor", null);
+        } else {
+            String qualified = qualify(vectorName + "Vector", vector.modelId());
+            properties.put(qualified, vector.values());
+            properties.put(qualified + "ComputedAt", vector.computedAt().toString());
+            properties.put(qualified + "ComputedFor", JavAIRuntime.externalVectorKey(entity, vectorName));
+        }
+        try (Session session = driver().session()) {
+            session.executeWrite(tx -> tx.run("MERGE (n:`" + label + "` {id: $id}) SET n += $props",
+                    Values.parameters("id", id.toString(), "props", properties)).consume());
+        }
+    }
+
+    /**
+     * Restores each {@code @ExternalVector} from its declared model's node properties, together with the
+     * content key it was written for (OMI-290).
+     *
+     * <p>The key is what makes the restored vector answerable at all: {@code externalVector()} compares it
+     * against the entity's current content on every read, so hydrating the vector alone would leave the
+     * entity holding something it can never serve -- indistinguishable, from outside, from a vector that had
+     * been superseded, and from a pipeline that had never run.
+     */
+    private void hydrateExternalVectors(Class<?> entityType, Object entity, Node node) {
+        for (String vectorName : JavAIRuntime.externalVectorNames(entityType)) {
+            String declaredModel = JavAIRuntime.externalVectorModel(entityType, vectorName);
+            String qualified = qualify(vectorName + "Vector", declaredModel);
+            if (!node.containsKey(qualified) || node.get(qualified).isNull()) {
+                continue;
+            }
+            List<Object> raw = node.get(qualified).asList();
+            float[] values = new float[raw.size()];
+            for (int i = 0; i < values.length; i++) {
+                values[i] = ((Number) raw.get(i)).floatValue();
+            }
+            Instant computedAt = node.containsKey(qualified + "ComputedAt")
+                    ? Instant.parse(node.get(qualified + "ComputedAt").asString())
+                    : Instant.now();
+            String computedFor = node.containsKey(qualified + "ComputedFor")
+                    && !node.get(qualified + "ComputedFor").isNull()
+                    ? node.get(qualified + "ComputedFor").asString()
+                    : null;
+            JavAIRuntime.hydrateExternalVector(entity, vectorName,
+                    new EmbeddingVector(values, declaredModel, values.length, computedAt), computedFor);
         }
     }
 
@@ -1338,6 +1467,124 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         return result.toString();
     }
 
+    /**
+     * The {@code @Taggregate} containment of the registered model, as relationship traversal (OMI-304).
+     *
+     * <p>The <em>declaration</em> comes from {@link Containment} exactly as it does on Postgres -- which
+     * field of which type holds what is reflection over the model and has nothing to do with a store. Only
+     * the traversal is native here: this backend maps a collection or reference field to a relationship
+     * named after it, so "which containers hold this member" is the same edge read backwards.
+     */
+    @Override
+    public TaggregateContainment taggregateContainment() {
+        return new TaggregateContainment() {
+            @Override
+            public boolean isEmpty() {
+                return containment().hasNoTaggregates();
+            }
+
+            @Override
+            public void containersOf(String childTypeName, UUID childId, BiConsumer<String, UUID> sink) {
+                Class<?> childType = typeOf(childTypeName);
+                if (childType == null) {
+                    return;
+                }
+                try (Session session = driver().session()) {
+                    for (Containment.Edge edge : containment().taggregateEdges()) {
+                        if (!edge.childType().isAssignableFrom(childType)) {
+                            continue;
+                        }
+                        var result = session.run("MATCH (p:`" + label(edge.parentType()) + "`)-[:`"
+                                        + relationshipType(edge.fieldName()) + "`]->(c:`" + label(childType)
+                                        + "` {id: $childId}) RETURN p.id AS id",
+                                Values.parameters("childId", childId.toString()));
+                        for (Record record : result.list()) {
+                            sink.accept(edge.parentType().getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void membersOf(String containerTypeName, UUID containerId, BiConsumer<String, UUID> sink) {
+                Class<?> containerType = typeOf(containerTypeName);
+                if (containerType == null) {
+                    return;
+                }
+                try (Session session = driver().session()) {
+                    for (Containment.Edge edge : containment().taggregateEdges()) {
+                        if (!edge.parentType().isAssignableFrom(containerType)) {
+                            continue;
+                        }
+                        var result = session.run("MATCH (p:`" + label(containerType) + "` {id: $containerId})-[:`"
+                                        + relationshipType(edge.fieldName()) + "`]->(c:`"
+                                        + label(edge.childType()) + "`) RETURN c.id AS id",
+                                Values.parameters("containerId", containerId.toString()));
+                        for (Record record : result.list()) {
+                            sink.accept(edge.childType().getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void allContainers(BiConsumer<String, UUID> sink) {
+                try (Session session = driver().session()) {
+                    for (Class<?> containerType : containment().taggregateContainerTypes()) {
+                        var result = session.run(
+                                "MATCH (p:`" + label(containerType) + "`) RETURN p.id AS id");
+                        for (Record record : result.list()) {
+                            sink.accept(containerType.getName(), UUID.fromString(record.get("id").asString()));
+                        }
+                    }
+                }
+            }
+
+            /** No ambient JDBC transaction exists on this backend -- tagging writes on its own connection,
+             *  and says so by getting {@code false} rather than a silently-ignored callback. */
+            @Override
+            public boolean inAmbientTransaction(ConnectionWork work) {
+                return false;
+            }
+
+            /** No ambient transaction to hang a commit callback on either -- the caller drains inline. */
+            @Override
+            public boolean afterCommit(Runnable drain) {
+                return false;
+            }
+        };
+    }
+
+    /**
+     * The declared containment of every registered type, resolved once on first use.
+     *
+     * <p>Lazily rather than in the constructor for the same reason the Postgres backend does it: registration
+     * is still in progress there, and by the first containment question every repository this application
+     * needs has necessarily been created.
+     */
+    private Containment containment() {
+        Containment resolved = containment;
+        if (resolved == null) {
+            synchronized (this) {
+                resolved = containment;
+                if (resolved == null) {
+                    resolved = Containment.of(typesByLabel.values());
+                    containment = resolved;
+                }
+            }
+        }
+        return resolved;
+    }
+
+    private Class<?> typeOf(String typeName) {
+        for (Class<?> registered : typesByLabel.values()) {
+            if (registered.getName().equals(typeName)) {
+                return registered;
+            }
+        }
+        return null;
+    }
+
     private static String label(Class<?> entityType) {
         return entityType.getSimpleName();
     }
@@ -1345,17 +1592,33 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     // ---- lazy bootstrap -----------------------------------------------------------------------
 
     private Driver driver() {
+        if (released) {
+            throw RepositoryBackend.releasedError();
+        }
         Driver current = driver;
         if (current != null) {
             return current;
         }
         synchronized (this) {
+            if (released) {
+                throw RepositoryBackend.releasedError();
+            }
             if (driver == null) {
                 driver = config.externalNeo4jDriver() != null
                         ? config.externalNeo4jDriver()
                         : GraphDatabase.driver(config.neo4jUri(), AuthTokens.basic(config.neo4jUsername(), config.neo4jPassword()));
             }
             return driver;
+        }
+    }
+
+    @Override
+    public void release() {
+        synchronized (this) {
+            released = true;
+            if (driver != null && config.externalNeo4jDriver() == null) {
+                driver.close();
+            }
         }
     }
 }

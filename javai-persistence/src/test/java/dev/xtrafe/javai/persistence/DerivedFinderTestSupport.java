@@ -61,6 +61,9 @@ final class DerivedFinderTestSupport {
         assertFalse(repository.existsByEmail("ghost@example.com"));
         assertEquals(3, repository.countByActive(true));
         assertEquals(1, repository.countByActive(false));
+        // An int-returning count, which nothing declared until OMI-398: the adapter must box to Integer, not
+        // widen to Long and let the repository proxy throw ClassCastException on the way out.
+        assertEquals(repository.findByAgeGreaterThanEqual(30).size(), repository.countByAgeGreaterThan(29));
 
         // boolean True keyword, comparison, Between.
         assertEquals(3, repository.findByActiveTrue().size());

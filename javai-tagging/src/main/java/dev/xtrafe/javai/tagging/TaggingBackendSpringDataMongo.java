@@ -19,8 +19,14 @@ import org.bson.conversions.Bson;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -60,10 +66,24 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     /** MongoDB's {@code CallbackCanceled} -- see {@link #isTransientSearchServiceError}. */
     private static final int CALLBACK_CANCELED_ERROR_CODE = 90;
 
+    /** Tag-text sibling of {@link #TAG_SUMMARY_VECTORS_COLLECTION} -- same dedicated-collection reasoning
+     *  (one Atlas {@code $vectorSearch} index spanning every {@code Taggable} type), holding the
+     *  deterministic text beside each model's vector. */
+    private static final String TAG_TEXT_VECTORS_COLLECTION = "_javaiTagTextVectors";
+
+    /** {@code javai_taggregate_pending} in this backend's convention. The membership snapshot that used to
+     *  sit beside it is gone (OMI-304): the reference arrays already are the membership. */
+    private static final String TAGGREGATE_PENDING_COLLECTION = "_javaiTaggregatePending";
+
     private final JavAIPersistenceConfig config;
     private final Set<String> tagSummaryVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
+    private final Set<String> tagTextVectorIndexesEnsured = ConcurrentHashMap.newKeySet();
     private final AtomicBoolean tagSummaryVectorsUniqueIndexEnsured = new AtomicBoolean();
+    private final AtomicBoolean tagTextVectorsUniqueIndexEnsured = new AtomicBoolean();
+    private final AtomicBoolean taggregateIndexesEnsured = new AtomicBoolean();
     private volatile MongoDatabase database;
+    private MongoClient client;
+    private volatile boolean released;
 
     TaggingBackendSpringDataMongo(JavAIPersistenceConfig config) {
         this.config = config;
@@ -151,31 +171,271 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     }
 
     @Override
-    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n) {
+    public List<RankedTaggableRef> nearestByTagSummaryVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
         String field = qualify(reference.modelId());
         ensureTagSummaryVectorIndex(field, reference.dims());
-        String indexName = tagSummaryVectorIndexName(field);
+        return nearestByVector(tagSummaryVectorsCollection(), tagSummaryVectorIndexName(field), field,
+                reference, n, candidateTypeNames);
+    }
+
+    @Override
+    public int tagSummaryVectorCount(List<String> candidateTypeNames) {
+        return count(tagSummaryVectorsCollection(), candidateTypeNames);
+    }
+
+    /**
+     * One narrowed (or unnarrowed) {@code $vectorSearch} over whichever of the two tag-vector collections is
+     * passed (OMI-460).
+     *
+     * <p><b>{@code filter} is a genuine pre-filter</b>, which is what lets this backend answer "the nearest n
+     * albums" rather than "the albums among the nearest n": Atlas applies it during the search, so
+     * {@code limit} counts only documents that already satisfy it. The path it narrows on is
+     * {@code taggableType}, declared as a {@code filter} field by {@link #ensureTagSummaryVectorIndex}/
+     * {@link #ensureTagTextVectorIndex} -- unlike {@code RepositoryBackendSpringDataMongo}, which cannot know
+     * which paths a caller's predicate will touch and so routes everything through {@code _id}, this index
+     * has exactly one thing anyone narrows it by.
+     */
+    private List<RankedTaggableRef> nearestByVector(MongoCollection<Document> collection, String indexName,
+            String field, EmbeddingVector reference, int n, List<String> candidateTypeNames) {
+        Document search = new Document()
+                .append("index", indexName)
+                .append("path", field)
+                .append("queryVector", toDoubleList(reference.values()));
+        if (!candidateTypeNames.isEmpty()) {
+            search.append("filter", new Document("taggableType", new Document("$in", candidateTypeNames)));
+        }
+        search.append("numCandidates", Math.max(n * 10, 100)).append("limit", n);
         List<Bson> pipeline = List.of(
-                new Document("$vectorSearch", new Document()
-                        .append("index", indexName)
-                        .append("path", field)
-                        .append("queryVector", toDoubleList(reference.values()))
-                        .append("numCandidates", Math.max(n * 10, 100))
-                        .append("limit", n)),
+                new Document("$vectorSearch", search),
                 new Document("$project", new Document("taggableType", 1)
                         .append("taggableId", 1)
                         .append("score", new Document("$meta", "vectorSearchScore"))));
         List<RankedTaggableRef> ranked = new ArrayList<>();
-        for (Document doc : tagSummaryVectorsCollection().aggregate(pipeline)) {
+        for (Document doc : collection.aggregate(pipeline)) {
             TaggableRef ref = new TaggableRef(doc.getString("taggableType"), UUID.fromString(doc.getString("taggableId")));
-            ranked.add(new RankedTaggableRef(ref, doc.getDouble("score")));
+            // Atlas reports a cosine index's score rescaled into (0, 1] as (1 + cosine) / 2; RankedTaggableRef
+            // speaks raw cosine, like the rest of JavAI, so undo the rescaling here (OMI-460) -- the same
+            // conversion RepositoryBackendSpringDataMongo already applies to Ranked.
+            ranked.add(new RankedTaggableRef(ref, 2.0 * doc.getDouble("score") - 1.0));
         }
         return ranked;
     }
 
+    private static int count(MongoCollection<Document> collection, List<String> candidateTypeNames) {
+        return (int) (candidateTypeNames.isEmpty()
+                ? collection.countDocuments()
+                : collection.countDocuments(Filters.in("taggableType", candidateTypeNames)));
+    }
+
     @Override
-    public int tagSummaryVectorCount() {
-        return (int) tagSummaryVectorsCollection().countDocuments();
+    public Map<TaggableRef, List<TagAssociation>> associationsOfAll(Collection<TaggableRef> refs) {
+        Map<TaggableRef, List<TagAssociation>> result = new HashMap<>();
+        Map<String, List<TaggableRef>> refsByType = new LinkedHashMap<>();
+        for (TaggableRef ref : refs) {
+            result.put(ref, new ArrayList<>());
+            refsByType.computeIfAbsent(ref.taggableType(), ignored -> new ArrayList<>()).add(ref);
+        }
+        // One query per distinct type, not per ref -- associations live embedded on each type's own
+        // collection, so per-type is this backend's minimum. Documented deviation from the single-query
+        // Postgres/Neo4j shape; see TaggingBackend#associationsOfAll.
+        for (Map.Entry<String, List<TaggableRef>> entry : refsByType.entrySet()) {
+            MongoCollection<Document> collection = collectionFor(entry.getKey());
+            List<String> ids = entry.getValue().stream().map(ref -> ref.taggableId().toString()).toList();
+            for (Document doc : collection.find(Filters.in("_id", ids))) {
+                TaggableRef ref = new TaggableRef(entry.getKey(), UUID.fromString(doc.getString("_id")));
+                for (Document tagging : doc.getList(TAGGINGS_FIELD, Document.class, List.of())) {
+                    result.get(ref).add(new TagAssociation(
+                            UUID.fromString(tagging.getString("tagId")),
+                            tagging.getDouble("affinity"), tagging.getString("source")));
+                }
+            }
+        }
+        return result;
+    }
+
+
+
+
+    @Override
+    public void enqueueTaggregatePending(TaggableRef aggregate) {
+        taggregatePendingCollection().insertOne(new Document("_id", UUID.randomUUID().toString())
+                .append("aggregateType", aggregate.taggableType())
+                .append("aggregateId", aggregate.taggableId().toString())
+                .append("enqueuedAt", Instant.now().toEpochMilli()));
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePending(int limit) {
+        Set<TaggableRef> aggregates = new LinkedHashSet<>();
+        List<UUID> rowIds = new ArrayList<>();
+        for (Document doc : taggregatePendingCollection().find()
+                .sort(new Document("enqueuedAt", 1)).limit(limit)) {
+            rowIds.add(UUID.fromString(doc.getString("_id")));
+            aggregates.add(new TaggableRef(
+                    doc.getString("aggregateType"), UUID.fromString(doc.getString("aggregateId"))));
+        }
+        return new TaggregatePendingClaim(List.copyOf(aggregates), rowIds);
+    }
+
+    @Override
+    public TaggregatePendingClaim claimTaggregatePendingFor(TaggableRef aggregate) {
+        List<UUID> rowIds = new ArrayList<>();
+        for (Document doc : taggregatePendingCollection().find(Filters.and(
+                Filters.eq("aggregateType", aggregate.taggableType()),
+                Filters.eq("aggregateId", aggregate.taggableId().toString())))) {
+            rowIds.add(UUID.fromString(doc.getString("_id")));
+        }
+        return rowIds.isEmpty() ? TaggregatePendingClaim.EMPTY
+                : new TaggregatePendingClaim(List.of(aggregate), rowIds);
+    }
+
+    @Override
+    public void deleteTaggregatePending(List<UUID> rowIds) {
+        if (rowIds.isEmpty()) {
+            return;
+        }
+        taggregatePendingCollection().deleteMany(
+                Filters.in("_id", rowIds.stream().map(UUID::toString).toList()));
+    }
+
+    @Override
+    public List<RankedTaggableRef> rankedByTags(List<UUID> tagIds, List<String> candidateTypeNames, int limit) {
+        if (tagIds.isEmpty() || candidateTypeNames.isEmpty()) {
+            return List.of();
+        }
+        List<String> tagIdStrings = tagIds.stream().map(UUID::toString).toList();
+        // One aggregation per candidate type, merged and capped here -- associations live embedded on each
+        // type's own collection. Documented deviation; see TaggingBackend#rankedByTags.
+        List<RankedTaggableRef> ranked = new ArrayList<>();
+        for (String typeName : candidateTypeNames) {
+            List<Bson> pipeline = List.of(
+                    new Document("$match", new Document(TAGGINGS_FIELD,
+                            new Document("$elemMatch", new Document("tagId", new Document("$in", tagIdStrings))))),
+                    new Document("$unwind", "$" + TAGGINGS_FIELD),
+                    new Document("$match", new Document(TAGGINGS_FIELD + ".tagId", new Document("$in", tagIdStrings))),
+                    new Document("$group", new Document("_id", "$_id")
+                            .append("score", new Document("$sum",
+                                    new Document("$ifNull", List.of("$" + TAGGINGS_FIELD + ".affinity", 1.0))))));
+            for (Document doc : collectionFor(typeName).aggregate(pipeline)) {
+                ranked.add(new RankedTaggableRef(
+                        new TaggableRef(typeName, UUID.fromString(doc.getString("_id"))),
+                        doc.getDouble("score")));
+            }
+        }
+        ranked.sort(Comparator.comparingDouble(RankedTaggableRef::similarity).reversed()
+                .thenComparing(r -> r.ref().taggableType())
+                .thenComparing(r -> r.ref().taggableId()));
+        return ranked.size() > limit ? List.copyOf(ranked.subList(0, limit)) : ranked;
+    }
+
+    @Override
+    public void upsertTagTextVector(TaggableRef ref, String text, EmbeddingVector vector) {
+        MongoCollection<Document> collection = tagTextVectorsCollection();
+        String field = qualifyTagText(vector.modelId());
+        ensureTagTextVectorIndex(field, vector.dims());
+        Document update = new Document("$set", new Document("taggableType", ref.taggableType())
+                .append("taggableId", ref.taggableId().toString())
+                .append(field, toDoubleList(vector.values()))
+                .append(field + "Text", text)
+                .append(field + "ComputedAt", vector.computedAt().toString()));
+        collection.updateOne(filterFor(ref), update, new UpdateOptions().upsert(true));
+    }
+
+    @Override
+    public void deleteTagTextVector(TaggableRef ref) {
+        tagTextVectorsCollection().deleteOne(filterFor(ref));
+    }
+
+    @Override
+    public String tagText(TaggableRef ref, String modelId) {
+        Document doc = tagTextVectorsCollection().find(filterFor(ref)).first();
+        return doc == null ? null : doc.getString(qualifyTagText(modelId) + "Text");
+    }
+
+    @Override
+    public EmbeddingVector tagTextVector(TaggableRef ref, String modelId) {
+        String field = qualifyTagText(modelId);
+        Document doc = tagTextVectorsCollection().find(filterFor(ref)).first();
+        if (doc == null || doc.get(field) == null) {
+            return EmbeddingVector.absent();
+        }
+        List<Double> stored = doc.getList(field, Double.class);
+        float[] values = new float[stored.size()];
+        for (int i = 0; i < values.length; i++) {
+            values[i] = stored.get(i).floatValue();
+        }
+        return new EmbeddingVector(values, modelId, values.length,
+                Instant.parse(doc.getString(field + "ComputedAt")));
+    }
+
+    @Override
+    public List<RankedTaggableRef> nearestByTagTextVector(EmbeddingVector reference, int n,
+            List<String> candidateTypeNames) {
+        String field = qualifyTagText(reference.modelId());
+        ensureTagTextVectorIndex(field, reference.dims());
+        return nearestByVector(tagTextVectorsCollection(), tagTextVectorIndexName(field), field,
+                reference, n, candidateTypeNames);
+    }
+
+    @Override
+    public int tagTextVectorCount(List<String> candidateTypeNames) {
+        return count(tagTextVectorsCollection(), candidateTypeNames);
+    }
+
+    private static Document aggregateFilter(TaggableRef aggregate) {
+        return new Document("aggregateType", aggregate.taggableType())
+                .append("aggregateId", aggregate.taggableId().toString());
+    }
+
+
+    private MongoCollection<Document> taggregatePendingCollection() {
+        MongoCollection<Document> collection = database().getCollection(TAGGREGATE_PENDING_COLLECTION);
+        ensureTaggregateIndexes();
+        return collection;
+    }
+
+    private void ensureTaggregateIndexes() {
+        if (!taggregateIndexesEnsured.compareAndSet(false, true)) {
+            return;
+        }
+        database().getCollection(TAGGREGATE_PENDING_COLLECTION)
+                .createIndex(Indexes.ascending("aggregateType", "aggregateId"));
+        database().getCollection(TAGGREGATE_PENDING_COLLECTION)
+                .createIndex(Indexes.ascending("enqueuedAt"));
+    }
+
+    private MongoCollection<Document> tagTextVectorsCollection() {
+        MongoCollection<Document> collection = database().getCollection(TAG_TEXT_VECTORS_COLLECTION);
+        if (tagTextVectorsUniqueIndexEnsured.compareAndSet(false, true)) {
+            collection.createIndex(Indexes.ascending("taggableType", "taggableId"), new IndexOptions().unique(true));
+        }
+        return collection;
+    }
+
+    private void ensureTagTextVectorIndex(String field, int dims) {
+        String indexName = tagTextVectorIndexName(field);
+        if (tagTextVectorIndexesEnsured.contains(indexName)) {
+            return;
+        }
+        // The taggableType filter field is what makes a narrowed tag search possible (OMI-460):
+        // $vectorSearch's own filter may only touch paths the index declares as filter fields.
+        Document definition = new Document("fields", List.of(
+                new Document("type", "vector")
+                        .append("path", field)
+                        .append("numDimensions", dims)
+                        .append("similarity", "cosine"),
+                new Document("type", "filter").append("path", "taggableType")));
+        ensureSearchIndex(TAG_TEXT_VECTORS_COLLECTION, indexName, definition);
+        tagTextVectorIndexesEnsured.add(indexName);
+    }
+
+    private static String tagTextVectorIndexName(String field) {
+        return "javai_tagtextvectors_" + field;
+    }
+
+    private static String qualifyTagText(String modelId) {
+        return "tagTextVector__" + ModelIds.sanitize(modelId);
     }
 
     private static Document filterFor(TaggableRef ref) {
@@ -195,17 +455,117 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         if (tagSummaryVectorIndexesEnsured.contains(indexName)) {
             return;
         }
-        Document definition = new Document("fields", List.of(new Document("type", "vector")
-                .append("path", field)
-                .append("numDimensions", dims)
-                .append("similarity", "cosine")));
-        Document command = new Document("createSearchIndexes", TAG_SUMMARY_VECTORS_COLLECTION)
-                .append("indexes", List.of(new Document("name", indexName)
-                        .append("type", "vectorSearch")
-                        .append("definition", definition)));
-        createSearchIndexWithRetry(command);
-        awaitIndexQueryable(indexName);
+        // The taggableType filter field is what makes a narrowed tag search possible (OMI-460):
+        // $vectorSearch's own filter may only touch paths the index declares as filter fields.
+        Document definition = new Document("fields", List.of(
+                new Document("type", "vector")
+                        .append("path", field)
+                        .append("numDimensions", dims)
+                        .append("similarity", "cosine"),
+                new Document("type", "filter").append("path", "taggableType")));
+        ensureSearchIndex(TAG_SUMMARY_VECTORS_COLLECTION, indexName, definition);
         tagSummaryVectorIndexesEnsured.add(indexName);
+    }
+
+    /**
+     * Creates the index, or <b>amends an existing one whose definition is out of date</b> (OMI-460).
+     *
+     * <p>The amendment is not a nicety. {@code createSearchIndexes} on an existing name is a no-op, so a
+     * store whose tag-vector index was created before this version carries a definition with no
+     * {@code taggableType} filter path -- and every narrowed search against it then fails outright with
+     * "Path 'taggableType' needs to be indexed as filter". Leaving that to adopters would turn a capability
+     * that is supposed to just work into an upgrade step discovered from a runtime error.
+     *
+     * <p><b>Drop and recreate, not {@code updateSearchIndex}</b> -- measured, not assumed: an in-place
+     * update of a {@code vectorSearch} index is rejected with {@code "mappings" is required}, the server
+     * validating the new definition as though it were a plain {@code search} index. Recreating is safe here
+     * because the index is derived data over a collection JavAI owns and maintains: nothing is lost, Atlas
+     * rebuilds it from the same rows, and {@link #awaitIndexQueryable} holds the caller until it can answer.
+     *
+     * <p>Only ever <em>widens</em>, and only when the existing definition does not already match: an index
+     * that already declares what this version needs is left alone, so the ordinary call costs one
+     * {@code listSearchIndexes} and nothing else, and the rebuild happens once per store rather than once
+     * per query.
+     */
+    private void ensureSearchIndex(String collectionName, String indexName, Document definition) {
+        Document existing = findSearchIndex(collectionName, indexName);
+        if (existing != null && !declaresFilterPath(existing, "taggableType")) {
+            database().runCommand(new Document("dropSearchIndex", collectionName).append("name", indexName));
+            awaitIndexAbsent(collectionName, indexName);
+            existing = null;
+        }
+        if (existing == null) {
+            createSearchIndexWithRetry(new Document("createSearchIndexes", collectionName)
+                    .append("indexes", List.of(new Document("name", indexName)
+                            .append("type", "vectorSearch")
+                            .append("definition", definition))));
+        }
+        awaitIndexQueryable(collectionName, indexName);
+    }
+
+    /** A dropped search index lingers briefly; recreating the same name before it is gone is rejected as a
+     *  duplicate, which {@link #createSearchIndexWithRetry} would then treat as success and leave the stale
+     *  definition in place. */
+    private void awaitIndexAbsent(String collectionName, String indexName) {
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(90));
+        while (Instant.now().isBefore(deadline)) {
+            if (findSearchIndex(collectionName, indexName) == null) {
+                return;
+            }
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            }
+        }
+        throw new IllegalStateException("Vector search index '" + indexName + "' on '" + collectionName
+                + "' was dropped so it could be recreated with a taggableType filter path, but was still "
+                + "listed 90s later.");
+    }
+
+    private Document findSearchIndex(String collectionName, String indexName) {
+        Instant deadline = Instant.now().plus(Duration.ofSeconds(90));
+        while (true) {
+            try {
+                for (Document index : database().getCollection(collectionName).listSearchIndexes()) {
+                    if (indexName.equals(index.getString("name"))) {
+                        return index;
+                    }
+                }
+                return null;
+            } catch (MongoCommandException e) {
+                // listSearchIndexes is itself a Search Index Management operation, so it hits the same
+                // transient startup window createSearchIndexWithRetry already absorbs.
+                if (!isTransientSearchServiceError(e) || Instant.now().isAfter(deadline)) {
+                    throw e;
+                }
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    /** Whether an existing index already declares {@code path} as a filter field, read from whichever of
+     *  {@code latestDefinition}/{@code definition} this server reports it under. */
+    private static boolean declaresFilterPath(Document index, String path) {
+        Document definition = index.get("latestDefinition", Document.class);
+        if (definition == null) {
+            definition = index.get("definition", Document.class);
+        }
+        if (definition == null) {
+            return false;
+        }
+        for (Document field : definition.getList("fields", Document.class, List.of())) {
+            if ("filter".equals(field.getString("type")) && path.equals(field.getString("path"))) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** See {@code RepositoryBackendSpringDataMongo.createSearchIndexWithRetry}'s own identical javadoc --
@@ -233,11 +593,11 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
         }
     }
 
-    private void awaitIndexQueryable(String indexName) {
+    private void awaitIndexQueryable(String collectionName, String indexName) {
         Instant deadline = Instant.now().plus(Duration.ofSeconds(90));
         while (Instant.now().isBefore(deadline)) {
             try {
-                for (Document index : database().getCollection(TAG_SUMMARY_VECTORS_COLLECTION).listSearchIndexes()) {
+                for (Document index : database().getCollection(collectionName).listSearchIndexes()) {
                     if (indexName.equals(index.getString("name")) && Boolean.TRUE.equals(index.getBoolean("queryable"))) {
                         return;
                     }
@@ -255,7 +615,7 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
             }
         }
         throw new IllegalStateException(
-                "Vector search index '" + indexName + "' on '" + TAG_SUMMARY_VECTORS_COLLECTION
+                "Vector search index '" + indexName + "' on '" + collectionName
                         + "' did not become queryable within 90s");
     }
 
@@ -297,14 +657,30 @@ final class TaggingBackendSpringDataMongo implements TaggingBackend {
     }
 
     private MongoDatabase database() {
+        if (released) {
+            throw TaggingBackend.releasedError();
+        }
         if (database == null) {
             synchronized (this) {
+                if (released) {
+                    throw TaggingBackend.releasedError();
+                }
                 if (database == null) {
-                    MongoClient client = MongoClients.create(config.mongoUri());
+                    client = MongoClients.create(config.mongoUri());
                     database = client.getDatabase(config.mongoDatabase());
                 }
             }
         }
         return database;
+    }
+
+    @Override
+    public void release() {
+        synchronized (this) {
+            released = true;
+            if (client != null) {
+                client.close();
+            }
+        }
     }
 }

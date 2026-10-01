@@ -28,9 +28,23 @@ Controls what gets embedded and how it's searched. See `doc/spec/vector-core.md`
 | `JavAIVectorizable` | class | Opts a class into the woven `JavAIVectorizable` interface (see `javai-model`) |
 | `Vectorize` / `VectorizeIgnore` | field | Include/exclude a field from the local embedding |
 | `SearchVisibility(PUBLIC\|PROTECTED\|PRIVATE)` | field / class | Search-semantic visibility, independent of Java access modifiers |
-| `Summary` | field / class | Marks contribution to a container's hierarchical summary vector |
+| `Summary` | field / class | Marks contribution to a container's hierarchical summary vector. `concatenate = true` additionally opts into concatenated text vectoring (OMI-191); `persistModelSummaries = true`, **class only**, persists the container's per-model summaries so `nearestBySummary(modelId)` is an indexed lookup rather than an in-memory fold (OMI-458) |
+| `ExternalVector(name, keyField, model)` | class, repeatable | Declares a vector JavAI stores, versions and searches but **never computes** — supplied from outside the process, in its own model (OMI-290) |
 | `EmbeddingModel("id")` | class / field | Overrides which embedding model vectorizes this element |
 | `JavAIGraphNode` / `JavAIEdge` | class / record | Declares knowledge-graph participation (Vector Collections) |
+
+### 1b. Persistence Bridge — a query a repository method carries itself
+
+| Annotation | Target | Purpose |
+|---|---|---|
+| `Query(value, countQuery, nativeQuery)` | method | JPQL or SQL on a `JavAIRepository` method, for what a derived name cannot ask — grouped aggregates, projections (OMI-398). Postgres only |
+| `Modifying(flushAutomatically, clearAutomatically)` | method | Marks a `@Query` as an `update`/`delete`, including the atomic `set c = c + 1` a counter needs |
+
+**`@Param` is deliberately *not* defined here** — it is reused from `spring-data-commons`
+(`org.springframework.data.repository.query.Param`), already a dependency of `javai-persistence`, the same
+reuse-not-reinvent choice `@Id` makes. `@Query`/`@Modifying` could not be reused the same way: they live in
+`spring-data-jpa`, whose repository infrastructure JavAI does not use and will not take on for two
+annotations. See `doc/spec/persistence-bridge.md` for what a `@Modifying` write is refused, and why.
 
 ### 2. Codegen Guidance — governing what an LLM agent may read, generate, or modify
 
@@ -71,10 +85,15 @@ is off-limits regardless of how good a proposed fix looks.
 
 ## What's actually implemented
 
-All 17 annotations exist as real, compilable definitions (`AgentWritable`, `Costly`, `EmbeddingModel`,
-`Ensures`, `Frozen`, `HumanOnly`, `Intent`, `Invariant`, `JavAIEdge`, `JavAIGraphNode`,
-`JavAIVectorizable`, `Nondeterministic`, `Provenance`, `Requires`, `SearchVisibility`, `Summary`,
-`Vectorize`, `VectorizeIgnore`), each with correct `@Retention`/`@Target`. `Requires`/`Ensures`/`Invariant`
+Every annotation exists as a real, compilable definition (`AgentWritable`, `AsyncSupervision`, `Costly`,
+`EmbeddingModel`, `Ensures`, `ExternalVector`, `Frozen`, `HumanOnly`, `Intent`, `Invariant`, `JavAIEdge`,
+`JavAIGraphNode`, `JavAIVectorizable`, `Modifying`, `Nondeterministic`, `PersistenceIgnore`, `PromptContext`,
+`Provenance`, `Query`, `Requires`, `SearchVisibility`, `Summary`, `SupervisionPointcut`, `SyncSupervision`,
+`Taggable`, `Taggregate`, `TagIgnore`, `Vectorize`, `VectorizeIgnore`), each with correct
+`@Retention`/`@Target`. (This paragraph used to open "All 19 annotations", which had been wrong for several
+tickets -- a count is the one thing in a list like this that goes stale silently, so it is gone.) `ExternalVector` is `@Repeatable` (a class may declare several) and `Taggable` is
+`@Inherited` as of OMI-290 — a subclass of a taggable class is genuinely taggable, which `JavAIVectorizable`
+cannot say of itself, since it commits the weaver to per-class bytecode. `Requires`/`Ensures`/`Invariant`
 are repeatable, each via a nested `List` container annotation. `AnnotationsSmokeTest` reflectively proves
 every annotation is present, retained, and applicable to the right element kind.
 

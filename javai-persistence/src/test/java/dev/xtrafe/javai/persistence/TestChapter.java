@@ -71,6 +71,12 @@ final class TestChapter implements JavAIVectorizable {
         JavAIRuntime.vectorizeFieldMutated(this, "heading", oldValue, heading);
     }
 
+    void setProse(String prose) {
+        String oldValue = this.prose;
+        this.prose = prose;
+        JavAIRuntime.vectorizeFieldMutated(this, "prose", oldValue, prose);
+    }
+
     TestChapter getContinuation() {
         return continuation;
     }

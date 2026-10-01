@@ -5,6 +5,7 @@ import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.EmbeddingConsistencyMode;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.vector.testsupport.FakeEmbeddingProvider;
+import org.hibernate.Hibernate;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -268,7 +269,13 @@ class RepositoryBackendHibernatePostgresTest {
         team.getMembers().add(new TestMember("grace"));
         TestTeam saved = teamRepository.save(team);
 
-        TestTeam reloaded = teamRepository.findById(saved.getId()).orElseThrow();
+        // Inside a unit of work: a repository returns a detached entity, so its lazy @OneToMany is only
+        // traversable while the session that loaded it is still open (OMI-271).
+        TestTeam reloaded = JavAIPI.inTransaction(config, () -> {
+            TestTeam loaded = teamRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getMembers());
+            return loaded;
+        });
         assertEquals(2, reloaded.getMembers().size(),
                 "a natively-mapped @OneToMany must round-trip exactly its own members, not doubled ones");
         assertEquals(List.of("ada", "grace"),
@@ -405,7 +412,11 @@ class RepositoryBackendHibernatePostgresTest {
         crew.getMembers().add(new TestMember("buzz"));
         TestCrew saved = crewRepository.save(crew);
 
-        TestCrew reloaded = crewRepository.findById(saved.getId()).orElseThrow();
+        TestCrew reloaded = JavAIPI.inTransaction(config, () -> {
+            TestCrew loaded = crewRepository.findById(saved.getId()).orElseThrow();
+            Hibernate.initialize(loaded.getMembers());
+            return loaded;
+        });
         JavAIList<TestMember> members = reloaded.getMembers();
 
         // Hibernate substituted JavAI's own persistent collection -- not a plain PersistentBag...
@@ -428,26 +439,22 @@ class RepositoryBackendHibernatePostgresTest {
         }
     }
 
-    /** Hibernate owns the association, so it must be a real join table -- not this backend's
-     *  {@code javai_collection_members} side table. */
+    /**
+     * Hibernate owns the association, so it must be a real join table.
+     *
+     * <p>This used to also assert the row was absent from {@code javai_collection_members}, the side table a
+     * concrete-typed JavAI collection went to. That mapping was withdrawn in OMI-277 and its table is no
+     * longer created at all, so the check became a query against a relation that does not exist -- which is
+     * a stronger guarantee than the one it replaced, just not one a SELECT can express.
+     */
     @Test
-    void nativelyMappedJavAICollectionUsesHibernatesJoinTableNotTheSideTable() throws Exception {
+    void nativelyMappedJavAICollectionUsesHibernatesJoinTable() throws Exception {
         TestCrew crew = new TestCrew("phase2-storage");
         crew.getMembers().add(new TestMember("sally"));
         TestCrew saved = crewRepository.save(crew);
 
         try (Connection connection = DriverManager.getConnection(
                 postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword())) {
-            try (PreparedStatement statement = connection.prepareStatement(
-                    "SELECT count(*) FROM javai_collection_members WHERE owner_type = ? AND owner_id = ?")) {
-                statement.setString(1, TestCrew.class.getName());
-                statement.setObject(2, saved.getId());
-                try (ResultSet resultSet = statement.executeQuery()) {
-                    resultSet.next();
-                    assertEquals(0, resultSet.getInt(1),
-                            "a natively-mapped JavAI collection must not be claimed by the side table");
-                }
-            }
             // Hibernate's own join table for the association exists and holds the row. Named
             // test_crew_test_member, not testcrew_testmember, since OMI-145 made
             // CamelCaseToUnderscoresNamingStrategy the default -- the join table's name is derived from the
@@ -677,5 +684,28 @@ class RepositoryBackendHibernatePostgresTest {
                 return values;
             }
         }
+    }
+
+    @Test
+    void countAnswersTheSameNumberAsFindAllWithoutMaterializingIt() {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before, "count() and findAll().size() are the same "
+                + "question -- one of them just does not hydrate every row to answer it");
+
+        repository.save(new TestArticle("Counted one", "First of two rows added for the count."));
+        repository.save(new TestArticle("Counted two", "Second of two rows added for the count."));
+
+        assertEquals(before + 2, repository.count());
+        assertEquals(repository.findAll().size(), repository.count());
+    }
+
+    @Test
+    void countIsScopedToThisRepositorysOwnType() {
+        long articlesBefore = repository.count();
+
+        accountRepository.save(new TestAccount("counting-user", "counting@example.com", 30, true, null));
+
+        assertEquals(articlesBefore, repository.count(),
+                "another type's rows must not reach this repository's count");
     }
 }

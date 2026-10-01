@@ -28,6 +28,9 @@ final class ContextWindows {
             Map.entry("claude-sonnet-5", 200_000),
             Map.entry("claude-opus-4-8", 200_000),
             Map.entry("llama-3.3-70b-versatile", 128_000),
+            Map.entry("mistral-large-latest", 262_144),
+            Map.entry("mistral-medium-latest", 262_144),
+            Map.entry("mistral-small-latest", 262_144),
             Map.entry("qwen3:8b", 40_000),
             Map.entry("qwen3:4b", 40_000),
             Map.entry("meta-llama/Llama-3.2-3B-Instruct", 128_000));

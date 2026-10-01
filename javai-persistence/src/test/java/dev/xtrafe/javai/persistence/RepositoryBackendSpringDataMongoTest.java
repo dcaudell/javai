@@ -439,4 +439,62 @@ class RepositoryBackendSpringDataMongoTest {
         }
         return result;
     }
+
+    @Test
+    void countAnswersTheSameNumberAsFindAllWithoutMaterializingIt() {
+        long before = repository.count();
+        assertEquals(repository.findAll().size(), before, "count() and findAll().size() are the same "
+                + "question -- one of them just does not hydrate every row to answer it");
+
+        repository.save(new TestArticle("Counted one", "First of two rows added for the count."));
+        repository.save(new TestArticle("Counted two", "Second of two rows added for the count."));
+
+        assertEquals(before + 2, repository.count());
+        assertEquals(repository.findAll().size(), repository.count());
+    }
+
+    @Test
+    void countIsScopedToThisRepositorysOwnType() {
+        long articlesBefore = repository.count();
+
+        accountRepository.save(new TestAccount("counting-user", "counting@example.com", 30, true, null));
+
+        assertEquals(articlesBefore, repository.count(),
+                "another type's rows must not reach this repository's count");
+    }
+
+    /** OMI-410: release closes the {@code MongoClient} this backend opened -- its connections leave the
+     *  server's count -- and the same config then builds a working backend again. */
+    @Test
+    void releaseClosesTheClientAndTheSameConfigRebuilds() throws InterruptedException {
+        JavAIPersistenceConfig own = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.MONGODB)
+                .mongoUri(mongoUri())
+                .mongoDatabase(DATABASE)
+                .build();
+        try (MongoClient probe = MongoClients.create(mongoUri())) {
+            int baseline = currentConnections(probe);
+            TestArticleRepository before = JavAIPI.repository(TestArticleRepository.class, own);
+            TestArticle saved = before.save(new TestArticle("release-" + UUID.randomUUID(), "body"));
+            assertTrue(currentConnections(probe) > baseline, "the backend's own client is connected");
+
+            JavAIPI.release(own);
+
+            long deadline = System.nanoTime() + 5_000_000_000L;
+            while (currentConnections(probe) > baseline && System.nanoTime() < deadline) {
+                Thread.sleep(50);
+            }
+            assertEquals(baseline, currentConnections(probe), "release must close every connection it opened");
+            IllegalStateException stale = assertThrows(IllegalStateException.class, before::findAll);
+            assertTrue(stale.getMessage().contains("released"), stale.getMessage());
+            TestArticleRepository after = JavAIPI.repository(TestArticleRepository.class, own);
+            assertTrue(after.findById(saved.getId()).isPresent());
+            JavAIPI.release(own);
+        }
+    }
+
+    private static int currentConnections(MongoClient probe) {
+        Document status = probe.getDatabase("admin").runCommand(new Document("serverStatus", 1));
+        return status.get("connections", Document.class).getInteger("current");
+    }
 }

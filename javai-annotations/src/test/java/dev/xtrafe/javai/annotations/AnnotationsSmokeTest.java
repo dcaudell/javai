@@ -47,6 +47,17 @@ class AnnotationsSmokeTest {
         @HumanOnly
         void doNotTouch() {
         }
+
+        @Query("select s from Sample s where s.title = :title")
+        String declaredQuery(String title) {
+            return title;
+        }
+
+        @Modifying(clearAutomatically = true)
+        @Query(value = "update Sample s set s.note = 'x'", nativeQuery = true)
+        int declaredWrite() {
+            return 0;
+        }
     }
 
     @Test
@@ -84,5 +95,21 @@ class AnnotationsSmokeTest {
 
         Method doNotTouch = Sample.class.getDeclaredMethod("doNotTouch");
         assertTrue(doNotTouch.isAnnotationPresent(HumanOnly.class));
+    }
+
+    /** Persistence Bridge's declared-query pair (OMI-398), whose defaults are load-bearing: a @Query is JPQL
+     *  and carries no countQuery unless it says so, and a @Modifying neither flushes nor clears by default. */
+    @Test
+    void declaredQueryAnnotationsArePresentWithTheirDefaults() throws NoSuchMethodException {
+        Method read = Sample.class.getDeclaredMethod("declaredQuery", String.class);
+        Query query = read.getAnnotation(Query.class);
+        assertTrue(query != null && query.value().startsWith("select"));
+        assertTrue(!query.nativeQuery() && query.countQuery().isEmpty());
+        assertTrue(!read.isAnnotationPresent(Modifying.class));
+
+        Method write = Sample.class.getDeclaredMethod("declaredWrite");
+        assertTrue(write.getAnnotation(Query.class).nativeQuery());
+        Modifying modifying = write.getAnnotation(Modifying.class);
+        assertTrue(modifying.clearAutomatically() && !modifying.flushAutomatically());
     }
 }

@@ -139,4 +139,22 @@ class CortexAnthropicTest {
             executor.awaitTermination(10, TimeUnit.SECONDS);
         }
     }
+
+    /** OMI-68: a typed request is sent as output_config's json_schema format. */
+    @Test
+    void aTypedRequestSendsItsSchema() throws IOException {
+        startFakeServer("""
+                {"id":"msg_3","type":"message","role":"assistant","content":[{"type":"text","text":"{}"}],
+                 "model":"claude-sonnet-5","stop_reason":"end_turn","usage":{"input_tokens":5,"output_tokens":1}}
+                """);
+
+        Cortex cortex = CortexAnthropic.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+                .apiKey("test-key").model("claude-sonnet-5").build();
+        cortex.complete(CompletionRequest.builder().prompt("Did they agree?")
+                .responseListOf(CompletionResultTypedTest.Verdict.class).build());
+
+        assertTrue(capturedRequestBody.contains("\"output_config\""), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"json_schema\""), capturedRequestBody);
+        assertTrue(capturedRequestBody.contains("\"personA\""), capturedRequestBody);
+    }
 }

@@ -1,5 +1,6 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.vector.Ranked;
 import org.hibernate.SessionFactory;
 
 import java.lang.reflect.InvocationHandler;
@@ -7,8 +8,10 @@ import java.lang.reflect.Method;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Proxy;
 import java.lang.reflect.Type;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Supplier;
 
 /**
@@ -65,10 +68,17 @@ import java.util.function.Supplier;
  * already registered, directly or because another entity referenced it -- and fails only when it would
  * genuinely add an unknown type, in which case the error names the call that built the factory, since that
  * is the thing to move.
+ *
+ * <p><b>Lifecycle</b>: a backend lives until {@link #release(JavAIPersistenceConfig)} closes its connections
+ * and evicts it (OMI-410). Nothing releases one implicitly -- an application that builds configs per
+ * context, or per test, releases each when it is done with it.
  */
 public final class JavAIPI {
 
     private static final Map<JavAIPersistenceConfig, RepositoryBackend> BACKENDS = new ConcurrentHashMap<>();
+
+    /** Resources other modules opened from a config, closed by {@link #release} -- see {@link #onRelease}. */
+    private static final Map<JavAIPersistenceConfig, List<AutoCloseable>> RELEASE_HOOKS = new ConcurrentHashMap<>();
 
     private JavAIPI() {
     }
@@ -101,6 +111,12 @@ public final class JavAIPI {
             if (method.getDeclaringClass() == JavAIRepository.class || method.getDeclaringClass() == Object.class) {
                 continue; // the base CRUD contract itself, always fine
             }
+            if (DeclaredQuery.isDeclaredQuery(method)) {
+                // First, so a @Query method's own name is never held to a grammar it isn't using (OMI-398).
+                DeclaredQuery declared = DeclaredQuery.parse(method, entityType); // signature; throws if invalid
+                backend.validateDeclaredQuery(entityType, declared); // query text + store feasibility
+                continue;
+            }
             if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
                 DerivedQueryMethods.ParsedQuery parsed =
                         DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid
@@ -116,7 +132,8 @@ public final class JavAIPI {
                 continue;
             }
             throw new IllegalArgumentException("Unsupported repository method " + method + " on repository for "
-                    + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, the "
+                    + entityType.getName() + " -- JavAIRepository supports the base CRUD contract, a @Query "
+                    + "carrying its own JPQL or SQL (optionally @Modifying), the "
                     + "findNearestBy<Field>Vector/findNearestByVector/findNearestBySummaryVector vector "
                     + "convention (optionally narrowed as ...VectorAnd<Predicate>, returning List<Ranked<T>>, "
                     + "and/or paged with a trailing Pageable/Limit), and ordinary Spring-Data-style derived "
@@ -226,7 +243,7 @@ public final class JavAIPI {
      * {@code SessionFactory} is a {@code jakarta.persistence.EntityManagerFactory}, so the JPA manager takes
      * it directly. {@code HibernateTransactionManager}'s {@code (SessionFactory)} constructor eagerly
      * unwraps a {@code javax.sql.DataSource} to share connections with plain JDBC, and a JavAI-built factory
-     * configures Hibernate's own connection provider from raw {@code jakarta.persistence.jdbc.*} settings --
+     * on a URL configures Hibernate's own connection provider from raw {@code jakarta.persistence.jdbc.*} settings --
      * so it throws {@code UnknownUnwrapTypeException}. Confirmed empirically, not inferred.
      *
      * <pre>{@code
@@ -256,6 +273,69 @@ public final class JavAIPI {
                     + "integration is likewise Postgres-only in this phase; see JavAIPI.inTransaction's javadoc.");
         }
         return postgres.sessionFactory();
+    }
+
+    /**
+     * The {@code @Taggregate} containment of the registered model for {@code config} (OMI-304) -- which
+     * containers hold a given member, which members a container holds, and the ambient transaction to write
+     * on. Backed by the very {@code Containment} instance this module already resolved for {@code @Summary}
+     * recomputation, so there is exactly one implementation of parents-from-child in the codebase.
+     *
+     * <p>Exists because {@code javai-tagging} needs that answer and must not keep its own copy of it: it
+     * used to maintain a {@code javai_taggregate_members} snapshot, which was written by reconciliation and
+     * therefore could not name a container nothing had reconciled yet. Every backend answers, each in its
+     * own storage's terms.
+     *
+     * <p>Resolves lazily on first use rather than at construction, preserving the deliberate absence of a
+     * startup ordering dependency between tagging and the entity mapper.
+     */
+    public static TaggregateContainment taggregateContainment(JavAIPersistenceConfig config) {
+        return backendFor(config).taggregateContainment();
+    }
+
+    /**
+     * Closes every connection JavAI opened for {@code config} and forgets the backend, so the next
+     * {@code repository(...)}, {@code sessionFactory(...)} or {@code inTransaction(...)} call for the same
+     * config builds a fresh one rather than returning a closed one (OMI-410). Also closes whatever other
+     * modules registered through {@link #onRelease} -- {@code javai-tagging}'s connections among them.
+     *
+     * <p>Repositories realized before the release fail with an {@code IllegalStateException} instead of
+     * reconnecting; realize them again. A {@code SessionFactory}, {@code Driver}, {@code MongoTemplate} or
+     * {@code DataSource} the application supplied is never closed. A no-op for a config with nothing built.
+     */
+    public static void release(JavAIPersistenceConfig config) {
+        RepositoryBackend backend = BACKENDS.remove(config);
+        List<AutoCloseable> hooks = RELEASE_HOOKS.remove(config);
+        RuntimeException failure = null;
+        if (backend != null) {
+            try {
+                backend.release();
+            } catch (RuntimeException e) {
+                failure = e;
+            }
+        }
+        for (AutoCloseable hook : hooks == null ? List.<AutoCloseable>of() : hooks) {
+            try {
+                hook.close();
+            } catch (Exception e) {
+                if (failure == null) {
+                    failure = new IllegalStateException("Releasing a resource opened for this config failed", e);
+                } else {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    /**
+     * Registers {@code resource} to be closed by {@link #release(JavAIPersistenceConfig)} for {@code config}.
+     * For a module that opens its own connections from a config, so one release covers them too.
+     */
+    public static void onRelease(JavAIPersistenceConfig config, AutoCloseable resource) {
+        RELEASE_HOOKS.computeIfAbsent(config, c -> new CopyOnWriteArrayList<>()).add(resource);
     }
 
     private static RepositoryBackend backendFor(JavAIPersistenceConfig config) {

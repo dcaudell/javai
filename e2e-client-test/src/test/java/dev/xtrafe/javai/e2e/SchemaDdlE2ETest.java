@@ -26,12 +26,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * <em>behavior</em> (a save round-trips, a finder matches); this one asserts the <em>shape of the database</em>,
  * which is what a DBA, a reporting tool, or a hand-written SQL query would see.
  *
- * <p>The load-bearing claim is that {@link Article} carries <b>both</b> collection mappings simultaneously:
- * {@code comments} is an interface-typed JavAI collection with a plain {@code @OneToMany}, so Hibernate owns
- * it as a genuine association with its own join table and foreign keys; {@code relatedComments} is a
- * concrete-typed JavAI collection, so it round-trips through JavAI's own {@code javai_collection_members}
- * side table. Neither leaks a column onto the owning entity's table. If a future change quietly collapsed
- * one path into the other, these assertions fail rather than the behavior silently drifting.
+ * <p>The load-bearing claim is that {@link Article}'s two collection fields are <b>real Hibernate
+ * associations</b> -- each with its own join table and foreign keys, neither leaking a column onto the
+ * owning entity's table, and each in a table of its own rather than sharing the one Hibernate would name by
+ * default for two to-manys of the same element type. It also pins the <em>absence</em> of
+ * {@code javai_collection_members}: the mapping that used it was refused in OMI-277 and its DDL went with
+ * it, so a database built from scratch must not have one.
  */
 class SchemaDdlE2ETest {
 
@@ -80,21 +80,19 @@ class SchemaDdlE2ETest {
         assertTrue(keys.contains("comments_id -> comment"), "join table must FK to the target; got " + keys);
     }
 
-    /** ...and the side table still exists for the concrete-typed shape, holding its own membership rows. */
+    /**
+     * The membership side table is not created at all any more (OMI-277).
+     *
+     * <p>It used to hold the concrete-typed shape's rows while the natively-mapped one used a real join
+     * table, and this test pinned that split. The concrete shape was refused, which left the table
+     * unclaimed -- and an unclaimed table created in every database on every boot is vestigial, so its DDL
+     * went too. Asserted rather than assumed, because "nothing writes to it" and "it does not exist" are
+     * different promises and only the second one survives a rebuild from scratch.
+     */
     @Test
-    void concreteTypedJavAICollectionStillUsesTheSideTable() throws Exception {
-        assertTrue(tables().contains("javai_collection_members"));
-        assertEquals(
-                Set.of("owner_type", "owner_id", "field_name", "member_type", "member_id", "member_key", "ordinal"),
-                columns("javai_collection_members"),
-                "the membership side table's shape is part of the contract");
-
-        // relatedComments (concrete) is in the side table; comments (native) must NOT be.
-        assertTrue(sideTableHasField("relatedComments"),
-                "the concrete-typed collection must round-trip through javai_collection_members");
-        assertFalse(sideTableHasField("comments"),
-                "the natively-mapped collection must NOT be claimed by the side table -- that double-claim was "
-                        + "the silent duplication bug OMI-142 fixed");
+    void theMembershipSideTableIsNoLongerCreated() throws Exception {
+        assertFalse(tables().contains("javai_collection_members"),
+                "no supported mapping uses it, so nothing should be creating it either");
     }
 
     /** Neither collection shape may leak a column onto the owning entity's own table. */
@@ -121,7 +119,10 @@ class SchemaDdlE2ETest {
         for (String table : fieldVectorTables) {
             assertTrue(table.length() > "javai_vectors__".length(),
                     "a vector table must be model-qualified, not a single shared table: " + table);
-            assertEquals(Set.of("owner_type", "owner_id", "field_name", "model_id", "dims", "vector", "computed_at"),
+            // computed_for is OMI-290's content key for an externally-supplied vector -- null for an
+            // ordinary @Vectorize field, the key the supplier echoed back for an @ExternalVector one.
+            assertEquals(Set.of("owner_type", "owner_id", "field_name", "model_id", "dims", "vector",
+                            "computed_at", "computed_for"),
                     columns(table), "vector table shape is part of the contract");
         }
         // No vector column ever appears on the entity's own table.
@@ -195,15 +196,4 @@ class SchemaDdlE2ETest {
         return found;
     }
 
-    private static boolean sideTableHasField(String fieldName) throws Exception {
-        try (Connection connection = connection();
-                PreparedStatement statement = connection.prepareStatement(
-                        "SELECT count(*) FROM javai_collection_members WHERE field_name = ?")) {
-            statement.setString(1, fieldName);
-            try (ResultSet resultSet = statement.executeQuery()) {
-                resultSet.next();
-                return resultSet.getInt(1) > 0;
-            }
-        }
-    }
 }
