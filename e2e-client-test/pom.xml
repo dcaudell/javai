@@ -28,8 +28,8 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
     <javai.version>0.1.10-SNAPSHOT</javai.version>
-    <junit.version>6.1.2</junit.version>
-    <lombok.version>1.18.46</lombok.version>
+    <junit.version>6.1.3</junit.version>
+    <lombok.version>1.18.48</lombok.version>
     <!--
       Originally confirmed via `mvn dependency:tree -Dverbose` to fix a real, severe cross-version jackson
       mismatch caused by Testcontainers' own com.github.docker-java:docker-java-api hard-pinning
@@ -40,7 +40,7 @@
       longer applies; kept anyway as cheap, defensive version pinning across whatever else transitively
       touches Jackson (Spring AI, Hibernate).
     -->
-    <jackson.version>2.22.1</jackson.version>
+    <jackson.version>2.22.2</jackson.version>
 
     <!--
       Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
@@ -169,7 +169,7 @@
            test discovery reflectively touches (and thereby unwovenly loads) the domain classes. -->
       <groupId>org.junit.platform</groupId>
       <artifactId>junit-platform-launcher</artifactId>
-      <version>6.1.2</version>
+      <version>6.1.3</version>
       <scope>test</scope>
     </dependency>
   </dependencies>
@@ -179,7 +179,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-compiler-plugin</artifactId>
-        <version>3.15.0</version>
+        <version>3.16.0</version>
         <configuration>
           <!--
             Confirmed empirically, not assumed: with this module's full dependency set on the classpath,

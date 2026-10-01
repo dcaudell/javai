@@ -84,13 +84,13 @@
          .github/workflows runs) never pays for any of them. -->
     <javai.excludedTestGroups>performance, requires-model, cost</javai.excludedTestGroups>
 
-    <junit.version>6.1.2</junit.version>
+    <junit.version>6.1.3</junit.version>
     <!--
       Bumped from the 1.15.10 placeholder while building the javai-substrate weaving spike: 1.15.10 hard-fails
       parsing any class file compiled for a JDK newer than 24 ("Java 26 (70) is not supported"), and this
       repo's dev/CI JVM is 26. 1.18.11 is current stable and adds support for the newer class file version.
     -->
-    <byte-buddy.version>1.18.11</byte-buddy.version>
+    <byte-buddy.version>1.18.12</byte-buddy.version>
     <!-- Backs javai-tagging's build-time self-weaving (see JavAIBuildTimeWeaverPlugin in javai-substrate).
          Confirmed on Maven Central: the plugin's own release train lags core byte-buddy; 1.17.5 is
          current for the plugin, well behind the 1.18.11 core already pinned above. The plugin's own POM
@@ -100,12 +100,12 @@
          reason 1.15.10 was rejected above; untested whether 1.17.5's own bundled core would hit the same
          wall running under this repo's JDK 26 dev/CI toolchain, but there's no reason to risk finding out
          empirically when overriding to the already-proven-working version costs nothing. -->
-    <byte-buddy-maven-plugin.version>1.17.5</byte-buddy-maven-plugin.version>
+    <byte-buddy-maven-plugin.version>1.18.12</byte-buddy-maven-plugin.version>
     <hibernate.version>7.4.5.Final</hibernate.version>
     <!-- Must match the hibernate-models version hibernate-core's own POM declares (runtime scope there);
          javai-persistence compiles against it directly (OMI-556). -->
     <hibernate-models.version>1.1.1</hibernate-models.version>
-    <neo4j-driver.version>6.2.0</neo4j-driver.version>
+    <neo4j-driver.version>6.2.1</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
     <postgresql-driver.version>42.7.13</postgresql-driver.version>
@@ -143,15 +143,15 @@
          (the standard relational finders on all three backends, OMI-138); a direct use shouldn't rely on a
          transitive it doesn't name. Must stay equal to whatever spring-data-mongodb.version above resolves
          to; bumping one without the other risks two spring-data-commons lines on one classpath. -->
-    <spring-data-commons.version>4.1.0</spring-data-commons.version>
+    <spring-data-commons.version>4.1.1</spring-data-commons.version>
     <!-- Spring Framework itself is otherwise never named here: spring-core/tx/context/beans arrive
          transitively via spring-data-mongodb (7.0.8, confirmed via `mvn dependency:tree`). This property
          exists only so javai-persistence can name spring-orm explicitly for OMI-146's Spring-transaction
          bridge, and MUST stay equal to the Spring Framework version the two spring-data properties above
          resolve to. A spring-orm on a different line than the spring-tx it collaborates with is exactly
          the kind of split-version classpath the comments above are guarding against. -->
-    <spring-framework.version>7.0.8</spring-framework.version>
-    <mongodb-driver.version>5.9.0</mongodb-driver.version>
+    <spring-framework.version>7.0.9</spring-framework.version>
+    <mongodb-driver.version>5.10.0</mongodb-driver.version>
     <!--
       1.0.0 doesn't actually resolve: Spring AI's artifact layout changed between milestone
       and GA. There never was a GA "spring-ai-core" — it existed only as milestones M5/M6,
@@ -172,7 +172,7 @@
     <!-- CompletionRequest.render()'s Mustache-compatible templating engine (javai-completion). Current
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
-    <handlebars.version>4.5.3</handlebars.version>
+    <handlebars.version>4.5.4</handlebars.version>
     <!-- Forces jackson-annotations onto the same release line as the jackson-databind Spring AI already
          pulls in transitively (2.21.x). javai-tagging is the first module to combine Hibernate
          (javai-persistence) with Spring AI's own Jackson stack (javai-completion) and Testcontainers'
@@ -185,7 +185,7 @@
          JsonSerializeAs (removed from jackson-annotations well before 2.10, present in whatever
          jackson-databind:2.21.4 itself expects). Pinned here in dependencyManagement, which overrides
          transitive resolution for every reactor module regardless of declaration depth. -->
-    <jackson-annotations.version>2.21</jackson-annotations.version>
+    <jackson-annotations.version>2.22</jackson-annotations.version>
   </properties>
 
   <!--
@@ -391,7 +391,7 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-jar-plugin</artifactId>
-          <version>3.4.2</version>
+          <version>3.5.1</version>
         </plugin>
         <!-- Build-time self-weaving, currently only bound in javai-tagging/pom.xml (the first module
              shipping its own pre-built @JavAIVectorizable classes); see JavAIBuildTimeWeaverPlugin's own
