@@ -173,18 +173,17 @@
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
     <handlebars.version>4.5.4</handlebars.version>
-    <!-- Forces jackson-annotations onto the same release line as the jackson-databind Spring AI already
-         pulls in transitively (2.21.x). javai-tagging is the first module to combine Hibernate
-         (javai-persistence) with Spring AI's own Jackson stack (javai-completion) and Testcontainers'
-         docker-java-api (test scope), and docker-java-api's own bundled jackson-annotations:2.10.3 wins
-         Maven's nearest-declaration mediation over the correct, deeper-transitive 2.21.x, confirmed via a
-         real test run: Hibernate 7's own optional Jackson-based JSON format mapper auto-detects
-         jackson-databind on the classpath at SessionFactory bootstrap and eagerly initializes it,
-         regardless of whether any entity actually uses a JSON-mapped column, and jackson-databind:2.21.4
-         calling into a mismatched jackson-annotations:2.10.3 throws NoClassDefFoundError on
-         JsonSerializeAs (removed from jackson-annotations well before 2.10, present in whatever
-         jackson-databind:2.21.4 itself expects). Pinned here in dependencyManagement, which overrides
-         transitive resolution for every reactor module regardless of declaration depth. -->
+    <!-- Forces one jackson-annotations version on every reactor module, at or above what each
+         jackson-databind on the classpath expects: tools.jackson.core:jackson-databind:3.1.4 via Spring AI
+         (Jackson 3 keeps the 2.x annotations artifact; its BOM expects 2.21) and
+         com.fasterxml.jackson.core:jackson-databind:2.18.2 via openai-java-core (javai-completion). Without
+         this pin, Testcontainers' docker-java-api declares jackson-annotations:2.20, which wins Maven's
+         nearest-declaration mediation in javai-persistence (test) and javai-tagging (compile). A mismatch
+         here has broken a real test run before: Hibernate 7's optional Jackson-based JSON format mapper
+         eagerly initializes jackson-databind at SessionFactory bootstrap whenever it is on the classpath,
+         and databind against an older jackson-annotations threw NoClassDefFoundError on JsonSerializeAs.
+         Pinned here in dependencyManagement, which overrides transitive resolution for every reactor
+         module regardless of declaration depth. -->
     <jackson-annotations.version>2.22</jackson-annotations.version>
   </properties>
 
