@@ -120,7 +120,7 @@ TEI's `cpu-1.9` image at all (it has no arm64 build).
 
 ## Hosted-vendor providers (mirroring `javai-completion`'s `Cortex` vendor set)
 
-`javai-completion` ships a `Cortex` for six vendors (OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate).
+`javai-completion` ships a `Cortex` for seven vendors (OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate).
 `javai-vector` mirrors that set for embeddings **only where the vendor actually has an embeddings API**:
 
 | Implementation | Backend | Status |
@@ -135,6 +135,9 @@ embeddings partner instead; Groq's own API reference (`console.groq.com/docs/api
 this table was written) lists Chat completions, Responses, Audio, Models, Batches, Files, and Fine Tuning —
 no Embeddings category. Fabricating a client against a nonexistent endpoint would be worse than not having
 one, so this project doesn't.
+
+**No `EmbeddingProviderMistral` exists yet, and that one is a gap, not a decision.** Mistral does have an
+embeddings API (`/v1/embeddings`, `mistral-embed`); OMI-598 added only `CortexMistral`.
 
 **`EmbeddingProviderReplicate` is a genuinely different case from the other four.** Every other provider in
 this family wraps one fixed, vendor-wide contract. Replicate has none — each hosted model defines its own

@@ -62,6 +62,13 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **`CortexMistral` (OMI-598).** `javai-completion`. A `Cortex` for Mistral's hosted chat-completions API,
+  sharing `CortexOpenAiCompatibleSupport` with OpenAI, Groq and vLLM since Mistral's API is
+  OpenAI-wire-compatible. `providerId()` is `"mistral"`; `ContextWindows` knows `mistral-large-latest`,
+  `mistral-medium-latest` and `mistral-small-latest` (262,144 tokens, from Mistral's `/v1/models`).
+  Verified against the live endpoint by `CortexMistralLiveTest`, which is tagged `requires-model` and so
+  excluded from CI.
+
 - **Filter-by-type on a `VectorIndex`, applied by the query rather than to its result (OMI-460).**
   `javai-collections` + `javai-tagging`. `tagSimilarityIndex()`/`tagTextIndex()` span **every** `@Taggable`
   type at once — that is what they are for — so "the nearest 20" of one was unanswerable: a caller wanting

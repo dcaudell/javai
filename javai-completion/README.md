@@ -6,7 +6,7 @@ Extension area: **Completion Fabric**. Whitepaper: §5.3, §7.1–§7.3. Full de
 Depends on `javai-collections` (+ `javai-vector`/`javai-model` transitively). Covers both halves of
 `doc/spec/completion-fabric.md`: the **connector layer** — naming, constructing, and tuning the objects that
 actually talk to an LLM backend, called a **`Cortex`** per this project's own naming (the spec calls this
-`JavAICompletionProvider`) — six providers (OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate), easy to
+`JavAICompletionProvider`) — seven providers (OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate), easy to
 construct several of at once, local or remote, each with its own provider-specific tuning parameters — and
 the **RAG-integration half**: grounding a completion in a `JavAIList`/`Set`/`Map` via `PromptContext`, which
 this module consumes from `javai-model` rather than owning — see "RAG integration" below for why.
@@ -16,7 +16,7 @@ this module consumes from `javai-model` rather than owning — see "RAG integrat
 | Element | Kind | Purpose |
 |---|---|---|
 | `Cortex` | Interface | The connector to one LLM backend — `complete()`, `completeStreaming()`, `providerId()`, `modelId()`, `contextWindowTokens()`. Renames the spec's `JavAICompletionProvider`. |
-| `CortexOpenAI` / `CortexAnthropic` / `CortexOllama` / `CortexGroq` / `CortexVLlm` / `CortexReplicate` | `Cortex` implementations | One per provider, each with its own builder — see "Provider coverage" below |
+| `CortexOpenAI` / `CortexAnthropic` / `CortexOllama` / `CortexGroq` / `CortexMistral` / `CortexVLlm` / `CortexReplicate` | `Cortex` implementations | One per provider, each with its own builder — see "Provider coverage" below |
 | `CompletionRequest` | Value type + builder | A `List<String>` of prompt strings + optional `PromptContext` + `promptParams` (a Handlebars template model) + generation parameters + an open-ended `providerOptions` bag for tuning parameters specific to one provider/model |
 | `CompletionRequest.render(int)` | Method | Sizes `context` to fit the calling Cortex's `contextWindowTokens()` before rendering — see "Context-window budgeting" below |
 | `CompletionResult` | Value type | Text result + `providerId`/`modelId`/`completedAt` |
@@ -52,14 +52,15 @@ CompletionResult fromLocal = local.complete(request);
 |---|---|---|
 | OpenAI | `spring-ai-openai`'s `OpenAiChatModel` | native |
 | Groq | same `OpenAiChatModel`, repointed | **OpenAI-compatible** (`base-url=api.groq.com/openai/v1`) — Groq's own documented integration path |
+| Mistral | same `OpenAiChatModel`, repointed | **OpenAI-compatible** (`base-url=api.mistral.ai/v1`) |
 | vLLM | same `OpenAiChatModel`, repointed | **OpenAI-compatible** (`base-url=http://host:8000/v1`) — vLLM implements this specifically to be an OpenAI drop-in |
 | Anthropic | `spring-ai-anthropic`'s `AnthropicChatModel` | native |
 | Ollama | Spring AI's low-level `OllamaApi` directly (not `OllamaChatModel`) | native — see below for why the lower-level client |
 | Replicate | hand-rolled HTTP client | job-submission + poll, not chat-completions-shaped at all |
 
-OpenAI/Groq/vLLM share one real implementation (`CortexOpenAiCompatibleSupport`, package-private) behind
-three distinct public classes — three separate connector types were asked for, and that's the vocabulary
-that should show up in code, even though underneath all three just configure a repointed `OpenAiChatModel`.
+OpenAI/Groq/Mistral/vLLM share one real implementation (`CortexOpenAiCompatibleSupport`, package-private) behind
+four distinct public classes — separate connector types were asked for, and that's the vocabulary
+that should show up in code, even though underneath all four just configure a repointed `OpenAiChatModel`.
 
 **Ollama uses Spring AI's low-level `OllamaApi`, not the higher-level `OllamaChatModel`/`OllamaOptions`
 pair — deliberately, not an oversight.** As of Spring AI 1.0.9, `OllamaOptions` doesn't yet expose Ollama's
@@ -108,7 +109,7 @@ concrete, real, tested examples backing this requirement, not just a claim:
   reasoning trace appears in `message.thinking()`), not just gets accepted and ignored. Any other
   `providerOptions` key on `CortexOllama` passes straight through as an Ollama request option unmodified
   (e.g. `"num_ctx"`, `"repeat_penalty"`).
-- **OpenAI/Groq/vLLM**: `"reasoning_effort"` (a `String`: `"low"`/`"medium"`/`"high"`) maps onto
+- **OpenAI/Groq/Mistral/vLLM**: `"reasoning_effort"` (a `String`: `"low"`/`"medium"`/`"high"`) maps onto
   `OpenAiChatOptions.reasoningEffort(...)`.
 
 ## Concurrency: every Cortex supports concurrent callers
@@ -135,7 +136,7 @@ This lives in `javai-vector`, not here, specifically so both modules can share o
 `javai-completion` depends on `javai-vector` transitively, never the reverse. Each provider's own 429
 *detection* is the only per-provider piece, since each uses a different HTTP client:
 
-- **OpenAI/Groq/vLLM, Anthropic, Ollama (non-streaming)**: a shared `TooManyRequestsResponseErrorHandler`
+- **OpenAI/Groq/Mistral/vLLM, Anthropic, Ollama (non-streaming)**: a shared `TooManyRequestsResponseErrorHandler`
   (`javai-completion`, implements Spring's `ResponseErrorHandler`) plugged into each provider's
   `.responseErrorHandler(...)` builder call.
 - **Ollama (streaming), and Spring AI's own internal reactive client**: `TooManyRequestsExchangeFilterFunction`
@@ -286,15 +287,16 @@ never depends on network access at run time, only at (one-time) image-build time
 
 ## What's actually implemented
 
-`Cortex`, `CompletionRequest`/`CompletionResult`, and all six connector classes described above, plus
+`Cortex`, `CompletionRequest`/`CompletionResult`, and all seven connector classes described above, plus
 `LocalCompletionDefaults`, `ContextWindows`, and the shared rate-limiting/retry infrastructure (concurrency
 proof, 429 handling/backoff, `contextWindowTokens()`/`render(int)`, `PromptContext.targetPercentage` — see
 their own sections above). `PromptContext`/`Contextable`/`ContextableObject` (consumed from `javai-model`)
 are real and tested there — see that module's own README. Every Cortex is covered by hermetic tests
 (request/option-mapping against a fake HTTP server, `com.sun.net.httpserver.HttpServer` — the same pattern
 `EmbeddingProviderOllamaTest` already established), plus its own `concurrentCallsAllSucceed()` test.
-`CortexOllamaRealContainerTest` is this module's one real-backend proof (Testcontainers, this module's own
-Dockerfile baking in `qwen3:8b`) — there's no
+`CortexOllamaRealContainerTest` is this module's real-container proof (Testcontainers, this module's own
+Dockerfile baking in `qwen3:8b`), and `CortexMistralLiveTest` runs against Mistral's hosted endpoint
+(`requires-model`, skipped without `MISTRAL_API_KEY`) — there's no
 meaningful way to fake whether a real completion, real streaming, or a real tuning parameter's effect
 actually works. `e2e-client-test` now wires a real `CortexOllama` into its own `Article`/`Comment` domain
 too (`CompletionE2ETest`), grounding a completion in real, woven objects via `PromptContext`/

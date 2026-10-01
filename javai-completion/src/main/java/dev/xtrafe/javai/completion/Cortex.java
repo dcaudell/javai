@@ -55,8 +55,8 @@ public interface Cortex {
         });
     }
 
-    /** {@code "openai"}, {@code "anthropic"}, {@code "groq"}, {@code "vllm"}, {@code "ollama"}, or
-     *  {@code "replicate"} -- stable identifier, not a display name. */
+    /** {@code "openai"}, {@code "anthropic"}, {@code "groq"}, {@code "mistral"}, {@code "vllm"},
+     *  {@code "ollama"}, or {@code "replicate"} -- stable identifier, not a display name. */
     String providerId();
 
     /** The specific model this Cortex is configured to call, e.g. {@code "gpt-4.1"}, {@code "qwen3:8b"}. */

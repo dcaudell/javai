@@ -214,7 +214,7 @@ clear error at registration time instead -- and, as of OMI-398, declared queries
 repository method for what a derived name cannot ask, plus `@Any` predicates including the `OfType`
 target-type keyword, both Postgres-only) all have real, tested implementations — see each module's own
 README for exactly what's covered and what's still deliberately out of scope. `javai-completion` (Completion Fabric) has both its connector layer (`Cortex`,
-six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
+seven providers: OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate; `CompletionRequest`/`CompletionResult`,
 provider-specific tuning parameters, Handlebars-based prompt templating via `CompletionRequest.render()`)
 and its RAG-integration half real and tested: grounding a completion in a `JavAIList`/`Set`/`Map` via
 `PromptContext` (`Contextable`, `ContextableObject`) — these primitives live in `javai-model`, not

@@ -1,6 +1,6 @@
 /**
- * Completion Fabric: {@code CompletionRequest}/{@code CompletionResult}, {@code Cortex} (six providers --
- * OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate -- wrapping Spring AI's {@code ChatModel} where one
+ * Completion Fabric: {@code CompletionRequest}/{@code CompletionResult}, {@code Cortex} (seven providers --
+ * OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate -- wrapping Spring AI's {@code ChatModel} where one
  * exists), and provider-specific tuning parameters via {@code CompletionRequest.providerOptions()}.
  *
  * <p>{@code PromptContext} and {@code Contextable} -- the RAG-integration primitives grounding a completion
