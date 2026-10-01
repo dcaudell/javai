@@ -250,7 +250,7 @@ assistant can add all the dependencies, wire up both weavers, and stand up the r
 
      ```java
      Cortex cortex = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
-     // or CortexAnthropic / CortexGroq / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
+     // or CortexAnthropic / CortexGroq / CortexMistral / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
      ```
 
      Constructing several `Cortex`es side by side, local and remote, is normal — each is a plain object, not
@@ -301,8 +301,8 @@ smoke tests:
   embedding model, so a provider swap needs no schema migration) and Neo4j (native vector index, one
   model-qualified property per model), a `JavAIRepository<T>` dynamic-proxy contract, and `reindexAll()`
   for re-embedding an existing store after a provider swap, reverting non-destructively.
-- **`javai-completion`** (Completion Fabric) — real and tested: six `Cortex` providers (OpenAI, Anthropic,
-  Groq, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
+- **`javai-completion`** (Completion Fabric) — real and tested: seven `Cortex` providers (OpenAI, Anthropic,
+  Groq, Mistral, vLLM, Ollama, Replicate), `CompletionRequest`/`CompletionResult`, provider-specific tuning
   parameters, Handlebars-based prompt templating (`CompletionRequest.render()`), and the RAG-integration
   half grounding a completion in `PromptContext`.
 - **`javai-supervision`** (Agentic Supervision) — a full, independent ByteBuddy weaver (`SupervisionWeaver`)

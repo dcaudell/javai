@@ -19,7 +19,7 @@
     Completion Fabric: PromptContext, CompletionRequest/Result, Cortex (the connector interface;
     see doc/spec/completion-fabric.md's JavAICompletionProvider, renamed per the user's own naming
     request), wrapping Spring AI ChatModel implementations rather than writing new provider clients
-    for OpenAI/Anthropic/Ollama. Groq and vLLM are OpenAI-wire-compatible (repointed spring-ai-openai,
+    for OpenAI/Anthropic/Ollama. Groq, Mistral and vLLM are OpenAI-wire-compatible (repointed spring-ai-openai,
     different base-url), so they need no separate Spring AI module. Replicate has no Spring AI
     ChatModel at all; its own Cortex is a hand-rolled HTTP client, the one deliberate deviation from
     "wrap Spring AI, never write a provider client" (see this module's own README for why).
@@ -53,7 +53,7 @@
       <artifactId>spring-ai-client-chat</artifactId>
     </dependency>
     <!-- Real ChatModel implementations, not just the abstractions above. spring-ai-openai backs
-         CortexOpenAI directly, and CortexGroq/CortexVLlm too (both OpenAI-wire-compatible, just a
+         CortexOpenAI directly, and CortexGroq/CortexMistral/CortexVLlm too (all OpenAI-wire-compatible, just a
          repointed base-url/api-key/model, no separate Spring AI module needed for either). -->
     <dependency>
       <groupId>org.springframework.ai</groupId>

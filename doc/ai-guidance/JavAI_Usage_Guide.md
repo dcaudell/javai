@@ -28,7 +28,7 @@ mutating it. JavAI Extensions makes that a property of the object model itself:
 | **Native knowledge-graph structure** | `KnowledgeGraph<N, E>` — nodes/edges plus hybrid pattern-match + similarity queries (`nearestSubgraph`) in one call, re-queryable on the result itself | `javai-collections` (Vector Collections) |
 | **Vector-aware standard collections** | `JavAIList`/`JavAISet`/`JavAIMap` — drop-in `java.util` replacements that are themselves `JavAIVectorizable` (a collection has its own `vector()`/`summaryVector()`) | `javai-model` |
 | **Persisted, searchable object graphs** | `JavAIPI.repository(YourRepository.class)` — CRUD plus `findNearestBy<Field>Vector`-style derived queries, against Postgres+pgvector or Neo4j, model-versioned automatically | `javai-persistence` (Persistence Bridge) |
-| **Provider-agnostic RAG completions** | `Cortex` (six providers: OpenAI, Anthropic, Groq, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
+| **Provider-agnostic RAG completions** | `Cortex` (seven providers: OpenAI, Anthropic, Groq, Mistral, vLLM, Ollama, Replicate) + `CompletionRequest`/`CompletionResult`, wrapping Spring AI rather than competing with it | `javai-completion` (Completion Fabric) |
 | **Grounding a completion in real object-graph data** | `PromptContext`/`Contextable`/`ContextableObject` — a `query()` result, or any `JavAIList`/`Set`/`Map`, renders directly as prompt material, no manual serialization | `javai-model` (lives here, not `javai-completion` — see "Module layout" below) |
 | **Agentic Supervision** | `@SyncSupervision`/`@AsyncSupervision` on a method or constructor — a registered `SupervisionListener` can veto/rewrite a call (blocking) and/or react to it (fire-and-forget), at PRE/POST/EXCEPTION | `javai-supervision` |
 | **Tagging** | `@Taggable` marks a class as taggable; a `JavAITagRepository` instance then handles structural queries (`tagsOf`/`taggingsOf`/`taggedWith`/`addTag`/`removeTag`/`hasTag`/`rankedByTags`), LLM-based classification (`classify`/`classifyAll` via `Cortex`), cross-type tag-similarity search (`tagSimilarityIndex()`, narrowable to one type via `ofType(...)`/`nearestByTagSimilarity(...)`), and Taggregate — `@Taggregate` fields make a container's tags a derived aggregate of its members', and `@Taggregate(concatenate = true)` renders any taggable's tags as an embedded, searchable string (`tagTextIndex()`) — no methods are woven onto the tagged class itself | `javai-tagging` (Tagging) |
@@ -1065,7 +1065,7 @@ run in production — each backend is configured independently:
 | Embedding provider | `javai-vector`'s `LocalEmbeddingDefaults` picks Ollama or Hugging Face TEI per host platform, or supply your own `JavAIEmbeddingProvider` |
 | Postgres/Neo4j | `javai-persistence/README.md`; connection settings default to `javai.persistence.*` system properties |
 | Postgres schema naming | snake_case by default (`emailVerified` → `email_verified`); override with `JavAIPersistenceConfig.Builder.physicalNamingStrategy(...)` or the general `.hibernateProperty(key, value)` passthrough — see below |
-| Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
+| Completion provider | `javai-completion/README.md` — hosted API key (OpenAI/Anthropic/Groq/Mistral/Replicate) or a local Ollama/vLLM instance; `Cortex.contextWindowTokens()`/`CompletionRequest.render(int)` size a `PromptContext` to fit automatically |
 
 **Embedding provider, in detail** — registered once, globally, before anything calls `vector()`:
 
@@ -1292,7 +1292,7 @@ you use it:
 
 ```java
 Cortex cortex = CortexOpenAI.builder().apiKey(System.getenv("OPENAI_API_KEY")).model("gpt-4.1").build();
-// or CortexAnthropic / CortexGroq / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
+// or CortexAnthropic / CortexGroq / CortexMistral / CortexVLlm / CortexOllama / CortexReplicate -- same builder shape
 ```
 
 Constructing several `Cortex`es side by side, local and remote, is normal — each is a plain object, not
