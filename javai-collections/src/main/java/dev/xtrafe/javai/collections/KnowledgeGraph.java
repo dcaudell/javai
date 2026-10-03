@@ -31,6 +31,22 @@ public interface KnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
 
     void addEdge(N from, N to, E edge);
 
+    /**
+     * Removes {@code node} and every edge to or from it. A persisted graph drops them on its owner's next save
+     * (OMI-612).
+     *
+     * @return whether the graph held it
+     */
+    boolean removeNode(N node);
+
+    /**
+     * Removes the one edge from {@code from} to {@code to} equal to {@code edge}; both nodes stay. A persisted graph
+     * drops it on its owner's next save (OMI-612).
+     *
+     * @return whether the graph held it
+     */
+    boolean removeEdge(N from, N to, E edge);
+
     JavAISet<N> nodes();
 
     JavAISet<E> edges(N from, N to);

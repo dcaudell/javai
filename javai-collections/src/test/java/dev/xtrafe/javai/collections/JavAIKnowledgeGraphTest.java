@@ -106,4 +106,23 @@ class JavAIKnowledgeGraphTest {
         assertEquals(Set.of(a, b), narrowed.nodes(), "narrowing to 1 hop must drop c");
         assertEquals(Set.of(a, b, c, d), graph.nodes(), "narrowing a result must never mutate the original graph");
     }
+
+    /** OMI-612. */
+    @Test
+    void removeNodeTakesItsEdgesAndRemoveEdgeOnlyThatEdge() {
+        TestGraphEdge also = new TestGraphEdge("also");
+        graph.addEdge(a, b, also);
+        TestGraphEdge relates = graph.edges(a, b).stream().filter(e -> e != also).findFirst().orElseThrow();
+
+        assertTrue(graph.removeEdge(a, b, relates));
+        assertFalse(graph.removeEdge(a, b, relates), "already gone");
+        assertEquals(java.util.Set.of(also), new java.util.HashSet<>(graph.edges(a, b)));
+        assertTrue(graph.nodes().contains(a) && graph.nodes().contains(b), "both nodes stay");
+
+        assertTrue(graph.removeNode(c));
+        assertFalse(graph.removeNode(c), "already gone");
+        assertFalse(graph.nodes().contains(c));
+        assertTrue(graph.edges(b, c).isEmpty(), "its incoming edge went with it");
+        assertTrue(graph.neighbors(d).isEmpty() && graph.edges(c, d).isEmpty(), "and its outgoing one");
+    }
 }

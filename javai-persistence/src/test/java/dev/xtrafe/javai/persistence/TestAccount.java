@@ -64,6 +64,10 @@ final class TestAccount {
         return active;
     }
 
+    void setProfile(TestProfile profile) {
+        this.profile = profile;
+    }
+
     TestProfile getProfile() {
         return profile;
     }

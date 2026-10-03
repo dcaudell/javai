@@ -931,19 +931,44 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                 continue;
             }
             String relationshipType = relationshipType(fieldName);
+            // What the field holds now, as (target id, map key) pairs: anything else the owner points to through
+            // this relationship type was removed, and goes (OMI-612).
+            List<List<String>> held = new ArrayList<>();
             if (value instanceof Map<?, ?> map) {
                 for (Map.Entry<?, ?> mapEntry : map.entrySet()) {
-                    saveRelationship(tx, label, id, mapEntry.getValue(), relationshipType, alreadySaved,
-                            String.valueOf(mapEntry.getKey()));
+                    String mapKey = String.valueOf(mapEntry.getKey());
+                    saveRelationship(tx, label, id, mapEntry.getValue(), relationshipType, alreadySaved, mapKey);
+                    held.add(heldPair(mapEntry.getValue(), mapKey));
                 }
             } else if (value instanceof Iterable<?> iterable) {
                 for (Object element : iterable) {
                     saveRelationship(tx, label, id, element, relationshipType, alreadySaved, null);
+                    held.add(heldPair(element, null));
                 }
             } else if (value != null) {
                 saveRelationship(tx, label, id, value, relationshipType, alreadySaved, null);
+                held.add(heldPair(value, null));
             }
+            deleteStaleRelationships(tx, label, id, relationshipType, held);
         }
+    }
+
+    /** ⚠️ No nulls: Cypher compares a list holding null as null, never true, so a missing map key is "". */
+    private static List<String> heldPair(Object target, String mapKey) {
+        return List.of(EntityReflection.readId(target).toString(), mapKey == null ? "" : mapKey);
+    }
+
+    /**
+     * Deletes the owner's {@code relationshipType} relationships to anything not in {@code held}. ⚠️ Without this a
+     * save only ever adds: an element removed from a collection, a map entry removed or re-pointed, or a reference
+     * set to null all came back on the next read (OMI-612). Only the relationship goes; the target node may belong
+     * to others.
+     */
+    private static void deleteStaleRelationships(SimpleQueryRunner tx, String ownerLabel, UUID ownerId,
+            String relationshipType, List<List<String>> held) {
+        tx.run(new Query("MATCH (a:`" + ownerLabel + "` {id: $ownerId})-[r:`" + relationshipType + "`]->(b) "
+                        + "WHERE NOT [b.id, coalesce(r.mapKey, '')] IN $held DELETE r",
+                Map.of("ownerId", ownerId.toString(), "held", held)));
     }
 
     /** {@code mapKey} is {@code null} for a singular reference or a {@code Collection} element, or the
@@ -980,13 +1005,34 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                             + "MERGE (owner)-[:`" + memberType + "`]->(n)",
                     Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString())));
         }
+        List<Map<String, Object>> edges = new ArrayList<>();
         for (N from : graph.nodes()) {
             for (N to : graph.neighbors(from)) {
                 for (E edge : graph.edges(from, to)) {
                     saveGraphEdge(tx, from, to, edgeType, edge);
+                    // ⚠️ Without its null properties, as Neo4j stores it: a null in the map would never compare equal,
+                    // and the edge just written would be deleted.
+                    Map<String, Object> props = new HashMap<>(edgeProperties(edge));
+                    props.values().removeIf(java.util.Objects::isNull);
+                    edges.add(Map.of("from", EntityReflection.readId(from).toString(),
+                            "to", EntityReflection.readId(to).toString(), "props", props));
                 }
             }
         }
+        // ⚠️ What the graph no longer holds goes, edges first while a removed node is still a member, then the
+        // membership itself. Without this a removed node or edge came back on the next read (OMI-612). A node
+        // leaving this graph keeps its own record: it may belong to another.
+        tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[:`" + memberType + "`]->(a)"
+                        + "-[r:`" + edgeType + "`]->(b)<-[:`" + memberType + "`]-(owner) "
+                        + "WHERE NOT {from: a.id, to: b.id, props: properties(r)} IN $edges DELETE r",
+                Map.of("ownerId", ownerId.toString(), "edges", edges)));
+        List<String> members = new ArrayList<>();
+        for (N node : graph.nodes()) {
+            members.add(EntityReflection.readId(node).toString());
+        }
+        tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[m:`" + memberType + "`]->(n) "
+                        + "WHERE NOT n.id IN $members DELETE m",
+                Map.of("ownerId", ownerId.toString(), "members", members)));
     }
 
     /** MERGEs on the edge's own reflected property values as part of the match pattern itself, not via a

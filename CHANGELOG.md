@@ -12,6 +12,19 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A Postgres save accepts element collections of enums (OMI-613).** `javai-persistence`. The save walks treated an
+  enum declared in application code as an entity and reflected into `java.lang.Enum`'s fields, which threw
+  `InaccessibleObjectException`: `java.lang` is not opened. An enum is now a leaf, like a `java.*` value (OMI-275).
+
+- **A Neo4j save persists removals (OMI-612).** `javai-persistence` + `javai-collections`. Saving an entity on Neo4j
+  only ever MERGEd its relationships, so an element removed from a collection, a map entry removed or re-pointed, a
+  reference set to null, and anything removed from a `KnowledgeGraph` all came back on the next read. A save now
+  deletes the owner's relationships the field no longer holds; for a `KnowledgeGraph`, its stale edges and then its
+  stale memberships. Target nodes are kept: they may belong to others. `KnowledgeGraph` gains `removeNode` (which
+  takes the node's edges with it) and `removeEdge`.
+
 ### Added
 
 - **`CortexOllama.Builder.thinking(Boolean)` (OMI-608).** `javai-completion`. A per-Cortex default for whether a
