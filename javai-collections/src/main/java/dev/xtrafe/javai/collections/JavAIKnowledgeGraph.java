@@ -66,6 +66,33 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
     }
 
     @Override
+    public boolean removeNode(N node) {
+        if (!nodes.remove(node)) {
+            return false;
+        }
+        adjacency.remove(node);
+        for (Map<N, Set<E>> targets : adjacency.values()) {
+            targets.remove(node);
+        }
+        CollectionVectorSupport.onMutated($javai$state, this);
+        return true;
+    }
+
+    @Override
+    public boolean removeEdge(N from, N to, E edge) {
+        Map<N, Set<E>> targets = adjacency.get(from);
+        Set<E> edges = targets == null ? null : targets.get(to);
+        if (edges == null || !edges.remove(edge)) {
+            return false;
+        }
+        if (edges.isEmpty()) {
+            targets.remove(to);
+        }
+        CollectionVectorSupport.onMutated($javai$state, this);
+        return true;
+    }
+
+    @Override
     public JavAISet<N> nodes() {
         return new JavAILinkedHashSet<>(nodes);
     }

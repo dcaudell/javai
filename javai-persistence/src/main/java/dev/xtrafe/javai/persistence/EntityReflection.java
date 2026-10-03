@@ -148,6 +148,16 @@ final class EntityReflection {
      * Hibernate does its own mapping and ignores statics; nothing else in this repository declared one on an
      * entity, so the whole class of failure sat one ordinary constant away the entire time.
      */
+    /**
+     * Whether {@code value} is a leaf a reflective walk must not enter: a JDK value ({@code String} in an
+     * {@code @ElementCollection}, OMI-275) or an enum, wherever it is declared, whose fields are
+     * {@code java.lang.Enum}'s. Entering either throws: the module system will not open {@code java.lang}
+     * (OMI-613).
+     */
+    static boolean isLeafValue(Object value) {
+        return value instanceof Enum<?> || value.getClass().getName().startsWith("java.");
+    }
+
     static List<Field> allFields(Class<?> type) {
         List<Field> fields = new ArrayList<>();
         for (Class<?> current = type; current != null && current != Object.class; current = current.getSuperclass()) {

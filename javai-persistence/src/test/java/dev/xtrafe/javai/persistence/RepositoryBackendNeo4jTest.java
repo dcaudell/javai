@@ -28,6 +28,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -334,6 +335,67 @@ class RepositoryBackendNeo4jTest {
      * {@code <FIELD>_EDGE}) is what makes an edge-less node still round-trip, per
      * {@code RepositoryBackendNeo4j#saveKnowledgeGraphField}'s javadoc.
      */
+    /** OMI-612: a node or edge removed from a graph stays removed after its owner is saved again. */
+    @Test
+    void knowledgeGraphRemovalsPersist() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Removal owner");
+        TestGraphNode a = new TestGraphNode("removal A");
+        TestGraphNode b = new TestGraphNode("removal B");
+        TestGraphNode c = new TestGraphNode("removal C");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("A to B"));
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("A to B, again"));
+        owner.getGraph().addEdge(b, c, new TestGraphEdge("B to C"));
+        TestOwnerWithGraph loaded = graphOwnerRepository.findById(graphOwnerRepository.save(owner).getId())
+                .orElseThrow();
+
+        TestGraphNode loadedA = findByName(loaded.getGraph(), "removal A");
+        TestGraphNode loadedB = findByName(loaded.getGraph(), "removal B");
+        assertTrue(loaded.getGraph().removeEdge(loadedA, loadedB, new TestGraphEdge("A to B")));
+        assertTrue(loaded.getGraph().removeNode(findByName(loaded.getGraph(), "removal C")));
+        graphOwnerRepository.save(loaded);
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> reloaded = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+
+        assertEquals(2, reloaded.nodes().size(), "the removed node is no longer a member");
+        assertEquals(java.util.Set.of(new TestGraphEdge("A to B, again")),
+                new java.util.HashSet<>(reloaded.edges(findByName(reloaded, "removal A"),
+                        findByName(reloaded, "removal B"))), "only the removed edge goes");
+        assertTrue(reloaded.neighbors(findByName(reloaded, "removal B")).isEmpty(),
+                "the removed node's edges went with it");
+    }
+
+    /** OMI-612: a removed or re-pointed map entry, a removed collection element, and a nulled reference persist. */
+    @Test
+    void relationshipRemovalsPersist() {
+        JavAIPI.repository(TestTagRepository.class, config);
+        TestArticleWithTagsRepository articles = JavAIPI.repository(TestArticleWithTagsRepository.class, config);
+        TestArticleWithTags article = new TestArticleWithTags("Map removal");
+        article.getTagsByCode().put("first", new TestTag("alpha"));
+        article.getTagsByCode().put("second", new TestTag("beta"));
+        TestArticleWithTags loadedArticle = articles.findById(articles.save(article).getId()).orElseThrow();
+        loadedArticle.getTagsByCode().remove("first");
+        loadedArticle.getTagsByCode().put("second", new TestTag("gamma"));
+        articles.save(loadedArticle);
+        TestArticleWithTags reloadedArticle = articles.findById(article.getId()).orElseThrow();
+        assertEquals(java.util.Set.of("second"), reloadedArticle.getTagsByCode().keySet());
+        assertEquals("gamma", reloadedArticle.getTagsByCode().get("second").getLabel());
+
+        TestVenue venue = new TestVenue("Removal venue", null,
+                List.of(new TestReview("kept", 5), new TestReview("dropped", 1)));
+        TestVenue loadedVenue = venueRepository.findById(venueRepository.save(venue).getId()).orElseThrow();
+        loadedVenue.getReviews().removeIf(r -> r.getReviewer().equals("dropped"));
+        venueRepository.save(loadedVenue);
+        assertEquals(List.of("kept"), venueRepository.findById(venue.getId()).orElseThrow().getReviews().stream()
+                .map(TestReview::getReviewer).toList());
+
+        TestAccount account = new TestAccount("nulled-" + UUID.randomUUID(), "n@example.com", 30, true,
+                new TestProfile("nulled-handle", "Lisbon"));
+        TestAccount loadedAccount = accountRepository.findById(accountRepository.save(account).getId()).orElseThrow();
+        loadedAccount.setProfile(null);
+        accountRepository.save(loadedAccount);
+        assertNull(accountRepository.findById(account.getId()).orElseThrow().getProfile());
+    }
+
     /** OMI-607: a type outside this package whose constructors aren't public still hydrates -- owner, node and edge. */
     @Test
     void hydratesTypesWhoseConstructorsAreNotPublic() {
