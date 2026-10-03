@@ -334,6 +334,27 @@ class RepositoryBackendNeo4jTest {
      * {@code <FIELD>_EDGE}) is what makes an edge-less node still round-trip, per
      * {@code RepositoryBackendNeo4j#saveKnowledgeGraphField}'s javadoc.
      */
+    /** OMI-607: a type outside this package whose constructors aren't public still hydrates -- owner, node and edge. */
+    @Test
+    void hydratesTypesWhoseConstructorsAreNotPublic() {
+        dev.xtrafe.javai.persistence.elsewhere.ProtectedOwnerRepository owners = JavAIPI.repository(
+                dev.xtrafe.javai.persistence.elsewhere.ProtectedOwnerRepository.class, config);
+        JavAIPI.repository(dev.xtrafe.javai.persistence.elsewhere.ProtectedNodeRepository.class, config);
+        var owner = new dev.xtrafe.javai.persistence.elsewhere.ProtectedOwner("protected");
+        owner.link(new dev.xtrafe.javai.persistence.elsewhere.ProtectedNode("a"),
+                new dev.xtrafe.javai.persistence.elsewhere.ProtectedNode("b"), "a to b");
+
+        owners.save(owner);
+        var reloaded = owners.findById(owner.getId()).orElseThrow();
+
+        assertEquals("protected", reloaded.getTitle());
+        assertEquals(2, reloaded.nodes().size());
+        var a = reloaded.nodes().stream().filter(n -> n.getName().equals("a")).findFirst().orElseThrow();
+        var b = reloaded.neighbors(a).iterator().next();
+        assertEquals("b", b.getName());
+        assertEquals(java.util.Set.of("a to b"), reloaded.reasons(a, b));
+    }
+
     @Test
     void knowledgeGraphFieldRoundTripsNodesAndEdges() {
         TestOwnerWithGraph owner = new TestOwnerWithGraph("Graph owner");

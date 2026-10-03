@@ -83,6 +83,18 @@ final class EntityReflection {
         return null;
     }
 
+    /**
+     * A new instance through {@code type}'s declared constructor taking {@code parameterTypes}, whatever its
+     * visibility: JPA allows a {@code protected} no-arg constructor, and a hydrated type rarely shares this
+     * package, so the constructor is made accessible first (OMI-607).
+     */
+    static <T> T instantiate(Class<T> type, Class<?>[] parameterTypes, Object... args)
+            throws ReflectiveOperationException {
+        java.lang.reflect.Constructor<T> constructor = type.getDeclaredConstructor(parameterTypes);
+        constructor.setAccessible(true);
+        return constructor.newInstance(args);
+    }
+
     static UUID readId(Object entity) {
         Field field = idField(entity.getClass());
         try {

@@ -83,6 +83,14 @@ interface TestCounterRowRepository extends JavAIRepository<TestCounterRow> {
             nativeQuery = true)
     Page<TestCounterRow> nativePageByLabel(@Param("label") String label, Pageable pageable);
 
+    /** A native single-result query that limits itself, as native SQL commonly does (OMI-606). */
+    @Query(value = "select * from test_counter_row where label = :label order by votes desc limit 1",
+            nativeQuery = true)
+    Optional<TestCounterRow> nativeTopByLabel(@Param("label") String label);
+
+    @Query(value = "select * from test_counter_row where label = :label", nativeQuery = true)
+    Optional<TestCounterRow> nativeOneByLabel(@Param("label") String label);
+
     // ---- writes ------------------------------------------------------------------------------------
 
     /** The atomic read-modify-write a counter wants, and the reason {@code @Modifying} exists. */

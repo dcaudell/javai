@@ -498,7 +498,10 @@ final class DeclaredQuery {
 
     private Object executeSingle(RepositoryBackend backend, Class<?> entityTypeArg, Object[] args) {
         DerivedFinderQuery.Constraints constraints = resolveConstraints(args);
-        if (constraints.maxResults() == null) {
+        // ⚠️ Never on a native query: its text is the backend's own and may already limit itself (`LIMIT 1`), and
+        // the backend's limit clause appended after that is a syntax error (OMI-606). Ambiguity is still caught:
+        // the query just reads every row it selects.
+        if (constraints.maxResults() == null && !nativeQuery) {
             // Two, not one: enough to notice an ambiguous result and say so, without reading a whole table to
             // find out. The same discipline a single-result derived finder uses.
             constraints = new DerivedFinderQuery.Constraints(constraints.sort(), constraints.skip(), 2);

@@ -1028,7 +1028,10 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (edgeType.isRecord()) {
             for (RecordComponent component : edgeType.getRecordComponents()) {
                 try {
-                    Object value = component.getAccessor().invoke(edge);
+                    // ⚠️ Accessible first: a record edge declared outside this package need not be public (OMI-607).
+                    java.lang.reflect.Method accessor = component.getAccessor();
+                    accessor.setAccessible(true);
+                    Object value = accessor.invoke(edge);
                     if (isSimpleValue(value)) {
                         properties.put(component.getName(), toNeo4jValue(value));
                     }
@@ -1058,7 +1061,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         }
         Object entity;
         try {
-            entity = entityType.getDeclaredConstructor().newInstance();
+            entity = EntityReflection.instantiate(entityType, new Class<?>[0]);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(entityType + " needs a no-arg constructor to be hydrated from Neo4j", e);
         }
@@ -1359,14 +1362,14 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                         : null;
             }
             try {
-                return edgeType.getDeclaredConstructor(paramTypes).newInstance(args);
+                return EntityReflection.instantiate(edgeType, paramTypes, args);
             } catch (ReflectiveOperationException e) {
                 throw new IllegalStateException("Cannot reconstruct record " + edgeType + " from relationship properties", e);
             }
         }
         Object edge;
         try {
-            edge = edgeType.getDeclaredConstructor().newInstance();
+            edge = EntityReflection.instantiate(edgeType, new Class<?>[0]);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(edgeType + " needs a no-arg constructor, or must be a record, to be "
                     + "hydrated as a KnowledgeGraph edge from Neo4j", e);

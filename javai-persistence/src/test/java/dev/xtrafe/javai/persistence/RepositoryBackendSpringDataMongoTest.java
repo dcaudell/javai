@@ -117,6 +117,16 @@ class RepositoryBackendSpringDataMongoTest {
      * {@code RepositoryBackendNeo4jTest}'s copy of this test. No atomicity is claimed: this backend writes
      * each document independently.
      */
+    /** OMI-607: a type outside this package whose only no-arg constructor is protected still hydrates. */
+    @Test
+    void hydratesATypeWhoseConstructorIsNotPublic() {
+        dev.xtrafe.javai.persistence.elsewhere.ProtectedNodeRepository nodes = JavAIPI.repository(
+                dev.xtrafe.javai.persistence.elsewhere.ProtectedNodeRepository.class, config);
+        var node = nodes.save(new dev.xtrafe.javai.persistence.elsewhere.ProtectedNode("protected"));
+
+        assertEquals("protected", nodes.findById(EntityReflection.readId(node)).orElseThrow().getName());
+    }
+
     @Test
     void saveAllBatchesEveryEntityIntoOneProviderCall() {
         RecordingEmbeddingProvider recording = new RecordingEmbeddingProvider(new FakeEmbeddingProvider());

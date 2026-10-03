@@ -1065,7 +1065,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
         Object entity;
         try {
-            entity = entityType.getDeclaredConstructor().newInstance();
+            entity = EntityReflection.instantiate(entityType, new Class<?>[0]);
         } catch (ReflectiveOperationException e) {
             throw new IllegalStateException(entityType + " needs a no-arg constructor to be hydrated from MongoDB", e);
         }
