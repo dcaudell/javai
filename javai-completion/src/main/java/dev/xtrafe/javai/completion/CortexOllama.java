@@ -63,14 +63,18 @@ public final class CortexOllama implements Cortex {
     private final String model;
     private final String baseUrl;
     private final Integer contextWindowTokensOverride;
+    /** Whether a thinking model thinks when a request doesn't say; {@code null} leaves Ollama's own default. */
+    private final Boolean thinking;
     private final OllamaApi ollamaApi;
     private final WebClient webClient;
     private final Gson gson;
 
-    private CortexOllama(String baseUrl, String model, Integer contextWindowTokensOverride, Duration readTimeout) {
+    private CortexOllama(String baseUrl, String model, Integer contextWindowTokensOverride, Duration readTimeout,
+                         Boolean thinking) {
         this.model = model;
         this.baseUrl = baseUrl;
         this.contextWindowTokensOverride = contextWindowTokensOverride;
+        this.thinking = thinking;
         OllamaApi.Builder apiBuilder = OllamaApi.builder()
                 .baseUrl(baseUrl)
                 .responseErrorHandler(new TooManyRequestsResponseErrorHandler());
@@ -192,6 +196,8 @@ public final class CortexOllama implements Cortex {
                 .options(options);
         if (request.providerOptions().get(ENABLE_THINKING_KEY) instanceof Boolean enableThinking) {
             builder.think(new ThinkOption.ThinkBoolean(enableThinking));
+        } else if (thinking != null) {
+            builder.think(new ThinkOption.ThinkBoolean(thinking));
         }
         if (request.responseSchema() != null) {
             builder.format(gson.fromJson(request.responseSchema(), Map.class)); // Ollama's structured outputs
@@ -204,6 +210,7 @@ public final class CortexOllama implements Cortex {
         private String model;
         private Integer contextWindowTokens;
         private Duration readTimeout;
+        private Boolean thinking;
 
         private Builder() {
         }
@@ -239,6 +246,18 @@ public final class CortexOllama implements Cortex {
             return this;
         }
 
+        /**
+         * Whether a thinking model (qwen3, deepseek-r1, …) thinks before it answers, for every request that doesn't
+         * say otherwise through the {@code enable_thinking} provider option. Unset by default, which leaves Ollama's
+         * own default -- thinking, for those models. Turning it off is what makes such a model usable on a CPU: its
+         * thinking counts against {@code maxTokens} and can exhaust them before any answer, or any typed value, is
+         * written.
+         */
+        public Builder thinking(Boolean thinking) {
+            this.thinking = thinking;
+            return this;
+        }
+
         /** Overrides {@link ContextWindows}'s best-effort lookup for this model. */
         public Builder contextWindowTokens(int contextWindowTokens) {
             this.contextWindowTokens = contextWindowTokens;
@@ -249,7 +268,7 @@ public final class CortexOllama implements Cortex {
             if (model == null) {
                 throw new IllegalStateException("CortexOllama requires a model -- e.g. \"qwen3:8b\"");
             }
-            return new CortexOllama(baseUrl, model, contextWindowTokens, readTimeout);
+            return new CortexOllama(baseUrl, model, contextWindowTokens, readTimeout, thinking);
         }
     }
 }

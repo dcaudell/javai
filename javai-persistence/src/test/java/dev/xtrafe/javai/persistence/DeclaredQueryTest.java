@@ -209,6 +209,18 @@ class DeclaredQueryTest {
     // ---- native ------------------------------------------------------------------------------------
 
     @Test
+    void runsANativeSingleResultQueryThatLimitsItself() {
+        save(3, 0);
+        save(9, 0);
+
+        assertEquals(9, counters.nativeTopByLabel(label).orElseThrow().getVotes(),
+                "a native query's own LIMIT must not be followed by a second limit clause (OMI-606)");
+        assertEquals(Optional.empty(), counters.nativeTopByLabel("absent-" + label));
+        assertThrows(IllegalStateException.class, () -> counters.nativeOneByLabel(label),
+                "an ambiguous native single result is still reported");
+    }
+
+    @Test
     void runsANativeQueryReturningEntities() {
         save(2, 0);
         save(8, 0);

@@ -100,6 +100,23 @@ class CortexOllamaTest {
     }
 
     @Test
+    void theBuildersThinkingIsTheDefaultARequestCanOverride() throws IOException {
+        startFakeServer("""
+                {"message":{"role":"assistant","content":"ok"},"done":true}
+                """);
+        Cortex cortex = CortexOllama.builder().baseUrl("http://localhost:" + server.getAddress().getPort())
+                .model("qwen3:8b").thinking(false).build();
+
+        cortex.complete(CompletionRequest.builder().prompt("plain question").build());
+        assertTrue(capturedRequestBody.contains("\"think\":false"),
+                "a Cortex built not to think sends think:false when the request doesn't say");
+
+        cortex.complete(CompletionRequest.builder().prompt("think hard").providerOption("enable_thinking", true)
+                .build());
+        assertTrue(capturedRequestBody.contains("\"think\":true"), "the request's own enable_thinking wins");
+    }
+
+    @Test
     void otherProviderOptionsPassThroughAsOllamaRequestOptions() throws IOException {
         startFakeServer("""
                 {"message":{"role":"assistant","content":"ok"},"done":true}

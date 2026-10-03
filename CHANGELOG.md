@@ -12,6 +12,34 @@ version -- a given release usually changes only one or two of them.
 
 ## [Unreleased]
 
+### Added
+
+- **`CortexOllama.Builder.thinking(Boolean)` (OMI-608).** `javai-completion`. A per-Cortex default for whether a
+  thinking model thinks, applied to every request that doesn't set the `enable_thinking` provider option itself.
+  Unset keeps Ollama's default. A thinking model's reasoning counts against `maxTokens`, so on a CPU it can spend the
+  whole budget before writing an answer or a typed value; this lets a deployment turn it off once, in configuration.
+
+### Fixed
+
+- **Neo4j and MongoDB hydrate types whose constructors aren't public (OMI-607).** `javai-persistence`. Hydration
+  called `getDeclaredConstructor().newInstance()` without making the constructor accessible, so an entity with the
+  `protected` no-arg constructor JPA allows, declared outside `dev.xtrafe.javai.persistence`, failed with "needs a
+  no-arg constructor"; a non-public record edge failed the same way, and so did reading its components on save. All
+  are now made accessible first. JavAI's own fixtures share its package, which is why none of them caught it.
+
+- **A native single-result `@Query` that limits itself no longer fails (OMI-606).** `javai-persistence`. An
+  `Optional`/single-entity `@Query(nativeQuery = true)` was given an implicit two-row probe limit to detect ambiguity,
+  which Hibernate appends as `fetch first ? rows only`; after the query's own `LIMIT 1` that is a syntax error. Native
+  queries no longer get the probe: their text is authoritative. An ambiguous native single result is still reported.
+
+- **Text that is data can no longer be read as a template (OMI-604).** `javai-model` + `javai-completion`.
+  `CompletionRequest.render()` runs prompt and context alike through Handlebars with `%%` delimiters, so a chat
+  message or memory in a `PromptContext` that contained `%%` either threw `HandlebarsException` -- failing the whole
+  completion -- or, as `%%key%%`, was substituted. Neither backslash escaping nor a raw block survives the custom
+  delimiter. New `LiteralTextEntry` carries such text: its `%%` is neutralised into a same-length sentinel before
+  templating and restored after (`TemplateLiteral`), so it reaches the model verbatim and `PromptContext` budgets
+  are unchanged. `PlainTextEntry` (via `PromptContext.of`) is still a template, as before.
+
 ## [0.1.10] - 2026-10-01
 
 ### Fixed

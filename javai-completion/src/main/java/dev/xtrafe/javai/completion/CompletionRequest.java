@@ -3,6 +3,7 @@ package dev.xtrafe.javai.completion;
 import com.github.jknack.handlebars.EscapingStrategy;
 import com.github.jknack.handlebars.Handlebars;
 import dev.xtrafe.javai.model.PromptContext;
+import dev.xtrafe.javai.model.TemplateLiteral;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -72,7 +73,7 @@ public record CompletionRequest(
         Map<String, Object> providerOptions,
         String responseSchema) {
 
-    private static final String DELIMITER = "%%";
+    private static final String DELIMITER = TemplateLiteral.DELIMITER;
     private static final Handlebars HANDLEBARS = new Handlebars()
             .with(EscapingStrategy.NOOP)
             .startDelimiter(DELIMITER)
@@ -109,7 +110,8 @@ public record CompletionRequest(
         String promptText = String.join("\n\n", prompt);
         String combined = context == null ? promptText : promptText + "\n\n" + context.toString();
         try {
-            return HANDLEBARS.compileInline(combined).apply(promptParams);
+            // ⚠️ LiteralTextEntry text was protected from the template on its way in; restored only now (OMI-604).
+            return TemplateLiteral.restore(HANDLEBARS.compileInline(combined).apply(promptParams));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to render CompletionRequest as a Handlebars template", e);
         }
