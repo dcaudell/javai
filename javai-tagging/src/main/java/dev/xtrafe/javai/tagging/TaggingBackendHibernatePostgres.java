@@ -700,6 +700,11 @@ final class TaggingBackendHibernatePostgres implements TaggingBackend {
             connection = config.dataSource() != null
                     ? config.dataSource().getConnection()
                     : DriverManager.getConnection(config.postgresUrl(), config.postgresUsername(), config.postgresPassword());
+            // ⚠️ This backend's own connection is an autocommit one: its schema DDL and its writes outside a
+            // caller's transaction commit as they run. A pool may hand out connections with autocommit off
+            // (OMI-614), which would leave them uncommitted, holding their locks; closing hands it back to the
+            // pool, which restores its own setting.
+            connection.setAutoCommit(true);
             ensureSchema(connection);
         }
         return connection;

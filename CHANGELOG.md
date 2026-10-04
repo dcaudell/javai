@@ -14,6 +14,10 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **Tagging commits on a pool with autocommit off (OMI-614).** `javai-tagging`. The Postgres backend's own connection,
+  taken from an application `DataSource`, kept the pool's autocommit setting; with it off, the schema DDL and every
+  write outside a caller's transaction stayed uncommitted, the connection idle in transaction, holding its locks. That
+  connection now runs autocommit, as it always assumed.
 - **A Postgres save accepts element collections of enums (OMI-613).** `javai-persistence`. The save walks treated an
   enum declared in application code as an entity and reflected into `java.lang.Enum`'s fields, which threw
   `InaccessibleObjectException`: `java.lang` is not opened. An enum is now a leaf, like a `java.*` value (OMI-275).

@@ -84,6 +84,63 @@ class TaggingConnectionLifecycleTest {
         }
     }
 
+    /**
+     * OMI-614: a pool that hands out connections with autocommit off (Hibernate's own pool default, which an
+     * application keeps for Postgres large objects) must not leave tagging's own connection holding an open
+     * transaction: its schema DDL and its writes outside a caller's transaction commit as they run.
+     */
+    @Test
+    void taggingCommitsOnAPoolWithAutocommitOff() throws Exception {
+        String appName = "tagging-manual-" + System.nanoTime();
+        HikariConfig hikari = new HikariConfig();
+        hikari.setJdbcUrl(postgres.getJdbcUrl());
+        hikari.setUsername(postgres.getUsername());
+        hikari.setPassword(postgres.getPassword());
+        hikari.setMinimumIdle(0);
+        hikari.setMaximumPoolSize(4);
+        hikari.setAutoCommit(false);
+        hikari.addDataSourceProperty("ApplicationName", appName);
+        try (HikariDataSource pool = new HikariDataSource(hikari)) {
+            JavAIPersistenceConfig config = JavAIPersistenceConfig.builder().dataSource(pool).build();
+
+            Tagged tagged = tagSomething(config, "manual");
+
+            assertEquals(0, connections(appName, "idle in transaction"),
+                    "no connection of the pool may be left holding an open transaction");
+            assertEquals(1, committedTaggings(tagged.thing()), "the tag is committed, visible to anyone");
+            JavAIPI.release(config);
+        }
+    }
+
+    private static int committedTaggings(TestThing thing) throws SQLException {
+        try (Connection probe = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+             PreparedStatement count = probe.prepareStatement(
+                     "SET lock_timeout = '2s'; SELECT count(*) FROM taggings WHERE taggable_id = ?")) {
+            count.setObject(1, thing.getId());
+            count.execute();
+            count.getMoreResults();
+            try (ResultSet rows = count.getResultSet()) {
+                rows.next();
+                return rows.getInt(1);
+            }
+        }
+    }
+
+    private static int connections(String appName, String state) throws SQLException {
+        try (Connection probe = DriverManager.getConnection(
+                postgres.getJdbcUrl(), postgres.getUsername(), postgres.getPassword());
+             PreparedStatement count = probe.prepareStatement(
+                     "SELECT count(*) FROM pg_stat_activity WHERE application_name = ? AND state = ?")) {
+            count.setString(1, appName);
+            count.setString(2, state);
+            try (ResultSet rows = count.executeQuery()) {
+                rows.next();
+                return rows.getInt(1);
+            }
+        }
+    }
+
     private record Tagged(JavAITagRepository tagging, TestThing thing) {
     }
 
