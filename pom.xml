@@ -175,7 +175,7 @@
     <!-- CompletionRequest.render()'s Mustache-compatible templating engine (javai-completion). Current
          stable as of this pin; its own transitive deps (commons-lang3, commons-text, slf4j-api) come in
          automatically via its published POM, no separate version management needed. -->
-    <handlebars.version>4.5.4</handlebars.version>
+    <handlebars.version>4.5.5</handlebars.version>
     <!-- Forces one jackson-annotations version on every reactor module, at or above what each
          jackson-databind on the classpath expects: tools.jackson.core:jackson-databind:3.1.4 via Spring AI
          (Jackson 3 keeps the 2.x annotations artifact; its BOM expects 2.21) and
