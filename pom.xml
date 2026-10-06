@@ -391,7 +391,7 @@
         <plugin>
           <groupId>org.apache.maven.plugins</groupId>
           <artifactId>maven-compiler-plugin</artifactId>
-          <version>3.15.0</version>
+          <version>3.16.0</version>
         </plugin>
         <!-- Only version-pinned here; the test-jar execution that actually needs it is bound in
              javai-vector/pom.xml, which explains why that module publishes its test tree. -->
