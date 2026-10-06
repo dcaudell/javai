@@ -139,7 +139,7 @@
          before finding this exact pairing. mongodb-driver-sync is not pulled in transitively by
          spring-data-mongodb (confirmed via `mvn dependency:tree`: it only brings mongodb-driver-core —
          BSON/wire-protocol types), so it needs its own explicit dependency below regardless. -->
-    <spring-data-mongodb.version>5.1.0</spring-data-mongodb.version>
+    <spring-data-mongodb.version>5.1.1</spring-data-mongodb.version>
     <!-- Pinned to exactly what spring-data-mongodb 5.1.0 already brings transitively (its own
          `${springdata.commons}`, confirmed 4.1.0 via the resolved dependency), declared explicitly here
          only because javai-persistence now uses spring-data-commons' PartTree derived-query parser directly
