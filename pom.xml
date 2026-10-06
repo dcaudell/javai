@@ -104,7 +104,7 @@
     <hibernate.version>7.4.5.Final</hibernate.version>
     <!-- Must match the hibernate-models version hibernate-core's own POM declares (runtime scope there);
          javai-persistence compiles against it directly (OMI-556). -->
-    <hibernate-models.version>1.1.1</hibernate-models.version>
+    <hibernate-models.version>1.3.4</hibernate-models.version>
     <neo4j-driver.version>6.2.1</neo4j-driver.version>
     <!-- Confirmed on Maven Central: hibernate-vector publishes on the same release train as
          hibernate-core, so this stays pinned to ${hibernate.version} rather than its own property. -->
