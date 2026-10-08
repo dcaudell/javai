@@ -474,27 +474,28 @@ class RepositoryBackendSpringDataMongoTest {
     }
 
     /** OMI-410: release closes the {@code MongoClient} this backend opened -- its connections leave the
-     *  server's count -- and the same config then builds a working backend again. */
+     *  server -- and the same config then builds a working backend again. Counted by {@code appName}, as
+     *  the server-wide total still holds a just-closed client's connections for a few milliseconds. */
     @Test
     void releaseClosesTheClientAndTheSameConfigRebuilds() throws InterruptedException {
+        String appName = "release-" + UUID.randomUUID();
         JavAIPersistenceConfig own = JavAIPersistenceConfig.builder()
                 .backend(JavAIPersistenceConfig.Backend.MONGODB)
-                .mongoUri(mongoUri())
+                .mongoUri(mongoUri() + "&appName=" + appName)
                 .mongoDatabase(DATABASE)
                 .build();
         try (MongoClient probe = MongoClients.create(mongoUri())) {
-            int baseline = currentConnections(probe);
             TestArticleRepository before = JavAIPI.repository(TestArticleRepository.class, own);
             TestArticle saved = before.save(new TestArticle("release-" + UUID.randomUUID(), "body"));
-            assertTrue(currentConnections(probe) > baseline, "the backend's own client is connected");
+            assertTrue(connectionsNamed(probe, appName) > 0, "the backend's own client is connected");
 
             JavAIPI.release(own);
 
             long deadline = System.nanoTime() + 5_000_000_000L;
-            while (currentConnections(probe) > baseline && System.nanoTime() < deadline) {
+            while (connectionsNamed(probe, appName) > 0 && System.nanoTime() < deadline) {
                 Thread.sleep(50);
             }
-            assertEquals(baseline, currentConnections(probe), "release must close every connection it opened");
+            assertEquals(0, connectionsNamed(probe, appName), "release must close every connection it opened");
             IllegalStateException stale = assertThrows(IllegalStateException.class, before::findAll);
             assertTrue(stale.getMessage().contains("released"), stale.getMessage());
             TestArticleRepository after = JavAIPI.repository(TestArticleRepository.class, own);
@@ -503,8 +504,10 @@ class RepositoryBackendSpringDataMongoTest {
         }
     }
 
-    private static int currentConnections(MongoClient probe) {
-        Document status = probe.getDatabase("admin").runCommand(new Document("serverStatus", 1));
-        return status.get("connections", Document.class).getInteger("current");
+    private static int connectionsNamed(MongoClient probe, String appName) {
+        List<Document> named = probe.getDatabase("admin").aggregate(List.of(
+                new Document("$currentOp", new Document("allUsers", true).append("idleConnections", true)),
+                new Document("$match", new Document("appName", appName)))).into(new ArrayList<>());
+        return named.size();
     }
 }
