@@ -68,9 +68,11 @@
             ByteBuddyAgent.install() self-attaches to this same JVM to obtain an Instrumentation
             instance for the weaving spike's tests. Self-attach is disabled by default since JDK 9;
             without this flag the tests fail with "does not support attachment" rather than exercising
-            any weaving logic.
+            any weaving logic. EnableDynamicAgentLoading stops the JDK printing its dynamic-agent warning from
+            the Attach Listener thread: surefire 3.6.0's stderr capture throws ExceptionInInitializerError on
+            a null context classloader there, failing the attach ("Agent failed to start!").
           -->
-          <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+          <argLine>-Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading</argLine>
         </configuration>
       </plugin>
     </plugins>
