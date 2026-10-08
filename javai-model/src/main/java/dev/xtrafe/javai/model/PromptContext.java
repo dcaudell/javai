@@ -162,6 +162,26 @@ public record PromptContext(
     }
 
     private String assemble() {
+        return assemble(null);
+    }
+
+    /**
+     * Renders this context as {@link #toString()} does, and reports how (OMI-619): the budget each nested context
+     * was given, what it rendered and whether it fit. The root trace's {@link PromptContextTrace#context()} is this
+     * instance.
+     */
+    public PromptContextTrace trace() {
+        return trace(this);
+    }
+
+    private PromptContextTrace trace(PromptContext reportedAs) {
+        List<PromptContextTrace> nested = new java.util.ArrayList<>();
+        String text = assemble(nested);
+        return new PromptContextTrace(reportedAs, maxLength, text, true, nested);
+    }
+
+    /** @param nested where each nested context's trace goes, or {@code null} when not tracing */
+    private String assemble(List<PromptContextTrace> nested) {
         StringBuilder buffer = new StringBuilder();
         if (sourceLabel != null && !sourceLabel.isBlank()) {
             buffer.append("[Source: ").append(sourceLabel).append("]\n");
@@ -172,16 +192,26 @@ public record PromptContext(
         boolean first = true;
         for (Contextable entry : entries) {
             Contextable effectiveEntry = entry;
-            if (percentageSum != null && entry instanceof PromptContext nested && nested.maxLength() == null) {
+            if (percentageSum != null && entry instanceof PromptContext nestedContext
+                    && nestedContext.maxLength() == null) {
                 int remaining = maxLength - buffer.length();
-                double share = nested.targetPercentage() / percentageSum;
+                double share = nestedContext.targetPercentage() / percentageSum;
                 int allocated = Math.max(0, (int) (remaining * share));
-                effectiveEntry = nested.withMaxLength(allocated);
+                effectiveEntry = nestedContext.withMaxLength(allocated);
             }
-            String rendered = effectiveEntry.toContext(this);
+            PromptContextTrace entryTrace = nested != null && effectiveEntry instanceof PromptContext sized
+                    ? sized.trace((PromptContext) entry) : null;
+            String rendered = entryTrace != null ? entryTrace.text() : effectiveEntry.toContext(this);
             String candidate = first ? rendered : ENTRY_SEPARATOR + rendered;
             if (maxLength != null && buffer.length() + candidate.length() > maxLength) {
+                if (entryTrace != null) {
+                    nested.add(new PromptContextTrace(entryTrace.context(), entryTrace.budget(), entryTrace.text(),
+                            false, entryTrace.nested()));
+                }
                 break;
+            }
+            if (entryTrace != null) {
+                nested.add(entryTrace);
             }
             buffer.append(candidate);
             first = false;
