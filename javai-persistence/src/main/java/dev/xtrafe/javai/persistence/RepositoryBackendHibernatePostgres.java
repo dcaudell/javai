@@ -2681,7 +2681,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
         ensurePendingSummaryTable();
         while (pendingCount() > 0) {
-            int before = pendingCount();
+            long before = pendingCount();
             drain(null);
             if (pendingCount() >= before) {
                 // No progress -- either a drain is failing (already logged) or another pod is enqueueing at
@@ -2691,11 +2691,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
-    private int pendingCount() {
+    /** For {@link JavAIPI#pendingSummaryCount}: provisions the queue first, since nothing may have written it yet. */
+    long pendingSummaryCount() {
+        ensurePendingSummaryTable();
+        return pendingCount();
+    }
+
+    private long pendingCount() {
         return inSession(session -> session.doReturningWork(connection -> {
             try (Statement statement = connection.createStatement();
                  ResultSet rows = statement.executeQuery("SELECT count(*) FROM " + PendingSummaries.TABLE)) {
-                return rows.next() ? rows.getInt(1) : 0;
+                return rows.next() ? rows.getLong(1) : 0L;
             }
         }));
     }

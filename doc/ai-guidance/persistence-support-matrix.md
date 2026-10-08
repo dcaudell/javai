@@ -363,6 +363,7 @@ Then drain it somewhere — a scheduled job, a quiet-period task, or the next or
 
 ```java
 JavAIPI.drainPendingSummaries(config);           // safe to run concurrently from several pods
+long queued = JavAIPI.pendingSummaryCount(config); // the queue's depth, read on config's own connection
 ```
 
 ⚠️ **`QUEUE_ONLY` with nothing ever draining leaves summaries stale indefinitely, and nothing will tell you

@@ -6,7 +6,7 @@ target/
 *.ipr
 *.iws
 out/
-
+javai-intellij-idea/bin/
 # OS
 .DS_Store
 

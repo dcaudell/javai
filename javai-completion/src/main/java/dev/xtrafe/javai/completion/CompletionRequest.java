@@ -3,6 +3,7 @@ package dev.xtrafe.javai.completion;
 import com.github.jknack.handlebars.EscapingStrategy;
 import com.github.jknack.handlebars.Handlebars;
 import dev.xtrafe.javai.model.PromptContext;
+import dev.xtrafe.javai.model.PromptContextTrace;
 import dev.xtrafe.javai.model.TemplateLiteral;
 
 import java.io.IOException;
@@ -109,9 +110,14 @@ public record CompletionRequest(
     public String render() {
         String promptText = String.join("\n\n", prompt);
         String combined = context == null ? promptText : promptText + "\n\n" + context.toString();
+        return template(combined);
+    }
+
+    /** Runs {@code text} through this request's template, then restores protected literals. */
+    private String template(String text) {
         try {
             // ⚠️ LiteralTextEntry text was protected from the template on its way in; restored only now (OMI-604).
-            return TemplateLiteral.restore(HANDLEBARS.compileInline(combined).apply(promptParams));
+            return TemplateLiteral.restore(HANDLEBARS.compileInline(text).apply(promptParams));
         } catch (IOException e) {
             throw new IllegalStateException("Failed to render CompletionRequest as a Handlebars template", e);
         }
@@ -130,13 +136,33 @@ public record CompletionRequest(
         if (context == null || context.maxLength() != null) {
             return render();
         }
+        return new CompletionRequest(prompt, sizedContext(contextWindowTokens), promptParams, maxTokens,
+                temperature, providerOptions, responseSchema)
+                .render();
+    }
+
+    /**
+     * How {@link #render(int)} lays out {@link #context()} (OMI-619, prompt inspection): the same budgets, with each
+     * context's text templated as the model receives it. {@code null} when there is no context. ⚠️ Each text is
+     * templated on its own; a template that spans contexts renders only in {@link #render(int)}.
+     */
+    public PromptContextTrace trace(int contextWindowTokens) {
+        if (context == null) {
+            return null;
+        }
+        PromptContext sized = context.maxLength() != null ? context : sizedContext(contextWindowTokens);
+        PromptContextTrace trace = sized.trace();
+        return new PromptContextTrace(context, trace.budget(), trace.text(), true, trace.nested())
+                .mapText(this::template);
+    }
+
+    /** {@link #context()} with the budget {@link #render(int)} gives it. */
+    private PromptContext sizedContext(int contextWindowTokens) {
         String promptText = String.join("\n\n", prompt);
         int totalBudgetChars = contextWindowTokens * CHARS_PER_TOKEN_ESTIMATE;
         int reservedForOutput = (maxTokens == null ? 0 : maxTokens) * CHARS_PER_TOKEN_ESTIMATE;
         int contextBudget = Math.max(0, totalBudgetChars - promptText.length() - reservedForOutput);
-        return new CompletionRequest(prompt, context.withMaxLength(contextBudget), promptParams, maxTokens,
-                temperature, providerOptions, responseSchema)
-                .render();
+        return context.withMaxLength(contextBudget);
     }
 
     public static final class Builder {

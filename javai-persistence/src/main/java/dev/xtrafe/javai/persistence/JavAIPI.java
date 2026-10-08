@@ -220,6 +220,20 @@ public final class JavAIPI {
     }
 
     /**
+     * How many recomputations are queued for {@link #drainPendingSummaries} -- rows, not distinct containers, so
+     * ten writes beneath one container count ten. Read on {@code config}'s own connection, which is the only
+     * database that holds the queue.
+     *
+     * <p>Postgres only, and 0 elsewhere, for the reason {@link #drainPendingSummaries} is a no-op there.
+     */
+    public static long pendingSummaryCount(JavAIPersistenceConfig config) {
+        if (backendFor(config) instanceof RepositoryBackendHibernatePostgres postgres) {
+            return postgres.pendingSummaryCount();
+        }
+        return 0L;
+    }
+
+    /**
      * The Hibernate {@link SessionFactory} this module built for {@code config} -- the same instance every
      * repository sharing that config runs on. <b>Postgres only</b>; the other two backends have no such
      * thing and throw rather than return null.
