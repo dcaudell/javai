@@ -40,7 +40,7 @@
       longer applies; kept anyway as cheap, defensive version pinning across whatever else transitively
       touches Jackson (Spring AI, Hibernate).
     -->
-    <jackson.version>2.22.2</jackson.version>
+    <jackson.version>2.22.3</jackson.version>
 
     <!--
       Empty default, not absent: LocalEmbeddingDefaults.preferOllama() treats a blank value the same as
@@ -203,7 +203,7 @@
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
         <artifactId>maven-surefire-plugin</artifactId>
-        <version>3.5.6</version>
+        <version>3.6.0</version>
         <configuration>
           <!--
             ByteBuddyAgent.install() self-attaches to this JVM to weave the domain classes below;
@@ -219,7 +219,7 @@
             passthrough) measured ~1822s in one real run where the model wasn't already warm in Ollama's
             memory; once warm, the same five calls typically complete in a few seconds combined.
           -->
-          <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+          <argLine>-Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading</argLine>
           <forkedProcessTimeoutInSeconds>3600</forkedProcessTimeoutInSeconds>
           <!--
             Surefire does not forward -D properties from the `mvn` command line into the forked test JVM

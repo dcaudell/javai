@@ -52,9 +52,9 @@
             ByteBuddyAgent.install() self-attaches to this same JVM to obtain an Instrumentation instance
             for the weaving tests. Self-attach is disabled by default since JDK 9; without this flag the
             tests fail with "does not support attachment" rather than exercising any weaving logic. Same
-            requirement as javai-substrate's pom.xml, for the identical reason.
+            requirement as javai-substrate's pom.xml, for the identical reason, as is EnableDynamicAgentLoading.
           -->
-          <argLine>-Djdk.attach.allowAttachSelf=true</argLine>
+          <argLine>-Djdk.attach.allowAttachSelf=true -XX:+EnableDynamicAgentLoading</argLine>
         </configuration>
       </plugin>
     </plugins>

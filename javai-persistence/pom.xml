@@ -96,6 +96,12 @@
       <artifactId>mongodb-driver-sync</artifactId>
     </dependency>
     <dependency>
+      <!-- Named so a consumer resolves core at sync's version (nearest wins) rather than the older one
+           spring-data-mongodb brings; a mismatched pair throws NoClassDefFoundError. See the root pom. -->
+      <groupId>org.mongodb</groupId>
+      <artifactId>mongodb-driver-core</artifactId>
+    </dependency>
+    <dependency>
       <!-- OMI-146: lets a JavAIRepository call join a caller's Spring @Transactional unit of work rather
            than always opening its own session. <optional> deliberately: only SpringManagedSessions touches
            it, and only after a runtime presence check, so a non-Spring consumer never loads that class and
