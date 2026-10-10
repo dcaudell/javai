@@ -1,5 +1,8 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.JavAIEdge;
+import dev.xtrafe.javai.collections.JavAIGraphNode;
+import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
 import dev.xtrafe.javai.vector.EmbeddingVector;
@@ -360,6 +363,13 @@ interface RepositoryBackend {
      * @see NearestSpec for the limit-applies-after-the-predicate contract
      */
     List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec);
+
+    /** See {@link JavAIRepository#nearestSubgraph}. A {@code KnowledgeGraph} persists on Neo4j alone (OMI-212). */
+    default <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> nearestSubgraph(
+            Class<?> ownerType, UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " does not persist a KnowledgeGraph, "
+                + "so it cannot search one -- see doc/ai-guidance/persistence-support-matrix.md");
+    }
 
     /**
      * Rejects, at repository-creation time, a vector search this specific backend structurally cannot serve.

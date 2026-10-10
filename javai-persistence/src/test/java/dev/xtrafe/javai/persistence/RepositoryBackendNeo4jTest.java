@@ -43,7 +43,7 @@ class RepositoryBackendNeo4jTest {
     private static final String NEO4J_PASSWORD = "javai-test-password";
 
     @Container
-    static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:5.26-community"))
+    static final Neo4jContainer<?> neo4j = new Neo4jContainer<>(DockerImageName.parse("neo4j:2026.08.1-community"))
             .withAdminPassword(NEO4J_PASSWORD);
 
     private static JavAIPersistenceConfig config;
@@ -364,6 +364,40 @@ class RepositoryBackendNeo4jTest {
                 "the removed node's edges went with it");
     }
 
+    /**
+     * A record edge with a null component saves, reloads with it null, and is removed like any other: Neo4j refuses a
+     * null in a MERGE pattern, so a null component is no property at all. ⚠️ And it is its own edge beside one with
+     * more properties: an edge is matched on its whole property set, never a subset (omiai-fabric OMI-601 step 11).
+     */
+    @Test
+    void knowledgeGraphEdgeWithANullComponentPersists() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Null-edge owner");
+        TestGraphNode a = new TestGraphNode("null-edge A");
+        TestGraphNode b = new TestGraphNode("null-edge B");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("named"));
+        TestOwnerWithGraph loaded = graphOwnerRepository.findById(graphOwnerRepository.save(owner).getId())
+                .orElseThrow();
+        loaded.getGraph().addEdge(findByName(loaded.getGraph(), "null-edge A"),
+                findByName(loaded.getGraph(), "null-edge B"), new TestGraphEdge(null));
+        graphOwnerRepository.save(loaded);
+        graphOwnerRepository.save(graphOwnerRepository.findById(owner.getId()).orElseThrow());
+
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> reloaded = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+        assertEquals(java.util.Set.of(new TestGraphEdge(null), new TestGraphEdge("named")),
+                new java.util.HashSet<>(reloaded.edges(findByName(reloaded, "null-edge A"),
+                        findByName(reloaded, "null-edge B"))), "both, each once, saved three times");
+
+        TestOwnerWithGraph again = graphOwnerRepository.findById(owner.getId()).orElseThrow();
+        assertTrue(again.getGraph().removeEdge(findByName(again.getGraph(), "null-edge A"),
+                findByName(again.getGraph(), "null-edge B"), new TestGraphEdge(null)));
+        graphOwnerRepository.save(again);
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> last = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+        assertEquals(java.util.Set.of(new TestGraphEdge("named")), new java.util.HashSet<>(
+                last.edges(findByName(last, "null-edge A"), findByName(last, "null-edge B"))));
+    }
+
     /** OMI-612: a removed or re-pointed map entry, a removed collection element, and a nulled reference persist. */
     @Test
     void relationshipRemovalsPersist() {
@@ -532,6 +566,126 @@ class RepositoryBackendNeo4jTest {
                 "the 1-hop neighbor reached via the graph's own edge must be included in the subgraph");
         assertTrue(subgraph.nodes().stream().noneMatch(n -> n.getName().equals("championship game recap")),
                 "a node with no edge to the origin must not appear in a 1-hop subgraph");
+    }
+
+    // ---- the store's own nearest subgraph (omiai-fabric OMI-601 step 11) --------------------------------
+
+    /** The store answers as the hydrated graph does, from this owner's nodes alone. */
+    @Test
+    void storeSideNearestSubgraphAnswersAsTheGraphDoesFromThisOwnersNodesAlone() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Store-side owner");
+        TestGraphNode security = new TestGraphNode("store-side zero-day vulnerability disclosed");
+        TestGraphNode cooking = new TestGraphNode("store-side weeknight pasta recipes");
+        TestGraphNode sports = new TestGraphNode("store-side championship game recap");
+        owner.getGraph().addEdge(security, cooking, new TestGraphEdge("published same day"));
+        owner.getGraph().addNode(sports);
+        graphOwnerRepository.save(owner);
+        TestOwnerWithGraph other = new TestOwnerWithGraph("Store-side other owner");
+        other.getGraph().addNode(new TestGraphNode("store-side zero-day vulnerability disclosed"));
+        graphOwnerRepository.save(other);
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> graph = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+        var reference = findByName(graph, "store-side zero-day vulnerability disclosed").vector();
+
+        SubgraphResult<TestGraphNode, TestGraphEdge> stored =
+                graphOwnerRepository.nearestSubgraph(owner.getId(), "graph", reference, 1, 1);
+        SubgraphResult<TestGraphNode, TestGraphEdge> inMemory = graph.nearestSubgraph(reference, 1, 1);
+
+        assertEquals(names(inMemory), names(stored));
+        assertEquals(java.util.Set.of("store-side zero-day vulnerability disclosed", "store-side weeknight pasta recipes"),
+                names(stored), "the nearest node, and its neighbour; not the other owner's twin");
+        assertEquals(java.util.Set.of(new TestGraphEdge("published same day")), new java.util.HashSet<>(stored.edges(
+                findByName(stored, "store-side zero-day vulnerability disclosed"),
+                findByName(stored, "store-side weeknight pasta recipes"))));
+        assertEquals(1.0, stored.scoreOf(findByName(stored, "store-side zero-day vulnerability disclosed")), 1e-6);
+        assertEquals(3, graphOwnerRepository.nearestSubgraph(owner.getId(), "graph", reference, 5, 0).nodes().size(),
+                "k beyond the graph is the whole graph, and nothing of the other owner's");
+    }
+
+    /** The origins are chosen by a vector index that filters on the owner, not by reading the graph. */
+    @Test
+    void storeSideNearestSubgraphSearchesAVectorIndexFilteredByOwner() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Indexed owner");
+        owner.getGraph().addNode(new TestGraphNode("indexed node"));
+        graphOwnerRepository.save(owner);
+        var reference = findByName(graphOwnerRepository.findById(owner.getId()).orElseThrow().getGraph(),
+                "indexed node").vector();
+
+        graphOwnerRepository.nearestSubgraph(owner.getId(), "graph", reference, 1, 1);
+
+        try (org.neo4j.driver.Driver driver = org.neo4j.driver.GraphDatabase.driver(neo4j.getBoltUrl(),
+                org.neo4j.driver.AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+             org.neo4j.driver.Session session = driver.session()) {
+            List<String> filtered = session.run("SHOW VECTOR INDEXES YIELD labelsOrTypes, properties "
+                    + "WHERE labelsOrTypes = ['TestGraphNode'] RETURN properties").list(r -> r.get(0).asList(Value::asString))
+                    .stream().flatMap(List::stream).toList();
+            assertTrue(filtered.contains("javaiMember__TestOwnerWithGraph__GRAPH"), filtered.toString());
+        }
+    }
+
+    /** A node removed from the graph is no longer found. */
+    @Test
+    void storeSideNearestSubgraphNoLongerFindsARemovedNode() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Removing owner");
+        owner.getGraph().addNode(new TestGraphNode("removed from the store-side search"));
+        owner.getGraph().addNode(new TestGraphNode("kept in the store-side search"));
+        TestOwnerWithGraph loaded = graphOwnerRepository.findById(graphOwnerRepository.save(owner).getId()).orElseThrow();
+        TestGraphNode removed = findByName(loaded.getGraph(), "removed from the store-side search");
+        var reference = removed.vector();
+        loaded.getGraph().removeNode(removed);
+        graphOwnerRepository.save(loaded);
+
+        assertEquals(java.util.Set.of("kept in the store-side search"),
+                names(graphOwnerRepository.nearestSubgraph(owner.getId(), "graph", reference, 5, 1)));
+    }
+
+    /** A node belongs to one owner's graph per field: the index filters on a property that holds one owner. */
+    @Test
+    void aNodeInAnotherOwnersGraphIsRefused() {
+        TestGraphNode shared = new TestGraphNode("shared between owners");
+        TestOwnerWithGraph first = new TestOwnerWithGraph("First sharing owner");
+        first.getGraph().addNode(shared);
+        graphOwnerRepository.save(first);
+        TestOwnerWithGraph second = new TestOwnerWithGraph("Second sharing owner");
+        second.getGraph().addNode(shared);
+
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () -> graphOwnerRepository.save(second));
+
+        assertTrue(refused.getMessage().contains("one owner's graph"), refused.getMessage());
+    }
+
+    /** A graph saved before the membership property existed is found: the first search gives its members the property. */
+    @Test
+    void storeSideNearestSubgraphFindsAGraphSavedWithoutTheMembershipProperty() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Older owner");
+        owner.getGraph().addNode(new TestGraphNode("saved by an older JavAI"));
+        graphOwnerRepository.save(owner);
+        var reference = findByName(graphOwnerRepository.findById(owner.getId()).orElseThrow().getGraph(),
+                "saved by an older JavAI").vector();
+        try (org.neo4j.driver.Driver driver = org.neo4j.driver.GraphDatabase.driver(neo4j.getBoltUrl(),
+                org.neo4j.driver.AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+             org.neo4j.driver.Session session = driver.session()) {
+            session.run("MATCH (n:TestGraphNode) REMOVE n.javaiMember__TestOwnerWithGraph__GRAPH").consume();
+        }
+        JavAIPersistenceConfig fresh = JavAIPersistenceConfig.builder()
+                .backend(JavAIPersistenceConfig.Backend.NEO4J)
+                .neo4jUri(neo4j.getBoltUrl())
+                .neo4jUsername("neo4j")
+                .neo4jPassword(NEO4J_PASSWORD)
+                .build();
+        try {
+            JavAIPI.repository(TestGraphNodeRepository.class, fresh);
+            TestOwnerWithGraphRepository owners = JavAIPI.repository(TestOwnerWithGraphRepository.class, fresh);
+
+            assertEquals(java.util.Set.of("saved by an older JavAI"),
+                    names(owners.nearestSubgraph(owner.getId(), "graph", reference, 1, 0)));
+        } finally {
+            JavAIPI.release(fresh);
+        }
+    }
+
+    private static java.util.Set<String> names(KnowledgeGraph<TestGraphNode, TestGraphEdge> graph) {
+        return graph.nodes().stream().map(TestGraphNode::getName).collect(java.util.stream.Collectors.toSet());
     }
 
     // ---- ordinary (non-vector) derived finders, OMI-138 ----------------------------------------
