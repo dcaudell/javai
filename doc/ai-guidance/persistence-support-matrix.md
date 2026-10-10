@@ -109,7 +109,8 @@ hand-implemented.
 | Arbitrary geo polygons / `$near`-index / spatial indexes | ❌ | ❌ | ❌ | Only point-distance `Near`/`Within` is modeled. |
 
 > **Not repository queries** (so not in this table): the object-graph `query()` (Vector Core, in-memory) and
-> a `KnowledgeGraph`'s `nearestSubgraph(...)` — both operate on an in-memory object, not the store.
+> a `KnowledgeGraph`'s `nearestSubgraph(...)` — both operate on an in-memory object, not the store. The store's own
+> `JavAIRepository.nearestSubgraph(ownerId, field, …)` is Neo4j-only, from 2026.02 (`doc/spec/persistence-bridge.md`).
 
 ---
 
@@ -222,7 +223,8 @@ Notes:
 - **`KnowledgeGraph`** is a graph-native structure (multi-hop traversal + similarity in one query via
   `nearestSubgraph`). Persistence is **Neo4j-only** by design; Postgres and MongoDB reject a
   `KnowledgeGraph`-typed field with a clear message at registration. It is not reachable by a derived finder —
-  query it in memory after `findById` hydrates it.
+  query it in memory after `findById` hydrates it, or with the repository's `nearestSubgraph`, which reads only the
+  subgraph it answers (Neo4j 2026.02+).
 - **`P·N·M`** = Postgres · Neo4j · MongoDB.
 
 ---

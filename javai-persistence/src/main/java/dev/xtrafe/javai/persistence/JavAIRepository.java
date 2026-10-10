@@ -1,5 +1,8 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.JavAIEdge;
+import dev.xtrafe.javai.collections.JavAIGraphNode;
+import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import java.util.List;
@@ -219,4 +222,17 @@ public interface JavAIRepository<T> {
      *                                  vectoring, since nothing would ever be stored for this to search
      */
     NearestQuery<T> nearestByConcatenatedText();
+
+    /**
+     * {@link dev.xtrafe.javai.collections.KnowledgeGraph#nearestSubgraph} answered by the store, for one entity's
+     * {@code KnowledgeGraph} field: the {@code k} nodes nearest {@code reference} by their combined {@code vector()},
+     * chosen by the store's vector index, and everything within {@code hops} along their outgoing edges. Only that
+     * subgraph is read, never the whole graph. Neo4j only, from 2026.02 (omiai-fabric OMI-601 step 11).
+     *
+     * @param ownerId    the entity holding the graph
+     * @param graphField the {@code KnowledgeGraph} field's name as declared
+     * @throws UnsupportedOperationException on a backend that does not persist a {@code KnowledgeGraph}
+     */
+    <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> nearestSubgraph(
+            UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops);
 }

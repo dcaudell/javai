@@ -95,7 +95,16 @@ ResearchTopicRepository repo = JavAIPI.repository(ResearchTopicRepository.class,
 repo.save(topic);                                     // writes nodes + edges in one shot
 ResearchTopic reloaded = repo.findById(topic.getId()).orElseThrow();
 reloaded.graph.nearestSubgraph(reference, 1, 2);       // works on the rehydrated graph exactly like in-memory
+repo.nearestSubgraph(topic.getId(), "graph", reference, 1, 2); // the same answer, searched by the store
 ```
+
+**The store's own nearest subgraph** (omiai-fabric OMI-601 step 11). `repo.nearestSubgraph(ownerId, "graph",
+reference, k, hops)` answers what the hydrated graph's `nearestSubgraph` would, without reading the graph whole: a
+vector index on the node label's combined `vector__<model>` property, filtered inside the index to this owner's graph
+by the node property `javaiMember__<Owner>__<FIELD>`, chooses the `k` origins, and the same query reads their outgoing
+paths up to `hops`. It needs Neo4j 2026.02 or later (Cypher 25 `SEARCH … WHERE`). A node therefore belongs to one
+owner's graph per field, and saving it into a second is refused. Members saved before the property existed are given
+it by the first search.
 
 **This is Neo4j-only.** `RepositoryBackendNeo4j` maps a `KnowledgeGraph` field to two field-name-scoped
 relationship types — `<FIELD>_MEMBER` (owner → node, so an isolated node with no edges still round-trips)

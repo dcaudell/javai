@@ -4,6 +4,7 @@ import dev.xtrafe.javai.collections.JavAIEdge;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.collections.JavAIKnowledgeGraph;
 import dev.xtrafe.javai.collections.KnowledgeGraph;
+import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
@@ -18,6 +19,7 @@ import org.neo4j.driver.Session;
 import org.neo4j.driver.Value;
 import org.neo4j.driver.Values;
 import org.neo4j.driver.types.Node;
+import org.neo4j.driver.types.Path;
 import org.neo4j.driver.types.Relationship;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.geo.Point;
@@ -33,6 +35,7 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -374,6 +377,94 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     private record Scored(Node node, double score) {
+    }
+
+    /**
+     * The store's own nearest subgraph (OMI-601 step 11): the vector index chooses the {@code k} origins, filtered to this
+     * owner's graph inside the index by the membership property {@link #saveKnowledgeGraphField} keeps, and the same
+     * query reads everything within {@code hops} along their outgoing edges. Nothing else of the graph is read.
+     * ⚠️ Needs Cypher 25's {@code SEARCH … WHERE}: Neo4j 2026.02 or later.
+     */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> nearestSubgraph(
+            Class<?> ownerType, UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops) {
+        Field field = EntityReflection.findField(ownerType, graphField);
+        Class<?> nodeClass = genericTypeArgument(field, 0);
+        Class<?> edgeClass = genericTypeArgument(field, 1);
+        if (!KnowledgeGraph.class.isAssignableFrom(field.getType()) || nodeClass == null || edgeClass == null
+                || nodeClass.isInterface() || java.lang.reflect.Modifier.isAbstract(nodeClass.getModifiers())) {
+            throw new IllegalArgumentException(field + " must be declared KnowledgeGraph<NodeType, EdgeType> with a "
+                    + "concrete node type: the search reads one node label, and a node's label is its own class");
+        }
+        String nodeLabel = label(nodeClass);
+        String memberProperty = memberProperty(label(ownerType), graphField);
+        String vectorProperty = qualify("vector", reference.modelId());
+        if (k <= 0 || !anyNodeCarries(nodeLabel, vectorProperty)) {
+            return JavAIKnowledgeGraph.subgraphAround(List.of(), node -> Map.of(), reference, hops);
+        }
+        String indexName = ensureGraphVectorIndex(ownerType, graphField, nodeLabel, memberProperty, vectorProperty,
+                reference.dims());
+        String reach = hops <= 0 ? "" : "OPTIONAL MATCH p = (n)-[:`" + relationshipType(graphField) + "_EDGE`*1.."
+                + hops + "]->() WHERE all(x IN nodes(p) WHERE x.`" + memberProperty + "` = $ownerId) ";
+        try (Session session = driver().session()) {
+            List<Record> records = session.executeRead(tx -> tx.run(new Query("CYPHER 25 MATCH (n:`" + nodeLabel + "`) "
+                    + "SEARCH n IN (VECTOR INDEX `" + indexName + "` FOR $reference WHERE n.`" + memberProperty
+                    + "` = $ownerId LIMIT $k) SCORE AS score " + reach
+                    + "RETURN n, score, " + (hops <= 0 ? "[]" : "collect(p)") + " AS paths ORDER BY score DESC",
+                    Map.of("reference", reference.values(), "ownerId", ownerId.toString(), "k", k))).list());
+            Map<UUID, Object> hydrated = new HashMap<>();
+            List<N> origins = new ArrayList<>();
+            Map<N, Map<N, Set<E>>> outgoing = new LinkedHashMap<>();
+            for (Record record : records) {
+                origins.add((N) hydrateRelated(session, record.get("n").asNode(), hydrated));
+                for (Value value : record.get("paths").values()) {
+                    Path path = value.asPath();
+                    for (Path.Segment segment : path) {
+                        N from = (N) hydrateRelated(session, segment.start(), hydrated);
+                        N to = (N) hydrateRelated(session, segment.end(), hydrated);
+                        outgoing.computeIfAbsent(from, ignored -> new LinkedHashMap<>())
+                                .computeIfAbsent(to, ignored -> new LinkedHashSet<>())
+                                .add((E) hydrateEdge(edgeClass, segment.relationship()));
+                    }
+                }
+            }
+            return JavAIKnowledgeGraph.subgraphAround(origins, node -> outgoing.getOrDefault(node, Map.of()),
+                    reference, hops);
+        }
+    }
+
+    /** The node property naming the one owner whose graph field holds the node: what the vector index filters on. */
+    private static String memberProperty(String ownerLabel, String graphField) {
+        return "javaiMember__" + ownerLabel + "__" + relationshipType(graphField);
+    }
+
+    /**
+     * The graph field's vector index, filterable by its membership property, created on first use. First, members
+     * saved before the property existed are given it, so a graph written by an older JavAI is found.
+     */
+    private String ensureGraphVectorIndex(Class<?> ownerType, String graphField, String nodeLabel,
+                                          String memberProperty, String vectorProperty, int dims) {
+        String indexName = vectorIndexName(nodeLabel, vectorProperty) + "_" + memberProperty.toLowerCase(java.util.Locale.ROOT);
+        if (!vectorIndexesEnsured.add(indexName)) {
+            return indexName;
+        }
+        String ownerLabel = label(ownerType);
+        // ⚠️ Two transactions: Neo4j refuses a schema change after a write in the same one.
+        try (Session session = driver().session()) {
+            session.executeWrite(tx -> tx.run("MATCH (owner:`" + ownerLabel + "`)-[:`" + relationshipType(graphField)
+                    + "_MEMBER`]->(n:`" + nodeLabel + "`) WHERE n.`" + memberProperty + "` IS NULL SET n.`"
+                    + memberProperty + "` = owner.id").consume());
+            session.executeWrite(tx -> tx.run("CYPHER 25 CREATE VECTOR INDEX `" + indexName + "` IF NOT EXISTS FOR (n:`"
+                    + nodeLabel + "`) ON n.`" + vectorProperty + "` WITH [n.`" + memberProperty + "`] "
+                    + "OPTIONS {indexConfig: {`vector.dimensions`: $dims, `vector.similarity_function`: 'cosine'}}",
+                    Values.parameters("dims", dims)).consume());
+            awaitIndexOnline(session, indexName);
+        } catch (RuntimeException e) {
+            vectorIndexesEnsured.remove(indexName);
+            throw e;
+        }
+        return indexName;
     }
 
     /** Whether a single node of {@code label} carries {@code property} at all -- one indexed-free lookup
@@ -997,12 +1088,21 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             KnowledgeGraph<N, E> graph, Map<Object, UUID> alreadySaved) {
         String memberType = relationshipType(fieldName) + "_MEMBER";
         String edgeType = relationshipType(fieldName) + "_EDGE";
+        String memberProperty = memberProperty(ownerLabel, fieldName);
         for (N node : graph.nodes()) {
             saveNode(tx, node, alreadySaved);
             UUID nodeId = EntityReflection.readId(node);
             String nodeLabel = label(node.getClass());
+            // ⚠️ One owner per node and field: the store-side search filters its vector index on this property, and a
+            // property holds one value (nearestSubgraph).
+            if (tx.run(new Query("MATCH (other:`" + ownerLabel + "`)-[:`" + memberType + "`]->(n:`" + nodeLabel
+                            + "` {id: $nodeId}) WHERE other.id <> $ownerId RETURN other.id LIMIT 1",
+                    Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString()))).hasNext()) {
+                throw new IllegalStateException(nodeLabel + " " + nodeId + " is already in another " + ownerLabel
+                        + "'s " + fieldName + ": a node belongs to one owner's graph per field");
+            }
             tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId}), (n:`" + nodeLabel + "` {id: $nodeId}) "
-                            + "MERGE (owner)-[:`" + memberType + "`]->(n)",
+                            + "MERGE (owner)-[:`" + memberType + "`]->(n) SET n.`" + memberProperty + "` = $ownerId",
                     Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString())));
         }
         List<Map<String, Object>> edges = new ArrayList<>();
@@ -1021,7 +1121,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         }
         // ⚠️ What the graph no longer holds goes, edges first while a removed node is still a member, then the
         // membership itself. Without this a removed node or edge came back on the next read (OMI-612). A node
-        // leaving this graph keeps its own record: it may belong to another.
+        // leaving this graph keeps its own record, free to join another, and loses this graph's membership property.
         tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[:`" + memberType + "`]->(a)"
                         + "-[r:`" + edgeType + "`]->(b)<-[:`" + memberType + "`]-(owner) "
                         + "WHERE NOT {from: a.id, to: b.id, props: properties(r)} IN $edges DELETE r",
@@ -1031,37 +1131,30 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
             members.add(EntityReflection.readId(node).toString());
         }
         tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[m:`" + memberType + "`]->(n) "
-                        + "WHERE NOT n.id IN $members DELETE m",
+                        + "WHERE NOT n.id IN $members DELETE m REMOVE n.`" + memberProperty + "`",
                 Map.of("ownerId", ownerId.toString(), "members", members)));
     }
 
-    /** MERGEs on the edge's own reflected property values as part of the match pattern itself, not via a
-     *  bare-pattern MERGE followed by SET (contrast {@code TaggingBackendNeo4j}'s deliberate "zero or one
-     *  association" bare-pattern MERGE) -- this is what gives {@code Set}-like value-based dedup, matching
-     *  {@code KnowledgeGraph.edges(from, to)}'s {@code Set<E>} contract: two {@code addEdge} calls with
-     *  identical edge property values collapse into one relationship, two calls with different values create
-     *  two distinct relationships. */
+    /** Writes the edge unless one of exactly its property values already joins the two nodes (contrast {@code
+     *  TaggingBackendNeo4j}'s deliberate "zero or one association" bare-pattern MERGE) -- this is what gives {@code
+     *  Set}-like value-based dedup, matching {@code KnowledgeGraph.edges(from, to)}'s {@code Set<E>} contract: two
+     *  {@code addEdge} calls with identical edge property values collapse into one relationship, two calls with
+     *  different values create two distinct relationships. ⚠️ Matched on the whole property set, not by a MERGE
+     *  pattern: a pattern matches any relationship holding at least its properties, so an edge with fewer (a null
+     *  component is no property) was taken for one with more, and never written. */
     private void saveGraphEdge(SimpleQueryRunner tx, Object from, Object to, String edgeType, Object edge) {
         UUID fromId = EntityReflection.readId(from);
         UUID toId = EntityReflection.readId(to);
         String fromLabel = label(from.getClass());
         String toLabel = label(to.getClass());
-        Map<String, Object> properties = edgeProperties(edge);
         Map<String, Object> params = new HashMap<>();
         params.put("fromId", fromId.toString());
         params.put("toId", toId.toString());
-        StringBuilder pattern = new StringBuilder();
-        int i = 0;
-        for (Map.Entry<String, Object> entry : properties.entrySet()) {
-            pattern.append(i == 0 ? " {" : ", ").append('`').append(entry.getKey()).append("`: $p").append(i);
-            params.put("p" + i, entry.getValue());
-            i++;
-        }
-        if (i > 0) {
-            pattern.append('}');
-        }
+        params.put("props", edgeProperties(edge));
         tx.run(new Query("MATCH (a:`" + fromLabel + "` {id: $fromId}), (b:`" + toLabel + "` {id: $toId}) "
-                        + "MERGE (a)-[:`" + edgeType + "`" + pattern + "]->(b)", params));
+                        + "OPTIONAL MATCH (a)-[r:`" + edgeType + "`]->(b) WHERE properties(r) = $props "
+                        + "WITH a, b, count(r) AS held WHERE held = 0 "
+                        + "CREATE (a)-[:`" + edgeType + "` $props]->(b)", params));
     }
 
     /** An edge's simple-valued fields (or record components), converted for storage as relationship
@@ -1078,7 +1171,8 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
                     java.lang.reflect.Method accessor = component.getAccessor();
                     accessor.setAccessible(true);
                     Object value = accessor.invoke(edge);
-                    if (isSimpleValue(value)) {
+                    // ⚠️ A null is no property: Neo4j refuses one in a MERGE pattern, and hydration reads absence as null.
+                    if (value != null && isSimpleValue(value)) {
                         properties.put(component.getName(), toNeo4jValue(value));
                     }
                 } catch (ReflectiveOperationException e) {
@@ -1088,7 +1182,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         } else {
             for (Field field : EntityReflection.allFields(edgeType)) {
                 Object value = EntityReflection.readField(edge, field.getName());
-                if (isSimpleValue(value)) {
+                if (value != null && isSimpleValue(value)) {
                     properties.put(field.getName(), toNeo4jValue(value));
                 }
             }

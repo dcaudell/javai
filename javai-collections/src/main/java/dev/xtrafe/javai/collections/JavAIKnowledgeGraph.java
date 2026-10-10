@@ -21,6 +21,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
 
 /**
@@ -127,8 +128,19 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
         ranked.removeIf(node -> !(node instanceof JavAIVectorizable));
         ranked.sort(Comparator.comparingDouble((N node) -> CollectionVectorSupport.similarityOf(node, reference))
                 .reversed());
-        List<N> origins = ranked.subList(0, Math.min(k, ranked.size()));
+        return subgraphAround(ranked.subList(0, Math.min(k, ranked.size())),
+                node -> adjacency.getOrDefault(node, Map.of()), reference, hops);
+    }
 
+    /**
+     * The subgraph {@link #nearestSubgraph} answers, around origins already chosen: each origin and everything
+     * within {@code hops} along its outgoing edges. Public so a store that chose the origins from its own vector
+     * index answers exactly as an in-memory graph would (OMI-601 step 11).
+     *
+     * @param outgoing a node's outgoing edges, by target
+     */
+    public static <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> subgraphAround(
+            List<N> origins, Function<N, Map<N, Set<E>>> outgoing, EmbeddingVector reference, int hops) {
         Set<N> resultNodes = new LinkedHashSet<>();
         Map<N, Map<N, Set<E>>> resultAdjacency = new LinkedHashMap<>();
         Map<N, Map<N, Integer>> hopsByNodeThenOrigin = new LinkedHashMap<>();
@@ -146,7 +158,7 @@ public class JavAIKnowledgeGraph<N extends JavAIGraphNode, E extends JavAIEdge>
                 if (currentHop >= hops) {
                     continue;
                 }
-                for (Map.Entry<N, Set<E>> entry : adjacency.getOrDefault(current, Map.of()).entrySet()) {
+                for (Map.Entry<N, Set<E>> entry : outgoing.apply(current).entrySet()) {
                     N neighbor = entry.getKey();
                     resultNodes.add(neighbor);
                     resultAdjacency.computeIfAbsent(current, ignored -> new LinkedHashMap<>())

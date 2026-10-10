@@ -83,6 +83,9 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "nearestByConcatenatedText":
                 DerivedQueryMethods.requireConcatenationParticipant(entityType);
                 return newNearestQuery(DerivedQueryMethods.Kind.CONCATENATED_TEXT, null);
+            case "nearestSubgraph":
+                return backend.nearestSubgraph(entityType, (UUID) args[0], (String) args[1],
+                        (EmbeddingVector) args[2], (Integer) args[3], (Integer) args[4]);
             case "toString":
                 return "JavAIRepository<" + entityType.getSimpleName() + ">";
             case "hashCode":
