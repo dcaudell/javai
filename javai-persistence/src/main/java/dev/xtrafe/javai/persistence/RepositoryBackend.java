@@ -364,6 +364,23 @@ interface RepositoryBackend {
      */
     List<Ranked<Object>> findNearest(Class<?> entityType, NearestSpec spec);
 
+    /**
+     * Whether this backend has full-text search (OMI-642): {@link #findMatching}, and the text half of a hybrid
+     * {@link NearestSpec}. Postgres alone, today.
+     */
+    default boolean supportsFullText() {
+        return false;
+    }
+
+    /**
+     * A ranked full-text search of one {@code @FullText} field, narrowed before the limit (OMI-642). See
+     * {@link TextQuery}.
+     */
+    default List<Ranked<Object>> findMatching(Class<?> entityType, TextSpec spec) {
+        throw new UnsupportedOperationException(getClass().getSimpleName() + " has no full-text search (OMI-642) -- "
+                + "see doc/ai-guidance/persistence-support-matrix.md");
+    }
+
     /** See {@link JavAIRepository#nearestSubgraph}. A {@code KnowledgeGraph} persists on Neo4j alone (OMI-212). */
     default <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> nearestSubgraph(
             Class<?> ownerType, UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops) {

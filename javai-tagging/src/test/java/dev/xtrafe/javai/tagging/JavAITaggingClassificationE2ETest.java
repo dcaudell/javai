@@ -133,4 +133,45 @@ class JavAITaggingClassificationE2ETest {
         assertTrue(result.appliedTags().isEmpty());
         assertTrue(tagging.tagsOf(thing).isEmpty());
     }
+
+    // ---- the caller's prompt (OMI-640)
+
+    private static final String TEMPLATE = "Decide which tags fit.\nTags: %%candidates%%\nItem:\n%%object%%";
+
+    @Test
+    void classifyWithTheCallersPromptSendsOnlyThatPromptAndItsData() {
+        TagSet tagSet = tagSetRepository.save(new TagSet("priority5"));
+        Tag urgent = tagRepository.save(new Tag(tagSet, "en", "Urgent"));
+        tagRepository.save(new Tag(tagSet, "en", "Low Priority"));
+        TestClassifiableThing thing = thingRepository.save(
+                new TestClassifiableThing("Server is on fire, customers affected", "internal note, ignore"));
+
+        CORTEX.willRespond("[{\"slug\": \"urgent\", \"affinity\": 0.9, \"reasoning\": null}]");
+        ClassificationResult result = tagging.classify(thing, tagSet, TEMPLATE);
+
+        String sent = CORTEX.lastRequest.render();
+        assertTrue(sent.startsWith("Decide which tags fit."), sent);
+        assertTrue(sent.contains("urgent") && sent.contains("low-priority"), "the candidate slugs: " + sent);
+        assertTrue(sent.contains("Server is on fire"), "the marshalled object: " + sent);
+        assertFalse(sent.contains("internal note, ignore"), "a @TagIgnore'd field stays out: " + sent);
+        assertFalse(sent.contains("You are a tagging classifier"), "none of the library's own prompt: " + sent);
+        assertTrue(CORTEX.lastRequest.responseSchema() != null, "the shape travels as a schema, not as prose");
+
+        assertEquals(1, result.appliedTags().size());
+        assertTrue(tagging.hasTag(thing, urgent));
+    }
+
+    @Test
+    void classifyWithTheCallersPromptRefusesAReplyOfTheWrongShape() {
+        TagSet tagSet = tagSetRepository.save(new TagSet("priority6"));
+        tagRepository.save(new Tag(tagSet, "en", "Urgent"));
+        TestClassifiableThing thing = thingRepository.save(new TestClassifiableThing("Some issue", "note"));
+
+        CORTEX.willRespond("[{\"slug\": 7, \"affinity\": null, \"reasoning\": null}]");
+        dev.xtrafe.javai.completion.CompletionResponseException thrown = org.junit.jupiter.api.Assertions.assertThrows(
+                dev.xtrafe.javai.completion.CompletionResponseException.class,
+                () -> tagging.classify(thing, tagSet, TEMPLATE));
+        assertEquals(dev.xtrafe.javai.completion.CompletionResponseException.Reason.SCHEMA_VIOLATION, thrown.reason());
+        assertTrue(tagging.tagsOf(thing).isEmpty(), "nothing applied from a reply that did not read");
+    }
 }

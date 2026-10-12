@@ -309,6 +309,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     @Override
     public void deleteById(Class<?> entityType, UUID id) {
         collectionFor(entityType).deleteOne(Filters.eq("_id", id.toString()));
+        deleteFullText(entityType, List.of(id.toString()));
     }
 
     @Override
@@ -352,6 +353,26 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
      * rather than a subset chosen by whatever the index happened to declare.
      */
     private List<Ranked<Object>> findNearest(Class<?> entityType, String basePropertyName, NearestSpec spec) {
+        if (spec.alsoMatching() != null) {
+            return hybridNearest(entityType, basePropertyName, spec);
+        }
+        Map<UUID, Object> hydrated = new HashMap<>();
+        List<Ranked<Object>> results = new ArrayList<>();
+        int seen = 0;
+        for (Document doc : vectorDocs(entityType, basePropertyName, spec, spec.limitIncludingOffset())) {
+            if (seen++ < spec.offset()) {
+                continue; // ranking is total, so skipping its head is exact
+            }
+            // Atlas reports a cosine index's score rescaled into (0, 1] as (1 + cosine) / 2; Ranked speaks
+            // raw cosine, like the rest of JavAI, so undo the rescaling here where it is known.
+            double score = doc.get(SCORE_FIELD, Number.class).doubleValue();
+            results.add(new Ranked<>(hydrate(entityType, doc, hydrated), 2.0 * score - 1.0));
+        }
+        return results;
+    }
+
+    /** The {@code fetch} documents nearest the spec's reference, narrowed by its predicate, best first. */
+    private List<Document> vectorDocs(Class<?> entityType, String basePropertyName, NearestSpec spec, int fetch) {
         EmbeddingVector reference = spec.reference();
         String collectionName = collectionName(entityType);
         String qualifiedField = qualify(basePropertyName, reference.modelId());
@@ -371,7 +392,6 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
                 .append("index", indexName)
                 .append("path", qualifiedField)
                 .append("queryVector", toDoubleList(reference.values()));
-        int fetch = spec.limitIncludingOffset();
         if (spec.isNarrowed()) {
             Set<UUID> allowed = queryIds(entityType, buildFilter(entityType, spec.predicate()));
             if (allowed.isEmpty()) {
@@ -385,18 +405,208 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         List<Bson> pipeline = List.of(
                 new Document("$vectorSearch", search),
                 new Document("$addFields", new Document(SCORE_FIELD, new Document("$meta", "vectorSearchScore"))));
+        return collectionFor(entityType).aggregate(pipeline).into(new ArrayList<>());
+    }
 
+    // ---- full text (OMI-642): a javai_fulltext side collection --------------------------------
+
+    /**
+     * Where a {@code @FullText} field's text is kept for search: one document per (type, id, field) holding the text,
+     * its {@code $text} language, and its trigrams. A side collection, as Postgres' is a side table, rather than a
+     * text index on the entity's own collection: MongoDB allows one text index per collection and searches every field
+     * in it at once, so a per-field search needs the field to be the document. Kept on save and delete, and read
+     * synchronously -- unlike an Atlas Search index, nothing about it is eventually consistent, and it needs no
+     * {@code mongot}.
+     */
+    private static final String FULL_TEXT_COLLECTION = "javai_fulltext";
+
+    /** Below this trigram similarity a fuzzy candidate is not a match: {@code pg_trgm}'s own default. */
+    private static final double TRIGRAM_THRESHOLD = 0.3;
+
+    private volatile boolean fullTextIndexesEnsured;
+
+    private MongoCollection<Document> fullText() {
+        MongoCollection<Document> collection = mongoTemplate().getCollection(FULL_TEXT_COLLECTION);
+        if (!fullTextIndexesEnsured) {
+            collection.createIndex(Indexes.text("body"), new com.mongodb.client.model.IndexOptions()
+                    .name("javai_fulltext_text").defaultLanguage("none").languageOverride("language"));
+            collection.createIndex(Indexes.ascending("ownerType", "field", "ownerId"));
+            collection.createIndex(Indexes.ascending("trigrams"));
+            fullTextIndexesEnsured = true;
+        }
+        return collection;
+    }
+
+    /** MongoDB's name for a {@code @FullText} language: {@code simple} is its {@code none}; the rest are shared. */
+    private static String mongoLanguage(String language) {
+        return language.equals("simple") ? "none" : language;
+    }
+
+    private void syncFullText(Class<?> entityType, UUID id, Object entity) {
+        List<FullTextFields.Indexed> fields = FullTextFields.of(entityType);
+        for (FullTextFields.Indexed field : fields) {
+            String key = entityType.getName() + "|" + id + "|" + field.name();
+            Object body = EntityReflection.readField(entity, field.name());
+            if (body == null || body.toString().isBlank()) {
+                fullText().deleteOne(Filters.eq("_id", key));
+                continue;
+            }
+            Document doc = new Document("_id", key)
+                    .append("ownerType", entityType.getName())
+                    .append("ownerId", id.toString())
+                    .append("field", field.name())
+                    .append("language", mongoLanguage(field.language()))
+                    .append("body", body.toString())
+                    .append("trigrams", WebSearchQuery.trigrams(body.toString()));
+            fullText().replaceOne(Filters.eq("_id", key), doc, new com.mongodb.client.model.ReplaceOptions().upsert(true));
+        }
+    }
+
+    private void deleteFullText(Class<?> entityType, Collection<String> ids) {
+        if (!FullTextFields.of(entityType).isEmpty() && !ids.isEmpty()) {
+            fullText().deleteMany(Filters.and(Filters.eq("ownerType", entityType.getName()), Filters.in("ownerId", ids)));
+        }
+    }
+
+    @Override
+    public boolean supportsFullText() {
+        return true;
+    }
+
+    /**
+     * A ranked full-text search (OMI-642) over the {@code javai_fulltext} side collection: the predicate resolved to an
+     * id set first, by the same {@link #buildFilter} the derived finders use, so the limit counts only matches.
+     *
+     * <p>Terms: {@code $text} in the field's language, ranked by {@code textScore}. {@code $text} treats words as
+     * alternatives, so when the query has no {@code or} each required word is searched alone first and only documents
+     * holding all of them are ranked -- the same words-are-required reading Postgres gives. Fuzzy: trigram similarity
+     * of the whole value ({@code pg_trgm}'s {@code similarity}), at or above {@value #TRIGRAM_THRESHOLD}.
+     */
+    @Override
+    public List<Ranked<Object>> findMatching(Class<?> entityType, TextSpec spec) {
+        List<String> allowed = null;
+        if (spec.isNarrowed()) {
+            allowed = queryIds(entityType, buildFilter(entityType, spec.predicate())).stream().map(UUID::toString).toList();
+            if (allowed.isEmpty()) {
+                return List.of();
+            }
+        }
+        List<Document> hits = spec.fuzzy()
+                ? fuzzyDocs(entityType, spec.field(), spec.text(), allowed, spec.offset(), spec.limit())
+                : textDocs(entityType, spec.field(), spec.text(), allowed, spec.offset(), spec.limit());
+        Map<UUID, Object> hydrated = new HashMap<>();
+        List<Ranked<Object>> results = new ArrayList<>(hits.size());
+        for (Document hit : hits) {
+            Document doc = collectionFor(entityType).find(Filters.eq("_id", hit.getString("ownerId"))).first();
+            if (doc != null) {
+                results.add(new Ranked<>(hydrate(entityType, doc, hydrated), hit.get(SCORE_FIELD, Number.class).doubleValue()));
+            }
+        }
+        return results;
+    }
+
+    private List<Document> textDocs(Class<?> entityType, FullTextFields.Indexed field, String text,
+            List<String> allowed, int skip, int limit) {
+        WebSearchQuery query = WebSearchQuery.parse(text);
+        if (!query.hasPositive()) {
+            return List.of();
+        }
+        String language = mongoLanguage(field.language());
+        Bson scope = Filters.and(Filters.eq("ownerType", entityType.getName()), Filters.eq("field", field.name()));
+        Set<String> candidates = allowed == null ? null : new LinkedHashSet<>(allowed);
+        List<WebSearchQuery.Clause> required = query.clauses().stream()
+                .filter(clause -> !clause.excluded() && !clause.phrase()).toList();
+        if (!query.hasOr() && required.size() > 1) {
+            for (WebSearchQuery.Clause word : required) {
+                Set<String> holding = new LinkedHashSet<>();
+                Bson filter = Filters.and(scope, Filters.text(word.text(),
+                        new com.mongodb.client.model.TextSearchOptions().language(language)));
+                for (Document doc : fullText().find(filter).projection(new Document("ownerId", 1))) {
+                    holding.add(doc.getString("ownerId"));
+                }
+                if (candidates == null) {
+                    candidates = holding;
+                } else {
+                    candidates.retainAll(holding);
+                }
+                if (candidates.isEmpty()) {
+                    return List.of();
+                }
+            }
+        }
+        StringBuilder search = new StringBuilder();
+        for (WebSearchQuery.Clause clause : query.clauses()) {
+            search.append(' ').append(clause.excluded() ? "-" : "")
+                    .append(clause.phrase() ? "\"" + clause.text().replace("\"", "") + "\"" : clause.text());
+        }
+        List<Bson> filters = new ArrayList<>(List.of(scope, Filters.text(search.toString().strip(),
+                new com.mongodb.client.model.TextSearchOptions().language(language))));
+        if (candidates != null) {
+            filters.add(Filters.in("ownerId", candidates));
+        }
+        return fullText().find(Filters.and(filters))
+                .projection(new Document("ownerId", 1).append(SCORE_FIELD, new Document("$meta", "textScore")))
+                .sort(new Document(SCORE_FIELD, new Document("$meta", "textScore")).append("ownerId", 1))
+                .skip(skip).limit(limit).into(new ArrayList<>());
+    }
+
+    private List<Document> fuzzyDocs(Class<?> entityType, FullTextFields.Indexed field, String text,
+            List<String> allowed, int skip, int limit) {
+        List<String> grams = WebSearchQuery.trigrams(text);
+        if (grams.isEmpty()) {
+            return List.of();
+        }
+        Document match = new Document("ownerType", entityType.getName()).append("field", field.name())
+                .append("trigrams", new Document("$in", grams));
+        if (allowed != null) {
+            match.append("ownerId", new Document("$in", allowed));
+        }
+        Document similarity = new Document("$divide", List.of(
+                new Document("$size", new Document("$setIntersection", List.of("$trigrams", grams))),
+                new Document("$size", new Document("$setUnion", List.of("$trigrams", grams)))));
+        List<Bson> pipeline = List.of(
+                new Document("$match", match),
+                new Document("$addFields", new Document(SCORE_FIELD, similarity)),
+                new Document("$match", new Document(SCORE_FIELD, new Document("$gte", TRIGRAM_THRESHOLD))),
+                new Document("$sort", new Document(SCORE_FIELD, -1).append("ownerId", 1)),
+                new Document("$skip", skip),
+                new Document("$limit", limit));
+        return fullText().aggregate(pipeline).into(new ArrayList<>());
+    }
+
+    /**
+     * A hybrid search (OMI-642): the vector ranking (narrowed by {@code $vectorSearch}'s own pre-filter) and the term
+     * ranking (narrowed by the same id set), each drawn to a pool deeper than the page, fused by reciprocal rank.
+     */
+    private List<Ranked<Object>> hybridNearest(Class<?> entityType, String basePropertyName, NearestSpec spec) {
+        int pool = Math.max(50, Math.multiplyExact(4, spec.limitIncludingOffset()));
+        List<String> allowed = null;
+        if (spec.isNarrowed()) {
+            allowed = queryIds(entityType, buildFilter(entityType, spec.predicate())).stream().map(UUID::toString).toList();
+            if (allowed.isEmpty()) {
+                return List.of();
+            }
+        }
+        List<String> byVector = vectorDocs(entityType, basePropertyName, spec, pool).stream()
+                .map(doc -> doc.getString("_id")).toList();
+        List<String> byText = textDocs(entityType, spec.alsoMatching().field(), spec.alsoMatching().text(), allowed,
+                0, pool).stream().map(doc -> doc.getString("ownerId")).toList();
+        Map<String, Double> fused = new java.util.LinkedHashMap<>();
+        for (List<String> ranking : List.of(byVector, byText)) {
+            for (int i = 0; i < ranking.size(); i++) {
+                fused.merge(ranking.get(i), 1.0 / (60 + i + 1), Double::sum);
+            }
+        }
+        List<Map.Entry<String, Double>> ordered = new ArrayList<>(fused.entrySet());
+        ordered.sort(Map.Entry.<String, Double>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()));
         Map<UUID, Object> hydrated = new HashMap<>();
         List<Ranked<Object>> results = new ArrayList<>();
-        int seen = 0;
-        for (Document doc : collectionFor(entityType).aggregate(pipeline)) {
-            if (seen++ < spec.offset()) {
-                continue; // ranking is total, so skipping its head is exact
+        int to = Math.min(ordered.size(), spec.limitIncludingOffset());
+        for (int i = Math.min(spec.offset(), to); i < to; i++) {
+            Document doc = collectionFor(entityType).find(Filters.eq("_id", ordered.get(i).getKey())).first();
+            if (doc != null) {
+                results.add(new Ranked<>(hydrate(entityType, doc, hydrated), ordered.get(i).getValue()));
             }
-            // Atlas reports a cosine index's score rescaled into (0, 1] as (1 + cosine) / 2; Ranked speaks
-            // raw cosine, like the rest of JavAI, so undo the rescaling here where it is known.
-            double score = doc.get(SCORE_FIELD, Number.class).doubleValue();
-            results.add(new Ranked<>(hydrate(entityType, doc, hydrated), 2.0 * score - 1.0));
         }
         return results;
     }
@@ -669,7 +879,11 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
     public long deleteByDerivedQuery(Class<?> entityType, DerivedFinderQuery query, Object[] args) {
         // deleteMany, mirroring deleteById -- removes the matched documents but not the documents they
         // reference, the same documented Mongo non-cascade boundary.
-        return collectionFor(entityType).deleteMany(buildFilter(entityType, query.boundOrGroups(args))).getDeletedCount();
+        Bson filter = buildFilter(entityType, query.boundOrGroups(args));
+        if (!FullTextFields.of(entityType).isEmpty()) {
+            deleteFullText(entityType, queryIds(entityType, filter).stream().map(UUID::toString).toList());
+        }
+        return collectionFor(entityType).deleteMany(filter).getDeletedCount();
     }
 
     private Bson buildFilter(Class<?> entityType, List<List<DerivedFinderQuery.BoundPart>> orGroups) {
@@ -1013,6 +1227,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
         }
         collectionFor(entityType).updateOne(
                 Filters.eq("_id", id.toString()), Updates.combine(setOps), new UpdateOptions().upsert(true));
+        syncFullText(entityType, id, entity);
     }
 
     /** Builds the value to store for one reference field: recursively saves whatever it points to (so the

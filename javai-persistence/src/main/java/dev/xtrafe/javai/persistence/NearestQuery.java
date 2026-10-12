@@ -60,6 +60,7 @@ public final class NearestQuery<T> {
     private Integer limit;
     private int offset;
     private boolean spent;
+    private NearestSpec.AlsoMatching alsoMatching;
 
     NearestQuery(RepositoryBackend backend, Class<?> entityType, DerivedQueryMethods.Kind kind, String fieldName) {
         this.backend = backend;
@@ -150,6 +151,20 @@ public final class NearestQuery<T> {
     /** Maximum hits to return, applied <em>after</em> any narrowing. Required: an unbounded vector search
      *  over a whole store is never what a caller means, and defaulting to one silently would be worse than
      *  asking. */
+    /**
+     * Makes this a hybrid search (OMI-642): the vector ranking and a full-text ranking of the {@code @FullText} field
+     * {@code field} for {@code text}, each narrowed by the same predicate, fused by reciprocal rank -- an entity near
+     * the reference and matching the words outranks one that is only either. A hit's {@link Ranked#similarity()} is
+     * then its fused score, not a cosine. Refused by a backend with no full-text search.
+     */
+    public NearestQuery<T> alsoMatching(String field, String text) {
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("Nothing to match: the text is blank.");
+        }
+        this.alsoMatching = new NearestSpec.AlsoMatching(FullTextFields.require(entityType, field), text);
+        return this;
+    }
+
     public NearestQuery<T> limit(int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive, but was " + limit + ".");
@@ -199,6 +214,10 @@ public final class NearestQuery<T> {
     @SuppressWarnings("unchecked")
     public List<Ranked<T>> ranked() {
         NearestSpec spec = build();
+        if (spec.alsoMatching() != null && !backend.supportsFullText()) {
+            throw new UnsupportedOperationException(backend.getClass().getSimpleName() + " has no full-text search, "
+                    + "so it cannot run a hybrid search (OMI-642) -- see doc/ai-guidance/persistence-support-matrix.md");
+        }
         backend.validateNearestQuery(entityType, spec);
         return (List<Ranked<T>>) (List<?>) backend.findNearest(entityType, spec);
     }
@@ -223,7 +242,7 @@ public final class NearestQuery<T> {
             }
         }
         NearestSpec spec = new NearestSpec(kind, fieldName, reference, limit, offset,
-                List.copyOf(predicate), modelId);
+                List.copyOf(predicate), modelId, alsoMatching);
         // Checked here rather than in the backend so it fails on the builder that made the mistake, the
         // same discipline resolve(...) follows for a bad property name (OMI-458).
         spec.requireModelAgreement();

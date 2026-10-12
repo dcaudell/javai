@@ -65,6 +65,15 @@ public final class CortexReplicate implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
+        if (!request.tools().isEmpty()) {
+            throw new UnsupportedOperationException("replicate cannot offer a model tools; the request offers "
+                    + request.tools().size());
+        }
+        if (!request.images().isEmpty()) {
+            // ⚠️ Never answer without the images the request is about (OMI-639): this connector sends text only.
+            throw new UnsupportedOperationException("replicate sends no images; the request carries "
+                    + request.images().size());
+        }
         String promptText = request.render(contextWindowTokens());
 
         String responseBody = createPrediction(promptText, request);

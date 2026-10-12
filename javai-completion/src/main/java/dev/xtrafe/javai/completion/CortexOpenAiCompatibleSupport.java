@@ -60,15 +60,43 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
-        Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, null));
         ChatResponse response;
         try {
             response = RetrySupport.withRetry(baseUrl, () -> callChecked(prompt));
         } catch (TooManyRequestsException e) {
             throw new CompletionException(providerId + " rate-limited too many times", e);
         }
-        return new CompletionResult(response.getResult().getOutput().getText(), providerId, model, Instant.now());
+        return SpringAiPrompts.result(response, providerId, model);
     }
+
+    /** See {@link CortexAnthropic#complete(CompletionRequest, CompletionToolExecutor)}; the same, here (OMI-643). */
+    @Override
+    public CompletionResult complete(CompletionRequest request, CompletionToolExecutor executor) {
+        SpringAiTools tools = new SpringAiTools(request, executor);
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, tools));
+        try {
+            return tools.run(prompt, turn -> {
+                try {
+                    return RetrySupport.withRetry(baseUrl, () -> {
+                        try {
+                            return callChecked(turn);
+                        } catch (TooManyRequestsException e) {
+                            if (!tools.calls().isEmpty()) {
+                                throw new CompletionException("" + providerId + " rate-limited after tools ran; not retried", e);
+                            }
+                            throw e;
+                        }
+                    });
+                } catch (TooManyRequestsException e) {
+                    throw new CompletionException("" + providerId + " rate-limited too many times", e);
+                }
+            }, providerId, model);
+        } catch (RuntimeException e) {
+            throw SpringAiTools.unwrap(e);
+        }
+    }
+
 
     private ChatResponse callChecked(Prompt prompt) {
         try {
@@ -80,7 +108,7 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
 
     @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
-        Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, null));
         CortexStreaming.bridge(
                 CortexStreamingRetry.withRetry(baseUrl,
                         chatModel.stream(prompt).onErrorMap(RateLimitException.class,
@@ -113,7 +141,7 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
     /** {@code reasoning_effort} (a real OpenAI-family tuning parameter -- "low"/"medium"/"high") is the one
      *  {@code providerOptions} key read here; everything else maps onto {@link CompletionRequest}'s own
      *  typed fields (max tokens, temperature) that {@code OpenAiChatOptions} already exposes directly. */
-    private OpenAiChatOptions optionsFor(CompletionRequest request) {
+    private OpenAiChatOptions optionsFor(CompletionRequest request, SpringAiTools tools) {
         OpenAiChatOptions.Builder builder = OpenAiChatOptions.builder().model(model);
         if (request.maxTokens() != null) {
             builder.maxTokens(request.maxTokens());
@@ -126,6 +154,9 @@ final class CortexOpenAiCompatibleSupport implements Cortex {
         }
         if (request.responseSchema() != null) {
             builder.outputSchema(request.responseSchema()); // sent as a strict json_schema response_format
+        }
+        if (tools != null) {
+            builder.toolCallbacks(tools.callbacks());
         }
         return builder.build();
     }

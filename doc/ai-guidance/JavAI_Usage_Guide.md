@@ -544,6 +544,7 @@ association on top of it.
 | `boolean hasTag(Object instance, Tag tag)` | Structural presence check. |
 | `ClassificationResult classify(Object instance, TagSet tagSet)` | One LLM call via the constructor-supplied `Cortex`: marshals `instance`'s `@PromptContext` fields (minus any `@TagIgnore`'d ones), shows the model only `tagSet`'s candidate **slugs**, and diffs the result against `instance`'s existing `source = "auto"` taggings *for this `TagSet` specifically* — adds/updates/removes as needed, never touching `source = "manual"` taggings even for tags in the same set. Client-invoked only; never triggered automatically by a `TagSet` edit. |
 | `List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet)` | Convenience batch form — still one LLM call per instance internally, not a fan-out you hand-loop yourself. |
+| `classify(Object instance, TagSet tagSet, String promptTemplate)` / `classifyAll(..., String promptTemplate)` | The same, with **your** prompt instead of JavAI's (OMI-640): the template is rendered with `%%candidates%%` (the set's slugs) and `%%object%%` (the marshalled instance), and the reply's shape travels as a schema, so the template need not describe it. A reply of the wrong shape throws `CompletionResponseException`. |
 | `ClassificationResult applyClassification(Object instance, TagSet tagSet, List<AppliedTag> results)` | The same reconciliation as `classify`, for a classifier that **is not an LLM** — an image tagger, a rules engine, anything returning `(tag, confidence)` of its own. Needs no `Cortex`. ⚠️ A tag from another `TagSet` throws here, where `classify` silently discards a hallucinated slug: a model inventing a slug is expected noise, but a caller passing the wrong set creates an automatic tagging no later run could ever retract. |
 | `VectorIndex<TaggableRef> tagSimilarityIndex()` | See "Tag-similarity search" below. Narrowable to one type with `ofType(...)`. |
 | `JavAIList<TaggableRef> nearestByTagSimilarity(EmbeddingVector reference, int n, List<Class<? extends Taggable>> candidateTypes)` | The nearest `n` instances **of one of `candidateTypes`** by tag-summary vector — the type restriction goes into the store's query, applied before the top-`n` is chosen. Exactly `tagSimilarityIndex().ofType(candidateTypes).nearestN(reference, n)`. |
@@ -882,6 +883,16 @@ runtime, or the shape isn't worth a method.
   `1 - similarity` if you would rather think in distances.) `Ranked` is
   `dev.xtrafe.javai.vector.Ranked` — it moved out of `dev.xtrafe.javai.persistence` when
   `VectorIndex.nearestNRanked` needed the same type, so an older import needs updating and nothing else.
+
+### Full-text and hybrid search (OMI-642)
+
+Annotate a `String` field `@FullText` (optionally `language = "simple"`, `fuzzy = true`), then
+`repo.matching("field").query("words \"a phrase\" -excluded").where(...).limit(n).ranked()`, `.fuzzy()` for misspelled
+names, or `repo.nearestBy("field").to(vector).alsoMatching("field", "words")` to fuse vector and text rankings. The
+method-name form is `findMatchingBy<Field>(String query, int limit)` and `findSimilarBy<Field>(…)` (fuzzy), narrowable
+with `And<Predicate>` and pageable as `findNearestBy…Vector` is. All three backends; narrowing applies before the limit;
+a hit's `similarity()` is the store's own text (or fused) score, not a cosine. Neo4j's hybrid search is unnarrowed only.
+See `doc/spec/persistence-bridge.md` § Full-text and hybrid search.
 
 ## Counting, and paging from an arbitrary offset
 
@@ -1395,6 +1406,26 @@ Typed replies -- `responseType`/`responseOptional`/`responseListOf`/`responseSet
 `as`/`asList`/`asSet`/`completion()` on the result -- and exactly what each outcome is are in
 `javai-completion/README.md`'s "Typed responses". Use Gson's `@SerializedName`, not Jackson annotations, to
 rename a field.
+
+Since OMI-639–643:
+
+- **Images.** `CompletionRequest.Builder.image(byte[], mediaType)` / `image(URI, mediaType)` send images beside the
+  text, for models that read them. Anthropic and the OpenAI-compatible family take both; Ollama takes bytes only;
+  Replicate refuses images (it throws rather than answering without them). Images take no share of a
+  `PromptContext`'s budget.
+- **A typed value, or one repair.** `cortex.completeTyped(request, r -> r.as(Foo.class), repair)` returns the value or
+  makes one more call with the request your `CompletionRepair` writes from the failed result and its
+  `CompletionResponseException` (whose `reason()` is `NO_VALUE`, `MALFORMED` or `SCHEMA_VIOLATION`). A `null` repair
+  throws the first failure. JavAI writes no repair prompt of its own.
+- **Usage.** `CompletionResult.inputTokens()`/`outputTokens()`: the provider's counts, `null` where it reports none.
+- **Tools (OMI-643).** `.tool(new CompletionTool("roll", description, Roll.class))` on the request, then
+  `cortex.complete(request, call -> run(call.name(), call.arguments(Roll.class)))`. The loop stops at
+  `maxToolCalls` (default 8), or past `maxToolLoopTokens` of reported usage, with `CompletionToolLimitException`;
+  `result.toolCalls()` is the trace. Not Replicate.
+  JavAI writes no tool description: they are your prompt text.
+- **Batches.** `cortex.submitBatch(requests)` on `CortexAnthropic` (Message Batches) and `CortexOpenAI` (Batch API)
+  returns a `CompletionBatch`: `refresh()` until `ENDED`, then `results()`, one `Item` per request in submitted order.
+  Keep `id()` to find it again with `cortex.batch(id)`. Every other Cortex throws `UnsupportedOperationException`.
 
 ## Quick reference: where to look next
 

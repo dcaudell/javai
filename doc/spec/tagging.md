@@ -282,6 +282,15 @@ on the same instance completely untouched, even for tags in the same set. Confid
 from the model is optional in the response schema, consistent with tags being binary by default — a
 classifier is free to say "this applies" without a strength score.
 
+### The caller's prompt (OMI-640)
+
+`classify(instance, tagSet, promptTemplate)` sends the caller's template instead of the library's prompt, for an
+application whose every prompt string is its own. The template is rendered with `%%candidates%%` (the set's slugs,
+comma separated) and `%%object%%` (the marshalled instance); the reply's shape -- a JSON array of `{slug, affinity,
+reasoning}` -- travels as a schema (`responseListOf`), so the template need not describe it. What follows the model
+call is the same as for `classify(instance, tagSet)`, except that a reply of the wrong shape throws
+`CompletionResponseException` instead of being parsed leniently.
+
 ### A classifier that is not an LLM (OMI-290)
 
 `classify()` is one path to a classification; the reconciliation underneath it is the valuable part, and is

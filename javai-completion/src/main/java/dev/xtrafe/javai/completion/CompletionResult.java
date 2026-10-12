@@ -26,12 +26,20 @@ import java.util.Set;
  * <ul>
  *   <li>no JSON in the text, or a {@code null} value under {@code responseOptional} -- {@link Optional#empty()};</li>
  *   <li>JSON that will not parse, more than one JSON value, a value of the wrong shape, or a duplicate in a
- *       {@code Set} -- a {@link CompletionException} saying which.</li>
+ *       {@code Set} -- a {@link CompletionResponseException} saying which, and why ({@link
+ *       CompletionResponseException#reason()}).</li>
  * </ul>
  * A schema-bound reply arrives as {@code {"completion": ..., "response": ...}}; that envelope is unwrapped
  * here, so the same calls read it and a bare value alike.
+ *
+ * <p><b>Usage (OMI-641).</b> {@link #inputTokens()} and {@link #outputTokens()} are the provider's own counts for this
+ * completion, {@code null} where it reported none (Replicate).
+ *
+ * <p><b>Tool calls (OMI-643).</b> {@link #toolCalls()} are the calls the model made while it answered, in order, each
+ * with what its executor returned; empty for a request offering no tools.
  */
-public record CompletionResult(String text, String providerId, String modelId, Instant completedAt) {
+public record CompletionResult(String text, String providerId, String modelId, Instant completedAt,
+        Integer inputTokens, Integer outputTokens, List<CompletionToolCall> toolCalls) {
 
     private static final Gson GSON = new Gson();
 
@@ -48,6 +56,18 @@ public record CompletionResult(String text, String providerId, String modelId, I
         if (completedAt == null) {
             completedAt = Instant.now();
         }
+        toolCalls = toolCalls == null ? List.of() : List.copyOf(toolCalls);
+    }
+
+    /** A result that made no tool calls. */
+    public CompletionResult(String text, String providerId, String modelId, Instant completedAt,
+            Integer inputTokens, Integer outputTokens) {
+        this(text, providerId, modelId, completedAt, inputTokens, outputTokens, List.of());
+    }
+
+    /** A result whose provider reported no token usage. */
+    public CompletionResult(String text, String providerId, String modelId, Instant completedAt) {
+        this(text, providerId, modelId, completedAt, null, null, List.of());
     }
 
     /** The one JSON object in the text, as a {@code type}. See this record's javadoc for every outcome. */
@@ -68,7 +88,8 @@ public record CompletionResult(String text, String providerId, String modelId, I
         return elements(type).map(list -> {
             Set<T> set = new LinkedHashSet<>(list);
             if (set.size() != list.size()) {
-                throw new CompletionException("The response holds " + (list.size() - set.size())
+                throw new CompletionResponseException(CompletionResponseException.Reason.SCHEMA_VIOLATION,
+                        "The response holds " + (list.size() - set.size())
                         + " duplicate " + type.getSimpleName() + " value(s) where a Set was asked for");
             }
             return Collections.unmodifiableSet(set);
@@ -104,7 +125,8 @@ public record CompletionResult(String text, String providerId, String modelId, I
             return Optional.empty();
         }
         if (!(value.get() instanceof JsonArray array)) {
-            throw new CompletionException("The response should be an array of " + type.getSimpleName()
+            throw new CompletionResponseException(CompletionResponseException.Reason.SCHEMA_VIOLATION,
+                    "The response should be an array of " + type.getSimpleName()
                     + " but is " + value.get());
         }
         ResponseSchemas.validate(array, TypeToken.getParameterized(List.class, type).getType(), "response");
@@ -120,14 +142,16 @@ public record CompletionResult(String text, String providerId, String modelId, I
         List<ResponseJson.Span> spans = ResponseJson.find(text);
         for (ResponseJson.Span span : spans) {
             if (span.error() != null) {
-                throw new CompletionException("The response holds JSON that does not parse: " + span.error());
+                throw new CompletionResponseException(CompletionResponseException.Reason.MALFORMED,
+                        "The response holds JSON that does not parse: " + span.error());
             }
         }
         if (spans.isEmpty()) {
             return Optional.empty();
         }
         if (spans.size() > 1) {
-            throw new CompletionException("The response holds " + spans.size()
+            throw new CompletionResponseException(CompletionResponseException.Reason.MALFORMED,
+                    "The response holds " + spans.size()
                     + " separate JSON values where one was asked for");
         }
         JsonElement value = spans.get(0).value();

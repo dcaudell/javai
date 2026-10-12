@@ -273,8 +273,45 @@ public final class JavAITagRepository {
         List<Tag> candidates = tagSet.getTags();
         String prompt = buildClassificationPrompt(ClassifierContext.marshal(instance), candidates);
         CompletionResult result = cortex().complete(CompletionRequest.builder().prompt(prompt).build());
-        List<ParsedTag> parsed = parseClassificationResponse(result.text());
+        return applyParsed(instance, tagSet, parseClassificationResponse(result.text()));
+    }
 
+    /**
+     * {@link #classify(Object, TagSet)} with the caller's prompt instead of this library's (OMI-640), for an
+     * application whose every prompt string is its own. {@code promptTemplate} is rendered by
+     * {@link CompletionRequest} with two parameters: {@code %%candidates%%}, the TagSet's candidate slugs, comma
+     * separated, and {@code %%object%%}, the instance's marshalled {@code @PromptContext}. The request names the
+     * response's shape as a schema -- a JSON array of {@code {slug, affinity, reasoning}}, the last two possibly {@code null} --
+     * so a schema-capable {@link Cortex} returns exactly that, and no wording of it is needed in the template.
+     * Everything after the model call is {@link #classify(Object, TagSet)}'s.
+     *
+     * @throws dev.xtrafe.javai.completion.CompletionResponseException when the reply is not that array
+     */
+    public ClassificationResult classify(Object instance, TagSet tagSet, String promptTemplate) {
+        List<Tag> candidates = tagSet.getTags();
+        CompletionRequest request = CompletionRequest.builder()
+                .prompt(promptTemplate)
+                .promptParam("candidates", candidates.stream().map(Tag::getSlug).collect(Collectors.joining(", ")))
+                .promptParam("object", ClassifierContext.marshal(instance))
+                .responseListOf(ParsedTag.class)
+                .build();
+        CompletionResult result = cortex().complete(request);
+        List<ParsedTag> parsed = result.asList(ParsedTag.class).orElse(List.of());
+        return applyParsed(instance, tagSet, parsed);
+    }
+
+    /** {@link #classifyAll(Collection, TagSet)} with the caller's prompt; see {@link #classify(Object, TagSet, String)}. */
+    public List<ClassificationResult> classifyAll(Collection<?> instances, TagSet tagSet, String promptTemplate) {
+        List<ClassificationResult> results = new ArrayList<>(instances.size());
+        for (Object instance : instances) {
+            results.add(classify(instance, tagSet, promptTemplate));
+        }
+        return results;
+    }
+
+    /** What the model returned, matched to {@code tagSet}'s candidates, then applied. */
+    private ClassificationResult applyParsed(Object instance, TagSet tagSet, List<ParsedTag> parsed) {
+        List<Tag> candidates = tagSet.getTags();
         Map<String, Tag> candidatesBySlug = new HashMap<>();
         for (Tag candidate : candidates) {
             candidatesBySlug.put(candidate.getSlug(), candidate);

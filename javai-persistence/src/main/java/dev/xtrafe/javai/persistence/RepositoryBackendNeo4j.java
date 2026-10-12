@@ -348,22 +348,13 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         if (!anyNodeCarries(label, property)) {
             return List.of();
         }
-        ensureVectorIndex(label, property, reference.dims());
-        String indexName = vectorIndexName(label, property);
+        if (spec.alsoMatching() != null) {
+            return hybridNearest(entityType, label, property, spec);
+        }
         try (Session session = driver().session()) {
             // limit + offset, then drop the head: ranking is total, so skipping it is exact -- unlike
             // narrowing, paging needs nothing from the index that it does not already provide.
-            int fetch = spec.limitIncludingOffset();
-            List<Scored> scored = session.executeRead(tx -> {
-                var result = tx.run("CALL db.index.vector.queryNodes($indexName, $limit, $reference) "
-                                + "YIELD node, score RETURN node, score",
-                        Values.parameters("indexName", indexName, "limit", fetch, "reference", reference.values()));
-                List<Scored> found = new ArrayList<>();
-                for (Record record : result.list()) {
-                    found.add(new Scored(record.get("node").asNode(), record.get("score").asDouble()));
-                }
-                return found;
-            });
+            List<Scored> scored = vectorScored(session, label, property, reference, spec.limitIncludingOffset());
             Map<UUID, Object> hydrated = new HashMap<>();
             List<Ranked<Object>> results = new ArrayList<>();
             for (int i = spec.offset(); i < scored.size(); i++) {
@@ -378,6 +369,202 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
     }
 
     private record Scored(Node node, double score) {
+    }
+
+    /**
+     * The {@code fetch} nodes nearest {@code reference} by {@code property}'s vector index, best first.
+     *
+     * <p>⚠️ <b>The index is asked for more candidates than are returned</b>, as MongoDB's {@code numCandidates} is
+     * (OMI-642). Neo4j's HNSW search explores as wide as the {@code k} it is given, so a small {@code k} -- with
+     * quantization on, Neo4j's default -- can settle in the wrong neighbourhood: asked for the 3 nearest of eleven
+     * nodes, it returned the three <em>least</em> similar, while asked for 5 it returned the right ones. Asking for
+     * {@code max(10 × fetch, 100)} and keeping the best {@code fetch} costs one wider search.
+     */
+    private List<Scored> vectorScored(Session session, String label, String property, EmbeddingVector reference,
+            int fetch) {
+        ensureVectorIndex(label, property, reference.dims());
+        String indexName = vectorIndexName(label, property);
+        int candidates = Math.max(Math.multiplyExact(fetch, 10), 100);
+        return session.executeRead(tx -> {
+            var result = tx.run("CALL db.index.vector.queryNodes($indexName, $candidates, $reference) "
+                            + "YIELD node, score RETURN node, score ORDER BY score DESC LIMIT $limit",
+                    Values.parameters("indexName", indexName, "candidates", candidates, "limit", fetch,
+                            "reference", reference.values()));
+            List<Scored> found = new ArrayList<>();
+            for (Record record : result.list()) {
+                found.add(new Scored(record.get("node").asNode(), record.get("score").asDouble()));
+            }
+            return found;
+        });
+    }
+
+    // ---- full text (OMI-642): a native full-text index per (label, field) -------------------------
+
+    /** Full-text indexes already created and online, by name. */
+    private final Set<String> fullTextIndexesEnsured = ConcurrentHashMap.newKeySet();
+
+    @Override
+    public boolean supportsFullText() {
+        return true;
+    }
+
+    /**
+     * A ranked full-text search (OMI-642) through Neo4j's native (Lucene) full-text index. Unlike its vector index,
+     * {@code db.index.fulltext.queryNodes} yields every matching node, best first, so a predicate applied after the
+     * {@code YIELD} and before the {@code LIMIT} narrows honestly: the best N that also match means N.
+     *
+     * <p>The query is translated from {@link WebSearchQuery}: required words and phrases become {@code +} clauses,
+     * exclusions {@code -} clauses; fuzzy, each word becomes a Lucene fuzzy term ({@code word~}). A hit's score is
+     * Lucene's.
+     */
+    @Override
+    public List<Ranked<Object>> findMatching(Class<?> entityType, TextSpec spec) {
+        String label = label(entityType);
+        String lucene = spec.fuzzy() ? luceneFuzzy(spec.text()) : luceneQuery(WebSearchQuery.parse(spec.text()));
+        if (lucene == null) {
+            return List.of();
+        }
+        try (Session session = driver().session()) {
+            List<Scored> scored = textScored(session, entityType, label, spec.field(), lucene, spec.predicate(),
+                    spec.offset(), spec.limit());
+            Map<UUID, Object> hydrated = new HashMap<>();
+            List<Ranked<Object>> results = new ArrayList<>(scored.size());
+            for (Scored hit : scored) {
+                results.add(new Ranked<>(hydrate(session, entityType, hit.node(), hydrated), hit.score()));
+            }
+            return results;
+        }
+    }
+
+    private List<Scored> textScored(Session session, Class<?> entityType, String label, FullTextFields.Indexed field,
+            String lucene, List<List<DerivedFinderQuery.BoundPart>> predicate, int skip, int limit) {
+        String indexName = ensureFullTextIndex(session, label, field);
+        Cypher cypher = new Cypher(label, entityType);
+        String where = cypher.buildWhere(predicate);
+        Map<String, Object> params = new HashMap<>(cypher.params());
+        params.put("javaiIndex", indexName);
+        params.put("javaiQuery", lucene);
+        params.put("javaiSkip", skip);
+        params.put("javaiLimit", limit);
+        String query = "CALL db.index.fulltext.queryNodes($javaiIndex, $javaiQuery) YIELD node AS n, score"
+                + (where == null ? "" : " WHERE " + where)
+                + " RETURN n, score ORDER BY score DESC, n.id SKIP $javaiSkip LIMIT $javaiLimit";
+        return session.executeRead(tx -> {
+            List<Scored> found = new ArrayList<>();
+            for (Record record : tx.run(new Query(query, params)).list()) {
+                found.add(new Scored(record.get("n").asNode(), record.get("score").asDouble()));
+            }
+            return found;
+        });
+    }
+
+    /**
+     * The full-text index on {@code label}'s {@code field}, created on first use in the field's language and awaited
+     * online. Not eventually consistent: a committed write is searchable at once, as on Postgres.
+     */
+    private String ensureFullTextIndex(Session session, String label, FullTextFields.Indexed field) {
+        String indexName = ("javai_ft_" + label + "_" + field.name()).replaceAll("[^A-Za-z0-9_]", "_")
+                .toLowerCase(java.util.Locale.ROOT);
+        if (fullTextIndexesEnsured.contains(indexName)) {
+            return indexName;
+        }
+        String analyzer = analyzerFor(session, field.language());
+        session.executeWrite(tx -> {
+            tx.run("CREATE FULLTEXT INDEX `" + indexName + "` IF NOT EXISTS FOR (n:`" + label + "`) ON EACH [n.`"
+                    + field.name() + "`] OPTIONS {indexConfig: {`fulltext.analyzer`: '" + analyzer + "', "
+                    + "`fulltext.eventually_consistent`: false}}");
+            return null;
+        });
+        awaitIndexOnline(session, indexName);
+        fullTextIndexesEnsured.add(indexName);
+        return indexName;
+    }
+
+    /** The Lucene analyzer for a {@code @FullText} language: one Neo4j has by that name, else refused. */
+    private static String analyzerFor(Session session, String language) {
+        List<String> available = session.executeRead(tx -> {
+            List<String> names = new ArrayList<>();
+            for (Record record : tx.run("CALL db.index.fulltext.listAvailableAnalyzers() YIELD analyzer "
+                    + "RETURN analyzer").list()) {
+                names.add(record.get("analyzer").asString());
+            }
+            return names;
+        });
+        if (!available.contains(language)) {
+            throw new IllegalArgumentException("@FullText(language = \"" + language + "\") has no Neo4j analyzer of "
+                    + "that name -- available: " + available);
+        }
+        return language;
+    }
+
+    /** {@code query} as Lucene: required clauses {@code +}, excluded {@code -}; alternatives when it has {@code or}. */
+    static String luceneQuery(WebSearchQuery query) {
+        if (!query.hasPositive()) {
+            return null;
+        }
+        List<String> parts = new ArrayList<>();
+        for (WebSearchQuery.Clause clause : query.clauses()) {
+            String term = clause.phrase()
+                    ? "\"" + clause.text().replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+                    : luceneEscape(clause.text());
+            parts.add(clause.excluded() ? "-" + term : (query.hasOr() ? term : "+" + term));
+        }
+        return String.join(" ", parts);
+    }
+
+    /** Each word of {@code text} as a Lucene fuzzy term, any of them matching. */
+    static String luceneFuzzy(String text) {
+        List<String> words = WebSearchQuery.words(text);
+        if (words.isEmpty()) {
+            return null;
+        }
+        return String.join(" ", words.stream().map(word -> luceneEscape(word) + "~").toList());
+    }
+
+    private static String luceneEscape(String text) {
+        StringBuilder escaped = new StringBuilder(text.length());
+        for (char c : text.toCharArray()) {
+            if ("+-&|!(){}[]^\"~*?:\\/".indexOf(c) >= 0) {
+                escaped.append('\\');
+            }
+            escaped.append(c);
+        }
+        return escaped.toString();
+    }
+
+    /**
+     * A hybrid search (OMI-642): the vector ranking and the full-text ranking, each drawn to a pool deeper than the
+     * page, fused by reciprocal rank, then paged. Unnarrowed only: a narrowed vector search is refused here by
+     * {@link #validateNearestQuery}, for the reason given there.
+     */
+    private List<Ranked<Object>> hybridNearest(Class<?> entityType, String label, String property, NearestSpec spec) {
+        int pool = Math.max(50, Math.multiplyExact(4, spec.limitIncludingOffset()));
+        NearestSpec.AlsoMatching text = spec.alsoMatching();
+        String lucene = luceneQuery(WebSearchQuery.parse(text.text()));
+        try (Session session = driver().session()) {
+            List<Scored> byVector = vectorScored(session, label, property, spec.reference(), pool);
+            List<Scored> byText = lucene == null ? List.of()
+                    : textScored(session, entityType, label, text.field(), lucene, List.of(), 0, pool);
+            Map<String, Node> nodes = new LinkedHashMap<>();
+            Map<String, Double> fused = new LinkedHashMap<>();
+            for (List<Scored> ranking : List.of(byVector, byText)) {
+                for (int i = 0; i < ranking.size(); i++) {
+                    String id = ranking.get(i).node().get("id").asString();
+                    nodes.putIfAbsent(id, ranking.get(i).node());
+                    fused.merge(id, 1.0 / (60 + i + 1), Double::sum);
+                }
+            }
+            List<Map.Entry<String, Double>> ordered = new ArrayList<>(fused.entrySet());
+            ordered.sort(Map.Entry.<String, Double>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()));
+            Map<UUID, Object> hydrated = new HashMap<>();
+            List<Ranked<Object>> results = new ArrayList<>();
+            int to = Math.min(ordered.size(), spec.limitIncludingOffset());
+            for (int i = Math.min(spec.offset(), to); i < to; i++) {
+                Map.Entry<String, Double> hit = ordered.get(i);
+                results.add(new Ranked<>(hydrate(session, entityType, nodes.get(hit.getKey()), hydrated), hit.getValue()));
+            }
+            return results;
+        }
     }
 
     /**
