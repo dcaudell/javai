@@ -53,6 +53,7 @@ import java.util.List;
  * @param modelId    which embedding model's summary to rank against, stated by the caller rather than
  *                   inferred (OMI-458); {@code null} for every search that does not name one, which is
  *                   every search that existed before it and means exactly what it always did
+ * @param alsoMatching the full-text half of a hybrid search (OMI-642), or {@code null}
  */
 record NearestSpec(
         DerivedQueryMethods.Kind kind,
@@ -61,7 +62,21 @@ record NearestSpec(
         int limit,
         int offset,
         List<List<DerivedFinderQuery.BoundPart>> predicate,
-        String modelId) {
+        String modelId,
+        AlsoMatching alsoMatching) {
+
+    /**
+     * The full-text half of a hybrid search (OMI-642): the vector ranking and this text ranking, run with the same
+     * predicate, are fused by reciprocal rank. {@code null} for a vector search alone.
+     */
+    record AlsoMatching(FullTextFields.Indexed field, String text) {
+    }
+
+    /** A vector search alone -- every search before OMI-642. */
+    NearestSpec(DerivedQueryMethods.Kind kind, String fieldName, EmbeddingVector reference, int limit, int offset,
+            List<List<DerivedFinderQuery.BoundPart>> predicate, String modelId) {
+        this(kind, fieldName, reference, limit, offset, predicate, modelId, null);
+    }
 
     /**
      * The model this search ranks in -- <b>the reference's own</b>, unconditionally.

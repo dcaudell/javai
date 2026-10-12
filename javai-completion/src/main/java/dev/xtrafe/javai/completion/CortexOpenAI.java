@@ -15,9 +15,28 @@ public final class CortexOpenAI implements Cortex {
     private static final String DEFAULT_BASE_URL = "https://api.openai.com";
 
     private final Cortex delegate;
+    private final String baseUrl;
+    private final String apiKey;
 
     private CortexOpenAI(String baseUrl, String apiKey, String model, Integer contextWindowTokens) {
         this.delegate = new CortexOpenAiCompatibleSupport("openai", baseUrl, apiKey, model, contextWindowTokens);
+        this.baseUrl = baseUrl;
+        this.apiKey = apiKey;
+    }
+
+    /** Through OpenAI's Batch API (OMI-641); see {@link OpenAiBatches}. */
+    @Override
+    public CompletionBatch submitBatch(java.util.List<CompletionRequest> requests) {
+        return batches().submit(requests);
+    }
+
+    @Override
+    public CompletionBatch batch(String id) {
+        return batches().find(id);
+    }
+
+    private OpenAiBatches batches() {
+        return new OpenAiBatches(baseUrl, apiKey, delegate.modelId(), delegate.contextWindowTokens());
     }
 
     public static Builder builder() {
@@ -27,6 +46,11 @@ public final class CortexOpenAI implements Cortex {
     @Override
     public CompletionResult complete(CompletionRequest request) {
         return delegate.complete(request);
+    }
+
+    @Override
+    public CompletionResult complete(CompletionRequest request, CompletionToolExecutor executor) {
+        return delegate.complete(request, executor);
     }
 
     @Override

@@ -45,11 +45,13 @@ public final class CortexAnthropic implements Cortex {
     private final String baseUrl;
     private final Integer contextWindowTokensOverride;
     private final AnthropicChatModel chatModel;
+    private final String apiKey;
 
     private CortexAnthropic(String baseUrl, String apiKey, String model, Integer contextWindowTokensOverride) {
         this.model = model;
         this.baseUrl = baseUrl;
         this.contextWindowTokensOverride = contextWindowTokensOverride;
+        this.apiKey = apiKey;
         this.chatModel = AnthropicChatModel.builder()
                 .options(AnthropicChatOptions.builder()
                         .model(model)
@@ -68,14 +70,44 @@ public final class CortexAnthropic implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
-        Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, null));
         ChatResponse response;
         try {
             response = RetrySupport.withRetry(baseUrl, () -> callChecked(prompt));
         } catch (TooManyRequestsException e) {
             throw new CompletionException("anthropic rate-limited too many times", e);
         }
-        return new CompletionResult(response.getResult().getOutput().getText(), "anthropic", model, Instant.now());
+        return SpringAiPrompts.result(response, "anthropic", model);
+    }
+
+    /**
+     * Answers a request offering tools (OMI-643): Spring AI's chat model runs the loop, and {@code executor} each call.
+     * ⚠️ Not retried on a 429 once a tool has run: a retry would run the tools again.
+     */
+    @Override
+    public CompletionResult complete(CompletionRequest request, CompletionToolExecutor executor) {
+        SpringAiTools tools = new SpringAiTools(request, executor);
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, tools));
+        try {
+            return tools.run(prompt, turn -> {
+                try {
+                    return RetrySupport.withRetry(baseUrl, () -> {
+                        try {
+                            return callChecked(turn);
+                        } catch (TooManyRequestsException e) {
+                            if (!tools.calls().isEmpty()) {
+                                throw new CompletionException("anthropic rate-limited after tools ran; not retried", e);
+                            }
+                            throw e;
+                        }
+                    });
+                } catch (TooManyRequestsException e) {
+                    throw new CompletionException("anthropic rate-limited too many times", e);
+                }
+            }, "anthropic", model);
+        } catch (RuntimeException e) {
+            throw SpringAiTools.unwrap(e);
+        }
     }
 
     private ChatResponse callChecked(Prompt prompt) {
@@ -88,7 +120,7 @@ public final class CortexAnthropic implements Cortex {
 
     @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
-        Prompt prompt = new Prompt(request.render(contextWindowTokens()), optionsFor(request));
+        Prompt prompt = SpringAiPrompts.of(request, contextWindowTokens(), optionsFor(request, null));
         CortexStreaming.bridge(
                 CortexStreamingRetry.withRetry(baseUrl,
                         chatModel.stream(prompt).onErrorMap(RateLimitException.class, CortexAnthropic::toTooManyRequests)),
@@ -100,6 +132,21 @@ public final class CortexAnthropic implements Cortex {
         Duration retryAfter = RetryAfterParser.parse(
                 e.headers().values("retry-after").stream().findFirst().orElse(null));
         return new TooManyRequestsException("Rate limited: HTTP 429 from Anthropic", retryAfter);
+    }
+
+    /** Through Anthropic's Message Batches API (OMI-641); see {@link AnthropicBatches}. */
+    @Override
+    public CompletionBatch submitBatch(java.util.List<CompletionRequest> requests) {
+        return batches().submit(requests);
+    }
+
+    @Override
+    public CompletionBatch batch(String id) {
+        return batches().find(id);
+    }
+
+    private AnthropicBatches batches() {
+        return new AnthropicBatches(baseUrl, apiKey, model, contextWindowTokens());
     }
 
     @Override
@@ -117,7 +164,7 @@ public final class CortexAnthropic implements Cortex {
         return contextWindowTokensOverride != null ? contextWindowTokensOverride : ContextWindows.lookup(model);
     }
 
-    private AnthropicChatOptions optionsFor(CompletionRequest request) {
+    private AnthropicChatOptions optionsFor(CompletionRequest request, SpringAiTools tools) {
         AnthropicChatOptions.Builder builder = AnthropicChatOptions.builder()
                 .model(model)
                 .maxTokens(request.maxTokens() != null ? request.maxTokens() : AnthropicChatOptions.DEFAULT_MAX_TOKENS);
@@ -129,6 +176,9 @@ public final class CortexAnthropic implements Cortex {
         }
         if (request.responseSchema() != null) {
             builder.outputSchema(request.responseSchema()); // sent as output_config's json_schema format
+        }
+        if (tools != null) {
+            builder.toolCallbacks(tools.callbacks());
         }
         return builder.build();
     }

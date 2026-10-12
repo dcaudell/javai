@@ -565,6 +565,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 if (memberId != null) {
                     deleteVectors(session, member.getClass().getName(), memberId);
                     deleteGeoPoints(session, member.getClass().getName(), memberId);
+                    deleteFullText(session, member.getClass().getName(), memberId);
                 }
             }
         }
@@ -653,6 +654,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 // this backend, not Hibernate), so merge() never copies it onto the managed instance and its
                 // value lives only on the original. entity's id was already assigned above, so it matches.
                 syncGeoPoints(session, entity, new IdentityHashMap<>());
+                syncFullText(session, entity, new IdentityHashMap<>());
                 // Last, after every write above has been flushed: covers anything Hibernate persisted by
                 // cascading that the explicit walks never reach (a related entity two or more hops away).
                 // Flushed, not committed: when this call joined a caller's transaction (OMI-146) the commit
@@ -885,12 +887,14 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 }
                 deleteVectors(session, entityType.getName(), id);
                 deleteGeoPoints(session, entityType.getName(), id);
+                deleteFullText(session, entityType.getName(), id);
                 // Flush the removal so Hibernate reports everything it actually cascade-deleted, then clear
                 // those rows too -- catches entities removed at a depth the explicit walk above never sees.
                 session.flush();
                 for (JavAIFlushVectorListener.DeletedRef deleted : JavAIFlushVectorListener.current().deleted()) {
                     deleteVectors(session, deleted.ownerType(), deleted.id());
                     deleteGeoPoints(session, deleted.ownerType(), deleted.id());
+                    deleteFullText(session, deleted.ownerType(), deleted.id());
                 }
                 enqueueSummaries(session, containers);
                 return null;
@@ -929,6 +933,11 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         spec.requireModelAgreement();
         requireConcatenatedTextInConfiguredModel(spec);
         if (foldsInMemory(entityType, spec)) {
+            if (spec.alsoMatching() != null) {
+                throw new UnsupportedOperationException("A hybrid search needs an indexed vector, and "
+                        + entityType.getSimpleName() + "'s '" + spec.resolvedModelId() + "' summaries are folded in "
+                        + "memory -- declare @Summary(persistModelSummaries = true) to index them (OMI-642).");
+            }
             return foldedNearestBySummary(entityType, spec);
         }
         boolean entityGrain = spec.kind() == DerivedQueryMethods.Kind.SUMMARY
@@ -953,6 +962,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
         }
         List<UUID> allowed = allowedIds;
+        if (spec.alsoMatching() != null) {
+            return hybridNearest(entityType, spec, table, fieldName, vectorColumn, allowed);
+        }
         List<RankedId> ranked = inSession(session -> session.doReturningWork(connection ->
                 tableExistsCached(connection, table)
                         ? rankIds(connection, table, entityType, fieldName, reference,
@@ -965,6 +977,26 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                     ? List.of() : new ArrayList<>(ranked.subList(spec.offset(), ranked.size()));
         }
         return hydrateRanked(entityType, ranked);
+    }
+
+    /**
+     * A hybrid search (OMI-642): the vector ranking and the text ranking, each narrowed by the same id set and each
+     * drawn to a pool deeper than the page, fused by reciprocal rank, then paged. The pool is what lets a hit that
+     * ranks modestly in both still surface above one that ranks well in only one.
+     */
+    private List<Ranked<Object>> hybridNearest(Class<?> entityType, NearestSpec spec, String table, String fieldName,
+            String vectorColumn, List<UUID> allowed) {
+        int pool = Math.max(50, Math.multiplyExact(4, spec.limitIncludingOffset()));
+        NearestSpec.AlsoMatching text = spec.alsoMatching();
+        List<ScoredId> fused = inSession(session -> session.doReturningWork(connection -> {
+            List<RankedId> byVector = tableExistsCached(connection, table)
+                    ? rankIds(connection, table, entityType, fieldName, spec.reference(), pool, vectorColumn, allowed)
+                    : List.<RankedId>of();
+            List<ScoredId> byText = rankTextIds(connection, entityType, text.field(), text.text(), false, pool,
+                    allowed);
+            return fuseByReciprocalRank(byVector, byText);
+        }));
+        return hydrateScored(entityType, page(fused, spec.offset(), spec.limit()));
     }
 
     // ---- the unindexed half of a model-scoped summary search (OMI-458) --------------------------
@@ -1577,11 +1609,21 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
     private static void requireNoJavAIOwnedStorage(Class<?> entityType, DeclaredQuery query) {
         boolean vectorized = JavAIVectorizable.class.isAssignableFrom(entityType);
         boolean hasGeo = !pointFieldsOf(entityType).isEmpty();
-        if (vectorized || hasGeo) {
+        boolean hasFullText = !FullTextFields.of(entityType).isEmpty();
+        if (vectorized || hasGeo || hasFullText) {
+            List<String> kept = new ArrayList<>();
+            if (vectorized) {
+                kept.add("vectors");
+            }
+            if (hasGeo) {
+                kept.add("geo points");
+            }
+            if (hasFullText) {
+                kept.add("full text");
+            }
             throw new IllegalArgumentException("@Modifying @Query(nativeQuery = true) on " + query.method()
                     + " is refused because JavAI keeps storage of its own for " + entityType.getSimpleName()
-                    + " (" + (vectorized ? "vectors" : "") + (vectorized && hasGeo ? " and " : "")
-                    + (hasGeo ? "geo points" : "") + "), and a SQL statement gives nothing this module can "
+                    + " (" + String.join(" and ", kept) + "), and a SQL statement gives nothing this module can "
                     + "inspect to tell whether the write invalidates it. Write the statement in JPQL, where "
                     + "each assignment is checked against the fields JavAI derives from, or make the change "
                     + "through save(entity).");
@@ -1988,6 +2030,191 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                 return resultSet.next() ? new Point(resultSet.getDouble(1), resultSet.getDouble(2)) : null;
             }
         }
+    }
+
+    // ---- full text (OMI-642): out-of-band storage in javai_fulltext -------------------------------
+
+    /** Upserts (or clears) the {@code @FullText} fields of every reachable {@code @Entity} into
+     *  {@code javai_fulltext}, walking the same graph {@link #syncGeoPoints} does. The tsvector is computed by
+     *  Postgres in the field's own language, in the same statement. */
+    private void syncFullText(Session session, Object entity, Map<Object, Boolean> visited) {
+        if (entity == null || visited.put(entity, Boolean.TRUE) != null) {
+            return;
+        }
+        if (entity.getClass().isAnnotationPresent(Entity.class)) {
+            List<FullTextFields.Indexed> fields = FullTextFields.of(entity.getClass());
+            if (!fields.isEmpty()) {
+                UUID id = EntityReflection.readId(entity);
+                String ownerType = entity.getClass().getName();
+                for (FullTextFields.Indexed field : fields) {
+                    String body = (String) EntityReflection.readField(entity, field.name());
+                    session.doWork(connection -> upsertFullText(connection, ownerType, id, field, body));
+                }
+            }
+        }
+        for (Object related : reachableRelated(entity)) {
+            syncFullText(session, related, visited);
+        }
+    }
+
+    private static void upsertFullText(Connection connection, String ownerType, UUID id,
+            FullTextFields.Indexed field, String body) throws SQLException {
+        try (PreparedStatement statement = connection.prepareStatement("DELETE FROM javai_fulltext "
+                + "WHERE owner_type = ? AND owner_id = ? AND field_name = ?")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, id);
+            statement.setString(3, field.name());
+            statement.executeUpdate();
+        }
+        if (body == null || body.isBlank()) {
+            return; // nothing to match: no row, rather than a row that matches nothing
+        }
+        try (PreparedStatement statement = connection.prepareStatement("INSERT INTO javai_fulltext "
+                + "(owner_type, owner_id, field_name, language, body, tsv) "
+                + "VALUES (?, ?, ?, ?, ?, to_tsvector(?::regconfig, ?))")) {
+            statement.setString(1, ownerType);
+            statement.setObject(2, id);
+            statement.setString(3, field.name());
+            statement.setString(4, field.language());
+            statement.setString(5, body);
+            statement.setString(6, field.language());
+            statement.setString(7, body);
+            statement.executeUpdate();
+        }
+    }
+
+    private static void deleteFullText(Session session, String ownerType, UUID id) {
+        session.doWork(connection -> {
+            try (PreparedStatement statement = connection.prepareStatement(
+                    "DELETE FROM javai_fulltext WHERE owner_type = ? AND owner_id = ?")) {
+                statement.setString(1, ownerType);
+                statement.setObject(2, id);
+                statement.executeUpdate();
+            }
+        });
+    }
+
+    /** One hit as a ranking answers it, before the entity behind it is loaded: a text score or a fused score. */
+    private record ScoredId(UUID id, double score) {
+    }
+
+    @Override
+    public boolean supportsFullText() {
+        return true;
+    }
+
+    /**
+     * A ranked full-text search (OMI-642), narrowed before the limit exactly as {@link #findNearest} is: the predicate
+     * is resolved to an id set first, through the same Criteria machinery, so the limit sees only matching rows.
+     */
+    @Override
+    public List<Ranked<Object>> findMatching(Class<?> entityType, TextSpec spec) {
+        List<UUID> allowedIds = null;
+        if (spec.isNarrowed()) {
+            allowedIds = matchingIds(entityType, spec.predicate());
+            if (allowedIds.isEmpty()) {
+                return List.of();
+            }
+        }
+        List<UUID> allowed = allowedIds;
+        List<ScoredId> scored = inSession(session -> session.doReturningWork(connection ->
+                rankTextIds(connection, entityType, spec.field(), spec.text(), spec.fuzzy(),
+                        spec.limitIncludingOffset(), allowed)));
+        return hydrateScored(entityType, page(scored, spec.offset(), spec.limit()));
+    }
+
+    /**
+     * Ranks the owners of one {@code @FullText} field: by {@code ts_rank_cd} over {@code websearch_to_tsquery} in the
+     * field's language, or, {@code fuzzy}, by trigram {@code word_similarity} -- the query's best match anywhere in
+     * the text -- among rows above pg_trgm's threshold ({@code <%}), ties broken by the whole value's similarity.
+     * Then by id, so paging is stable.
+     */
+    private static List<ScoredId> rankTextIds(Connection connection, Class<?> entityType,
+            FullTextFields.Indexed field, String text, boolean fuzzy, int limit, List<UUID> allowedIds)
+            throws SQLException {
+        StringBuilder sql = new StringBuilder(fuzzy
+                ? "SELECT owner_id, word_similarity(?, body) AS javai_score FROM javai_fulltext "
+                        + "WHERE owner_type = ? AND field_name = ? AND ? <% body"
+                : "SELECT owner_id, ts_rank_cd(tsv, q) AS javai_score FROM javai_fulltext, "
+                        + "websearch_to_tsquery(?::regconfig, ?) AS q "
+                        + "WHERE owner_type = ? AND field_name = ? AND tsv @@ q");
+        if (allowedIds != null) {
+            sql.append(" AND owner_id = ANY(?)");
+        }
+        // Fuzzy, ties on the best-matching word are broken by the whole value's similarity, so "Glabrezu" outranks
+        // "Glabrezu Lord" for "Glabreuz": both hold the same best word, and only one is that word alone.
+        sql.append(fuzzy ? " ORDER BY javai_score DESC, similarity(?, body) DESC, owner_id LIMIT ?"
+                : " ORDER BY javai_score DESC, owner_id LIMIT ?");
+        try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
+            int index = 1;
+            if (fuzzy) {
+                statement.setString(index++, text);
+                statement.setString(index++, entityType.getName());
+                statement.setString(index++, field.name());
+                statement.setString(index++, text);
+            } else {
+                statement.setString(index++, field.language());
+                statement.setString(index++, text);
+                statement.setString(index++, entityType.getName());
+                statement.setString(index++, field.name());
+            }
+            if (allowedIds != null) {
+                statement.setArray(index++, connection.createArrayOf("uuid", allowedIds.toArray()));
+            }
+            if (fuzzy) {
+                statement.setString(index++, text);
+            }
+            statement.setInt(index, limit);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                List<ScoredId> scored = new ArrayList<>();
+                while (resultSet.next()) {
+                    scored.add(new ScoredId((UUID) resultSet.getObject("owner_id"), resultSet.getDouble("javai_score")));
+                }
+                return scored;
+            }
+        }
+    }
+
+    /** The reciprocal-rank constant: a hit's fused score is the sum, over the rankings it is in, of 1 / (K + rank). */
+    private static final int RECIPROCAL_RANK_K = 60;
+
+    /**
+     * Fuses a vector ranking and a text ranking by reciprocal rank (OMI-642): each ranking contributes
+     * {@code 1 / (K + rank)} for a hit it holds, rank counted from 1, so a hit near the reference and matching the
+     * words outranks one that is only either, without either score's scale mattering.
+     */
+    private static List<ScoredId> fuseByReciprocalRank(List<RankedId> byVector, List<ScoredId> byText) {
+        Map<UUID, Double> fused = new LinkedHashMap<>();
+        for (int i = 0; i < byVector.size(); i++) {
+            fused.merge(byVector.get(i).id(), 1.0 / (RECIPROCAL_RANK_K + i + 1), Double::sum);
+        }
+        for (int i = 0; i < byText.size(); i++) {
+            fused.merge(byText.get(i).id(), 1.0 / (RECIPROCAL_RANK_K + i + 1), Double::sum);
+        }
+        List<ScoredId> scored = new ArrayList<>(fused.size());
+        fused.forEach((id, score) -> scored.add(new ScoredId(id, score)));
+        scored.sort(Comparator.comparingDouble(ScoredId::score).reversed().thenComparing(ScoredId::id));
+        return scored;
+    }
+
+    private static <E> List<E> page(List<E> ranked, int offset, int limit) {
+        int from = Math.min(offset, ranked.size());
+        int to = Math.min(Math.addExact(from, limit), ranked.size());
+        return List.copyOf(ranked.subList(from, to));
+    }
+
+    /** {@link #hydrateRanked}'s counterpart for a score that is not a cosine distance: kept as the store gave it. */
+    private List<Ranked<Object>> hydrateScored(Class<?> entityType, List<ScoredId> scored) {
+        return inSession(session -> {
+            List<Ranked<Object>> results = new ArrayList<>(scored.size());
+            for (ScoredId hit : scored) {
+                Object entity = session.find(entityType, hit.id());
+                if (entity != null) {
+                    results.add(new Ranked<>(entity, hit.score()));
+                }
+            }
+            return results;
+        });
     }
 
     private static void deleteGeoPoints(Session session, String ownerType, UUID id) {
@@ -4468,7 +4695,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         }
     }
 
-    /** The pgvector extension, and the geo side table. The per-model vector tables are created lazily, on
+    /** The pgvector extension, and the geo and full-text side tables. The per-model vector tables are created lazily, on
      *  first write, because each needs its model's dimension known upfront; neither of these does. */
     private static void initializeSchema(SessionFactory factory) {
         try (Session session = factory.openSession()) {
@@ -4495,6 +4722,24 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                             """);
                     statement.execute("CREATE INDEX IF NOT EXISTS javai_geo_points_lookup "
                             + "ON javai_geo_points (owner_type, field_name)");
+                    // Full text (OMI-642): a @FullText field's text and its tsvector, kept beside the entity as
+                    // its vectors and geo points are, so an adopter's own schema gains no column. pg_trgm is a
+                    // trusted contrib extension (Postgres 13+), for @FullText(fuzzy = true).
+                    statement.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+                    statement.execute("""
+                            CREATE TABLE IF NOT EXISTS javai_fulltext (
+                                owner_type   varchar(255) NOT NULL,
+                                owner_id     uuid         NOT NULL,
+                                field_name   varchar(128) NOT NULL,
+                                language     varchar(63)  NOT NULL,
+                                body         text         NOT NULL,
+                                tsv          tsvector     NOT NULL,
+                                PRIMARY KEY (owner_type, owner_id, field_name)
+                            )
+                            """);
+                    statement.execute("CREATE INDEX IF NOT EXISTS javai_fulltext_tsv ON javai_fulltext USING gin (tsv)");
+                    statement.execute("CREATE INDEX IF NOT EXISTS javai_fulltext_trgm "
+                            + "ON javai_fulltext USING gin (body gin_trgm_ops)");
                 }
             });
         }

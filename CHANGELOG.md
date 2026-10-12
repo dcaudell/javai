@@ -14,6 +14,52 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **A Neo4j vector search returns the nearest nodes for a small limit (OMI-642).** `javai-persistence`. The index was
+  asked for exactly `limit + offset` nodes; Neo4j's HNSW search explores only as wide as that `k`, and with
+  quantization on (its default) a small `k` could settle in the wrong neighbourhood: asked for the 3 nearest of eleven
+  nodes it returned the three least similar. It is now asked for `max(10 × fetch, 100)` candidates and the best `fetch`
+  kept, as MongoDB's `numCandidates` already was. Found by the full-text contract's hybrid test, which fails without it.
+
+### Added
+
+- **Images on a completion (OMI-639).** `javai-completion`. `CompletionImage` (bytes or a URL, with an image media
+  type) and `CompletionRequest.Builder.image(...)`. `CortexAnthropic` and the OpenAI-compatible family send them as
+  image content through Spring AI; `CortexOllama` sends bytes base64 and refuses a URL; `CortexReplicate` refuses
+  images. Images are not text: `render()` ignores them and they take no `PromptContext` budget.
+- **A typed value with one repair (OMI-640).** `javai-completion`. `Cortex.completeTyped(request, reader, repair)`:
+  on a failure to read the typed value it makes one more call with the request the caller's `CompletionRepair`
+  writes, then throws. `CompletionResult.as`/`asList`/`asSet` now throw `CompletionResponseException` (a
+  `CompletionException`) carrying a `Reason`: `NO_VALUE`, `MALFORMED` or `SCHEMA_VIOLATION`.
+- **Classification with the caller's prompt (OMI-640).** `javai-tagging`. `JavAITagRepository.classify(instance,
+  tagSet, promptTemplate)` and the matching `classifyAll`: the template is rendered with `%%candidates%%` and
+  `%%object%%`, and the reply's shape is sent as a schema (`responseListOf`). The two-argument forms are unchanged.
+- **Token usage on every result (OMI-641).** `javai-completion`. `CompletionResult.inputTokens()`/`outputTokens()`
+  from Anthropic, the OpenAI-compatible family and Ollama; `null` from Replicate. The four-argument constructor
+  remains. Streaming completions report none.
+- **Full-text and hybrid search (OMI-642).** `javai-annotations` + `javai-persistence`, every backend. `@FullText`
+  (`language`, `fuzzy`) on a `String` field. `JavAIRepository.matching(field)` returns a `TextQuery`; the method-name
+  form is `findMatchingBy<Field>` / `findSimilarBy<Field>` (fuzzy), narrowable with `And<Predicate>` and pageable.
+  Narrowed before the limit and paged. `NearestQuery.alsoMatching(field, text)` fuses the vector and text rankings by
+  reciprocal rank (Neo4j: unnarrowed only). Postgres: a JavAI-owned `javai_fulltext` table (`tsvector` + `pg_trgm`,
+  created with the extension at schema initialization). Neo4j: a native full-text index per label and field. MongoDB: a
+  `javai_fulltext` collection with `$text` and trigrams. Each is kept on save and delete. A native `@Modifying` query on
+  a `@FullText` type is refused, and a JPQL update may not assign a `@FullText` field.
+- **Tool calling with a bounded loop (OMI-643).** `javai-completion`. `CompletionTool(name, description, inputType)`
+  on `CompletionRequest.Builder.tool(...)`, answered by `Cortex.complete(request, CompletionToolExecutor)`: each call
+  the model makes is run by the caller's executor and its result sent back, until the model answers or makes
+  `maxToolCalls` calls (default 8; `CompletionToolLimitException`). `CompletionResult.toolCalls()` lists every call;
+  `CompletionToolCall.arguments(Class)` reads its arguments, held to the type. Anthropic and the OpenAI-compatible
+  family run through Spring AI's `ToolCallingManager` (Spring AI 2.0's chat models do not loop on their own);
+  `maxToolLoopTokens` bounds the tokens a loop may spend, from reported usage;
+  `CortexOllama` runs its own loop; `CortexReplicate` refuses tools. Descriptions are the caller's. A request
+  offering tools passed to `complete(request)` is refused. Not retried on a 429 once a tool has run.
+- **Batch completions (OMI-641).** `javai-completion`. `Cortex.submitBatch(requests)` and `Cortex.batch(id)` return a
+  `CompletionBatch` (`status`, `refresh`, `cancel`, `results`) on `CortexAnthropic` (Message Batches) and `CortexOpenAI`
+  (Batch API); every other Cortex throws `UnsupportedOperationException`. Each batch item's body equals what `complete`
+  sends for the same request, held by a contract test.
+
+### Fixed
+
 - **A JavAI annotation inside an `@Embedded` value is refused at registration (OMI-623).** `javai-persistence`. The
   weaver, `JavAIRuntime` and this module read annotations off the entity's own class hierarchy only, so a `@Vectorize`,
   `@Summary` or `@Taggregate` inside an embedded value (or `@JavAIVectorizable`, `@Taggable`, `@ExternalVector` on an

@@ -25,6 +25,8 @@ final class FakeCortex implements Cortex {
 
     private final Deque<String> responses = new ArrayDeque<>();
     private String lastResponse = "[]";
+    /** The request the last {@link #complete} call was given -- what the classifier actually sent. */
+    volatile CompletionRequest lastRequest;
 
     void willRespond(String json) {
         responses.addLast(json);
@@ -33,10 +35,12 @@ final class FakeCortex implements Cortex {
     void reset() {
         responses.clear();
         lastResponse = "[]";
+        lastRequest = null;
     }
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
+        lastRequest = request;
         String text = responses.isEmpty() ? lastResponse : responses.removeFirst();
         lastResponse = text;
         return new CompletionResult(text, providerId(), modelId(), Instant.now());

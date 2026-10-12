@@ -25,6 +25,7 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     private final RepositoryBackend backend;
     private final Class<?> entityType;
     private final Map<Method, DerivedQueryMethods.ParsedQuery> parsedQueries = new ConcurrentHashMap<>();
+    private final Map<Method, TextQueryMethods.ParsedText> parsedTextQueries = new ConcurrentHashMap<>();
     private final Map<Method, DerivedFinderQuery> derivedFinders = new ConcurrentHashMap<>();
     private final Map<Method, DeclaredQuery> declaredQueries = new ConcurrentHashMap<>();
 
@@ -83,6 +84,8 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "nearestByConcatenatedText":
                 DerivedQueryMethods.requireConcatenationParticipant(entityType);
                 return newNearestQuery(DerivedQueryMethods.Kind.CONCATENATED_TEXT, null);
+            case "matching":
+                return new TextQuery<>(backend, entityType, FullTextFields.require(entityType, (String) args[0]));
             case "nearestSubgraph":
                 return backend.nearestSubgraph(entityType, (UUID) args[0], (String) args[1],
                         (EmbeddingVector) args[2], (Integer) args[3], (Integer) args[4]);
@@ -101,6 +104,19 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             DeclaredQuery declared =
                     declaredQueries.computeIfAbsent(method, m -> DeclaredQuery.parse(m, entityType));
             return declared.execute(backend, entityType, args);
+        }
+        if (TextQueryMethods.isTextQueryMethod(method)) {
+            TextQueryMethods.ParsedText parsed =
+                    parsedTextQueries.computeIfAbsent(method, m -> TextQueryMethods.parse(m, entityType));
+            List<Ranked<Object>> hits = backend.findMatching(entityType, TextQueryMethods.toSpec(parsed, args));
+            if (parsed.ranked()) {
+                return hits;
+            }
+            List<Object> entities = new ArrayList<>(hits.size());
+            for (Ranked<Object> hit : hits) {
+                entities.add(hit.entity());
+            }
+            return entities;
         }
         if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
             DerivedQueryMethods.ParsedQuery parsed =

@@ -32,6 +32,11 @@ public final class CortexVLlm implements Cortex {
     }
 
     @Override
+    public CompletionResult complete(CompletionRequest request, CompletionToolExecutor executor) {
+        return delegate.complete(request, executor);
+    }
+
+    @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
         delegate.completeStreaming(request, subscriber);
     }

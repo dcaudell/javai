@@ -218,7 +218,7 @@ final class DerivedQueryMethods {
     }
 
     /** Hands the narrowing tail to {@link PartTree} by re-spelling it as the {@code findBy…} it is. */
-    private static PartTree parsePredicateTail(Method method, Class<?> entityType, String tail) {
+    static PartTree parsePredicateTail(Method method, Class<?> entityType, String tail) {
         if (tail.isEmpty()) {
             return null;
         }
@@ -326,7 +326,7 @@ final class DerivedQueryMethods {
     }
 
     /** Whether the declared return type is {@code List<Ranked<…>>} rather than {@code List<T>}. */
-    private static boolean returnsRanked(Method method) {
+    static boolean returnsRanked(Method method) {
         if (method.getGenericReturnType() instanceof ParameterizedType listType) {
             Type[] arguments = listType.getActualTypeArguments();
             if (arguments.length == 1) {

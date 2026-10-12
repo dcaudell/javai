@@ -55,6 +55,9 @@ final class BulkWriteGuard {
         if (field.isAnnotationPresent(Vectorize.class)) {
             return "it is @Vectorize, so its embedding would keep the value it had before this write";
         }
+        if (field.isAnnotationPresent(dev.xtrafe.javai.annotations.FullText.class)) {
+            return "it is @FullText, so its full-text index would keep the text it had before this write";
+        }
         if (field.isAnnotationPresent(Summary.class)) {
             return "it is @Summary, so the summary vectors of the containers it moves this entity between "
                     + "would both be left wrong, with no recomputation queued";

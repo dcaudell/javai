@@ -224,6 +224,12 @@ public interface JavAIRepository<T> {
     NearestQuery<T> nearestByConcatenatedText();
 
     /**
+     * A ranked full-text search of the {@code @FullText} field {@code field} (OMI-642): narrowed, paged and ranked as
+     * {@link #nearestBy} is. See {@link TextQuery}. Postgres only; other backends refuse the terminal.
+     */
+    TextQuery<T> matching(String field);
+
+    /**
      * {@link dev.xtrafe.javai.collections.KnowledgeGraph#nearestSubgraph} answered by the store, for one entity's
      * {@code KnowledgeGraph} field: the {@code k} nodes nearest {@code reference} by their combined {@code vector()},
      * chosen by the store's vector index, and everything within {@code hops} along their outgoing edges. Only that

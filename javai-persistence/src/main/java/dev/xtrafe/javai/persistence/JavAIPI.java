@@ -117,6 +117,10 @@ public final class JavAIPI {
                 backend.validateDeclaredQuery(entityType, declared); // query text + store feasibility
                 continue;
             }
+            if (TextQueryMethods.isTextQueryMethod(method)) {
+                TextQueryMethods.parse(method, entityType); // full-text convention (OMI-642); throws if invalid
+                continue;
+            }
             if (DerivedQueryMethods.isDerivedQueryMethod(method)) {
                 DerivedQueryMethods.ParsedQuery parsed =
                         DerivedQueryMethods.parse(method, entityType); // vector convention; throws if invalid

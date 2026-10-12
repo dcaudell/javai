@@ -18,6 +18,7 @@ import reactor.core.publisher.Flux;
 
 import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -125,6 +126,7 @@ public final class CortexOllama implements Cortex {
 
     @Override
     public CompletionResult complete(CompletionRequest request) {
+        requireNoTools(request);
         OllamaApi.ChatResponse response;
         try {
             response = RetrySupport.withRetry(baseUrl, () -> ollamaApi.chat(chatRequest(request, false)));
@@ -132,11 +134,86 @@ public final class CortexOllama implements Cortex {
             throw new CompletionException("ollama rate-limited too many times", e);
         }
         String text = response.message() == null ? "" : response.message().content();
-        return new CompletionResult(text, "ollama", model, Instant.now());
+        return new CompletionResult(text, "ollama", model, Instant.now(), response.promptEvalCount(),
+                response.evalCount());
+    }
+
+    /**
+     * Answers a request offering tools (OMI-643): the loop is this connector's own, since it is built on the
+     * low-level {@code OllamaApi}. Each turn's tool calls are run by {@code executor} and sent back as tool messages,
+     * until the model answers without one. Usage is summed over the turns. ⚠️ Not retried on a 429 once a tool has run.
+     */
+    @Override
+    public CompletionResult complete(CompletionRequest request, CompletionToolExecutor executor) {
+        List<OllamaApi.Message> messages = new ArrayList<>(List.of(userMessage(request)));
+        List<OllamaApi.ChatRequest.Tool> tools = request.tools().stream()
+                .map(tool -> new OllamaApi.ChatRequest.Tool(new OllamaApi.ChatRequest.Tool.Function(tool.name(),
+                        tool.description(), tool.inputSchema())))
+                .toList();
+        List<CompletionToolCall> calls = new ArrayList<>();
+        int inputTokens = 0;
+        int outputTokens = 0;
+        while (true) {
+            OllamaApi.ChatRequest chatRequest = chatRequest(request, false, messages, tools);
+            OllamaApi.ChatResponse response;
+            try {
+                response = RetrySupport.withRetry(baseUrl, () -> {
+                    try {
+                        return ollamaApi.chat(chatRequest);
+                    } catch (TooManyRequestsException e) {
+                        if (!calls.isEmpty()) {
+                            throw new CompletionException("ollama rate-limited after tools ran; not retried", e);
+                        }
+                        throw e;
+                    }
+                });
+            } catch (TooManyRequestsException e) {
+                throw new CompletionException("ollama rate-limited too many times", e);
+            }
+            inputTokens += response.promptEvalCount() == null ? 0 : response.promptEvalCount();
+            outputTokens += response.evalCount() == null ? 0 : response.evalCount();
+            OllamaApi.Message reply = response.message();
+            if (reply == null || reply.toolCalls() == null || reply.toolCalls().isEmpty()) {
+                return new CompletionResult(reply == null ? "" : reply.content(), "ollama", model, Instant.now(),
+                        inputTokens, outputTokens, calls);
+            }
+            if (request.maxToolLoopTokens() != null && inputTokens + outputTokens > request.maxToolLoopTokens()) {
+                throw CompletionToolLimitException.tokens(request.maxToolLoopTokens(), inputTokens + outputTokens, calls);
+            }
+            messages.add(reply);
+            for (OllamaApi.Message.ToolCall toolCall : reply.toolCalls()) {
+                if (calls.size() >= request.toolCallLimit()) {
+                    throw new CompletionToolLimitException(request.toolCallLimit(), calls);
+                }
+                String name = toolCall.function().name();
+                String arguments = gson.toJson(toolCall.function().arguments());
+                long started = System.nanoTime();
+                String result;
+                try {
+                    result = executor.execute(new CompletionToolCall(name, arguments, null, null, 0));
+                } catch (RuntimeException e) {
+                    calls.add(new CompletionToolCall(name, arguments, null, String.valueOf(e.getMessage()),
+                            (System.nanoTime() - started) / 1_000_000));
+                    throw new CompletionException("Tool '" + name + "' failed: " + e.getMessage(), e);
+                }
+                calls.add(new CompletionToolCall(name, arguments, result, null,
+                        (System.nanoTime() - started) / 1_000_000));
+                messages.add(OllamaApi.Message.builder(OllamaApi.Message.Role.TOOL).content(result).toolName(name)
+                        .build());
+            }
+        }
+    }
+
+    private static void requireNoTools(CompletionRequest request) {
+        if (!request.tools().isEmpty()) {
+            throw new IllegalArgumentException("this request offers tools -- answer it with "
+                    + "complete(request, executor), which runs the calls the model makes");
+        }
     }
 
     @Override
     public void completeStreaming(CompletionRequest request, Flow.Subscriber<String> subscriber) {
+        requireNoTools(request);
         CortexStreaming.bridge(
                 CortexStreamingRetry.withRetry(baseUrl, streamChatResponses(chatRequest(request, true))),
                 subscriber,
@@ -176,7 +253,21 @@ public final class CortexOllama implements Cortex {
     }
 
     private OllamaApi.ChatRequest chatRequest(CompletionRequest request, boolean stream) {
+        return chatRequest(request, stream, List.of(userMessage(request)), List.of());
+    }
+
+    /** The user message: the rendered text, and any images, base64. */
+    private OllamaApi.Message userMessage(CompletionRequest request) {
         String promptText = request.render(contextWindowTokens());
+        OllamaApi.Message.Builder message = OllamaApi.Message.builder(OllamaApi.Message.Role.USER).content(promptText);
+        if (!request.images().isEmpty()) {
+            message.images(request.images().stream().map(CortexOllama::base64).toList());
+        }
+        return message.build();
+    }
+
+    private OllamaApi.ChatRequest chatRequest(CompletionRequest request, boolean stream,
+            List<OllamaApi.Message> messages, List<OllamaApi.ChatRequest.Tool> tools) {
 
         Map<String, Object> options = new LinkedHashMap<>(request.providerOptions());
         options.remove(ENABLE_THINKING_KEY);
@@ -187,11 +278,8 @@ public final class CortexOllama implements Cortex {
             options.put("num_predict", request.maxTokens());
         }
 
-        OllamaApi.Message userMessage = OllamaApi.Message.builder(OllamaApi.Message.Role.USER)
-                .content(promptText)
-                .build();
         OllamaApi.ChatRequest.Builder builder = OllamaApi.ChatRequest.builder(model)
-                .messages(List.of(userMessage))
+                .messages(messages)
                 .stream(stream)
                 .options(options);
         if (request.providerOptions().get(ENABLE_THINKING_KEY) instanceof Boolean enableThinking) {
@@ -202,7 +290,19 @@ public final class CortexOllama implements Cortex {
         if (request.responseSchema() != null) {
             builder.format(gson.fromJson(request.responseSchema(), Map.class)); // Ollama's structured outputs
         }
+        if (!tools.isEmpty()) {
+            builder.tools(tools);
+        }
         return builder.build();
+    }
+
+    /** Ollama takes an image only as its bytes, base64-encoded; it fetches no URL (OMI-639). */
+    private static String base64(CompletionImage image) {
+        if (image.url() != null) {
+            throw new IllegalArgumentException("ollama takes images as bytes, not URLs -- fetch " + image.url()
+                    + " and send its bytes");
+        }
+        return java.util.Base64.getEncoder().encodeToString(image.data());
     }
 
     public static final class Builder {

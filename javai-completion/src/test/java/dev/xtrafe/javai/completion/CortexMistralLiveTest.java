@@ -87,4 +87,69 @@ class CortexMistralLiveTest {
                 .build());
         assertTrue(none.as(Planet.class).isEmpty(), none.text());
     }
+
+    // ---- OMI-639, OMI-641, OMI-643 against the real endpoint
+
+    /** A blue disc on white, drawn here, so the test needs no image from anywhere and the answer is known. */
+    private static byte[] blueCircle() throws java.io.IOException {
+        java.awt.image.BufferedImage image = new java.awt.image.BufferedImage(256, 256,
+                java.awt.image.BufferedImage.TYPE_INT_RGB);
+        java.awt.Graphics2D g = image.createGraphics();
+        g.setColor(java.awt.Color.WHITE);
+        g.fillRect(0, 0, 256, 256);
+        g.setColor(java.awt.Color.BLUE);
+        g.fillOval(48, 48, 160, 160);
+        g.dispose();
+        java.io.ByteArrayOutputStream png = new java.io.ByteArrayOutputStream();
+        javax.imageio.ImageIO.write(image, "png", png);
+        return png.toByteArray();
+    }
+
+    record Figure(String color, String shape) {
+    }
+
+    @Test
+    void aModelThatReadsImagesSeesTheImageSent() throws java.io.IOException {
+        Figure figure = cortex.complete(CompletionRequest.builder()
+                        .prompt("Describe the single figure in this image: its color and its shape, one word each, "
+                                + "lower case.")
+                        .image(blueCircle(), "image/png")
+                        .responseType(Figure.class)
+                        .temperature(0.0)
+                        .build())
+                .as(Figure.class).orElseThrow();
+        assertEquals("blue", figure.color());
+        assertTrue(figure.shape().contains("circle") || figure.shape().contains("disc")
+                || figure.shape().contains("disk") || figure.shape().contains("oval"), figure.shape());
+    }
+
+    @Test
+    void usageIsReported() {
+        CompletionResult result = cortex.complete(CompletionRequest.builder()
+                .prompt("Reply with exactly the single word: acknowledged").maxTokens(20).temperature(0.0).build());
+        assertTrue(result.inputTokens() != null && result.inputTokens() > 0, String.valueOf(result.inputTokens()));
+        assertTrue(result.outputTokens() != null && result.outputTokens() > 0, String.valueOf(result.outputTokens()));
+    }
+
+    record Roll(String dice) {
+    }
+
+    @Test
+    void aRealModelCallsTheToolAndAnswersWithItsResult() {
+        List<String> asked = new ArrayList<>();
+        CompletionResult result = cortex.complete(CompletionRequest.builder()
+                        .prompt("Roll 1d20 for my initiative using the roll tool, then tell me the number rolled.")
+                        .tool(new CompletionTool("roll", "Rolls dice written in NdM+K notation and returns the total.",
+                                Roll.class))
+                        .maxToolCalls(3)
+                        .temperature(0.0)
+                        .build(),
+                call -> {
+                    asked.add(call.arguments(Roll.class).dice());
+                    return "17";
+                });
+        assertEquals(1, result.toolCalls().size(), result.toolCalls().toString());
+        assertTrue(asked.get(0).toLowerCase().contains("d20"), asked.toString());
+        assertTrue(result.text().contains("17"), result.text());
+    }
 }

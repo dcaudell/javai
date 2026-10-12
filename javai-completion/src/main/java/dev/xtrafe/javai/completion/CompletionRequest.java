@@ -64,6 +64,14 @@ import java.util.Map;
  * {@link Builder#responseSetOf}, or {@code null} when none was. Every Cortex whose provider can constrain
  * its output to a schema sends it -- all but {@link CortexReplicate}, which sends the prompt alone -- and
  * {@link CompletionResult#as} and its siblings read the result back.
+ *
+ * <p><b>{@link #images()}</b> (OMI-639) are sent beside the rendered text, in order, as image content. They are not
+ * text: {@link #render()} ignores them and they take no share of a {@code PromptContext}'s budget. A {@link Cortex}
+ * that cannot send them throws rather than answering without them.
+ *
+ * <p><b>{@link #tools()}</b> (OMI-643) are offered to the model, which may call them while it answers, up to
+ * {@link #toolCallLimit()} times. A request with tools is answered by
+ * {@link Cortex#complete(CompletionRequest, CompletionToolExecutor)}, whose executor runs each call.
  */
 public record CompletionRequest(
         List<String> prompt,
@@ -72,7 +80,14 @@ public record CompletionRequest(
         Integer maxTokens,
         Double temperature,
         Map<String, Object> providerOptions,
-        String responseSchema) {
+        String responseSchema,
+        List<CompletionImage> images,
+        List<CompletionTool> tools,
+        Integer maxToolCalls,
+        Integer maxToolLoopTokens) {
+
+    /** How many tool calls a completion may make when its request sets no {@link #maxToolCalls()} (OMI-643). */
+    public static final int DEFAULT_MAX_TOOL_CALLS = 8;
 
     private static final String DELIMITER = TemplateLiteral.DELIMITER;
     private static final Handlebars HANDLEBARS = new Handlebars()
@@ -92,6 +107,34 @@ public record CompletionRequest(
         providerOptions = providerOptions == null
                 ? Map.of()
                 : Map.copyOf(providerOptions);
+        images = images == null ? List.of() : List.copyOf(images);
+        tools = tools == null ? List.of() : List.copyOf(tools);
+        if (maxToolCalls != null && maxToolCalls < 1) {
+            throw new IllegalArgumentException("maxToolCalls must be at least 1 -- got " + maxToolCalls);
+        }
+        if (maxToolLoopTokens != null && maxToolLoopTokens < 1) {
+            throw new IllegalArgumentException("maxToolLoopTokens must be at least 1 -- got " + maxToolLoopTokens);
+        }
+    }
+
+    /** The shape before OMI-643 added {@link #tools()}: a request offering the model no tools. */
+    public CompletionRequest(List<String> prompt, PromptContext context, Map<String, Object> promptParams,
+            Integer maxTokens, Double temperature, Map<String, Object> providerOptions, String responseSchema,
+            List<CompletionImage> images) {
+        this(prompt, context, promptParams, maxTokens, temperature, providerOptions, responseSchema, images,
+                List.of(), null, null);
+    }
+
+    /** How many tool calls this completion may make: {@link #maxToolCalls()}, or {@link #DEFAULT_MAX_TOOL_CALLS}. */
+    public int toolCallLimit() {
+        return maxToolCalls != null ? maxToolCalls : DEFAULT_MAX_TOOL_CALLS;
+    }
+
+    /** The shape before OMI-639 added {@link #images()}: a request of text alone. */
+    public CompletionRequest(List<String> prompt, PromptContext context, Map<String, Object> promptParams,
+            Integer maxTokens, Double temperature, Map<String, Object> providerOptions, String responseSchema) {
+        this(prompt, context, promptParams, maxTokens, temperature, providerOptions, responseSchema, List.of(),
+                List.of(), null, null);
     }
 
     /** The shape before OMI-68 added {@link #responseSchema()}: a request with no typed response. */
@@ -137,7 +180,7 @@ public record CompletionRequest(
             return render();
         }
         return new CompletionRequest(prompt, sizedContext(contextWindowTokens), promptParams, maxTokens,
-                temperature, providerOptions, responseSchema)
+                temperature, providerOptions, responseSchema, images, tools, maxToolCalls, maxToolLoopTokens)
                 .render();
     }
 
@@ -175,6 +218,10 @@ public record CompletionRequest(
         private ResponseSchemas.Kind responseKind;
         private Class<?> responseType;
         private boolean withCompletion;
+        private final List<CompletionImage> images = new ArrayList<>();
+        private final List<CompletionTool> tools = new ArrayList<>();
+        private Integer maxToolCalls;
+        private Integer maxToolLoopTokens;
 
         private Builder() {
         }
@@ -229,6 +276,47 @@ public record CompletionRequest(
             return this;
         }
 
+        /** Sends an image with the request (OMI-639): read by a model that reads images, refused by a {@link Cortex}
+         *  that cannot send one. Call repeatedly for several, in order. */
+        public Builder image(CompletionImage image) {
+            this.images.add(java.util.Objects.requireNonNull(image, "image"));
+            return this;
+        }
+
+        /** Sends an image as its bytes; see {@link #image(CompletionImage)}. */
+        public Builder image(byte[] data, String mediaType) {
+            return image(CompletionImage.of(data, mediaType));
+        }
+
+        /** Sends an image the provider fetches from {@code url}; see {@link #image(CompletionImage)}. */
+        public Builder image(java.net.URI url, String mediaType) {
+            return image(CompletionImage.of(url, mediaType));
+        }
+
+        /** Offers the model a tool it may call while it answers (OMI-643); answer such a request through
+         *  {@link Cortex#complete(CompletionRequest, CompletionToolExecutor)}. */
+        public Builder tool(CompletionTool tool) {
+            this.tools.add(java.util.Objects.requireNonNull(tool, "tool"));
+            return this;
+        }
+
+        /** The most tool calls the completion may make before it is stopped; {@link #DEFAULT_MAX_TOOL_CALLS} unset. */
+        public Builder maxToolCalls(int maxToolCalls) {
+            this.maxToolCalls = maxToolCalls;
+            return this;
+        }
+
+        /**
+         * The most tokens -- input and output, summed over every turn of the tool loop, as the provider reports them --
+         * the completion may spend before it is stopped with {@link CompletionToolLimitException} (OMI-643). Each turn
+         * resends the conversation so far, so a loop's cost grows faster than its calls; this bounds that. Unset, only
+         * {@link #maxToolCalls} bounds the loop.
+         */
+        public Builder maxToolLoopTokens(int maxToolLoopTokens) {
+            this.maxToolLoopTokens = maxToolLoopTokens;
+            return this;
+        }
+
         /** The reply is exactly one {@code type} -- read it with {@link CompletionResult#as}. */
         public Builder responseType(Class<?> type) {
             return response(ResponseSchemas.Kind.SINGLE, type);
@@ -269,8 +357,12 @@ public record CompletionRequest(
             }
             String schema = responseType == null ? null
                     : ResponseSchemas.envelope(responseKind, responseType, withCompletion);
+            long distinct = tools.stream().map(CompletionTool::name).distinct().count();
+            if (distinct != tools.size()) {
+                throw new IllegalStateException("two tools share a name -- a model calls a tool by its name alone");
+            }
             return new CompletionRequest(prompt, context, promptParams, maxTokens, temperature, providerOptions,
-                    schema);
+                    schema, images, tools, maxToolCalls, maxToolLoopTokens);
         }
     }
 }

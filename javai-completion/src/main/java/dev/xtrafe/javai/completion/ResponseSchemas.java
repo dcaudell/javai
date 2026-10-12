@@ -71,6 +71,12 @@ final class ResponseSchemas {
         return objectSchema(properties, required).toString();
     }
 
+    /** The JSON schema of one {@code type} object, unwrapped: a tool's input (OMI-643). */
+    static String inputSchema(Class<?> type) {
+        requireObjectType(type);
+        return schemaOf(type, new LinkedHashSet<>()).toString();
+    }
+
     /** Refuses a destination that is not an object -- {@code as(String.class)}, a {@code Map}, an enum. */
     static void requireObjectType(Class<?> type) {
         if (scalarSchema(type) != null || type.isEnum() || type.isArray()
@@ -124,7 +130,8 @@ final class ResponseSchemas {
                 String fieldPath = path + "." + field.getName();
                 JsonElement value = valueOf(object, field);
                 if (value == null) {
-                    throw new CompletionException("The response is missing field " + fieldPath);
+                    throw new CompletionResponseException(CompletionResponseException.Reason.SCHEMA_VIOLATION,
+                            "The response is missing field " + fieldPath);
                 }
                 if (value.isJsonNull()) {
                     if (field.getType().isPrimitive()) {
@@ -352,6 +359,7 @@ final class ResponseSchemas {
     }
 
     private static CompletionException violation(String path, String expected, JsonElement actual) {
-        return new CompletionException("The response's " + path + " should be " + expected + " but is " + actual);
+        return new CompletionResponseException(CompletionResponseException.Reason.SCHEMA_VIOLATION,
+                "The response's " + path + " should be " + expected + " but is " + actual);
     }
 }

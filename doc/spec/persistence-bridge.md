@@ -774,6 +774,56 @@ passthrough: pgvector reports cosine *distance*, while Neo4j and MongoDB both re
 backend converts as it reads its own result, so a threshold written once means the same thing whichever store
 answers it.
 
+## Full-text and hybrid search (OMI-642)
+
+A `@FullText` `String` field is searchable by its words, ranked, narrowed and paged as a vector search is, in a builder
+and a method-name form that compile to one `TextSpec`:
+
+```java
+@FullText                                   // stemmed in "english" by default
+private String text;
+@FullText(language = "simple", fuzzy = true) // also searchable fuzzily
+private String name;
+
+passages.matching("text").query("grapple \"called shot\"").where("ruleset").in(rulesets).limit(10).ranked();
+codex.matching("name").query("Glabreuz").fuzzy().limit(5).results();         // finds "Glabrezu"
+passages.nearestBy("text").to(reference).alsoMatching("text", "grappling")     // hybrid
+        .where("ruleset").in(rulesets).limit(10).ranked();
+
+List<Passage> findMatchingByText(String query, int limit);                               // method-name form
+List<Ranked<Passage>> findMatchingByTextAndRulesetIn(String query, Collection<String> r, Limit limit);
+List<Codex> findSimilarByName(String name, int limit);                                   // fuzzy
+```
+
+* **Query syntax**, every backend: words, `"quoted phrases"`, `-excluded` words or phrases, `or`. Without `or`
+  every word is required; Postgres reads `or` between its two neighbours (`websearch_to_tsquery`), Neo4j and MongoDB
+  read a query containing `or` as alternatives throughout (`WebSearchQuery`).
+* **Narrowing first**, every backend: the predicate is resolved before the limit, by each backend's own derived-finder
+  translation, so the best N that also match means N.
+* **Postgres.** `javai_fulltext(owner_type, owner_id, field_name, language, body, tsv)` beside `javai_geo_points`,
+  written on every save from the reachable graph, deleted with the entity and its cascaded members, backfilled by
+  `reindex()` (it goes through `save`). GIN on `tsv`, `pg_trgm` GIN on `body` (`pg_trgm` is created at schema
+  initialization). Terms ranked by `ts_rank_cd`; fuzzy by `word_similarity` above `pg_trgm`'s threshold, ties broken by
+  whole-value `similarity`. A native `@Modifying` query on a `@FullText` type is refused, and a JPQL update may not
+  assign a `@FullText` field.
+* **Neo4j.** A native full-text index per (label, field), in the analyzer named by `language` (refused if Neo4j has
+  none of that name), not eventually consistent, created on first search and awaited online. The query becomes Lucene:
+  required clauses `+`, excluded `-`; fuzzy, each word a Lucene fuzzy term. `db.index.fulltext.queryNodes` yields every
+  match, so the predicate after `YIELD` narrows honestly. Scores are Lucene's.
+* **MongoDB.** A `javai_fulltext` side collection -- one document per (type, id, field) with the text, its `$text`
+  language (`simple` is MongoDB's `none`) and its trigrams -- kept on save, `deleteById` and derived deletes. A side
+  collection because MongoDB allows one text index per collection and searches all its fields at once. `$text` ranks by
+  `textScore`; since `$text` treats words as alternatives, each required word is searched alone first and only documents
+  holding all of them are ranked. Fuzzy is trigram similarity of the whole value (`pg_trgm`'s `similarity`), at or above
+  0.3. Synchronous: no Atlas Search, no `mongot`.
+* **Hybrid.** The vector and term rankings, narrowed by the same predicate and each drawn to a pool of
+  `max(50, 4 × (limit + offset))`, fused by reciprocal rank (`Σ 1/(60 + rank)`), then paged. Neo4j: unnarrowed only,
+  as its vector search is. Refused when the vector half would be folded in memory.
+* **Scores** are each store's own (`ts_rank_cd`, Lucene, `textScore`, trigram similarity, or the fused score): higher is
+  better, not a cosine, not comparable across searches or backends.
+* **Not built:** a pluggable external index (OpenSearch). The repository API already names no store, so adopting one
+  later is a backend change; it waits on the measured test in omiai-charter's tabletop design.
+
 ## A JPA-style query, contrasted with an object-level query
 
 A repository query (`findNearestByBodyVector`) is scoped to the whole persisted store; an object-level
