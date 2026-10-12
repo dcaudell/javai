@@ -43,7 +43,7 @@ class EmbeddedAnnotationRefusalTest {
     @Test
     void theRefusalNamesEveryPathIntoTheValue() {
         IllegalArgumentException refused = assertThrows(IllegalArgumentException.class,
-                () -> EntityReflection.refuseJavAIAnnotationsInsideEmbeddedValues(TestEmbeddingOwner.class));
+                () -> EmbeddedAnnotationGuard.refuseJavAIAnnotationsInsideEmbeddedValues(TestEmbeddingOwner.class));
 
         assertTrue(refused.getMessage().contains("part.body"), refused.getMessage());
     }

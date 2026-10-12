@@ -321,7 +321,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             validateNoKnowledgeGraphFields(type);
             validateCollectionFieldMapping(type);
             Containment.validatePlacement(type);
-            EntityReflection.refuseJavAIAnnotationsInsideEmbeddedValues(type);
+            EmbeddedAnnotationGuard.refuseJavAIAnnotationsInsideEmbeddedValues(type);
             registeredEntityTypes.add(type);
         }
     }

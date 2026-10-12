@@ -58,19 +58,22 @@ class OneContainmentImplementationTest {
      * not hypothetical: {@code TaggregateReflection} used to do exactly that, from a loaded object graph,
      * and threw {@code LazyInitializationException} on the lazy collections that are the normal shape.
      *
-     * <p>Two readers outside {@code Containment} are permitted, each asking a different question of the same
+     * <p>Three readers outside {@code Containment} are permitted, each asking a different question of the same
      * annotation rather than a second version of this one. {@code TaggregateReflection} reads only its
      * TYPE-level {@code concatenate} flag, and is asserted below to hold no field walk.
      * {@code BulkWriteGuard} (OMI-398) asks whether a {@code @Modifying} statement assigning to one named
      * field would invalidate derived state, and refuses it if so -- a guard <em>over</em> Containment's
-     * inputs, deriving no containment and walking no object graph. Both are single-purpose files, which is
-     * what keeps the exemption checkable; adding one is a decision, not a formality.
+     * inputs, deriving no containment and walking no object graph. {@code EmbeddedAnnotationGuard} (OMI-623)
+     * asks whether the annotation sits inside an {@code @Embedded} value, where nothing reads it, and refuses
+     * it if so -- again deriving no containment. All are single-purpose files, which is what keeps the
+     * exemption checkable; adding one is a decision, not a formality.
      */
     @Test
     void onlyContainmentDerivesMembershipFromTheAnnotation() {
         List<Path> offenders = javaSources()
                 .filter(file -> read(file).contains("Taggregate.class"))
-                .filter(file -> !List.of("Containment.java", "TaggregateReflection.java", "BulkWriteGuard.java")
+                .filter(file -> !List.of("Containment.java", "TaggregateReflection.java", "BulkWriteGuard.java",
+                                "EmbeddedAnnotationGuard.java")
                         .contains(file.getFileName().toString()))
                 .toList();
         assertTrue(offenders.isEmpty(),
