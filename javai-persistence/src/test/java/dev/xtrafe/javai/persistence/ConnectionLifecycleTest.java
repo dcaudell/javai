@@ -125,8 +125,43 @@ class ConnectionLifecycleTest {
                 .build();
     }
 
+    /**
+     * ⚠️ JavAI's own tables are created by its schema initialization, and must survive a pool that does not autocommit:
+     * omiai-fabric's does (Postgres reads a large object only inside a transaction). Its DDL was rolled back when
+     * the connection went back to the pool, so javai_fulltext never existed and every delete failed on it.
+     */
+    @Test
+    void schemaInitializationCommitsOnAPoolThatDoesNotAutocommit() throws SQLException {
+        try (java.sql.Connection fresh = java.sql.DriverManager.getConnection(postgres.getJdbcUrl(),
+                postgres.getUsername(), postgres.getPassword())) {
+            // Another test in this class may have created them already, on a pool that autocommits.
+            fresh.createStatement().execute("DROP TABLE IF EXISTS javai_fulltext, javai_geo_points");
+        }
+        try (HikariDataSource pool = pool(uniqueName("no-autocommit"), false)) {
+            JavAIPersistenceConfig config = JavAIPersistenceConfig.builder().dataSource(pool).build();
+            TestArticleRepository articles = JavAIPI.repository(TestArticleRepository.class, config);
+            assertEquals(0, articles.findAll().size());
+
+            try (java.sql.Connection fresh = java.sql.DriverManager.getConnection(postgres.getJdbcUrl(),
+                    postgres.getUsername(), postgres.getPassword());
+                 java.sql.ResultSet tables = fresh.createStatement().executeQuery(
+                         "SELECT count(*) FROM pg_tables WHERE tablename IN ('javai_fulltext', 'javai_geo_points')")) {
+                tables.next();
+                assertEquals(2, tables.getInt(1), "javai_fulltext and javai_geo_points, committed");
+            }
+            TestArticle saved = articles.save(new TestArticle("deleted", "body"));
+            assertDoesNotThrow(() -> articles.deleteById(saved.getId()));
+            JavAIPI.release(config);
+        }
+    }
+
     private static HikariDataSource pool(String appName) {
+        return pool(appName, true);
+    }
+
+    private static HikariDataSource pool(String appName, boolean autoCommit) {
         HikariConfig hikari = new HikariConfig();
+        hikari.setAutoCommit(autoCommit);
         hikari.setJdbcUrl(postgres.getJdbcUrl());
         hikari.setUsername(postgres.getUsername());
         hikari.setPassword(postgres.getPassword());
