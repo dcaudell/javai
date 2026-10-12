@@ -14,6 +14,12 @@ version -- a given release usually changes only one or two of them.
 
 ### Fixed
 
+- **A JavAI annotation inside an `@Embedded` value is refused at registration (OMI-623).** `javai-persistence`. The
+  weaver, `JavAIRuntime` and this module read annotations off the entity's own class hierarchy only, so a `@Vectorize`,
+  `@Summary` or `@Taggregate` inside an embedded value (or `@JavAIVectorizable`, `@Taggable`, `@ExternalVector` on an
+  embeddable) did nothing, silently. Registration now names each one and refuses, on every backend. Reading them as
+  the owner's is not built.
+
 - **Tagging commits on a pool with autocommit off (OMI-614).** `javai-tagging`. The Postgres backend's own connection,
   taken from an application `DataSource`, kept the pool's autocommit setting; with it off, the schema DDL and every
   write outside a caller's transaction stayed uncommitted, the connection idle in transaction, holding its locks. That

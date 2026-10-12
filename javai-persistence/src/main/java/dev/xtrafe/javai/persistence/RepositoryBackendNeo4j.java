@@ -135,6 +135,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         // repository() call made at some point before traversal-hydration needs to resolve its label.
         validateMapKeyTypesAreSupported(entityType);
         validateNoAnyFields(entityType);
+        EmbeddedAnnotationGuard.refuseJavAIAnnotationsInsideEmbeddedValues(entityType);
         typesByLabel.put(label(entityType), entityType);
     }
 

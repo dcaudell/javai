@@ -161,6 +161,7 @@ final class RepositoryBackendSpringDataMongo implements RepositoryBackend {
             validateMapKeyTypesAreSupported(entityType);
         validateNoAnyFields(entityType);
             validateNoKnowledgeGraphFields(entityType);
+            EmbeddedAnnotationGuard.refuseJavAIAnnotationsInsideEmbeddedValues(entityType);
         }
         for (Field field : EntityReflection.allFields(entityType)) {
             Class<?> relatedType = relatedEntityType(field);
