@@ -4699,6 +4699,10 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      *  first write, because each needs its model's dimension known upfront; neither of these does. */
     private static void initializeSchema(SessionFactory factory) {
         try (Session session = factory.openSession()) {
+            // ⚠️ In a transaction that commits, as provisionTable's DDL is: on a pool that does not autocommit (an
+            // application's own, OMI-410), DDL issued outside one was rolled back when the connection went back,
+            // and javai_fulltext never existed.
+            Transaction tx = session.beginTransaction();
             session.doWork(connection -> {
                 try (Statement statement = connection.createStatement()) {
                     statement.execute("CREATE EXTENSION IF NOT EXISTS vector");
@@ -4742,6 +4746,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
                             + "ON javai_fulltext USING gin (body gin_trgm_ops)");
                 }
             });
+            tx.commit();
         }
     }
 }
