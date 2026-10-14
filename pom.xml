@@ -162,7 +162,7 @@
       7.0.8, exactly matching spring-data-mongodb 5.1.0's own transitive requirement, which is
       what makes running both on a combined classpath (e2e-client-test) safe again.
     -->
-    <spring-ai.version>2.0.0</spring-ai.version>
+    <spring-ai.version>2.0.1</spring-ai.version>
     <!-- javai-model's own Contextable/PromptContext marshalling; deliberately GSON, not the
          Jackson that Spring AI pulls in transitively (see javai-completion's Cortex classes' own
          javadoc for why javai-vector/javai-model never took a Jackson dependency of their own). -->
