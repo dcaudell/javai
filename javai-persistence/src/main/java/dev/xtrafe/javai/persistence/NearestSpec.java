@@ -54,6 +54,8 @@ import java.util.List;
  *                   inferred (OMI-458); {@code null} for every search that does not name one, which is
  *                   every search that existed before it and means exactly what it always did
  * @param alsoMatching the full-text half of a hybrid search (OMI-642), or {@code null}
+ * @param tieBreakById whether hits at an equal similarity are ordered by id (OMI-658), so every page of one search
+ *                   draws the same total order; {@code false} leaves their order to the backend, as it always was
  */
 record NearestSpec(
         DerivedQueryMethods.Kind kind,
@@ -63,7 +65,8 @@ record NearestSpec(
         int offset,
         List<List<DerivedFinderQuery.BoundPart>> predicate,
         String modelId,
-        AlsoMatching alsoMatching) {
+        AlsoMatching alsoMatching,
+        boolean tieBreakById) {
 
     /**
      * The full-text half of a hybrid search (OMI-642): the vector ranking and this text ranking, run with the same
@@ -75,7 +78,7 @@ record NearestSpec(
     /** A vector search alone -- every search before OMI-642. */
     NearestSpec(DerivedQueryMethods.Kind kind, String fieldName, EmbeddingVector reference, int limit, int offset,
             List<List<DerivedFinderQuery.BoundPart>> predicate, String modelId) {
-        this(kind, fieldName, reference, limit, offset, predicate, modelId, null);
+        this(kind, fieldName, reference, limit, offset, predicate, modelId, null, false);
     }
 
     /**

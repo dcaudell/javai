@@ -768,6 +768,16 @@ longer see it happening. Postgres resolves the predicate to an id set and ranks 
 id set to `$vectorSearch`'s own `filter`, which is a genuine pre-filter. Ranked results and paging work on all
 three: neither needs anything a top-K index lacks.
 
+**Ties, and `breakingTiesById()` (OMI-658).** Identical content embeds identically, so hits can sit at exactly one
+distance, and a ranking by distance alone leaves their order to the store's sort. Each page fetches `limit + offset`,
+so two pages may order one tie differently and repeat a hit while skipping another: sixty tied hits paged by four
+came back as fifty-four. `.breakingTiesById()` orders hits at an equal similarity by id — Postgres's `uuid` order,
+unsigned, so the in-memory fold sorts the same way — and every page then draws on one total order. It is optional,
+and without it nothing changes: on Postgres it is a second `ORDER BY` key, which keeps pgvector from walking its HNSW
+index in order, so a caller asks for it where paging matters more than the index. **Postgres only**; Neo4j and
+MongoDB refuse a query that asks (`RepositoryBackend.supportsTieBreakById`), since their vector indexes choose the
+nearest K before any second key could apply. A hybrid search already fuses its rankings with ties broken by id.
+
 `Ranked.similarity()` is **plain cosine in `[-1, 1]` on every backend** — the same number
 `VectorMath.cosineSimilarity` and `similarityTo` return in process. That is a deliberate normalization, not a
 passthrough: pgvector reports cosine *distance*, while Neo4j and MongoDB both report `(1 + cosine) / 2`. Each

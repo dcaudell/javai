@@ -61,6 +61,7 @@ public final class NearestQuery<T> {
     private int offset;
     private boolean spent;
     private NearestSpec.AlsoMatching alsoMatching;
+    private boolean tieBreakById;
 
     NearestQuery(RepositoryBackend backend, Class<?> entityType, DerivedQueryMethods.Kind kind, String fieldName) {
         this.backend = backend;
@@ -165,6 +166,16 @@ public final class NearestQuery<T> {
         return this;
     }
 
+    /**
+     * Orders hits at an equal similarity by their id (OMI-658). Optional: without it a backend orders ties as its
+     * sort happens to, so two pages of one search, each with its own limit, can repeat one hit and skip another.
+     * Postgres alone, today; a backend that cannot honour it refuses the query.
+     */
+    public NearestQuery<T> breakingTiesById() {
+        this.tieBreakById = true;
+        return this;
+    }
+
     public NearestQuery<T> limit(int limit) {
         if (limit <= 0) {
             throw new IllegalArgumentException("limit must be positive, but was " + limit + ".");
@@ -218,6 +229,10 @@ public final class NearestQuery<T> {
             throw new UnsupportedOperationException(backend.getClass().getSimpleName() + " has no full-text search, "
                     + "so it cannot run a hybrid search (OMI-642) -- see doc/ai-guidance/persistence-support-matrix.md");
         }
+        if (spec.tieBreakById() && !backend.supportsTieBreakById()) {
+            throw new UnsupportedOperationException(backend.getClass().getSimpleName() + " cannot order tied hits by "
+                    + "id (OMI-658) -- see doc/ai-guidance/persistence-support-matrix.md");
+        }
         backend.validateNearestQuery(entityType, spec);
         return (List<Ranked<T>>) (List<?>) backend.findNearest(entityType, spec);
     }
@@ -242,7 +257,7 @@ public final class NearestQuery<T> {
             }
         }
         NearestSpec spec = new NearestSpec(kind, fieldName, reference, limit, offset,
-                List.copyOf(predicate), modelId, alsoMatching);
+                List.copyOf(predicate), modelId, alsoMatching, tieBreakById);
         // Checked here rather than in the backend so it fails on the builder that made the mistake, the
         // same discipline resolve(...) follows for a bad property name (OMI-458).
         spec.requireModelAgreement();

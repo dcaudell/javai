@@ -373,6 +373,14 @@ interface RepositoryBackend {
     }
 
     /**
+     * Whether this backend can order a nearest search's tied hits by id (OMI-658), when the search asks for it with
+     * {@link NearestQuery#breakingTiesById()}. Postgres alone, today.
+     */
+    default boolean supportsTieBreakById() {
+        return false;
+    }
+
+    /**
      * A ranked full-text search of one {@code @FullText} field, narrowed before the limit (OMI-642). See
      * {@link TextQuery}.
      */

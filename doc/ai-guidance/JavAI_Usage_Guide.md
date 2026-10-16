@@ -878,6 +878,10 @@ runtime, or the shape isn't worth a method.
   index already chose. If you are on Neo4j: use `JavAIVectorizable.query(...)` to rank in memory after an
   ordinary derived finder narrows, or filter in the caller and accept the over-fetch explicitly. Ranked
   results and paging *do* work on Neo4j.
+- **Paging through ties.** Hits at exactly one distance (identical content embeds identically) are ordered by the
+  store's sort, and each page orders them its own way, so pages can repeat one and skip another. On Postgres, add
+  `.breakingTiesById()` to order ties by id; it is optional, costs pgvector its in-order HNSW walk, and Neo4j and
+  MongoDB refuse it.
 - **`Ranked.similarity()` is plain cosine in `[-1, 1]`** on every backend — the same number `similarityTo`
   gives you in process, so a threshold means the same thing whichever store answered. (`Ranked.distance()` is
   `1 - similarity` if you would rather think in distances.) `Ranked` is

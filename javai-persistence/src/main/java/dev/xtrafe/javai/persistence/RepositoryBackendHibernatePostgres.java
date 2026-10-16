@@ -968,7 +968,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         List<RankedId> ranked = inSession(session -> session.doReturningWork(connection ->
                 tableExistsCached(connection, table)
                         ? rankIds(connection, table, entityType, fieldName, reference,
-                                spec.limitIncludingOffset(), vectorColumn, allowed)
+                                spec.limitIncludingOffset(), vectorColumn, allowed, spec.tieBreakById())
                         // Nothing has ever been written in this model, so no row can match. Empty is the
                         // honest answer and creating the table to prove it would be vandalism.
                         : List.<RankedId>of()));
@@ -990,7 +990,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         NearestSpec.AlsoMatching text = spec.alsoMatching();
         List<ScoredId> fused = inSession(session -> session.doReturningWork(connection -> {
             List<RankedId> byVector = tableExistsCached(connection, table)
-                    ? rankIds(connection, table, entityType, fieldName, spec.reference(), pool, vectorColumn, allowed)
+                    ? rankIds(connection, table, entityType, fieldName, spec.reference(), pool, vectorColumn, allowed,
+                            false)
                     : List.<RankedId>of();
             List<ScoredId> byText = rankTextIds(connection, entityType, text.field(), text.text(), false, pool,
                     allowed);
@@ -1033,6 +1034,17 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * without reading it when {@code modelId} is not the configured provider's, and this path runs only for
      * models that are not. So a scan is slow in reads, never in model calls.
      */
+    /**
+     * The in-memory fold's ranking: most similar first, and with {@code tieBreakById} ties in Postgres's own uuid
+     * order -- unsigned, byte by byte, as the indexed path's {@code ORDER BY} sorts them -- which is the order of the
+     * lowercase hex text, not {@code UUID.compareTo}'s signed one (OMI-658).
+     */
+    static Comparator<Ranked<Object>> foldOrder(boolean tieBreakById) {
+        Comparator<Ranked<Object>> order = Comparator.comparingDouble(Ranked<Object>::similarity).reversed();
+        return tieBreakById ? order.thenComparing(hit -> idOrNull(hit.entity()),
+                Comparator.nullsLast(Comparator.comparing(UUID::toString))) : order;
+    }
+
     private List<Ranked<Object>> foldedNearestBySummary(Class<?> entityType, NearestSpec spec) {
         String modelId = spec.resolvedModelId();
         warnAboutFoldOnce(entityType, modelId);
@@ -1063,7 +1075,7 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
             }
             return hits;
         });
-        scored.sort(Comparator.comparingDouble(Ranked<Object>::similarity).reversed());
+        scored.sort(foldOrder(spec.tieBreakById()));
         int from = Math.min(spec.offset(), scored.size());
         int to = Math.min(Math.addExact(from, spec.limit()), scored.size());
         return List.copyOf(scored.subList(from, to));
@@ -2100,6 +2112,12 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
 
     @Override
     public boolean supportsFullText() {
+        return true;
+    }
+
+    /** By the ranking query's own {@code ORDER BY}, so a tie costs no second round trip (OMI-658). */
+    @Override
+    public boolean supportsTieBreakById() {
         return true;
     }
 
@@ -3915,8 +3933,8 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
      * are, so the statement text stays constant and re-plannable however selective the predicate was.
      */
     private static List<RankedId> rankIds(Connection connection, String table, Class<?> entityType,
-            String fieldName, EmbeddingVector reference, int limit, String vectorColumn, List<UUID> allowedIds)
-            throws SQLException {
+            String fieldName, EmbeddingVector reference, int limit, String vectorColumn, List<UUID> allowedIds,
+            boolean tieBreakById) throws SQLException {
         StringBuilder sql = new StringBuilder("SELECT owner_id, ").append(vectorColumn)
                 .append(" <=> ?::vector AS javai_distance FROM ").append(table)
                 .append(" WHERE owner_type = ?");
@@ -3927,7 +3945,9 @@ final class RepositoryBackendHibernatePostgres implements RepositoryBackend {
         if (allowedIds != null) {
             sql.append(" AND owner_id = ANY(?)");
         }
-        sql.append(" ORDER BY javai_distance LIMIT ?");
+        // ⚠️ By id among equal distances only when asked (OMI-658): a second sort key keeps pgvector from walking
+        // its HNSW index in order, so the default stays the ordering it always was.
+        sql.append(tieBreakById ? " ORDER BY javai_distance, owner_id LIMIT ?" : " ORDER BY javai_distance LIMIT ?");
         try (PreparedStatement statement = connection.prepareStatement(sql.toString())) {
             int index = 1;
             statement.setString(index++, toVectorLiteral(reference.values()));
