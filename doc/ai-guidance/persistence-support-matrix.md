@@ -227,7 +227,9 @@ Notes:
   `nearestSubgraph`). Persistence is **Neo4j-only** by design; Postgres and MongoDB reject a
   `KnowledgeGraph`-typed field with a clear message at registration. It is not reachable by a derived finder —
   query it in memory after `findById` hydrates it, or with the repository's `nearestSubgraph`, which reads only the
-  subgraph it answers (Neo4j 2026.02+).
+  subgraph it answers (Neo4j 2026.02+). One node or edge is written or removed, and a neighbourhood or matching nodes
+  read, without loading the graph: `saveGraphNode`, `removeGraphNode`, `saveGraphEdge`, `removeGraphEdge`,
+  `subgraphAround`, `findGraphNodes` (OMI-660, Neo4j only; Postgres and MongoDB throw `UnsupportedOperationException`).
 - **`P·N·M`** = Postgres · Neo4j · MongoDB.
 
 ---

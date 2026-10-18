@@ -2,10 +2,13 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.collections.JavAIEdge;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
+import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
+import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 
@@ -241,4 +244,57 @@ public interface JavAIRepository<T> {
      */
     <N extends JavAIGraphNode, E extends JavAIEdge> SubgraphResult<N, E> nearestSubgraph(
             UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops);
+
+    /**
+     * Writes one node into one entity's persisted {@code KnowledgeGraph} field (OMI-660): the node's own record, and its
+     * membership of that graph. Nothing else of the graph is read or written, so a graph too large to load is grown one
+     * node at a time. {@link #save} of the owner stays the whole-graph write, unchanged: it still removes whatever its
+     * in-memory graph does not hold. Neo4j only.
+     *
+     * @throws IllegalStateException if the owner is not stored, or the node is already in another owner's graph for
+     *                               that field
+     * @throws UnsupportedOperationException on a backend that does not persist a {@code KnowledgeGraph}
+     */
+    <N extends JavAIGraphNode> void saveGraphNode(UUID ownerId, String graphField, N node);
+
+    /**
+     * Takes one node out of one entity's persisted {@code KnowledgeGraph} field (OMI-660): its membership, and this
+     * graph's edges to and from it. The node's own record stays, free to join another graph. Neo4j only.
+     *
+     * @return whether the node was a member
+     */
+    <N extends JavAIGraphNode> boolean removeGraphNode(UUID ownerId, String graphField, N node);
+
+    /**
+     * Writes one edge of one entity's persisted {@code KnowledgeGraph} field (OMI-660), unless an edge of exactly its
+     * property values already joins the two nodes, as {@link #save} does. Neo4j only.
+     *
+     * @throws IllegalStateException if either node is not a member of that graph
+     */
+    <N extends JavAIGraphNode, E extends JavAIEdge> void saveGraphEdge(
+            UUID ownerId, String graphField, N from, N to, E edge);
+
+    /**
+     * Removes the edge of exactly {@code edge}'s property values from {@code from} to {@code to} in one entity's persisted
+     * {@code KnowledgeGraph} field (OMI-660). Neo4j only.
+     *
+     * @return whether such an edge was stored
+     */
+    <N extends JavAIGraphNode, E extends JavAIEdge> boolean removeGraphEdge(
+            UUID ownerId, String graphField, N from, N to, E edge);
+
+    /**
+     * Reads part of one entity's persisted {@code KnowledgeGraph} field (OMI-660): the members among {@code nodeIds}, and
+     * everything within {@code hops} along their outgoing edges inside that graph. Only that part is read. Neo4j only.
+     */
+    <N extends JavAIGraphNode, E extends JavAIEdge> KnowledgeGraph<N, E> subgraphAround(
+            UUID ownerId, String graphField, Collection<UUID> nodeIds, int hops);
+
+    /**
+     * The members of one entity's persisted {@code KnowledgeGraph} field whose fields equal {@code equalTo}, by field
+     * name (OMI-660). Only those nodes are read. Neo4j only.
+     *
+     * @throws IllegalArgumentException if a key is not a simple-valued field of the node type
+     */
+    <N extends JavAIGraphNode> List<N> findGraphNodes(UUID ownerId, String graphField, Map<String, Object> equalTo);
 }

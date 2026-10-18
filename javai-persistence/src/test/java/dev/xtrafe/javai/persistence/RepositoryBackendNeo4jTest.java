@@ -778,4 +778,207 @@ class RepositoryBackendNeo4jTest {
         assertTrue(after.findById(saved.getId()).isPresent());
         JavAIPI.release(own);
     }
+
+    /**
+     * OMI-660: one node and one edge at a time, into a stored graph, leave every other node and edge where it is; removal
+     * takes the node's membership and its edges in this graph, and keeps its own record.
+     */
+    @Test
+    void incrementalGraphWritesLeaveTheRestOfTheGraph() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Incremental owner");
+        TestGraphNode a = new TestGraphNode("incremental A");
+        TestGraphNode b = new TestGraphNode("incremental B");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("A to B"));
+        graphOwnerRepository.save(owner);
+
+        TestGraphNode c = new TestGraphNode("incremental C");
+        graphOwnerRepository.saveGraphNode(owner.getId(), "graph", c);
+        graphOwnerRepository.saveGraphEdge(owner.getId(), "graph", b, c, new TestGraphEdge("B to C"));
+        graphOwnerRepository.saveGraphEdge(owner.getId(), "graph", b, c, new TestGraphEdge("B to C"));
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> grown = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+        assertEquals(java.util.Set.of("incremental A", "incremental B", "incremental C"), names(grown));
+        assertEquals(java.util.Set.of(new TestGraphEdge("A to B")), grown.edges(findByName(grown, "incremental A"),
+                findByName(grown, "incremental B")));
+        assertEquals(java.util.Set.of(new TestGraphEdge("B to C")), grown.edges(findByName(grown, "incremental B"),
+                findByName(grown, "incremental C")), "an edge of the same values is written once");
+
+        assertTrue(graphOwnerRepository.removeGraphEdge(owner.getId(), "graph", a, b, new TestGraphEdge("A to B")));
+        assertTrue(graphOwnerRepository.removeGraphNode(owner.getId(), "graph", c));
+        assertTrue(!graphOwnerRepository.removeGraphNode(owner.getId(), "graph", c), "no longer a member");
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> shrunk = graphOwnerRepository.findById(owner.getId())
+                .orElseThrow().getGraph();
+        assertEquals(java.util.Set.of("incremental A", "incremental B"), names(shrunk));
+        assertTrue(shrunk.neighbors(findByName(shrunk, "incremental A")).isEmpty());
+        assertTrue(shrunk.neighbors(findByName(shrunk, "incremental B")).isEmpty(), "C's edges went with it");
+        assertTrue(JavAIPI.repository(TestGraphNodeRepository.class, config).findById(c.getId()).isPresent(),
+                "the removed node keeps its own record");
+    }
+
+    /** OMI-660: {@code save} of the owner stays the whole-graph write: what its in-memory graph lacks, it removes. */
+    @Test
+    void wholeGraphSaveStillReplacesTheGraph() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Whole-graph owner");
+        owner.getGraph().addNode(new TestGraphNode("whole A"));
+        graphOwnerRepository.save(owner);
+        TestOwnerWithGraph stale = graphOwnerRepository.findById(owner.getId()).orElseThrow();
+
+        graphOwnerRepository.saveGraphNode(owner.getId(), "graph", new TestGraphNode("whole B"));
+        graphOwnerRepository.save(stale);
+
+        assertEquals(java.util.Set.of("whole A"),
+                names(graphOwnerRepository.findById(owner.getId()).orElseThrow().getGraph()));
+    }
+
+    /** OMI-660: an edge joins members only; a node joins a stored owner only, and one owner per field. */
+    @Test
+    void incrementalGraphWritesRefuseWhatTheGraphCannotHold() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Refusing owner");
+        TestGraphNode member = new TestGraphNode("refusing member");
+        owner.getGraph().addNode(member);
+        graphOwnerRepository.save(owner);
+        TestGraphNode outsider = new TestGraphNode("refusing outsider");
+        JavAIPI.repository(TestGraphNodeRepository.class, config).save(outsider);
+
+        assertThrows(IllegalStateException.class, () -> graphOwnerRepository.saveGraphEdge(owner.getId(), "graph",
+                member, outsider, new TestGraphEdge("to an outsider")));
+        assertThrows(IllegalStateException.class, () -> graphOwnerRepository.saveGraphNode(UUID.randomUUID(), "graph",
+                new TestGraphNode("refusing orphan")));
+        TestOwnerWithGraph other = graphOwnerRepository.save(new TestOwnerWithGraph("Refusing other owner"));
+        assertThrows(IllegalStateException.class, () -> graphOwnerRepository.saveGraphNode(other.getId(), "graph",
+                member));
+        assertThrows(IllegalArgumentException.class, () -> graphOwnerRepository.saveGraphNode(owner.getId(), "title",
+                new TestGraphNode("refusing wrong field")));
+    }
+
+    /** OMI-660: bounded reads -- a neighbourhood by hops, and members by field value -- read only what they return. */
+    @Test
+    void boundedGraphReadsReturnOnlyTheirPart() {
+        TestOwnerWithGraph owner = new TestOwnerWithGraph("Bounded owner");
+        TestGraphNode a = new TestGraphNode("bounded A");
+        TestGraphNode b = new TestGraphNode("bounded B");
+        TestGraphNode c = new TestGraphNode("bounded C");
+        owner.getGraph().addEdge(a, b, new TestGraphEdge("A to B"));
+        owner.getGraph().addEdge(b, c, new TestGraphEdge("B to C"));
+        owner.getGraph().addNode(new TestGraphNode("bounded D"));
+        graphOwnerRepository.save(owner);
+
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> none = graphOwnerRepository.subgraphAround(owner.getId(), "graph",
+                List.of(a.getId()), 0);
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> one = graphOwnerRepository.subgraphAround(owner.getId(), "graph",
+                List.of(a.getId()), 1);
+        KnowledgeGraph<TestGraphNode, TestGraphEdge> two = graphOwnerRepository.subgraphAround(owner.getId(), "graph",
+                List.of(a.getId()), 2);
+        assertEquals(java.util.Set.of("bounded A"), names(none));
+        assertEquals(java.util.Set.of("bounded A", "bounded B"), names(one));
+        assertEquals(java.util.Set.of(new TestGraphEdge("A to B")),
+                one.edges(findByName(one, "bounded A"), findByName(one, "bounded B")));
+        assertEquals(java.util.Set.of("bounded A", "bounded B", "bounded C"), names(two));
+        assertTrue(graphOwnerRepository.<TestGraphNode, TestGraphEdge>subgraphAround(owner.getId(), "graph",
+                List.of(UUID.randomUUID()), 2).nodes().isEmpty(), "a non-member is no origin");
+
+        List<TestGraphNode> found = graphOwnerRepository.findGraphNodes(owner.getId(), "graph",
+                java.util.Map.of("name", "bounded C"));
+        assertEquals(List.of(c.getId()), found.stream().map(TestGraphNode::getId).toList());
+        assertThrows(IllegalArgumentException.class, () -> graphOwnerRepository.findGraphNodes(owner.getId(), "graph",
+                java.util.Map.of("noSuchField", "x")));
+    }
+
+    /** OMI-660: two writers adding different nodes to one graph at once both land. */
+    @Test
+    void concurrentGraphNodeWritesBothPersist() throws Exception {
+        TestOwnerWithGraph owner = graphOwnerRepository.save(new TestOwnerWithGraph("Concurrent owner"));
+        TestGraphNode first = new TestGraphNode("concurrent first");
+        TestGraphNode second = new TestGraphNode("concurrent second");
+
+        List<Throwable> failures = race(
+                () -> graphOwnerRepository.saveGraphNode(owner.getId(), "graph", first),
+                () -> graphOwnerRepository.saveGraphNode(owner.getId(), "graph", second));
+
+        assertEquals(List.of(), failures);
+        assertEquals(java.util.Set.of("concurrent first", "concurrent second"),
+                names(graphOwnerRepository.findById(owner.getId()).orElseThrow().getGraph()));
+    }
+
+    /**
+     * OMI-660: two owners claiming one node at once -- as two instances, so no in-process lock serializes them, only the
+     * store's -- leave it in exactly one graph.
+     */
+    @Test
+    void concurrentClaimsOnOneNodeLeaveItInOneGraph() throws Exception {
+        TestOwnerWithGraph left = graphOwnerRepository.save(new TestOwnerWithGraph("Claiming left"));
+        TestOwnerWithGraph right = graphOwnerRepository.save(new TestOwnerWithGraph("Claiming right"));
+        TestGraphNode claimed = JavAIPI.repository(TestGraphNodeRepository.class, config)
+                .save(new TestGraphNode("claimed"));
+        TestGraphNode copy = new TestGraphNode("claimed");
+        EntityReflection.writeId(copy, claimed.getId());
+
+        List<Throwable> failures = race(
+                () -> graphOwnerRepository.saveGraphNode(left.getId(), "graph", claimed),
+                () -> graphOwnerRepository.saveGraphNode(right.getId(), "graph", copy));
+
+        assertEquals(1, failures.size(), failures.toString());
+        assertTrue(failures.get(0) instanceof IllegalStateException, failures.toString());
+        int holders = graphOwnerRepository.findById(left.getId()).orElseThrow().getGraph().nodes().size()
+                + graphOwnerRepository.findById(right.getId()).orElseThrow().getGraph().nodes().size();
+        assertEquals(1, holders);
+    }
+
+    /**
+     * OMI-660: an edge written to a node while the node is removed from the graph either goes with it or is refused;
+     * no edge of this graph is left at a node outside it.
+     */
+    @Test
+    void concurrentEdgeWriteAndNodeRemovalLeaveNoStrayEdge() throws Exception {
+        for (int round = 0; round < 10; round++) {
+            TestOwnerWithGraph owner = new TestOwnerWithGraph("Stray-edge owner " + round);
+            TestGraphNode kept = new TestGraphNode("stray kept " + round);
+            TestGraphNode removed = new TestGraphNode("stray removed " + round);
+            owner.getGraph().addNode(kept);
+            owner.getGraph().addNode(removed);
+            graphOwnerRepository.save(owner);
+
+            List<Throwable> failures = race(
+                    () -> graphOwnerRepository.saveGraphEdge(owner.getId(), "graph", kept, removed,
+                            new TestGraphEdge("racing")),
+                    () -> graphOwnerRepository.removeGraphNode(owner.getId(), "graph", removed));
+
+            assertTrue(failures.stream().allMatch(IllegalStateException.class::isInstance), failures.toString());
+            try (Driver driver = GraphDatabase.driver(neo4j.getBoltUrl(), AuthTokens.basic("neo4j", NEO4J_PASSWORD));
+                 org.neo4j.driver.Session session = driver.session()) {
+                assertEquals(0, session.run("MATCH (n {id: $id})-[r:GRAPH_EDGE]-() RETURN count(r) AS edges",
+                        java.util.Map.of("id", removed.getId().toString())).single().get("edges").asLong());
+            }
+        }
+    }
+
+    /** Runs each task on its own thread, all released together by one barrier; returns what they threw. */
+    private static List<Throwable> race(Runnable... tasks) throws Exception {
+        java.util.concurrent.CyclicBarrier start = new java.util.concurrent.CyclicBarrier(tasks.length);
+        java.util.concurrent.ExecutorService pool = java.util.concurrent.Executors.newFixedThreadPool(tasks.length);
+        try {
+            List<java.util.concurrent.Future<Throwable>> outcomes = new ArrayList<>();
+            for (Runnable task : tasks) {
+                outcomes.add(pool.submit(() -> {
+                    start.await(10, java.util.concurrent.TimeUnit.SECONDS);
+                    try {
+                        task.run();
+                        return null;
+                    } catch (Throwable thrown) {
+                        return thrown;
+                    }
+                }));
+            }
+            List<Throwable> failures = new ArrayList<>();
+            for (java.util.concurrent.Future<Throwable> outcome : outcomes) {
+                Throwable thrown = outcome.get(60, java.util.concurrent.TimeUnit.SECONDS);
+                if (thrown != null) {
+                    failures.add(thrown);
+                }
+            }
+            return failures;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
 }

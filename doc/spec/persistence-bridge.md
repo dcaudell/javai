@@ -106,6 +106,22 @@ paths up to `hops`. It needs Neo4j 2026.02 or later (Cypher 25 `SEARCH … WHERE
 owner's graph per field, and saving it into a second is refused. Members saved before the property existed are given
 it by the first search.
 
+**One node or edge at a time** (OMI-660). `save(owner)` writes the whole graph and removes whatever its in-memory graph
+does not hold, so it needs the graph loaded whole. A graph too large for that is written and read in parts:
+
+| Method | Writes / reads |
+|---|---|
+| `saveGraphNode(ownerId, "graph", node)` | the node's record and its `<FIELD>_MEMBER`; the owner must be stored, and the node in no other owner's graph |
+| `removeGraphNode(ownerId, "graph", node)` | this graph's edges at the node, then its membership; the node's record stays |
+| `saveGraphEdge(ownerId, "graph", from, to, edge)` | one `<FIELD>_EDGE`, unless one of exactly its values joins the pair; both ends must be members |
+| `removeGraphEdge(ownerId, "graph", from, to, edge)` | the edge of exactly those values |
+| `subgraphAround(ownerId, "graph", nodeIds, hops)` | the members among `nodeIds` and their outgoing paths up to `hops`, as a plain `JavAIKnowledgeGraph` |
+| `findGraphNodes(ownerId, "graph", Map.of("name", "x"))` | the members whose simple-valued fields equal the given values |
+
+Nothing else of the graph is read or written. Concurrent writers are safe: an edge write and a node removal each lock
+their nodes before checking membership, so an edge is never left at a node outside the graph, and two owners claiming
+one node at once leave it in one graph.
+
 **This is Neo4j-only.** `RepositoryBackendNeo4j` maps a `KnowledgeGraph` field to two field-name-scoped
 relationship types — `<FIELD>_MEMBER` (owner → node, so an isolated node with no edges still round-trips)
 and `<FIELD>_EDGE` (node → node, the graph's own edges, MERGed on their full property set so `Set<E>`'s

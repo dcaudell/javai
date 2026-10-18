@@ -22,6 +22,11 @@ version -- a given release usually changes only one or two of them.
 
 ### Added
 
+- **A persisted `KnowledgeGraph` written and read in parts (OMI-660).** `javai-persistence`. `JavAIRepository`
+  `saveGraphNode`, `removeGraphNode`, `saveGraphEdge`, `removeGraphEdge`, `subgraphAround` and `findGraphNodes` write
+  one node or edge of an owner's graph field, or read a neighbourhood or the nodes matching field values, without
+  loading or saving the graph whole. `save(owner)` is unchanged: still the whole-graph write. Neo4j only; safe under
+  concurrent writers (barrier-raced tests).
 - **Images on a completion (OMI-639).** `javai-completion`. `CompletionImage` (bytes or a URL, with an image media
   type) and `CompletionRequest.Builder.image(...)`. `CortexAnthropic` and the OpenAI-compatible family send them as
   image content through Spring AI; `CortexOllama` sends bytes base64 and refuses a URL; `CortexReplicate` refuses
