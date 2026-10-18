@@ -1,11 +1,14 @@
 package dev.xtrafe.javai.persistence;
 
+import dev.xtrafe.javai.collections.JavAIEdge;
+import dev.xtrafe.javai.collections.JavAIGraphNode;
 import dev.xtrafe.javai.vector.EmbeddingVector;
 
 import dev.xtrafe.javai.vector.Ranked;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -35,6 +38,7 @@ final class RepositoryInvocationHandler implements InvocationHandler {
     }
 
     @Override
+    @SuppressWarnings("unchecked")
     public Object invoke(Object proxy, Method method, Object[] args) {
         switch (method.getName()) {
             case "save":
@@ -89,6 +93,24 @@ final class RepositoryInvocationHandler implements InvocationHandler {
             case "nearestSubgraph":
                 return backend.nearestSubgraph(entityType, (UUID) args[0], (String) args[1],
                         (EmbeddingVector) args[2], (Integer) args[3], (Integer) args[4]);
+            case "saveGraphNode":
+                backend.saveGraphNode(entityType, (UUID) args[0], (String) args[1], (JavAIGraphNode) args[2]);
+                return null;
+            case "removeGraphNode":
+                return backend.removeGraphNode(entityType, (UUID) args[0], (String) args[1], (JavAIGraphNode) args[2]);
+            case "saveGraphEdge":
+                backend.saveGraphEdge(entityType, (UUID) args[0], (String) args[1], (JavAIGraphNode) args[2],
+                        (JavAIGraphNode) args[3], (JavAIEdge) args[4]);
+                return null;
+            case "removeGraphEdge":
+                return backend.removeGraphEdge(entityType, (UUID) args[0], (String) args[1], (JavAIGraphNode) args[2],
+                        (JavAIGraphNode) args[3], (JavAIEdge) args[4]);
+            case "subgraphAround":
+                return backend.subgraphAround(entityType, (UUID) args[0], (String) args[1],
+                        (Collection<UUID>) args[2], (Integer) args[3]);
+            case "findGraphNodes":
+                return backend.findGraphNodes(entityType, (UUID) args[0], (String) args[1],
+                        (Map<String, Object>) args[2]);
             case "toString":
                 return "JavAIRepository<" + entityType.getSimpleName() + ">";
             case "hashCode":

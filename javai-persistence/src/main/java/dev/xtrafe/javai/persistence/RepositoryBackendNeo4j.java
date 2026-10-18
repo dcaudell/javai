@@ -622,6 +622,220 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         }
     }
 
+    /** One persisted {@code KnowledgeGraph} field's names in the store: what every incremental write below needs. */
+    private record GraphField(String ownerLabel, String name, String memberType, String edgeType, String memberProperty,
+                              Class<?> nodeClass, Class<?> edgeClass) {
+    }
+
+    private GraphField graphField(Class<?> ownerType, String graphField) {
+        Field field = fieldNamed(ownerType, graphField);
+        if (!KnowledgeGraph.class.isAssignableFrom(field.getType()) || genericTypeArgument(field, 1) == null) {
+            throw new IllegalArgumentException(field + " must be declared KnowledgeGraph<NodeType, EdgeType>");
+        }
+        String ownerLabel = label(ownerType);
+        return new GraphField(ownerLabel, graphField, relationshipType(graphField) + "_MEMBER",
+                relationshipType(graphField) + "_EDGE", memberProperty(ownerLabel, graphField),
+                genericTypeArgument(field, 0), genericTypeArgument(field, 1));
+    }
+
+    private static Field fieldNamed(Class<?> type, String name) {
+        try {
+            return EntityReflection.findField(type, name);
+        } catch (IllegalStateException e) {
+            throw new IllegalArgumentException(e.getMessage(), e);
+        }
+    }
+
+    /**
+     * One node into one owner's graph (OMI-660). ⚠️ The node is written before the other-owner check, and that write
+     * holds the node's lock to commit, so two owners claiming the same node at once cannot both pass the check.
+     */
+    @Override
+    public <N extends JavAIGraphNode> void saveGraphNode(Class<?> ownerType, UUID ownerId, String graphField, N node) {
+        GraphField graph = graphField(ownerType, graphField);
+        JavAIRuntime.runWithSubgraphLockedForPersistence(node, () -> {
+            try (Session session = driver().session()) {
+                session.executeWrite(tx -> {
+                    if (!tx.run(new Query("MATCH (owner:`" + graph.ownerLabel() + "` {id: $ownerId}) RETURN owner.id",
+                            Map.of("ownerId", ownerId.toString()))).hasNext()) {
+                        throw new IllegalStateException(graph.ownerLabel() + " " + ownerId + " is not stored: save it "
+                                + "before writing its " + graphField);
+                    }
+                    saveNode(tx, node, new IdentityHashMap<>());
+                    joinGraph(tx, graph.ownerLabel(), ownerId, graphField, node);
+                    return null;
+                });
+            }
+        });
+    }
+
+    /** One node out of one owner's graph (OMI-660): this graph's edges at the node first, then its membership. */
+    @Override
+    public <N extends JavAIGraphNode> boolean removeGraphNode(Class<?> ownerType, UUID ownerId, String graphField,
+                                                              N node) {
+        GraphField graph = graphField(ownerType, graphField);
+        UUID nodeId = EntityReflection.readId(node);
+        if (nodeId == null) {
+            return false;
+        }
+        Map<String, Object> params = Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString());
+        String member = "MATCH (owner:`" + graph.ownerLabel() + "` {id: $ownerId})-[m:`" + graph.memberType()
+                + "`]->(n {id: $nodeId}) ";
+        try (Session session = driver().session()) {
+            return session.executeWrite(tx -> {
+                // ⚠️ The node's lock first: an edge written to it concurrently either commits before this reads the
+                // edges, and goes with them, or waits and then finds the node no member (saveGraphEdge).
+                lock(tx, label(node.getClass()), nodeId);
+                tx.run(new Query(member + "MATCH (n)-[r:`" + graph.edgeType() + "`]-(other)<-[:`" + graph.memberType()
+                        + "`]-(owner) DELETE r", params));
+                return tx.run(new Query(member + "DELETE m REMOVE n.`" + graph.memberProperty() + "` "
+                        + "RETURN count(*) AS removed", params)).single().get("removed").asLong() > 0;
+            });
+        }
+    }
+
+    /** One edge of one owner's graph (OMI-660), both ends locked and then checked to be members. */
+    @Override
+    public <N extends JavAIGraphNode, E extends JavAIEdge> void saveGraphEdge(
+            Class<?> ownerType, UUID ownerId, String graphField, N from, N to, E edge) {
+        GraphField graph = graphField(ownerType, graphField);
+        UUID fromId = EntityReflection.readId(from);
+        UUID toId = EntityReflection.readId(to);
+        if (fromId == null || toId == null) {
+            throw new IllegalStateException("Both nodes must be members of " + graph.ownerLabel() + " " + ownerId
+                    + "'s " + graphField + " before an edge joins them: save them with saveGraphNode first");
+        }
+        try (Session session = driver().session()) {
+            session.executeWrite(tx -> {
+                Map<UUID, String> ends = new java.util.TreeMap<>(Map.of(fromId, label(from.getClass())));
+                ends.put(toId, label(to.getClass()));
+                lockMembers(tx, graph, ownerId, ends);
+                saveGraphEdge(tx, from, to, graph.edgeType(), edge);
+                return null;
+            });
+        }
+    }
+
+    /** The edge of exactly {@code edge}'s property values, removed from one owner's graph (OMI-660). */
+    @Override
+    public <N extends JavAIGraphNode, E extends JavAIEdge> boolean removeGraphEdge(
+            Class<?> ownerType, UUID ownerId, String graphField, N from, N to, E edge) {
+        GraphField graph = graphField(ownerType, graphField);
+        UUID fromId = EntityReflection.readId(from);
+        UUID toId = EntityReflection.readId(to);
+        if (fromId == null || toId == null) {
+            return false;
+        }
+        try (Session session = driver().session()) {
+            return session.executeWrite(tx -> tx.run(new Query("MATCH (owner:`" + graph.ownerLabel()
+                            + "` {id: $ownerId})-[:`" + graph.memberType() + "`]->(a {id: $fromId})-[r:`"
+                            + graph.edgeType() + "`]->(b {id: $toId})<-[:`" + graph.memberType() + "`]-(owner) "
+                            + "WHERE properties(r) = $props WITH r LIMIT 1 DELETE r RETURN count(*) AS removed",
+                    Map.of("ownerId", ownerId.toString(), "fromId", fromId.toString(), "toId", toId.toString(),
+                            "props", edgeProperties(edge)))).single().get("removed").asLong() > 0);
+        }
+    }
+
+    /**
+     * Locks each node (by id, to label), in id order so two writers never wait on each other, then requires each to be a
+     * member of {@code graph}. ⚠️ Locked in a statement of its own, before the check: a statement that matched the
+     * membership and then waited on the lock would act on a membership removed while it waited.
+     */
+    private static void lockMembers(SimpleQueryRunner tx, GraphField graph, UUID ownerId, Map<UUID, String> nodes) {
+        for (Map.Entry<UUID, String> node : nodes.entrySet()) {
+            lock(tx, node.getValue(), node.getKey());
+        }
+        for (UUID nodeId : nodes.keySet()) {
+            if (!tx.run(new Query("MATCH (owner:`" + graph.ownerLabel() + "` {id: $ownerId})-[:`" + graph.memberType()
+                            + "`]->(n {id: $nodeId}) RETURN n.id",
+                    Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString()))).hasNext()) {
+                throw new IllegalStateException("Node " + nodeId + " is not a member of " + graph.ownerLabel() + " "
+                        + ownerId + "'s " + graph.name() + ": save it with saveGraphNode before an edge joins it");
+            }
+        }
+    }
+
+    /** Takes the node's write lock until the transaction ends, changing nothing. */
+    private static void lock(SimpleQueryRunner tx, String label, UUID nodeId) {
+        tx.run(new Query("MATCH (n:`" + label + "` {id: $nodeId}) SET n.javaiLock = true REMOVE n.javaiLock",
+                Map.of("nodeId", nodeId.toString()))).consume();
+    }
+
+    /** The members among {@code nodeIds}, and everything within {@code hops} along their outgoing edges (OMI-660). */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <N extends JavAIGraphNode, E extends JavAIEdge> KnowledgeGraph<N, E> subgraphAround(
+            Class<?> ownerType, UUID ownerId, String graphField, Collection<UUID> nodeIds, int hops) {
+        GraphField graph = graphField(ownerType, graphField);
+        List<String> ids = nodeIds.stream().map(UUID::toString).toList();
+        // Membership by relationship rather than by the member property, so a graph written before that property
+        // existed is read whole (ensureGraphVectorIndex backfills it only for the vector search).
+        String reach = hops <= 0 ? "" : "OPTIONAL MATCH p = (n)-[:`" + graph.edgeType() + "`*1.." + hops + "]->() "
+                + "WHERE all(x IN nodes(p) WHERE EXISTS { (owner)-[:`" + graph.memberType() + "`]->(x) }) ";
+        try (Session session = driver().session()) {
+            List<Record> records = session.executeRead(tx -> tx.run(new Query("MATCH (owner:`" + graph.ownerLabel()
+                            + "` {id: $ownerId})-[:`" + graph.memberType() + "`]->(n) WHERE n.id IN $ids " + reach
+                            + "RETURN n, " + (hops <= 0 ? "[]" : "collect(p)") + " AS paths",
+                    Map.of("ownerId", ownerId.toString(), "ids", ids))).list());
+            Map<UUID, Object> hydrated = new HashMap<>();
+            JavAIKnowledgeGraph<N, E> result = new JavAIKnowledgeGraph<>();
+            for (Record record : records) {
+                result.addNode((N) hydrateRelated(session, record.get("n").asNode(), hydrated));
+                for (Value value : record.get("paths").values()) {
+                    for (Path.Segment segment : value.asPath()) {
+                        N from = (N) hydrateRelated(session, segment.start(), hydrated);
+                        N to = (N) hydrateRelated(session, segment.end(), hydrated);
+                        result.addNode(from);
+                        result.addNode(to);
+                        result.addEdge(from, to, (E) hydrateEdge(graph.edgeClass(), segment.relationship()));
+                    }
+                }
+            }
+            return result;
+        }
+    }
+
+    /** The members whose properties equal {@code equalTo}, compared as {@link #saveNode} stores them (OMI-660). */
+    @Override
+    @SuppressWarnings("unchecked")
+    public <N extends JavAIGraphNode> List<N> findGraphNodes(Class<?> ownerType, UUID ownerId, String graphField,
+                                                             Map<String, Object> equalTo) {
+        GraphField graph = graphField(ownerType, graphField);
+        if (graph.nodeClass() == null) {
+            throw new IllegalArgumentException(ownerType.getName() + "." + graphField + " must name its node type "
+                    + "for its nodes to be found by field");
+        }
+        StringBuilder where = new StringBuilder();
+        Map<String, Object> params = new HashMap<>();
+        params.put("ownerId", ownerId.toString());
+        int i = 0;
+        for (Map.Entry<String, Object> condition : equalTo.entrySet()) {
+            Field field = fieldNamed(graph.nodeClass(), condition.getKey());
+            Object value = condition.getValue();
+            if (isIdField(field) || isRelationshipField(field) || (value != null && !isSimpleValue(value))) {
+                throw new IllegalArgumentException(field + " is not a simple-valued field, so it cannot be compared");
+            }
+            where.append(i == 0 ? "WHERE " : "AND ").append("n.`").append(field.getName()).append('`');
+            if (value == null) {
+                where.append(" IS NULL ");
+            } else {
+                where.append(" = $v").append(i).append(' ');
+                params.put("v" + i, toNeo4jValue(value));
+            }
+            i++;
+        }
+        try (Session session = driver().session()) {
+            List<Record> records = session.executeRead(tx -> tx.run(new Query("MATCH (owner:`" + graph.ownerLabel()
+                    + "` {id: $ownerId})-[:`" + graph.memberType() + "`]->(n) " + where + "RETURN n", params)).list());
+            Map<UUID, Object> hydrated = new HashMap<>();
+            List<N> found = new ArrayList<>();
+            for (Record record : records) {
+                found.add((N) hydrateRelated(session, record.get("n").asNode(), hydrated));
+            }
+            return found;
+        }
+    }
+
     /** The node property naming the one owner whose graph field holds the node: what the vector index filters on. */
     private static String memberProperty(String ownerLabel, String graphField) {
         return "javaiMember__" + ownerLabel + "__" + relationshipType(graphField);
@@ -1279,19 +1493,7 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         String memberProperty = memberProperty(ownerLabel, fieldName);
         for (N node : graph.nodes()) {
             saveNode(tx, node, alreadySaved);
-            UUID nodeId = EntityReflection.readId(node);
-            String nodeLabel = label(node.getClass());
-            // ⚠️ One owner per node and field: the store-side search filters its vector index on this property, and a
-            // property holds one value (nearestSubgraph).
-            if (tx.run(new Query("MATCH (other:`" + ownerLabel + "`)-[:`" + memberType + "`]->(n:`" + nodeLabel
-                            + "` {id: $nodeId}) WHERE other.id <> $ownerId RETURN other.id LIMIT 1",
-                    Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString()))).hasNext()) {
-                throw new IllegalStateException(nodeLabel + " " + nodeId + " is already in another " + ownerLabel
-                        + "'s " + fieldName + ": a node belongs to one owner's graph per field");
-            }
-            tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId}), (n:`" + nodeLabel + "` {id: $nodeId}) "
-                            + "MERGE (owner)-[:`" + memberType + "`]->(n) SET n.`" + memberProperty + "` = $ownerId",
-                    Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString())));
+            joinGraph(tx, ownerLabel, ownerId, fieldName, node);
         }
         List<Map<String, Object>> edges = new ArrayList<>();
         for (N from : graph.nodes()) {
@@ -1321,6 +1523,26 @@ final class RepositoryBackendNeo4j implements RepositoryBackend {
         tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId})-[m:`" + memberType + "`]->(n) "
                         + "WHERE NOT n.id IN $members DELETE m REMOVE n.`" + memberProperty + "`",
                 Map.of("ownerId", ownerId.toString(), "members", members)));
+    }
+
+    /** Makes the already-saved {@code node} a member of one owner's graph field: the {@code <FIELD>_MEMBER}
+     *  relationship, and the membership property the vector index filters on. */
+    private void joinGraph(SimpleQueryRunner tx, String ownerLabel, UUID ownerId, String fieldName, Object node) {
+        String memberType = relationshipType(fieldName) + "_MEMBER";
+        UUID nodeId = EntityReflection.readId(node);
+        String nodeLabel = label(node.getClass());
+        // ⚠️ One owner per node and field: the store-side search filters its vector index on this property, and a
+        // property holds one value (nearestSubgraph).
+        if (tx.run(new Query("MATCH (other:`" + ownerLabel + "`)-[:`" + memberType + "`]->(n:`" + nodeLabel
+                        + "` {id: $nodeId}) WHERE other.id <> $ownerId RETURN other.id LIMIT 1",
+                Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString()))).hasNext()) {
+            throw new IllegalStateException(nodeLabel + " " + nodeId + " is already in another " + ownerLabel
+                    + "'s " + fieldName + ": a node belongs to one owner's graph per field");
+        }
+        tx.run(new Query("MATCH (owner:`" + ownerLabel + "` {id: $ownerId}), (n:`" + nodeLabel + "` {id: $nodeId}) "
+                        + "MERGE (owner)-[:`" + memberType + "`]->(n) SET n.`" + memberProperty(ownerLabel, fieldName)
+                        + "` = $ownerId",
+                Map.of("ownerId", ownerId.toString(), "nodeId", nodeId.toString())));
     }
 
     /** Writes the edge unless one of exactly its property values already joins the two nodes (contrast {@code

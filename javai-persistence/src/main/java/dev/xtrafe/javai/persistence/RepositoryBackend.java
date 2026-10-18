@@ -2,6 +2,7 @@ package dev.xtrafe.javai.persistence;
 
 import dev.xtrafe.javai.collections.JavAIEdge;
 import dev.xtrafe.javai.collections.JavAIGraphNode;
+import dev.xtrafe.javai.collections.KnowledgeGraph;
 import dev.xtrafe.javai.collections.SubgraphResult;
 import dev.xtrafe.javai.model.JavAIRuntime;
 import dev.xtrafe.javai.model.JavAIVectorizable;
@@ -10,8 +11,10 @@ import dev.xtrafe.javai.vector.Ranked;
 import dev.xtrafe.javai.vector.VectorMath;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.function.Supplier;
@@ -394,6 +397,46 @@ interface RepositoryBackend {
             Class<?> ownerType, UUID ownerId, String graphField, EmbeddingVector reference, int k, int hops) {
         throw new UnsupportedOperationException(getClass().getSimpleName() + " does not persist a KnowledgeGraph, "
                 + "so it cannot search one -- see doc/ai-guidance/persistence-support-matrix.md");
+    }
+
+    /** See {@link JavAIRepository#saveGraphNode}. */
+    default <N extends JavAIGraphNode> void saveGraphNode(Class<?> ownerType, UUID ownerId, String graphField, N node) {
+        throw noKnowledgeGraph();
+    }
+
+    /** See {@link JavAIRepository#removeGraphNode}. */
+    default <N extends JavAIGraphNode> boolean removeGraphNode(Class<?> ownerType, UUID ownerId, String graphField,
+                                                               N node) {
+        throw noKnowledgeGraph();
+    }
+
+    /** See {@link JavAIRepository#saveGraphEdge}. */
+    default <N extends JavAIGraphNode, E extends JavAIEdge> void saveGraphEdge(
+            Class<?> ownerType, UUID ownerId, String graphField, N from, N to, E edge) {
+        throw noKnowledgeGraph();
+    }
+
+    /** See {@link JavAIRepository#removeGraphEdge}. */
+    default <N extends JavAIGraphNode, E extends JavAIEdge> boolean removeGraphEdge(
+            Class<?> ownerType, UUID ownerId, String graphField, N from, N to, E edge) {
+        throw noKnowledgeGraph();
+    }
+
+    /** See {@link JavAIRepository#subgraphAround}. */
+    default <N extends JavAIGraphNode, E extends JavAIEdge> KnowledgeGraph<N, E> subgraphAround(
+            Class<?> ownerType, UUID ownerId, String graphField, Collection<UUID> nodeIds, int hops) {
+        throw noKnowledgeGraph();
+    }
+
+    /** See {@link JavAIRepository#findGraphNodes}. */
+    default <N extends JavAIGraphNode> List<N> findGraphNodes(Class<?> ownerType, UUID ownerId, String graphField,
+                                                              Map<String, Object> equalTo) {
+        throw noKnowledgeGraph();
+    }
+
+    private UnsupportedOperationException noKnowledgeGraph() {
+        return new UnsupportedOperationException(getClass().getSimpleName() + " does not persist a KnowledgeGraph -- "
+                + "see doc/ai-guidance/persistence-support-matrix.md");
     }
 
     /**
